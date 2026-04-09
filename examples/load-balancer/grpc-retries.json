@@ -1,0 +1,71 @@
+{
+  "api_version": "v1_alpha1",
+  "name": "edge-grpc",
+  "defaults": {
+    "http": {
+      "http2": {
+        "max_concurrent_streams": 256,
+        "max_body_bytes": 16777216
+      }
+    }
+  },
+  "listeners": [
+    {
+      "name": "public-grpc",
+      "class": "public",
+      "bind_address": "127.0.0.1:8443",
+      "protocol": "http2",
+      "routes": ["grpc-payments"]
+    }
+  ],
+  "routes": [
+    {
+      "name": "grpc-payments",
+      "match": { "type": "path_prefix", "prefix": "/grpc.payments.v1.Payments" },
+      "upstream_cluster": "payments-grpc",
+      "policies": {
+        "retry_budget": "grpc-standard"
+      }
+    }
+  ],
+  "upstream_clusters": [
+    {
+      "name": "payments-grpc",
+      "endpoints": [
+        {
+          "id": "payments-grpc-a",
+          "address": "127.0.0.1:9100",
+          "state": "ready",
+          "zone": "zone-a",
+          "locality": "local-a",
+          "weight": 4
+        },
+        {
+          "id": "payments-grpc-b",
+          "address": "127.0.0.1:9101",
+          "state": "ready",
+          "zone": "zone-b",
+          "locality": "local-b",
+          "weight": 2
+        }
+      ],
+      "traffic_policy": {
+        "algorithm": "weighted_round_robin",
+        "locality": "prefer_locality",
+        "no_healthy_fallback": "fail"
+      }
+    }
+  ],
+  "policies": {
+    "retry_budgets": [
+      {
+        "name": "grpc-standard",
+        "spec": {
+          "min_retry_tokens": 5,
+          "retry_percent": 20,
+          "window_ms": 10000
+        }
+      }
+    ]
+  }
+}

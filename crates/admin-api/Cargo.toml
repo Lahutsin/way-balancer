@@ -1,0 +1,22 @@
+[package]
+name = "lb-admin-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+lb-config-model = { path = "../config-model" }
+lb-observability = { path = "../observability" }
+lb-proto-tls = { path = "../proto-tls" }
+lb-runtime = { path = "../runtime" }
+
+[dev-dependencies]
+bytes = "1"
+http = "0.2"
+lb-test-support = { path = "../test-support" }
+rcgen = "0.13"
+
+[lints]
+workspace = true

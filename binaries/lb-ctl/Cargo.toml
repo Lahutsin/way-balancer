@@ -1,0 +1,18 @@
+[package]
+name = "lb-ctl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+lb-admin-api = { path = "../../crates/admin-api" }
+lb-config-model = { path = "../../crates/config-model" }
+lb-runtime = { path = "../../crates/runtime" }
+
+[dev-dependencies]
+lb-test-support = { path = "../../crates/test-support" }
+
+[lints]
+workspace = true

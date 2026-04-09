@@ -1,0 +1,40 @@
+services:
+  demo-backend:
+    image: hashicorp/http-echo:1.0.0
+    command: ["-listen=:8080", "-text=docker-demo-upstream"]
+    networks:
+      demo-net:
+        ipv4_address: 172.28.0.10
+
+  lb-dataplane:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        LB_CONTROL_PLANE_SIGNING_KEY_ED25519: ${LB_CONTROL_PLANE_SIGNING_KEY_ED25519:?set LB_CONTROL_PLANE_SIGNING_KEY_ED25519}
+        LB_CTL_ADMIN_SECRET: ${LB_CTL_ADMIN_SECRET:?set LB_CTL_ADMIN_SECRET}
+        LB_CTL_OPERATOR_SECRET: ${LB_CTL_OPERATOR_SECRET:?set LB_CTL_OPERATOR_SECRET}
+    command:
+      - serve
+      - --config
+      - /config/docker-compose-public-admin.json
+    depends_on:
+      - demo-backend
+    environment:
+      LB_CONTROL_PLANE_SIGNING_KEY_ED25519: ${LB_CONTROL_PLANE_SIGNING_KEY_ED25519:?set LB_CONTROL_PLANE_SIGNING_KEY_ED25519}
+      LB_CTL_ADMIN_SECRET: ${LB_CTL_ADMIN_SECRET:?set LB_CTL_ADMIN_SECRET}
+      LB_CTL_OPERATOR_SECRET: ${LB_CTL_OPERATOR_SECRET:?set LB_CTL_OPERATOR_SECRET}
+    ports:
+      - "8080:8080"
+      - "127.0.0.1:9900:9900"
+    volumes:
+      - ./examples/load-balancer/docker-compose-public-admin.json:/config/docker-compose-public-admin.json:ro
+    networks:
+      demo-net:
+        ipv4_address: 172.28.0.11
+
+networks:
+  demo-net:
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24

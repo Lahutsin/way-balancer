@@ -1,0 +1,23 @@
+[package]
+name = "lb-dataplane"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+lb-admin-api = { path = "../../crates/admin-api" }
+lb-config-model = { path = "../../crates/config-model" }
+lb-runtime = { path = "../../crates/runtime" }
+lb-net-core = { path = "../../crates/net-core" }
+lb-proto-http = { path = "../../crates/proto-http" }
+lb-proto-tls = { path = "../../crates/proto-tls" }
+lb-observability = { path = "../../crates/observability" }
+tokio = { version = "1.37", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+
+[dev-dependencies]
+lb-test-support = { path = "../../crates/test-support" }
+
+[lints]
+workspace = true

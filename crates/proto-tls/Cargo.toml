@@ -1,0 +1,18 @@
+[package]
+name = "lb-proto-tls"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+rustls-pemfile = "2.1"
+sha2 = "0.10"
+x509-parser = { version = "0.16", features = ["verify"] }
+
+[dev-dependencies]
+rcgen = "0.13"
+
+[lints]
+workspace = true

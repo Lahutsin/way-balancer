@@ -1,0 +1,83 @@
+{
+  "api_version": "v1_alpha1",
+  "name": "edge-public-admin",
+  "security": {
+    "artifact_verification": {
+      "mode": "enforced",
+      "trusted_signers": []
+    }
+  },
+  "listeners": [
+    {
+      "name": "public-web",
+      "class": "public",
+      "bind_address": "127.0.0.1:8080",
+      "protocol": "http1",
+      "routes": ["web"]
+    },
+    {
+      "name": "admin-tcp",
+      "class": "admin",
+      "bind_address": "127.0.0.1:9900",
+      "protocol": "tcp"
+    }
+  ],
+  "routes": [
+    {
+      "name": "web",
+      "match": { "type": "path_prefix", "prefix": "/" },
+      "upstream_cluster": "frontend",
+      "policies": {
+        "cache_policy": "public-cache"
+      }
+    }
+  ],
+  "upstream_clusters": [
+    {
+      "name": "frontend",
+      "endpoints": [
+        {
+          "id": "frontend-a",
+          "address": "127.0.0.1:8081",
+          "state": "ready",
+          "zone": null,
+          "locality": null,
+          "weight": 1
+        }
+      ]
+    }
+  ],
+  "policies": {
+    "http_caches": [
+      {
+        "name": "public-cache",
+        "spec": {
+          "methods": ["get", "head"],
+          "default_ttl_secs": 60,
+          "max_ttl_secs": 300,
+          "stale_while_revalidate_secs": 30,
+          "stale_if_error_secs": 120,
+          "cacheable_status_codes": [200, 203, 204, 300, 301, 404, 410],
+          "vary_headers": ["accept-encoding"],
+          "max_object_bytes": 262144,
+          "honor_cache_control": true,
+          "allow_set_cookie_storage": false,
+          "authorization": "bypass",
+          "revalidation_enabled": true,
+          "purge_enabled": true,
+          "cache_key": {
+            "include_host": true,
+            "include_method": false,
+            "query": "include_all",
+            "headers": ["accept-language"]
+          },
+          "storage": {
+            "type": "memory",
+            "max_entries": 2048,
+            "max_bytes": 16777216
+          }
+        }
+      }
+    ]
+  }
+}

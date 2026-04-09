@@ -1,0 +1,45 @@
+{
+  "api_version": "v1_alpha1",
+  "name": "edge-local-dev",
+  "security": {
+    "insecure_dev_mode": {
+      "enabled": true,
+      "acknowledgement": "local development only; no attested artifact publication"
+    },
+    "artifact_verification": {
+      "mode": "disabled",
+      "trusted_signers": []
+    }
+  },
+  "listeners": [
+    {
+      "name": "dev-http",
+      "class": "public",
+      "bind_address": "127.0.0.1:8088",
+      "protocol": "http1",
+      "routes": ["dev-api"]
+    }
+  ],
+  "routes": [
+    {
+      "name": "dev-api",
+      "match": { "type": "path_prefix", "prefix": "/dev" },
+      "upstream_cluster": "dev-backend"
+    }
+  ],
+  "upstream_clusters": [
+    {
+      "name": "dev-backend",
+      "endpoints": [
+        {
+          "id": "dev-backend-a",
+          "address": "127.0.0.1:9200",
+          "state": "ready",
+          "zone": null,
+          "locality": null,
+          "weight": 1
+        }
+      ]
+    }
+  ]
+}

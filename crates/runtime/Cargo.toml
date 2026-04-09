@@ -1,0 +1,36 @@
+[package]
+name = "lb-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+bytes = "1.6"
+h2 = "0.3.27"
+http = "0.2"
+httpdate = "1.0"
+lb-config-model = { path = "../config-model" }
+lb-net-core = { path = "../net-core" }
+lb-observability = { path = "../observability" }
+lb-proto-http = { path = "../proto-http" }
+lb-proto-tls = { path = "../proto-tls" }
+tokio = { version = "1.37", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+
+[dev-dependencies]
+bytes = "1.6"
+criterion = "0.5"
+h2 = "0.3.27"
+http = "0.2"
+httpdate = "1.0"
+lb-config-model = { path = "../config-model" }
+lb-test-support = { path = "../test-support" }
+tokio = { version = "1.37", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+
+[[bench]]
+name = "http_cache"
+harness = false
+
+[lints]
+workspace = true

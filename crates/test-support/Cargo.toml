@@ -1,0 +1,19 @@
+[package]
+name = "lb-test-support"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+lb-admin-api = { path = "../admin-api" }
+lb-config-model = { path = "../config-model" }
+lb-runtime = { path = "../runtime" }
+
+[dev-dependencies]
+lb-proto-tls = { path = "../proto-tls" }
+rcgen = "0.13"
+
+[lints]
+workspace = true

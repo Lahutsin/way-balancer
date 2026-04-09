@@ -1,0 +1,41 @@
+[workspace]
+members = [
+  "crates/runtime",
+  "crates/net-core",
+  "crates/proto-http",
+  "crates/proto-tls",
+  "crates/config-model",
+  "crates/k8s-integration",
+  "crates/observability",
+  "crates/admin-api",
+  "crates/test-support",
+  "binaries/lb-dataplane",
+  "binaries/lb-ctl",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "UNLICENSED"
+rust-version = "1.81"
+version = "0.1.0"
+authors = ["way-balancer contributors"]
+publish = false
+
+[workspace.metadata]
+description = "Production-oriented Rust load balancer workspace with runtime, control-plane, security, Kubernetes, and release-readiness foundations"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unused_lifetimes = "deny"
+unused_attributes = "deny"
+rust_2018_idioms = { level = "deny", priority = -1 }
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+
+[workspace.dependencies]
