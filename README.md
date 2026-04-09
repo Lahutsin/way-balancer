@@ -27,6 +27,41 @@ The workspace is still pre-GA, but it already includes runnable dataplane/contro
 - `crates/observability`: metrics, tracing, diagnostics, support-bundle, and forensic export foundations
 - `crates/test-support`: upgrade/rollback and restore smoke fixtures used by release gates
 
+## Architecture Overview
+
+The diagram below shows how the main control-plane and dataplane pieces fit together in a typical deployment.
+
+```mermaid
+flowchart LR
+	user[Clients] --> public[Public listeners\nHTTP HTTPS gRPC]
+	operator[Operators and CI] --> ctl[lb-ctl]
+	k8s[Kubernetes Gateway API] --> k8s_integration[crates/k8s-integration]
+
+	subgraph ControlPlane[Control plane]
+		ctl --> admin_api[crates/admin-api]
+		k8s_integration --> config_model[crates/config-model]
+		admin_api --> config_model
+		config_model --> snapshot[Validated config snapshot\ncompile digest diff]
+	end
+
+	subgraph DataPlane[Dataplane]
+		dataplane[lb-dataplane] --> runtime[crates/runtime]
+		public --> dataplane
+		runtime --> upstreams[Upstream clusters and services]
+		snapshot --> runtime
+	end
+
+	proto_http[crates/proto-http]
+	proto_tls[crates/proto-tls]
+	observability[crates/observability]
+
+	proto_http --> runtime
+	proto_tls --> runtime
+	proto_tls --> admin_api
+	runtime --> observability
+	admin_api --> observability
+```
+
 ## Workspace Layout
 
 - `crates/`: shared libraries and architecture layers
