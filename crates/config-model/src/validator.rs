@@ -3,11 +3,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ArtifactVerificationMode, CacheKeyPolicyConfig, HttpCachePolicyConfig,
-    HttpCacheStorageConfig, ListenerProtocolConfig, LocalConcurrencyLimitPolicyConfig,
+    AdminAuthPolicyConfig, AdminAuthorizationScopeConfig, AnonymousSourceFilterConfig,
+    ArtifactVerificationMode, CacheKeyPolicyConfig,
+    HttpCachePolicyConfig, HttpCacheStorageConfig, ListenerAlpnProtocolConfig,
+    ListenerClassConfig, ListenerProtocolConfig, LocalConcurrencyLimitPolicyConfig,
     LocalLimitScopeConfig, LocalRateLimitPolicyConfig, NamedOverloadResponsePolicyConfig,
     OverloadResponsePolicyConfig, PolicyBindingConfig, PolicyResourcesConfig, RouteConfig,
-    RouteMatchConfig, WorkspaceConfig,
+    RouteMatchConfig, TrustedClientIpConfig, WorkspaceConfig,
 };
 
 /// Stable validation error category.
@@ -321,6 +323,44 @@ fn validate_security(config: &WorkspaceConfig, report: &mut ValidationReport) {
             ));
         }
     }
+
+    validate_anonymous_source_filter(&security.anonymous_source_filter, report);
+    validate_trusted_client_ip(&security.trusted_client_ip, report);
+}
+
+fn validate_trusted_client_ip(config: &TrustedClientIpConfig, report: &mut ValidationReport) {
+    for (index, cidr) in config.trusted_proxy_cidrs.iter().enumerate() {
+        if cidr.parse::<ipnet::IpNet>().is_err() {
+            report.errors.push(ValidationError::schema(
+                ValidationCode::InvalidSecurityDefaults,
+                format!("security.trusted_client_ip.trusted_proxy_cidrs[{index}]"),
+                format!("trusted proxy CIDR must be a valid IPv4 or IPv6 CIDR: {cidr}"),
+            ));
+        }
+    }
+}
+
+fn validate_anonymous_source_filter(
+    filter: &AnonymousSourceFilterConfig,
+    report: &mut ValidationReport,
+) {
+    for (path, cidrs) in [
+        ("security.anonymous_source_filter.deny_cidrs", &filter.deny_cidrs),
+        ("security.anonymous_source_filter.vpn_cidrs", &filter.vpn_cidrs),
+        ("security.anonymous_source_filter.proxy_cidrs", &filter.proxy_cidrs),
+        ("security.anonymous_source_filter.socks_cidrs", &filter.socks_cidrs),
+        ("security.anonymous_source_filter.tor_exit_cidrs", &filter.tor_exit_cidrs),
+    ] {
+        for (index, cidr) in cidrs.iter().enumerate() {
+            if cidr.parse::<ipnet::IpNet>().is_err() {
+                report.errors.push(ValidationError::schema(
+                    ValidationCode::InvalidSecurityDefaults,
+                    format!("{path}[{index}]"),
+                    format!("anonymous source CIDR must be a valid IPv4 or IPv6 CIDR: {cidr}"),
+                ));
+            }
+        }
+    }
 }
 
 fn validate_listener(
@@ -377,6 +417,127 @@ fn validate_listener(
                     "https listeners must use non-empty cert_path and key_path values",
                 ));
             }
+            if tls_termination
+                .certificate_source
+                .ocsp_path()
+                .is_some_and(|path| path.trim().is_empty())
+            {
+                report.errors.push(ValidationError::schema(
+                    ValidationCode::InvalidListenerField,
+                    format!("{base_path}.tls_termination.certificate_source.ocsp_path"),
+                    "https listeners must use a non-empty ocsp_path when OCSP stapling is configured",
+                ));
+            }
+
+            let mut seen_sni_names = BTreeSet::new();
+            for (sni_index, sni_certificate) in tls_termination.sni_certificates.iter().enumerate() {
+                let certificate_path =
+                    format!("{base_path}.tls_termination.sni_certificates[{sni_index}]");
+                if sni_certificate.server_names.is_empty() {
+                    report.errors.push(ValidationError::schema(
+                        ValidationCode::InvalidListenerField,
+                        format!("{certificate_path}.server_names"),
+                        "https SNI certificate mappings must declare at least one server name",
+                    ));
+                }
+                if sni_certificate.certificate_source.cert_path().trim().is_empty()
+                    || sni_certificate.certificate_source.key_path().trim().is_empty()
+                {
+                    report.errors.push(ValidationError::schema(
+                        ValidationCode::InvalidListenerField,
+                        format!("{certificate_path}.certificate_source"),
+                        "https SNI certificate mappings must use non-empty cert_path and key_path values",
+                    ));
+                }
+                if sni_certificate
+                    .certificate_source
+                    .ocsp_path()
+                    .is_some_and(|path| path.trim().is_empty())
+                {
+                    report.errors.push(ValidationError::schema(
+                        ValidationCode::InvalidListenerField,
+                        format!("{certificate_path}.certificate_source.ocsp_path"),
+                        "https SNI certificate mappings must use a non-empty ocsp_path when OCSP stapling is configured",
+                    ));
+                }
+
+                for (name_index, server_name) in sni_certificate.server_names.iter().enumerate() {
+                    match lb_proto_http::canonicalize_host(server_name) {
+                        Ok(normalized) => {
+                            if !seen_sni_names.insert(normalized.clone()) {
+                                report.errors.push(ValidationError::schema(
+                                    ValidationCode::InvalidListenerField,
+                                    format!("{certificate_path}.server_names[{name_index}]"),
+                                    format!(
+                                        "https listeners must not repeat SNI server name {normalized}"
+                                    ),
+                                ));
+                            }
+                        }
+                        Err(_) => report.errors.push(ValidationError::schema(
+                            ValidationCode::InvalidListenerField,
+                            format!("{certificate_path}.server_names[{name_index}]"),
+                            format!(
+                                "https listener {} declares invalid SNI server name {}",
+                                listener.name, server_name
+                            ),
+                        )),
+                    }
+                }
+            }
+
+            match tls_termination.session_resumption.mode {
+                crate::ListenerTlsSessionResumptionModeConfig::Disabled => {}
+                crate::ListenerTlsSessionResumptionModeConfig::Stateful
+                | crate::ListenerTlsSessionResumptionModeConfig::Hybrid => {
+                    if tls_termination.session_resumption.session_cache_size == 0 {
+                        report.errors.push(ValidationError::schema(
+                            ValidationCode::InvalidListenerField,
+                            format!("{base_path}.tls_termination.session_resumption.session_cache_size"),
+                            "https listeners using stateful session resumption must use a non-zero session_cache_size",
+                        ));
+                    }
+                }
+                crate::ListenerTlsSessionResumptionModeConfig::Tickets => {}
+            }
+
+            match tls_termination.session_resumption.mode {
+                crate::ListenerTlsSessionResumptionModeConfig::Tickets
+                | crate::ListenerTlsSessionResumptionModeConfig::Hybrid => {
+                    if tls_termination.session_resumption.tls13_ticket_count == 0 {
+                        report.errors.push(ValidationError::schema(
+                            ValidationCode::InvalidListenerField,
+                            format!("{base_path}.tls_termination.session_resumption.tls13_ticket_count"),
+                            "https listeners issuing TLS tickets must use a non-zero tls13_ticket_count",
+                        ));
+                    }
+                }
+                crate::ListenerTlsSessionResumptionModeConfig::Disabled
+                | crate::ListenerTlsSessionResumptionModeConfig::Stateful => {}
+            }
+
+            if tls_termination.alpn_protocols.is_empty() {
+                report.errors.push(ValidationError::schema(
+                    ValidationCode::InvalidListenerField,
+                    format!("{base_path}.tls_termination.alpn_protocols"),
+                    "https listeners must advertise at least one ALPN protocol",
+                ));
+            }
+
+            let mut seen_alpn = BTreeSet::new();
+            for (alpn_index, alpn_protocol) in tls_termination.alpn_protocols.iter().enumerate() {
+                if !seen_alpn.insert(*alpn_protocol) {
+                    let protocol_name = match alpn_protocol {
+                        ListenerAlpnProtocolConfig::Http2 => "http2",
+                        ListenerAlpnProtocolConfig::Http11 => "http11",
+                    };
+                    report.errors.push(ValidationError::schema(
+                        ValidationCode::InvalidListenerField,
+                        format!("{base_path}.tls_termination.alpn_protocols[{alpn_index}]"),
+                        format!("https listeners must not repeat ALPN protocol {protocol_name}"),
+                    ));
+                }
+            }
         }
         (_, Some(_)) => {
             report.errors.push(ValidationError::semantic(
@@ -387,6 +548,8 @@ fn validate_listener(
         }
         (_, None) => {}
     }
+
+    validate_admin_listener_policy(listener, &base_path, report);
 
     let mut seen_routes = BTreeSet::new();
     for (route_index, route_name) in listener.routes.iter().enumerate() {
@@ -425,6 +588,145 @@ fn validate_listener(
     );
 }
 
+fn validate_admin_listener_policy(
+    listener: &crate::ListenerResourceConfig,
+    base_path: &str,
+    report: &mut ValidationReport,
+) {
+    if listener.class != ListenerClassConfig::Admin && !listener.admin.is_default() {
+        report.errors.push(ValidationError::semantic(
+            ValidationCode::InvalidListenerField,
+            format!("{base_path}.admin"),
+            "admin policy is supported only on admin listeners",
+        ));
+        return;
+    }
+
+    if listener.class != ListenerClassConfig::Admin {
+        return;
+    }
+
+    for (index, cidr) in listener.admin.allowed_source_cidrs.iter().enumerate() {
+        if cidr.parse::<ipnet::IpNet>().is_err() {
+            report.errors.push(ValidationError::schema(
+                ValidationCode::InvalidListenerField,
+                format!("{base_path}.admin.allowed_source_cidrs[{index}]"),
+                format!("admin allowed source CIDR must be a valid IPv4 or IPv6 CIDR: {cidr}"),
+            ));
+        }
+    }
+
+    if listener.admin.rate_limit.requests_per_minute == 0 || listener.admin.rate_limit.burst == 0 {
+        report.errors.push(ValidationError::schema(
+            ValidationCode::InvalidListenerField,
+            format!("{base_path}.admin.rate_limit"),
+            "admin rate limits must use non-zero requests_per_minute and burst values",
+        ));
+    }
+
+    if listener.admin.audit.max_retained_events == 0 {
+        report.errors.push(ValidationError::schema(
+            ValidationCode::InvalidListenerField,
+            format!("{base_path}.admin.audit.max_retained_events"),
+            "admin audit retention must keep at least one event",
+        ));
+    }
+
+    match &listener.admin.auth {
+        AdminAuthPolicyConfig::Bearer { secret_env, permissions } => {
+            if secret_env.trim().is_empty() {
+                report.errors.push(ValidationError::schema(
+                    ValidationCode::InvalidListenerField,
+                    format!("{base_path}.admin.auth.secret_env"),
+                    "admin bearer auth must declare a non-empty secret_env",
+                ));
+            }
+            validate_admin_permissions(permissions, &format!("{base_path}.admin.auth.permissions"), report);
+        }
+        AdminAuthPolicyConfig::SignedHeaders {
+            operators,
+            max_clock_skew_secs,
+            nonce_ttl_secs,
+        } => {
+            if operators.is_empty() {
+                report.errors.push(ValidationError::schema(
+                    ValidationCode::InvalidListenerField,
+                    format!("{base_path}.admin.auth.operators"),
+                    "signed admin auth must declare at least one operator",
+                ));
+            }
+            if *max_clock_skew_secs == 0 || *nonce_ttl_secs == 0 {
+                report.errors.push(ValidationError::schema(
+                    ValidationCode::InvalidListenerField,
+                    format!("{base_path}.admin.auth"),
+                    "signed admin auth must use non-zero max_clock_skew_secs and nonce_ttl_secs",
+                ));
+            }
+
+            let mut seen_operator_ids = BTreeSet::new();
+            for (index, operator) in operators.iter().enumerate() {
+                let operator_path = format!("{base_path}.admin.auth.operators[{index}]");
+                if operator.id.trim().is_empty() {
+                    report.errors.push(ValidationError::schema(
+                        ValidationCode::InvalidListenerField,
+                        format!("{operator_path}.id"),
+                        "admin operator id must not be empty",
+                    ));
+                } else if !seen_operator_ids.insert(operator.id.trim().to_string()) {
+                    report.errors.push(ValidationError::schema(
+                        ValidationCode::DuplicateResourceName,
+                        format!("{operator_path}.id"),
+                        format!("admin operator {} is declared more than once", operator.id),
+                    ));
+                }
+                if operator.secret_env.trim().is_empty() {
+                    report.errors.push(ValidationError::schema(
+                        ValidationCode::InvalidListenerField,
+                        format!("{operator_path}.secret_env"),
+                        "admin operator secret_env must not be empty",
+                    ));
+                }
+                validate_admin_permissions(
+                    &operator.permissions,
+                    &format!("{operator_path}.permissions"),
+                    report,
+                );
+            }
+        }
+    }
+}
+
+fn validate_admin_permissions(
+    permissions: &[AdminAuthorizationScopeConfig],
+    path: &str,
+    report: &mut ValidationReport,
+) {
+    if permissions.is_empty() {
+        report.errors.push(ValidationError::schema(
+            ValidationCode::InvalidListenerField,
+            path.to_string(),
+            "admin permissions must declare at least one scope",
+        ));
+        return;
+    }
+
+    let mut seen = BTreeSet::new();
+    for permission in permissions {
+        if !seen.insert(*permission) {
+            let scope = match permission {
+                AdminAuthorizationScopeConfig::Read => "read",
+                AdminAuthorizationScopeConfig::Audit => "audit",
+                AdminAuthorizationScopeConfig::Write => "write",
+            };
+            report.errors.push(ValidationError::schema(
+                ValidationCode::InvalidListenerField,
+                path.to_string(),
+                format!("admin permissions must not repeat scope {scope}"),
+            ));
+        }
+    }
+}
+
 fn validate_route(
     route: &RouteConfig,
     index: usize,
@@ -442,14 +744,27 @@ fn validate_route(
     }
 
     match &route.match_rule {
-        RouteMatchConfig::PathPrefix { prefix } if prefix.trim().is_empty() => {
-            report.errors.push(ValidationError::schema(
-                ValidationCode::InvalidRouteMatch,
-                format!("{base_path}.match.prefix"),
-                format!("route {} must declare a non-empty path prefix", route.name),
-            ));
+        RouteMatchConfig::PathPrefix { prefix, hostnames } => {
+            if prefix.trim().is_empty() {
+                report.errors.push(ValidationError::schema(
+                    ValidationCode::InvalidRouteMatch,
+                    format!("{base_path}.match.prefix"),
+                    format!("route {} must declare a non-empty path prefix", route.name),
+                ));
+            }
+            for (hostname_index, hostname) in hostnames.iter().enumerate() {
+                if lb_proto_http::canonicalize_host(hostname).is_err() {
+                    report.errors.push(ValidationError::schema(
+                        ValidationCode::InvalidRouteMatch,
+                        format!("{base_path}.match.hostnames[{hostname_index}]"),
+                        format!(
+                            "route {} declares invalid hostname filter {}",
+                            route.name, hostname
+                        ),
+                    ));
+                }
+            }
         }
-        RouteMatchConfig::PathPrefix { .. } => {}
     }
 
     let upstream_name = route.upstream_cluster.trim();
@@ -1274,12 +1589,12 @@ mod tests {
         validate_workspace_config, ValidationCategory, ValidationCode, WorkspaceConfigValidator,
     };
     use crate::{
-        AuthorizationCacheBehaviorConfig, CacheKeyPolicyConfig, CacheQueryKeyBehaviorConfig,
-        HttpCacheMethodConfig, HttpCachePolicyConfig, HttpCacheStorageConfig,
-        ListenerCertificateSourceConfig, ListenerClassConfig, ListenerResourceConfig,
-        ListenerTlsTerminationConfig, LocalConcurrencyLimitPolicyConfig, LocalLimitKeyKindConfig,
-        LocalLimitScopeConfig, LocalRateLimitPolicyConfig,
-        NamedHttpCachePolicyConfig,
+        AdminListenerPolicyConfig, AuthorizationCacheBehaviorConfig, CacheKeyPolicyConfig,
+        CacheQueryKeyBehaviorConfig, HttpCacheMethodConfig, HttpCachePolicyConfig,
+        HttpCacheStorageConfig, ListenerCertificateSourceConfig, ListenerClassConfig,
+        ListenerResourceConfig, ListenerTlsTerminationConfig,
+        LocalConcurrencyLimitPolicyConfig, LocalLimitKeyKindConfig, LocalLimitScopeConfig,
+        LocalRateLimitPolicyConfig, NamedHttpCachePolicyConfig,
         NamedLocalConcurrencyLimitPolicyConfig, NamedLocalRateLimitPolicyConfig,
         NamedOverloadResponsePolicyConfig, NamedRetryBudgetPolicyConfig,
         OverloadResponsePolicyConfig, PolicyBindingConfig, PolicyResourcesConfig, RouteConfig,
@@ -1314,10 +1629,14 @@ mod tests {
                     cache_policy: Some(String::from("public-cache")),
                     ..PolicyBindingConfig::default()
                 },
+                admin: AdminListenerPolicyConfig::default(),
             }],
             routes: vec![RouteConfig {
                 name: String::from("api"),
-                match_rule: crate::RouteMatchConfig::PathPrefix { prefix: String::from("/api") },
+                match_rule: crate::RouteMatchConfig::PathPrefix {
+                    prefix: String::from("/api"),
+                    hostnames: Vec::new(),
+                },
                 upstream_cluster: String::from("payments"),
                 policies: PolicyBindingConfig {
                     local_concurrency_limits: vec![String::from("api-concurrency")],
@@ -1456,6 +1775,55 @@ mod tests {
     }
 
     #[test]
+    fn validator_rejects_invalid_route_hostname() -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = valid_workspace()?;
+        config.routes[0].match_rule = crate::RouteMatchConfig::PathPrefix {
+            prefix: String::from("/api"),
+            hostnames: vec![String::from("bad/host")],
+        };
+
+        let report = validate_workspace_config(&config);
+
+        assert_eq!(report.errors.len(), 1);
+        assert_eq!(report.errors[0].code, ValidationCode::InvalidRouteMatch);
+        assert_eq!(report.errors[0].path, "routes[0].match.hostnames[0]");
+        Ok(())
+    }
+
+    #[test]
+    fn validator_rejects_invalid_anonymous_source_cidr(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = valid_workspace()?;
+        config.security.anonymous_source_filter.enabled = true;
+        config.security.anonymous_source_filter.deny_tor = true;
+        config.security.anonymous_source_filter.tor_exit_cidrs = vec![String::from("not-a-cidr")];
+
+        let report = validate_workspace_config(&config);
+
+        assert!(report.errors.iter().any(|error| {
+            error.code == ValidationCode::InvalidSecurityDefaults
+                && error.path == "security.anonymous_source_filter.tor_exit_cidrs[0]"
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn validator_rejects_invalid_trusted_proxy_cidr(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = valid_workspace()?;
+        config.security.trusted_client_ip.enabled = true;
+        config.security.trusted_client_ip.trusted_proxy_cidrs = vec![String::from("bad-cidr")];
+
+        let report = validate_workspace_config(&config);
+
+        assert!(report.errors.iter().any(|error| {
+            error.code == ValidationCode::InvalidSecurityDefaults
+                && error.path == "security.trusted_client_ip.trusted_proxy_cidrs[0]"
+        }));
+        Ok(())
+    }
+
+    #[test]
     fn validator_rejects_conflicting_policy_scope_and_tcp_routes(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut config = valid_workspace()?;
@@ -1585,7 +1953,12 @@ mod tests {
             certificate_source: ListenerCertificateSourceConfig::Files {
                 cert_path: String::from("certs/server.pem"),
                 key_path: String::from("certs/server.key"),
+                ocsp_path: None,
             },
+            sni_certificates: Vec::new(),
+            session_resumption: crate::ListenerTlsSessionResumptionConfig::default(),
+            minimum_version: crate::ListenerTlsMinimumVersionConfig::Tls12,
+            alpn_protocols: vec![crate::ListenerAlpnProtocolConfig::Http2],
         });
 
         let report = validate_workspace_config(&config);
@@ -1593,6 +1966,210 @@ mod tests {
         assert!(report
             .to_string()
             .contains("tls_termination is currently supported only for https listeners"));
+        Ok(())
+    }
+
+    #[test]
+    fn validator_rejects_https_listener_without_alpn_protocols(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = valid_workspace()?;
+        config.listeners[0].protocol = crate::ListenerProtocolConfig::Https;
+        config.listeners[0].tls_termination = Some(ListenerTlsTerminationConfig {
+            certificate_source: ListenerCertificateSourceConfig::Files {
+                cert_path: String::from("certs/server.pem"),
+                key_path: String::from("certs/server.key"),
+                ocsp_path: None,
+            },
+            sni_certificates: Vec::new(),
+            session_resumption: crate::ListenerTlsSessionResumptionConfig::default(),
+            minimum_version: crate::ListenerTlsMinimumVersionConfig::Tls12,
+            alpn_protocols: Vec::new(),
+        });
+
+        let report = validate_workspace_config(&config);
+
+        assert!(report
+            .to_string()
+            .contains("https listeners must advertise at least one ALPN protocol"));
+        Ok(())
+    }
+
+    #[test]
+    fn validator_rejects_duplicate_https_alpn_protocols(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = valid_workspace()?;
+        config.listeners[0].protocol = crate::ListenerProtocolConfig::Https;
+        config.listeners[0].tls_termination = Some(ListenerTlsTerminationConfig {
+            certificate_source: ListenerCertificateSourceConfig::Files {
+                cert_path: String::from("certs/server.pem"),
+                key_path: String::from("certs/server.key"),
+                ocsp_path: None,
+            },
+            sni_certificates: Vec::new(),
+            session_resumption: crate::ListenerTlsSessionResumptionConfig::default(),
+            minimum_version: crate::ListenerTlsMinimumVersionConfig::Tls12,
+            alpn_protocols: vec![
+                crate::ListenerAlpnProtocolConfig::Http2,
+                crate::ListenerAlpnProtocolConfig::Http2,
+            ],
+        });
+
+        let report = validate_workspace_config(&config);
+
+        assert!(report
+            .to_string()
+            .contains("https listeners must not repeat ALPN protocol http2"));
+        Ok(())
+    }
+
+    #[test]
+    fn validator_rejects_https_sni_mapping_without_server_names(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = valid_workspace()?;
+        config.listeners[0].protocol = crate::ListenerProtocolConfig::Https;
+        config.listeners[0].tls_termination = Some(ListenerTlsTerminationConfig {
+            certificate_source: ListenerCertificateSourceConfig::Files {
+                cert_path: String::from("certs/server.pem"),
+                key_path: String::from("certs/server.key"),
+                ocsp_path: None,
+            },
+            sni_certificates: vec![crate::ListenerTlsSniCertificateConfig {
+                server_names: Vec::new(),
+                certificate_source: ListenerCertificateSourceConfig::Files {
+                    cert_path: String::from("certs/tenant.pem"),
+                    key_path: String::from("certs/tenant.key"),
+                    ocsp_path: None,
+                },
+            }],
+            session_resumption: crate::ListenerTlsSessionResumptionConfig::default(),
+            minimum_version: crate::ListenerTlsMinimumVersionConfig::Tls12,
+            alpn_protocols: vec![crate::ListenerAlpnProtocolConfig::Http11],
+        });
+
+        let report = validate_workspace_config(&config);
+        assert!(report
+            .to_string()
+            .contains("https SNI certificate mappings must declare at least one server name"));
+        Ok(())
+    }
+
+    #[test]
+    fn validator_rejects_duplicate_https_sni_server_names(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = valid_workspace()?;
+        config.listeners[0].protocol = crate::ListenerProtocolConfig::Https;
+        config.listeners[0].tls_termination = Some(ListenerTlsTerminationConfig {
+            certificate_source: ListenerCertificateSourceConfig::Files {
+                cert_path: String::from("certs/server.pem"),
+                key_path: String::from("certs/server.key"),
+                ocsp_path: None,
+            },
+            sni_certificates: vec![
+                crate::ListenerTlsSniCertificateConfig {
+                    server_names: vec![String::from("Tenant.Example")],
+                    certificate_source: ListenerCertificateSourceConfig::Files {
+                        cert_path: String::from("certs/tenant-a.pem"),
+                        key_path: String::from("certs/tenant-a.key"),
+                        ocsp_path: None,
+                    },
+                },
+                crate::ListenerTlsSniCertificateConfig {
+                    server_names: vec![String::from("tenant.example.")],
+                    certificate_source: ListenerCertificateSourceConfig::Files {
+                        cert_path: String::from("certs/tenant-b.pem"),
+                        key_path: String::from("certs/tenant-b.key"),
+                        ocsp_path: None,
+                    },
+                },
+            ],
+            session_resumption: crate::ListenerTlsSessionResumptionConfig::default(),
+            minimum_version: crate::ListenerTlsMinimumVersionConfig::Tls12,
+            alpn_protocols: vec![crate::ListenerAlpnProtocolConfig::Http11],
+        });
+
+        let report = validate_workspace_config(&config);
+        assert!(report
+            .to_string()
+            .contains("https listeners must not repeat SNI server name tenant.example"));
+        Ok(())
+    }
+
+    #[test]
+    fn validator_rejects_zero_stateful_session_cache_size(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = valid_workspace()?;
+        config.listeners[0].protocol = crate::ListenerProtocolConfig::Https;
+        config.listeners[0].tls_termination = Some(ListenerTlsTerminationConfig {
+            certificate_source: ListenerCertificateSourceConfig::Files {
+                cert_path: String::from("certs/server.pem"),
+                key_path: String::from("certs/server.key"),
+                ocsp_path: None,
+            },
+            sni_certificates: Vec::new(),
+            session_resumption: crate::ListenerTlsSessionResumptionConfig {
+                mode: crate::ListenerTlsSessionResumptionModeConfig::Stateful,
+                session_cache_size: 0,
+                tls13_ticket_count: 0,
+            },
+            minimum_version: crate::ListenerTlsMinimumVersionConfig::Tls12,
+            alpn_protocols: vec![crate::ListenerAlpnProtocolConfig::Http11],
+        });
+
+        let report = validate_workspace_config(&config);
+        assert!(report
+            .to_string()
+            .contains("https listeners using stateful session resumption must use a non-zero session_cache_size"));
+        Ok(())
+    }
+
+    #[test]
+    fn validator_rejects_zero_tls13_ticket_count_for_ticket_mode(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = valid_workspace()?;
+        config.listeners[0].protocol = crate::ListenerProtocolConfig::Https;
+        config.listeners[0].tls_termination = Some(ListenerTlsTerminationConfig {
+            certificate_source: ListenerCertificateSourceConfig::Files {
+                cert_path: String::from("certs/server.pem"),
+                key_path: String::from("certs/server.key"),
+                ocsp_path: None,
+            },
+            sni_certificates: Vec::new(),
+            session_resumption: crate::ListenerTlsSessionResumptionConfig {
+                mode: crate::ListenerTlsSessionResumptionModeConfig::Tickets,
+                session_cache_size: 256,
+                tls13_ticket_count: 0,
+            },
+            minimum_version: crate::ListenerTlsMinimumVersionConfig::Tls12,
+            alpn_protocols: vec![crate::ListenerAlpnProtocolConfig::Http11],
+        });
+
+        let report = validate_workspace_config(&config);
+        assert!(report
+            .to_string()
+            .contains("https listeners issuing TLS tickets must use a non-zero tls13_ticket_count"));
+        Ok(())
+    }
+
+    #[test]
+    fn validator_rejects_blank_ocsp_path() -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = valid_workspace()?;
+        config.listeners[0].protocol = crate::ListenerProtocolConfig::Https;
+        config.listeners[0].tls_termination = Some(ListenerTlsTerminationConfig {
+            certificate_source: ListenerCertificateSourceConfig::Files {
+                cert_path: String::from("certs/server.pem"),
+                key_path: String::from("certs/server.key"),
+                ocsp_path: Some(String::from("   ")),
+            },
+            sni_certificates: Vec::new(),
+            session_resumption: crate::ListenerTlsSessionResumptionConfig::default(),
+            minimum_version: crate::ListenerTlsMinimumVersionConfig::Tls12,
+            alpn_protocols: vec![crate::ListenerAlpnProtocolConfig::Http11],
+        });
+
+        let report = validate_workspace_config(&config);
+        assert!(report
+            .to_string()
+            .contains("https listeners must use a non-empty ocsp_path when OCSP stapling is configured"));
         Ok(())
     }
 

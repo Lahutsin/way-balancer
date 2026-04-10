@@ -1,14 +1,17 @@
 use std::collections::BTreeMap;
 use std::fmt;
-use std::net::SocketAddr;
-use std::sync::Arc;
+use std::hash::Hasher;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::{
-    build_http_cache_key_material, HttpCacheEntry, HttpCacheHeader, HttpCacheKey,
+    AnonymousSourceFilterPolicy, AnonymousSourceFilterState, build_http_cache_key_material,
+    HttpCacheEntry, HttpCacheHeader, HttpCacheKey,
     HttpCacheMetadata, HttpCacheRequest, HttpCacheRequestOutcome,
-    HttpCacheRevalidationResult, HttpCacheStore, ProtocolAnomalyCategory, RuntimeTelemetry,
-    SlowClientStage,
+    HttpCacheRevalidationResult, HttpCacheStore, ProtocolAnomalyCategory,
+    RouteEnumerationProtectionPolicy, RouteEnumerationProtectionState, RuntimeTelemetry,
+    SlowClientStage, TrustedClientIpPolicy,
 };
 use http::{HeaderName, HeaderValue, StatusCode};
 use httpdate::parse_http_date;
@@ -27,8 +30,28 @@ pub struct Http1ProxyConfig {
     pub limits: lb_proto_http::Http1Limits,
     /// Placeholder route rules for future routing extensions.
     pub routes: Vec<lb_proto_http::RoutePrefixRule>,
+    /// Optional route-to-upstream pools keyed by route label.
+    pub route_upstreams: BTreeMap<String, Vec<lb_net_core::UpstreamTarget>>,
+    /// Optional health-aware route backend pools keyed by route label.
+    pub route_backend_pools: BTreeMap<String, crate::RouteBackendPool>,
+    /// Deterministic round-robin cursors for route upstream pools.
+    route_upstream_cursors: Arc<Mutex<BTreeMap<String, usize>>>,
+    /// Whether requests with no matching route should be rejected locally.
+    pub reject_unmatched_routes: bool,
+    /// Optional CIDR-based anonymous source filter.
+    pub anonymous_source_filter: Option<Arc<AnonymousSourceFilterState>>,
+    /// Optional progressive ban guard for route and query enumeration by source.
+    pub route_enumeration_protection: Option<Arc<RouteEnumerationProtectionState>>,
+    /// Optional trusted-proxy model used to determine the effective client IP.
+    pub trusted_client_ip: Option<TrustedClientIpPolicy>,
     /// Optional response-cache runtime for GET/HEAD traffic.
     pub response_cache: Option<Http1ResponseCacheConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Http1RouteUpstream {
+    pub route_label: String,
+    pub upstream: lb_net_core::UpstreamTarget,
 }
 
 /// Response cache runtime configuration for HTTP/1 proxying.
@@ -81,8 +104,67 @@ impl Http1ProxyConfig {
             timeouts: lb_net_core::ConnectionTimeouts::default(),
             limits: lb_proto_http::Http1Limits::default(),
             routes: Vec::new(),
+            route_upstreams: BTreeMap::new(),
+            route_backend_pools: BTreeMap::new(),
+            route_upstream_cursors: Arc::new(Mutex::new(BTreeMap::new())),
+            reject_unmatched_routes: false,
+            anonymous_source_filter: None,
+            route_enumeration_protection: None,
+            trusted_client_ip: None,
             response_cache: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_route_upstreams(
+        mut self,
+        route_upstreams: impl IntoIterator<Item = Http1RouteUpstream>,
+    ) -> Self {
+        self.route_upstreams.clear();
+        for route_upstream in route_upstreams {
+            self.route_upstreams
+                .entry(route_upstream.route_label)
+                .or_default()
+                .push(route_upstream.upstream);
+        }
+        self
+    }
+
+    #[must_use]
+    pub fn with_route_backend_pools(
+        mut self,
+        route_backend_pools: impl IntoIterator<Item = (String, crate::RouteBackendPool)>,
+    ) -> Self {
+        self.route_backend_pools = route_backend_pools.into_iter().collect();
+        self
+    }
+
+    #[must_use]
+    pub fn rejecting_unmatched_routes(mut self) -> Self {
+        self.reject_unmatched_routes = true;
+        self
+    }
+
+    #[must_use]
+    pub fn with_anonymous_source_filter(mut self, policy: AnonymousSourceFilterPolicy) -> Self {
+        self.anonymous_source_filter = Some(Arc::new(AnonymousSourceFilterState::new(policy)));
+        self
+    }
+
+    #[must_use]
+    pub fn with_route_enumeration_protection(
+        mut self,
+        policy: RouteEnumerationProtectionPolicy,
+    ) -> Self {
+        self.route_enumeration_protection =
+            Some(Arc::new(RouteEnumerationProtectionState::new(policy)));
+        self
+    }
+
+    #[must_use]
+    pub fn with_trusted_client_ip(mut self, policy: TrustedClientIpPolicy) -> Self {
+        self.trusted_client_ip = Some(policy);
+        self
     }
 
     /// Attaches an HTTP response-cache runtime to the proxy.
@@ -218,11 +300,26 @@ impl Http1ProxyError {
 
 /// Proxies one or more sequential HTTP/1.1 requests over a downstream TCP connection.
 pub async fn proxy_http1_connection(
-    mut downstream: TcpStream,
+    downstream: TcpStream,
     config: &Http1ProxyConfig,
 ) -> Result<Http1ConnectionReport, Http1ProxyError> {
     let downstream_addr = downstream.peer_addr().map_err(Http1ProxyError::RequestIo)?;
+    proxy_http1_connection_with_downstream_addr(downstream, downstream_addr, config).await
+}
+
+/// Proxies one or more sequential HTTP/1.1 requests over an arbitrary downstream stream.
+pub async fn proxy_http1_connection_with_downstream_addr<S>(
+    mut downstream: S,
+    downstream_addr: SocketAddr,
+    config: &Http1ProxyConfig,
+) -> Result<Http1ConnectionReport, Http1ProxyError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let mut upstream = None;
+    let mut active_upstream: Option<lb_net_core::UpstreamTarget> = None;
+    let mut last_upstream_activity = None;
+    let mut upstream_connected_at = None;
     let mut connect_duration = Duration::ZERO;
     let mut upstream_addr = config.upstream.address;
 
@@ -246,6 +343,97 @@ pub async fn proxy_http1_connection(
 
         let Some(request) = request else {
             break;
+        };
+
+        let effective_client_ip = match resolve_effective_client_ip(config, downstream_addr, &request)
+        {
+            Ok(ip) => ip,
+            Err(_) => {
+                write_local_response(
+                    &mut downstream,
+                    false,
+                    StatusCode::BAD_REQUEST,
+                    "invalid forwarding headers\n",
+                )
+                .await
+                .map_err(Http1ProxyError::ResponseIo)?;
+                metrics.request_count += 1;
+                *metrics.response_status_counts.entry(StatusCode::BAD_REQUEST.as_u16()).or_insert(0) += 1;
+                break;
+            }
+        };
+        let effective_downstream_addr =
+            SocketAddr::new(effective_client_ip, downstream_addr.port());
+
+        if anonymous_source_blocked(config, effective_client_ip) {
+            write_local_response(
+                &mut downstream,
+                false,
+                StatusCode::FORBIDDEN,
+                "anonymous source blocked\n",
+            )
+            .await
+            .map_err(Http1ProxyError::ResponseIo)?;
+            metrics.request_count += 1;
+            *metrics.response_status_counts.entry(StatusCode::FORBIDDEN.as_u16()).or_insert(0) += 1;
+            break;
+        }
+
+        if route_enumeration_source_blocked(config, effective_downstream_addr) {
+            write_local_response(
+                &mut downstream,
+                false,
+                StatusCode::FORBIDDEN,
+                "source temporarily blocked\n",
+            )
+            .await
+            .map_err(Http1ProxyError::ResponseIo)?;
+            metrics.request_count += 1;
+            *metrics.response_status_counts.entry(StatusCode::FORBIDDEN.as_u16()).or_insert(0) += 1;
+            break;
+        }
+
+        if request.route.is_some()
+            && record_query_probe(
+                config,
+                effective_downstream_addr,
+                request_authority(&request),
+                &request.target,
+            )
+        {
+            write_local_response(
+                &mut downstream,
+                false,
+                StatusCode::FORBIDDEN,
+                "source temporarily blocked\n",
+            )
+            .await
+            .map_err(Http1ProxyError::ResponseIo)?;
+            metrics.request_count += 1;
+            *metrics.response_status_counts.entry(StatusCode::FORBIDDEN.as_u16()).or_insert(0) += 1;
+            break;
+        }
+
+        let selected_upstream = match resolve_request_upstream(config, &request) {
+            RequestUpstreamResolution::Selected(upstream) => upstream,
+            RequestUpstreamResolution::Reject(status, reason) => {
+                let blocked = status == StatusCode::FORBIDDEN
+                    && record_unmatched_route(config, effective_downstream_addr);
+                let response_reason = if blocked {
+                    "source temporarily blocked\n"
+                } else {
+                    reason
+                };
+                write_local_response(&mut downstream, request.keep_alive && !blocked, status, response_reason)
+                    .await
+                    .map_err(Http1ProxyError::ResponseIo)?;
+                metrics.request_count += 1;
+                *metrics.response_status_counts.entry(status.as_u16()).or_insert(0) += 1;
+                if blocked || !request.keep_alive {
+                    break;
+                }
+                continue;
+            }
         };
 
         let now = config
@@ -288,15 +476,19 @@ pub async fn proxy_http1_connection(
                         reason,
                         "cache lookup required origin fetch",
                     );
-                    match process_uncached_request(
+                    let result = process_uncached_request(
                         &mut upstream,
+                        &mut active_upstream,
+                        &mut last_upstream_activity,
+                        &mut upstream_connected_at,
                         &mut upstream_addr,
                         &mut connect_duration,
                         &mut downstream,
                         &mut downstream_buffer,
                         &mut upstream_buffer,
-                        downstream_addr,
+                        effective_client_ip,
                         config,
+                        &selected_upstream.target,
                         &request,
                         key,
                         stale_fallback.as_ref(),
@@ -304,8 +496,10 @@ pub async fn proxy_http1_connection(
                         &mut metrics,
                         now,
                     )
-                    .await {
-                        Ok(()) => {}
+                    .await;
+                    record_passive_health_result(&selected_upstream, &result);
+                    match result {
+                        Ok(_) => {}
                         Err(error)
                             if stale_fallback.is_some()
                                 && error_allows_stale_if_error(&error) => {
@@ -343,15 +537,19 @@ pub async fn proxy_http1_connection(
                         reason,
                         "request bypassed shared cache",
                     );
-                    process_uncached_request(
+                    let result = process_uncached_request(
                         &mut upstream,
+                        &mut active_upstream,
+                        &mut last_upstream_activity,
+                        &mut upstream_connected_at,
                         &mut upstream_addr,
                         &mut connect_duration,
                         &mut downstream,
                         &mut downstream_buffer,
                         &mut upstream_buffer,
-                        downstream_addr,
+                        effective_client_ip,
                         config,
+                        &selected_upstream.target,
                         &request,
                         None,
                         None,
@@ -359,19 +557,25 @@ pub async fn proxy_http1_connection(
                         &mut metrics,
                         now,
                     )
-                    .await?;
+                    .await;
+                    record_passive_health_result(&selected_upstream, &result);
+                    result?;
                 }
             }
         } else {
-            process_uncached_request(
+            let result = process_uncached_request(
                 &mut upstream,
+                &mut active_upstream,
+                &mut last_upstream_activity,
+                &mut upstream_connected_at,
                 &mut upstream_addr,
                 &mut connect_duration,
                 &mut downstream,
                 &mut downstream_buffer,
                 &mut upstream_buffer,
-                downstream_addr,
+                effective_client_ip,
                 config,
+                &selected_upstream.target,
                 &request,
                 None,
                 None,
@@ -379,7 +583,9 @@ pub async fn proxy_http1_connection(
                 &mut metrics,
                 now,
             )
-            .await?;
+            .await;
+            record_passive_health_result(&selected_upstream, &result);
+            result?;
         }
         if !request.keep_alive {
             break;
@@ -389,10 +595,199 @@ pub async fn proxy_http1_connection(
     Ok(Http1ConnectionReport {
         downstream_addr,
         upstream_addr,
-        upstream_name: config.upstream.name.clone(),
+        upstream_name: active_upstream
+            .as_ref()
+            .map(|upstream| upstream.name.clone())
+            .unwrap_or_else(|| config.upstream.name.clone()),
         connect_duration,
         metrics,
     })
+}
+
+enum RequestUpstreamResolution {
+    Selected(SelectedUpstream),
+    Reject(StatusCode, &'static str),
+}
+
+struct SelectedUpstream {
+    target: lb_net_core::UpstreamTarget,
+    route_backend: Option<crate::SelectedRouteBackend>,
+}
+
+fn resolve_request_upstream(
+    config: &Http1ProxyConfig,
+    request: &lb_proto_http::Http1RequestHead,
+) -> RequestUpstreamResolution {
+    if config.route_upstreams.is_empty() && config.route_backend_pools.is_empty() {
+        return RequestUpstreamResolution::Selected(SelectedUpstream {
+            target: config.upstream.clone(),
+            route_backend: None,
+        });
+    }
+
+    let Some(route) = &request.route else {
+        return if config.reject_unmatched_routes {
+            RequestUpstreamResolution::Reject(StatusCode::FORBIDDEN, "route not allowed\n")
+        } else {
+            RequestUpstreamResolution::Selected(SelectedUpstream {
+                target: config.upstream.clone(),
+                route_backend: None,
+            })
+        };
+    };
+
+    if let Some(pool) = config.route_backend_pools.get(&route.label) {
+        return match pool.select_backend_with_context(&selection_context_for_request(request)) {
+            Ok(route_backend) => RequestUpstreamResolution::Selected(SelectedUpstream {
+                target: route_backend.upstream().clone(),
+                route_backend: Some(route_backend),
+            }),
+            Err(_) => RequestUpstreamResolution::Reject(
+                StatusCode::BAD_GATEWAY,
+                "route backend unavailable\n",
+            ),
+        };
+    }
+
+    match config.route_upstreams.get(&route.label) {
+        Some(upstreams) if !upstreams.is_empty() => {
+            RequestUpstreamResolution::Selected(SelectedUpstream {
+                target: select_route_upstream(config, &route.label, upstreams),
+                route_backend: None,
+            })
+        }
+        _ => RequestUpstreamResolution::Reject(
+            StatusCode::BAD_GATEWAY,
+            "route backend unavailable\n",
+        ),
+    }
+}
+
+fn stable_request_hash(input: &[u8]) -> u64 {
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    hash.write(input);
+    hash.finish()
+}
+
+fn select_route_upstream(
+    config: &Http1ProxyConfig,
+    route_label: &str,
+    upstreams: &[lb_net_core::UpstreamTarget],
+) -> lb_net_core::UpstreamTarget {
+    if upstreams.len() == 1 {
+        return upstreams[0].clone();
+    }
+
+    let mut cursors = config
+        .route_upstream_cursors
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let cursor = cursors.entry(route_label.to_string()).or_insert(0);
+    let index = *cursor % upstreams.len();
+    *cursor = (*cursor + 1) % upstreams.len();
+    upstreams[index].clone()
+}
+
+fn request_authority(request: &lb_proto_http::Http1RequestHead) -> Option<&str> {
+    request
+        .headers
+        .iter()
+        .find(|header| header.name.eq_ignore_ascii_case("host"))
+        .map(|header| header.value.as_str())
+}
+
+fn selection_context_for_request(
+    request: &lb_proto_http::Http1RequestHead,
+) -> crate::SelectionContext {
+    crate::SelectionContext {
+        preferred_locality: request_header_value(request, "x-lb-locality").map(String::from),
+        preferred_zone: request_header_value(request, "x-lb-zone").map(String::from),
+        request_hash: stable_request_hash(request.target.as_bytes()),
+    }
+}
+
+fn request_header_value<'a>(
+    request: &'a lb_proto_http::Http1RequestHead,
+    name: &str,
+) -> Option<&'a str> {
+    request
+        .headers
+        .iter()
+        .find(|header| header.name.eq_ignore_ascii_case(name))
+        .map(|header| header.value.trim())
+        .filter(|value| !value.is_empty())
+}
+
+fn resolve_effective_client_ip(
+    config: &Http1ProxyConfig,
+    downstream_addr: SocketAddr,
+    request: &lb_proto_http::Http1RequestHead,
+) -> Result<IpAddr, crate::TrustedClientIpError> {
+    config.trusted_client_ip.as_ref().map_or(Ok(downstream_addr.ip()), |policy| {
+        policy.resolve_from_http1_headers(downstream_addr.ip(), &request.headers)
+    })
+}
+
+fn route_enumeration_source_blocked(
+    config: &Http1ProxyConfig,
+    downstream_addr: SocketAddr,
+) -> bool {
+    config
+        .route_enumeration_protection
+        .as_ref()
+        .is_some_and(|protection| protection.is_blocked(downstream_addr))
+}
+
+fn record_unmatched_route(config: &Http1ProxyConfig, downstream_addr: SocketAddr) -> bool {
+    config
+        .route_enumeration_protection
+        .as_ref()
+        .is_some_and(|protection| protection.record_unmatched_route(downstream_addr))
+}
+
+fn record_query_probe(
+    config: &Http1ProxyConfig,
+    downstream_addr: SocketAddr,
+    authority: Option<&str>,
+    target: &str,
+) -> bool {
+    config
+        .route_enumeration_protection
+        .as_ref()
+        .is_some_and(|protection| protection.record_query_probe(downstream_addr, authority, target))
+}
+
+fn anonymous_source_blocked(config: &Http1ProxyConfig, client_ip: IpAddr) -> bool {
+    config.anonymous_source_filter.as_ref().is_some_and(|filter| {
+        filter.classify_and_record(client_ip).is_some()
+    })
+}
+
+fn record_passive_health_result(
+    selected_upstream: &SelectedUpstream,
+    result: &Result<u16, Http1ProxyError>,
+) {
+    let Some(route_backend) = selected_upstream.route_backend.as_ref() else {
+        return;
+    };
+
+    let feedback_result = match result {
+        Ok(status) if *status < 500 => route_backend.note_passive_success(),
+        Err(error) if error_is_upstream_passive_failure(error) => route_backend.note_passive_failure(),
+        _ => return,
+    };
+    let _ = feedback_result;
+}
+
+fn error_is_upstream_passive_failure(error: &Http1ProxyError) -> bool {
+    matches!(
+        error,
+        Http1ProxyError::ConnectTimeout { .. }
+            | Http1ProxyError::Connect { .. }
+            | Http1ProxyError::RequestIo(_)
+            | Http1ProxyError::ParseResponse(_)
+            | Http1ProxyError::IdleTimeout("response head")
+    )
 }
 
 enum CacheRequestOutcome {
@@ -502,260 +897,426 @@ fn resolve_cache_request(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn process_uncached_request(
+async fn process_uncached_request<S>(
     upstream: &mut Option<TcpStream>,
+    active_upstream: &mut Option<lb_net_core::UpstreamTarget>,
+    last_upstream_activity: &mut Option<Instant>,
+    upstream_connected_at: &mut Option<Instant>,
     upstream_addr: &mut SocketAddr,
     connect_duration: &mut Duration,
-    downstream: &mut TcpStream,
+    downstream: &mut S,
     downstream_buffer: &mut Vec<u8>,
     upstream_buffer: &mut Vec<u8>,
-    downstream_addr: SocketAddr,
+    effective_client_ip: IpAddr,
     config: &Http1ProxyConfig,
+    selected_upstream: &lb_net_core::UpstreamTarget,
     request: &lb_proto_http::Http1RequestHead,
     cache_lookup_key: Option<HttpCacheKey>,
     stale_fallback: Option<&HttpCacheEntry>,
     revalidation_entry: Option<&HttpCacheEntry>,
     metrics: &mut Http1ConnectionMetrics,
     now: Duration,
-) -> Result<(), Http1ProxyError> {
-    ensure_upstream_connection(upstream, upstream_addr, connect_duration, config).await?;
+) -> Result<u16, Http1ProxyError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut retried_stale_reuse = false;
     let mut close_upstream = false;
-    let mut served_stale_if_error = false;
-    {
-        let Some(upstream_stream) = upstream.as_mut() else {
-            return Err(Http1ProxyError::ConnectTimeout { target: config.upstream.address });
-        };
-
-        let normalized_request_headers = lb_proto_http::normalize_request_headers(
-            &request.headers,
-            downstream_addr,
-            request.keep_alive,
-            &request.body_kind,
-        );
-        let normalized_request_headers =
-            append_conditional_revalidation_headers(normalized_request_headers, revalidation_entry);
-        let request_head = lb_proto_http::encode_request_head(
-            &request.method,
-            &request.target,
-            request.version,
-            &normalized_request_headers,
-        );
-        upstream_stream
-            .write_all(&request_head)
-            .await
-            .map_err(Http1ProxyError::RequestIo)?;
-        relay_body(
-            downstream,
-            downstream_buffer,
-            upstream_stream,
-            &request.body_kind,
-            config.limits.max_body_bytes,
-            config.timeouts.idle_timeout,
-            RelayDirection::Request,
+    loop {
+        let reused_existing_connection = ensure_upstream_connection(
+            upstream,
+            active_upstream,
+            last_upstream_activity,
+            upstream_connected_at,
+            upstream_addr,
+            connect_duration,
+            selected_upstream,
+            &config.timeouts,
         )
         .await?;
+        let retry_stale_reuse = reused_existing_connection
+            && !retried_stale_reuse
+            && request_is_safe_stale_reuse_retry_candidate(request);
 
-        let response = time::timeout(
-            config.timeouts.idle_timeout,
-            lb_proto_http::read_response_head(
-                upstream_stream,
-                upstream_buffer,
-                &config.limits,
+        {
+            let Some(upstream_stream) = upstream.as_mut() else {
+                break Err(Http1ProxyError::ConnectTimeout { target: selected_upstream.address });
+            };
+
+            let normalized_request_headers = lb_proto_http::normalize_request_headers(
+                &request.headers,
+                effective_client_ip,
+                request.keep_alive,
+                &request.body_kind,
+            );
+            let normalized_request_headers = append_conditional_revalidation_headers(
+                normalized_request_headers,
+                revalidation_entry,
+            );
+            let request_head = lb_proto_http::encode_request_head(
                 &request.method,
-            ),
-        )
-        .await
-        .map_err(|_| Http1ProxyError::IdleTimeout("response head"))?
-        .map_err(Http1ProxyError::ParseResponse)?;
+                &request.target,
+                request.version,
+                &normalized_request_headers,
+            );
+            if let Err(source) = upstream_stream.write_all(&request_head).await {
+                drop_upstream_connection(upstream, last_upstream_activity, upstream_connected_at);
+                if retry_stale_reuse {
+                    retried_stale_reuse = true;
+                    continue;
+                }
+                break Err(Http1ProxyError::RequestIo(source));
+            }
+            relay_body(
+                downstream,
+                downstream_buffer,
+                upstream_stream,
+                &request.body_kind,
+                config.limits.max_body_bytes,
+                config.timeouts.idle_timeout,
+                RelayDirection::Request,
+            )
+            .await?;
 
-        let normalized_response_headers = lb_proto_http::normalize_response_headers(
-            &response.headers,
-            response.keep_alive,
-            &response.body_kind,
-        );
-        let use_stale_if_error_response = stale_fallback.is_some()
-            && is_stale_if_error_response_status(response.status);
-        let use_not_modified_revalidation = response.status == 304 && revalidation_entry.is_some();
-        if use_not_modified_revalidation {
-            if let Some(stale_entry) = revalidation_entry {
-                let refreshed_entry = refresh_revalidated_entry(
-                    config.response_cache.as_ref().map(|response_cache| &response_cache.policy),
-                    stale_entry,
+            let response = match time::timeout(
+                config.timeouts.idle_timeout,
+                lb_proto_http::read_response_head(
+                    upstream_stream,
+                    upstream_buffer,
+                    &config.limits,
+                    &request.method,
+                ),
+            )
+            .await
+            {
+                Ok(Ok(response)) => response,
+                Ok(Err(source)) => {
+                    let error = Http1ProxyError::ParseResponse(source);
+                    drop_upstream_connection(upstream, last_upstream_activity, upstream_connected_at);
+                    if retry_stale_reuse && http1_stale_reuse_retryable_response_error(&error) {
+                        retried_stale_reuse = true;
+                        continue;
+                    }
+                    break Err(error);
+                }
+                Err(_) => {
+                    drop_upstream_connection(upstream, last_upstream_activity, upstream_connected_at);
+                    break Err(Http1ProxyError::IdleTimeout("response head"));
+                }
+            };
+
+            let normalized_response_headers = lb_proto_http::normalize_response_headers(
+                &response.headers,
+                response.keep_alive,
+                &response.body_kind,
+            );
+            let upstream_response_status = response.status;
+            let use_stale_if_error_response = stale_fallback.is_some()
+                && is_stale_if_error_response_status(response.status);
+            let use_not_modified_revalidation = response.status == 304 && revalidation_entry.is_some();
+            if use_not_modified_revalidation {
+                if let Some(stale_entry) = revalidation_entry {
+                    let refreshed_entry = refresh_revalidated_entry(
+                        config.response_cache.as_ref().map(|response_cache| &response_cache.policy),
+                        stale_entry,
+                        &normalized_response_headers,
+                        now,
+                    )
+                    .unwrap_or_else(|| stale_entry.clone());
+                    if let Some(response_cache) = config.response_cache.as_ref() {
+                        if let Some(cache_lookup_key) = cache_lookup_key.clone() {
+                            if response_cache
+                                .store
+                                .insert(now, cache_lookup_key, refreshed_entry.clone())
+                                .is_ok()
+                            {
+                                metrics.cache_fill_count += 1;
+                                record_cache_revalidation_telemetry(
+                                    Some(response_cache),
+                                    HttpCacheRevalidationResult::NotModified,
+                                    "origin returned 304 Not Modified",
+                                );
+                            }
+                        }
+                    }
+                    write_cached_response(
+                        downstream,
+                        &request.method,
+                        request.keep_alive,
+                        &refreshed_entry,
+                    )
+                    .await
+                    .map_err(Http1ProxyError::ResponseIo)?;
+                    metrics.request_count += 1;
+                    *metrics
+                        .response_status_counts
+                        .entry(refreshed_entry.metadata.status.as_u16())
+                        .or_insert(0) += 1;
+                    close_upstream = !response.keep_alive;
+                    if close_upstream {
+                        drop_upstream_connection(
+                            upstream,
+                            last_upstream_activity,
+                            upstream_connected_at,
+                        );
+                    } else {
+                        *last_upstream_activity = Some(Instant::now());
+                    }
+                    break Ok(upstream_response_status);
+                }
+            } else if use_stale_if_error_response {
+                if let Some(stale_entry) = stale_fallback {
+                    write_cached_response(downstream, &request.method, request.keep_alive, stale_entry)
+                        .await
+                        .map_err(Http1ProxyError::ResponseIo)?;
+                    metrics.request_count += 1;
+                    metrics.cache_hit_count += 1;
+                    record_cache_request_telemetry(
+                        config.response_cache.as_ref(),
+                        HttpCacheRequestOutcome::StaleHit,
+                        "stale_if_error_response",
+                        "served stale cached response after upstream error status",
+                    );
+                    *metrics
+                        .response_status_counts
+                        .entry(stale_entry.metadata.status.as_u16())
+                        .or_insert(0) += 1;
+                    close_upstream = true;
+                    if close_upstream {
+                        drop_upstream_connection(
+                            upstream,
+                            last_upstream_activity,
+                            upstream_connected_at,
+                        );
+                    }
+                    break Ok(upstream_response_status);
+                }
+            } else {
+                let response_head = lb_proto_http::encode_response_head(
+                    response.version,
+                    response.status,
+                    &response.reason,
                     &normalized_response_headers,
-                    now,
-                )
-                .unwrap_or_else(|| stale_entry.clone());
+                );
+                downstream
+                    .write_all(&response_head)
+                    .await
+                    .map_err(Http1ProxyError::ResponseIo)?;
+
+                let mut filled_cache = false;
                 if let Some(response_cache) = config.response_cache.as_ref() {
-                    if let Some(cache_lookup_key) = cache_lookup_key.clone() {
-                        if response_cache
-                            .store
-                            .insert(now, cache_lookup_key, refreshed_entry.clone())
-                            .is_ok()
+                    if let Some(cache_lookup_key) = cache_lookup_key {
+                        if let Some(entry) = build_cacheable_response_entry(
+                            response_cache,
+                            request,
+                            &response,
+                            &normalized_response_headers,
+                            upstream_stream,
+                            upstream_buffer,
+                            downstream,
+                            config,
+                            now,
+                        )
+                        .await?
                         {
-                            metrics.cache_fill_count += 1;
-                            record_cache_revalidation_telemetry(
-                                Some(response_cache),
-                                HttpCacheRevalidationResult::NotModified,
-                                "origin returned 304 Not Modified",
-                            );
+                            if response_cache.store.insert(now, cache_lookup_key, entry).is_ok() {
+                                metrics.cache_fill_count += 1;
+                                record_cache_request_telemetry(
+                                    Some(response_cache),
+                                    HttpCacheRequestOutcome::Fill,
+                                    if revalidation_entry.is_some() {
+                                        "revalidation_replace"
+                                    } else {
+                                        "origin_response"
+                                    },
+                                    "stored response in shared cache",
+                                );
+                                if revalidation_entry.is_some() {
+                                    record_cache_revalidation_telemetry(
+                                        Some(response_cache),
+                                        HttpCacheRevalidationResult::Replaced,
+                                        "origin returned replacement response for revalidation",
+                                    );
+                                }
+                                filled_cache = true;
+                            } else {
+                                metrics.cache_bypass_count += 1;
+                                record_cache_request_telemetry(
+                                    Some(response_cache),
+                                    HttpCacheRequestOutcome::Bypass,
+                                    "store_reject",
+                                    "cache store rejected response insertion",
+                                );
+                            }
                         }
                     }
                 }
-                write_cached_response(
-                    downstream,
-                    &request.method,
-                    request.keep_alive,
-                    &refreshed_entry,
-                )
-                .await
-                .map_err(Http1ProxyError::ResponseIo)?;
-                metrics.request_count += 1;
-                *metrics
-                    .response_status_counts
-                    .entry(refreshed_entry.metadata.status.as_u16())
-                    .or_insert(0) += 1;
-                close_upstream = !response.keep_alive;
-            }
-        } else if use_stale_if_error_response {
-            if let Some(stale_entry) = stale_fallback {
-                write_cached_response(downstream, &request.method, request.keep_alive, stale_entry)
-                    .await
-                    .map_err(Http1ProxyError::ResponseIo)?;
-                metrics.request_count += 1;
-                metrics.cache_hit_count += 1;
-                record_cache_request_telemetry(
-                    config.response_cache.as_ref(),
-                    HttpCacheRequestOutcome::StaleHit,
-                    "stale_if_error_response",
-                    "served stale cached response after upstream error status",
-                );
-                *metrics
-                    .response_status_counts
-                    .entry(stale_entry.metadata.status.as_u16())
-                    .or_insert(0) += 1;
-                close_upstream = true;
-                served_stale_if_error = true;
-            }
-        } else {
-            let response_head = lb_proto_http::encode_response_head(
-                response.version,
-                response.status,
-                &response.reason,
-                &normalized_response_headers,
-            );
-            downstream
-                .write_all(&response_head)
-                .await
-                .map_err(Http1ProxyError::ResponseIo)?;
-
-            let mut filled_cache = false;
-            if let Some(response_cache) = config.response_cache.as_ref() {
-                if let Some(cache_lookup_key) = cache_lookup_key {
-                    if let Some(entry) = build_cacheable_response_entry(
-                        response_cache,
-                        request,
-                        &response,
-                        &normalized_response_headers,
+                if !filled_cache {
+                    relay_body(
                         upstream_stream,
                         upstream_buffer,
                         downstream,
-                        config,
-                        now,
+                        &response.body_kind,
+                        config.limits.max_body_bytes,
+                        config.timeouts.idle_timeout,
+                        RelayDirection::Response,
                     )
-                    .await?
-                    {
-                        if response_cache.store.insert(now, cache_lookup_key, entry).is_ok() {
-                            metrics.cache_fill_count += 1;
-                            record_cache_request_telemetry(
-                                Some(response_cache),
-                                HttpCacheRequestOutcome::Fill,
-                                if revalidation_entry.is_some() {
-                                    "revalidation_replace"
-                                } else {
-                                    "origin_response"
-                                },
-                                "stored response in shared cache",
-                            );
-                            if revalidation_entry.is_some() {
-                                record_cache_revalidation_telemetry(
-                                    Some(response_cache),
-                                    HttpCacheRevalidationResult::Replaced,
-                                    "origin returned replacement response for revalidation",
-                                );
-                            }
-                            filled_cache = true;
-                        } else {
-                            metrics.cache_bypass_count += 1;
-                            record_cache_request_telemetry(
-                                Some(response_cache),
-                                HttpCacheRequestOutcome::Bypass,
-                                "store_reject",
-                                "cache store rejected response insertion",
-                            );
-                        }
-                    }
+                    .await?;
                 }
-            }
-            if !filled_cache {
-                relay_body(
-                    upstream_stream,
-                    upstream_buffer,
-                    downstream,
-                    &response.body_kind,
-                    config.limits.max_body_bytes,
-                    config.timeouts.idle_timeout,
-                    RelayDirection::Response,
-                )
-                .await?;
-            }
 
-            metrics.request_count += 1;
-            *metrics.response_status_counts.entry(response.status).or_insert(0) += 1;
-            if !response.keep_alive {
-                close_upstream = true;
+                metrics.request_count += 1;
+                *metrics.response_status_counts.entry(response.status).or_insert(0) += 1;
+                if !response.keep_alive {
+                    close_upstream = true;
+                }
+                if close_upstream {
+                    drop_upstream_connection(
+                        upstream,
+                        last_upstream_activity,
+                        upstream_connected_at,
+                    );
+                } else {
+                    *last_upstream_activity = Some(Instant::now());
+                }
+                break Ok(upstream_response_status);
             }
         }
     }
-    if close_upstream {
-        let _ = upstream.take();
-    }
-    if served_stale_if_error {
-        return Ok(());
-    }
-    Ok(())
 }
 
 async fn ensure_upstream_connection(
     upstream: &mut Option<TcpStream>,
+    active_upstream: &mut Option<lb_net_core::UpstreamTarget>,
+    last_upstream_activity: &mut Option<Instant>,
+    upstream_connected_at: &mut Option<Instant>,
     upstream_addr: &mut SocketAddr,
     connect_duration: &mut Duration,
-    config: &Http1ProxyConfig,
-) -> Result<(), Http1ProxyError> {
-    if upstream.is_some() {
-        return Ok(());
+    target: &lb_net_core::UpstreamTarget,
+    timeouts: &lb_net_core::ConnectionTimeouts,
+) -> Result<bool, Http1ProxyError> {
+    let now = Instant::now();
+    if upstream.is_some()
+        && active_upstream
+            .as_ref()
+            .is_some_and(|active| active.address == target.address && active.name == target.name)
+    {
+        if !upstream_connection_reuse_expired(
+            now,
+            *last_upstream_activity,
+            *upstream_connected_at,
+            timeouts.idle_timeout,
+        ) {
+            return Ok(true);
+        }
+
+        drop_upstream_connection(upstream, last_upstream_activity, upstream_connected_at);
     }
+
+    let _ = upstream.take();
     let connect_started = Instant::now();
-    let stream = time::timeout(config.timeouts.connect_timeout, TcpStream::connect(config.upstream.address))
+    let stream = time::timeout(timeouts.connect_timeout, TcpStream::connect(target.address))
         .await
-        .map_err(|_| Http1ProxyError::ConnectTimeout { target: config.upstream.address })?
-        .map_err(|source| Http1ProxyError::Connect {
-            target: config.upstream.address,
-            source,
-        })?;
+        .map_err(|_| Http1ProxyError::ConnectTimeout { target: target.address })?
+        .map_err(|source| Http1ProxyError::Connect { target: target.address, source })?;
     *connect_duration = connect_started.elapsed();
     *upstream_addr = stream
         .peer_addr()
-        .map_err(|source| Http1ProxyError::Connect { target: config.upstream.address, source })?;
+        .map_err(|source| Http1ProxyError::Connect { target: target.address, source })?;
+    *active_upstream = Some(target.clone());
+    let connected_at = Instant::now();
+    *last_upstream_activity = Some(connected_at);
+    *upstream_connected_at = Some(connected_at);
     *upstream = Some(stream);
+    Ok(false)
+}
+
+fn upstream_connection_reuse_expired(
+    now: Instant,
+    last_upstream_activity: Option<Instant>,
+    upstream_connected_at: Option<Instant>,
+    reuse_timeout: Duration,
+) -> bool {
+    last_upstream_activity.is_none_or(|last_used_at| {
+        now.saturating_duration_since(last_used_at) >= reuse_timeout
+    }) || upstream_connected_at.is_none_or(|connected_at| {
+        now.saturating_duration_since(connected_at) >= reuse_timeout
+    })
+}
+
+fn drop_upstream_connection(
+    upstream: &mut Option<TcpStream>,
+    last_upstream_activity: &mut Option<Instant>,
+    upstream_connected_at: &mut Option<Instant>,
+) {
+    *last_upstream_activity = None;
+    *upstream_connected_at = None;
+    let _ = upstream.take();
+}
+
+fn request_is_safe_stale_reuse_retry_candidate(request: &lb_proto_http::Http1RequestHead) -> bool {
+    matches!(request.body_kind, lb_proto_http::BodyKind::None)
+        && matches!(request.method.as_str(), "GET" | "HEAD" | "OPTIONS" | "TRACE")
+}
+
+fn http1_stale_reuse_retryable_response_error(error: &Http1ProxyError) -> bool {
+    match error {
+        Http1ProxyError::ParseResponse(lb_proto_http::Http1ParseError::IncompleteHead) => true,
+        Http1ProxyError::ParseResponse(lb_proto_http::Http1ParseError::Io(source)) => {
+            matches!(
+                source.kind(),
+                std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::NotConnected
+            )
+        }
+        _ => false,
+    }
+}
+
+async fn write_local_response<W>(
+    downstream: &mut W,
+    keep_alive: bool,
+    status: StatusCode,
+    body: &'static str,
+) -> Result<(), std::io::Error>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut headers = vec![lb_proto_http::HttpHeader {
+        name: String::from("content-type"),
+        value: String::from("text/plain; charset=utf-8"),
+    }];
+    if !keep_alive {
+        headers.push(lb_proto_http::HttpHeader {
+            name: String::from("connection"),
+            value: String::from("close"),
+        });
+    }
+    headers.push(lb_proto_http::HttpHeader {
+        name: String::from("content-length"),
+        value: body.len().to_string(),
+    });
+    let response_head = lb_proto_http::encode_response_head(
+        lb_proto_http::SupportedHttpVersion::Http1,
+        status.as_u16(),
+        "",
+        &headers,
+    );
+    downstream.write_all(&response_head).await?;
+    downstream.write_all(body.as_bytes()).await?;
     Ok(())
 }
 
-async fn write_cached_response(
-    downstream: &mut TcpStream,
+async fn write_cached_response<W>(
+    downstream: &mut W,
     request_method: &str,
     keep_alive: bool,
     entry: &HttpCacheEntry,
-) -> Result<(), std::io::Error> {
+) -> Result<(), std::io::Error>
+where
+    W: AsyncWrite + Unpin,
+{
     let mut headers = entry
         .headers
         .iter()
@@ -787,17 +1348,20 @@ async fn write_cached_response(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn build_cacheable_response_entry(
+async fn build_cacheable_response_entry<W>(
     response_cache: &Http1ResponseCacheConfig,
     request: &lb_proto_http::Http1RequestHead,
     response: &lb_proto_http::Http1ResponseHead,
     normalized_response_headers: &[lb_proto_http::HttpHeader],
     upstream: &mut TcpStream,
     upstream_buffer: &mut Vec<u8>,
-    downstream: &mut TcpStream,
+    downstream: &mut W,
     config: &Http1ProxyConfig,
     now: Duration,
-) -> Result<Option<HttpCacheEntry>, Http1ProxyError> {
+) -> Result<Option<HttpCacheEntry>, Http1ProxyError>
+where
+    W: AsyncWrite + Unpin,
+{
     if !request.method.eq_ignore_ascii_case("GET")
         || !response_is_cacheable(&response_cache.policy, response, normalized_response_headers)
     {
@@ -1525,14 +2089,17 @@ fn classify_http1_request_parse_error(
 #[cfg(test)]
 mod tests {
     use std::io;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
 
     use super::{
         body_limit_error, classify_http1_request_parse_error, idle_error, io_error,
         parse_side_error, read_crlf_line, relay_body, relay_chunked, relay_content_length,
-        relay_content_length_collect, relay_exact_bytes, Http1ProxyError, RelayDirection,
+        relay_content_length_collect, relay_exact_bytes, ensure_upstream_connection,
+        Http1ProxyError, RelayDirection,
     };
     use crate::{ProtocolAnomalyCategory, SlowClientStage};
 
@@ -1801,6 +2368,89 @@ mod tests {
         .await
         .expect_err("invalid chunk sizes should fail");
         assert!(matches!(invalid, Http1ProxyError::ParseRequest(_)));
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ensure_upstream_connection_reconnects_after_idle_timeout(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let target_addr = listener.local_addr()?;
+        let (accepted_tx, accepted_rx) = oneshot::channel();
+
+        tokio::spawn(async move {
+            let mut accepted_peer_addrs = Vec::new();
+            let mut held_streams = Vec::new();
+            for _ in 0..2 {
+                let Ok((stream, peer_addr)) = listener.accept().await else {
+                    break;
+                };
+                accepted_peer_addrs.push(peer_addr);
+                held_streams.push(stream);
+            }
+            let _ = accepted_tx.send(accepted_peer_addrs);
+            let _held_streams = held_streams;
+        });
+
+        let target = lb_net_core::UpstreamTarget::new("unit-http1-upstream", target_addr);
+        let timeouts = lb_net_core::ConnectionTimeouts {
+            connect_timeout: Duration::from_millis(100),
+            preface_timeout: Duration::from_millis(50),
+            idle_timeout: Duration::from_millis(25),
+        };
+        let mut upstream = None;
+        let mut active_upstream = None;
+        let mut last_upstream_activity = None;
+        let mut upstream_connected_at = None;
+        let mut upstream_addr = target_addr;
+        let mut connect_duration = Duration::ZERO;
+
+        ensure_upstream_connection(
+            &mut upstream,
+            &mut active_upstream,
+            &mut last_upstream_activity,
+            &mut upstream_connected_at,
+            &mut upstream_addr,
+            &mut connect_duration,
+            &target,
+            &timeouts,
+        )
+        .await?;
+
+        let first_local_addr = upstream
+            .as_ref()
+            .expect("first upstream connection")
+            .local_addr()?;
+        last_upstream_activity = Some(
+            Instant::now()
+                .checked_sub(Duration::from_millis(50))
+                .expect("valid instant subtraction"),
+        );
+
+        ensure_upstream_connection(
+            &mut upstream,
+            &mut active_upstream,
+            &mut last_upstream_activity,
+            &mut upstream_connected_at,
+            &mut upstream_addr,
+            &mut connect_duration,
+            &target,
+            &timeouts,
+        )
+        .await?;
+
+        let second_local_addr = upstream
+            .as_ref()
+            .expect("second upstream connection")
+            .local_addr()?;
+        assert_ne!(first_local_addr, second_local_addr);
+
+        drop(upstream.take());
+        let accepted_peer_addrs = accepted_rx.await?;
+        assert_eq!(accepted_peer_addrs.len(), 2);
+        assert_eq!(accepted_peer_addrs[0], first_local_addr);
+        assert_eq!(accepted_peer_addrs[1], second_local_addr);
+
         Ok(())
     }
 }

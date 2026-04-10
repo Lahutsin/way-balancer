@@ -16,10 +16,13 @@ fn documented_example_configs_parse_and_compile(
     for file_name in [
         "basic-http.json",
         "http-cache-public.json",
+        "docker-compose-public-admin.json",
         "grpc-retries.json",
         "https-termination.json",
         "public-admin.json",
         "local-dev-insecure.json",
+        "virtual-hosts.json",
+        "example-com-api.json",
     ] {
         let contents = fs::read_to_string(example_path(file_name))?;
         let config = lb_config_model::WorkspaceConfig::parse_json_str(&contents)?;

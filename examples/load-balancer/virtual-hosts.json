@@ -1,0 +1,69 @@
+{
+  "api_version": "v1_alpha1",
+  "name": "edge-virtual-hosts",
+  "security": {
+    "anonymous_source_filter": {
+      "enabled": true,
+      "deny_cidrs": ["198.19.10.0/24", "2001:db8:ffff::/48"],
+      "deny_tor": true,
+      "tor_exit_cidrs": ["198.18.0.0/15"]
+    }
+  },
+  "listeners": [
+    {
+      "name": "public-http",
+      "class": "public",
+      "bind_address": "127.0.0.1:8080",
+      "protocol": "http1",
+      "routes": ["shop-web", "api"]
+    }
+  ],
+  "routes": [
+    {
+      "name": "shop-web",
+      "match": {
+        "type": "path_prefix",
+        "prefix": "/",
+        "hostnames": ["shop.localhost:8080", "shop.localhost"]
+      },
+      "upstream_cluster": "shop-frontend"
+    },
+    {
+      "name": "api",
+      "match": {
+        "type": "path_prefix",
+        "prefix": "/api",
+        "hostnames": ["api.localhost:8080", "api.localhost"]
+      },
+      "upstream_cluster": "api-backend"
+    }
+  ],
+  "upstream_clusters": [
+    {
+      "name": "shop-frontend",
+      "endpoints": [
+        {
+          "id": "shop-frontend-a",
+          "address": "127.0.0.1:8081",
+          "state": "ready",
+          "zone": null,
+          "locality": null,
+          "weight": 1
+        }
+      ]
+    },
+    {
+      "name": "api-backend",
+      "endpoints": [
+        {
+          "id": "api-backend-a",
+          "address": "127.0.0.1:9000",
+          "state": "ready",
+          "zone": null,
+          "locality": null,
+          "weight": 1
+        }
+      ]
+    }
+  ]
+}

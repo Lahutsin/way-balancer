@@ -10,13 +10,16 @@
 - `EVID-006`: provenance and SBOM artifact refresh
 - `EVID-007`: security and secret-scanning review
 - `EVID-008`: final GA readiness sign-off
+- `EVID-009`: stability-contract review
 
 ## Release Candidate Sign-Off Checklist
 
 - required evidence links are present and current
 - cache runbooks match shipped config fields and runtime behavior
 - release artifacts were regenerated for the candidate build
-- GA sign-off references `EVID-008`# Release Evidence Checklist
+- GA sign-off references `EVID-008`
+
+# Release Evidence Checklist
 
 ## Required Evidence
 
@@ -30,6 +33,7 @@
 | `EVID-006` | SBOM placeholder or generated artifact location | `artifacts/sbom/README.md` | `./scripts/check-release-artifacts.sh` |
 | `EVID-007` | Provenance placeholder or generated artifact location | `artifacts/provenance/README.md` | `./scripts/check-release-artifacts.sh` |
 | `EVID-008` | Final GA review record | `docs/runbooks/ga-readiness-review-template.md` | `./scripts/check-release-artifacts.sh` |
+| `EVID-009` | Stability contract and breaking-change policy | `docs/runbooks/stability-contract.md` | `./scripts/check-release-artifacts.sh` |
 
 ## Release Candidate Sign-Off Checklist
 
@@ -41,6 +45,7 @@
 - [ ] `EVID-006` SBOM location recorded, even if still populated by placeholder automation.
 - [ ] `EVID-007` provenance location recorded, even if still populated by placeholder automation.
 - [ ] `EVID-008` GA review template completed with approver names or explicit exceptions.
+- [ ] `EVID-009` stability contract reviewed for stable versus experimental scope and breaking-change expectations.
 
 ## Security Exceptions
 

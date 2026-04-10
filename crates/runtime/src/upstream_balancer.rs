@@ -1,6 +1,7 @@
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
@@ -120,6 +121,176 @@ pub struct UpstreamSelectionMetrics {
     pub no_healthy_endpoint_count: u64,
     /// Number of fallback selections performed against unhealthy endpoints.
     pub unhealthy_fallback_selection_count: u64,
+}
+
+/// Reusable route backend pool that applies selection policy over a health-aware cluster view.
+#[derive(Debug, Clone)]
+pub struct RouteBackendPool {
+    cluster_name: lb_net_core::UpstreamClusterName,
+    registry: Arc<UpstreamHealthRegistry>,
+    balancer: Arc<UpstreamBalancer>,
+    selection_policy: UpstreamSelectionPolicy,
+}
+
+/// Selected route backend plus a handle for passive health feedback.
+#[derive(Debug, Clone)]
+pub struct SelectedRouteBackend {
+    pool: RouteBackendPool,
+    endpoint_id: lb_net_core::UpstreamEndpointId,
+    upstream: lb_net_core::UpstreamTarget,
+}
+
+/// Endpoint target exposed for active health probing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveProbeTarget {
+    /// Endpoint identifier within the cluster.
+    pub endpoint_id: lb_net_core::UpstreamEndpointId,
+    /// Endpoint address to probe.
+    pub address: std::net::SocketAddr,
+    /// Current dynamic health snapshot.
+    pub health: EndpointHealthSnapshot,
+}
+
+impl SelectedRouteBackend {
+    #[must_use]
+    pub fn upstream(&self) -> &lb_net_core::UpstreamTarget {
+        &self.upstream
+    }
+
+    #[must_use]
+    pub fn into_upstream(self) -> lb_net_core::UpstreamTarget {
+        self.upstream
+    }
+
+    pub fn note_passive_success(&self) -> Result<EndpointHealthSnapshot, UpstreamHealthError> {
+        self.pool.note_passive_success(&self.endpoint_id)
+    }
+
+    pub fn note_passive_failure(&self) -> Result<EndpointHealthSnapshot, UpstreamHealthError> {
+        self.pool.note_passive_failure(&self.endpoint_id)
+    }
+}
+
+impl RouteBackendPool {
+    /// Builds a health-aware route backend pool from a validated cluster model.
+    pub fn from_cluster(
+        cluster: lb_net_core::UpstreamCluster,
+        health_policy: crate::EndpointHealthPolicy,
+        selection_policy: UpstreamSelectionPolicy,
+    ) -> Result<Self, UpstreamHealthError> {
+        let cluster_name = cluster.name().clone();
+        let registry = Arc::new(UpstreamHealthRegistry::new(health_policy));
+        registry.insert_cluster(cluster)?;
+        Ok(Self {
+            cluster_name,
+            registry,
+            balancer: Arc::new(UpstreamBalancer::new()),
+            selection_policy,
+        })
+    }
+
+    /// Selects an upstream target for a request hash using the configured policy.
+    pub fn select_upstream(
+        &self,
+        request_hash: u64,
+    ) -> Result<lb_net_core::UpstreamTarget, UpstreamSelectionError> {
+        self.select_backend(request_hash)
+            .map(SelectedRouteBackend::into_upstream)
+    }
+
+    /// Selects a route backend for a request hash using the configured policy.
+    pub fn select_backend(
+        &self,
+        request_hash: u64,
+    ) -> Result<SelectedRouteBackend, UpstreamSelectionError> {
+        self.select_backend_with_context(&SelectionContext {
+            request_hash,
+            ..SelectionContext::default()
+        })
+    }
+
+    /// Selects an upstream target using the configured policy and full selection context.
+    pub fn select_upstream_with_context(
+        &self,
+        context: &SelectionContext,
+    ) -> Result<lb_net_core::UpstreamTarget, UpstreamSelectionError> {
+        self.select_backend_with_context(context)
+            .map(SelectedRouteBackend::into_upstream)
+    }
+
+    /// Selects a route backend using the configured policy and full selection context.
+    pub fn select_backend_with_context(
+        &self,
+        context: &SelectionContext,
+    ) -> Result<SelectedRouteBackend, UpstreamSelectionError> {
+        let selected = self.balancer.select_endpoint(
+            &self.registry,
+            &self.cluster_name,
+            &self.selection_policy,
+            context,
+        )?;
+        let endpoint_id = selected.endpoint_id;
+        Ok(SelectedRouteBackend {
+            pool: self.clone(),
+            upstream: lb_net_core::UpstreamTarget::new(
+                format!("{}:{}", self.cluster_name, endpoint_id),
+                selected.address,
+            ),
+            endpoint_id,
+        })
+    }
+
+    pub fn note_passive_success(
+        &self,
+        endpoint_id: &lb_net_core::UpstreamEndpointId,
+    ) -> Result<EndpointHealthSnapshot, UpstreamHealthError> {
+        self.registry.note_passive_success(&self.cluster_name, endpoint_id)
+    }
+
+    pub fn note_passive_failure(
+        &self,
+        endpoint_id: &lb_net_core::UpstreamEndpointId,
+    ) -> Result<EndpointHealthSnapshot, UpstreamHealthError> {
+        self.registry.note_passive_failure(&self.cluster_name, endpoint_id)
+    }
+
+    #[must_use]
+    pub fn cluster_name(&self) -> &lb_net_core::UpstreamClusterName {
+        &self.cluster_name
+    }
+
+    pub fn active_probe_targets(&self) -> Result<Vec<ActiveProbeTarget>, UpstreamHealthError> {
+        self.registry
+            .selection_candidates(&self.cluster_name, true)
+            .map(|candidates| {
+                candidates
+                    .into_iter()
+                    .map(|candidate| ActiveProbeTarget {
+                        endpoint_id: candidate.endpoint_id,
+                        address: candidate.address,
+                        health: candidate.health,
+                    })
+                    .collect()
+            })
+    }
+
+    pub fn note_active_success(
+        &self,
+        endpoint_id: &lb_net_core::UpstreamEndpointId,
+    ) -> Result<EndpointHealthSnapshot, UpstreamHealthError> {
+        self.registry.note_active_success(&self.cluster_name, endpoint_id)
+    }
+
+    pub fn note_active_failure(
+        &self,
+        endpoint_id: &lb_net_core::UpstreamEndpointId,
+    ) -> Result<EndpointHealthSnapshot, UpstreamHealthError> {
+        self.registry.note_active_failure(&self.cluster_name, endpoint_id)
+    }
+
+    pub fn advance_time(&self, elapsed: std::time::Duration) {
+        self.registry.advance_time(elapsed);
+    }
 }
 
 /// Errors returned during endpoint selection.

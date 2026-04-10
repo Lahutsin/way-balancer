@@ -30,7 +30,10 @@ impl RouteConfig {
     ) -> Self {
         Self {
             name: name.into(),
-            match_rule: RouteMatchConfig::PathPrefix { prefix: prefix.into() },
+            match_rule: RouteMatchConfig::PathPrefix {
+                prefix: prefix.into(),
+                hostnames: Vec::new(),
+            },
             upstream_cluster: upstream_cluster.into(),
             policies: PolicyBindingConfig::default(),
         }
@@ -38,14 +41,23 @@ impl RouteConfig {
 
     fn compile_rule(&self) -> Result<lb_proto_http::RoutePrefixRule, WorkspaceConfigError> {
         match &self.match_rule {
-            RouteMatchConfig::PathPrefix { prefix } => {
+            RouteMatchConfig::PathPrefix { prefix, hostnames } => {
                 if self.name.trim().is_empty() {
                     return Err(WorkspaceConfigError::EmptyRouteName);
                 }
                 if prefix.trim().is_empty() {
                     return Err(WorkspaceConfigError::EmptyRoutePrefix(self.name.clone()));
                 }
-                Ok(lb_proto_http::RoutePrefixRule::new(self.name.clone(), prefix.clone()))
+
+                let mut normalized_hostnames = BTreeSet::new();
+                for hostname in hostnames {
+                    let normalized = lb_proto_http::canonicalize_host(hostname)
+                        .map_err(|_| WorkspaceConfigError::InvalidRouteHostname(self.name.clone()))?;
+                    normalized_hostnames.insert(normalized);
+                }
+
+                Ok(lb_proto_http::RoutePrefixRule::new(self.name.clone(), prefix.clone())
+                    .with_hostnames(normalized_hostnames.into_iter().collect()))
             }
         }
     }
@@ -59,6 +71,9 @@ pub enum RouteMatchConfig {
     PathPrefix {
         /// Matched path prefix.
         prefix: String,
+        /// Optional hostnames matched against the normalized Host/:authority value.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        hostnames: Vec<String>,
     },
 }
 
@@ -102,5 +117,23 @@ mod tests {
         let result = compile_route_rules(&routes);
 
         assert_eq!(result, Err(WorkspaceConfigError::EmptyRoutePrefix(String::from("api"))));
+    }
+
+    #[test]
+    fn compile_routes_normalizes_hostnames() -> Result<(), Box<dyn std::error::Error>> {
+        let routes = vec![RouteConfig {
+            name: String::from("api"),
+            match_rule: crate::RouteMatchConfig::PathPrefix {
+                prefix: String::from("/api"),
+                hostnames: vec![String::from("Example.COM."), String::from("example.com")],
+            },
+            upstream_cluster: String::from("payments"),
+            policies: crate::PolicyBindingConfig::default(),
+        }];
+
+        let compiled = compile_route_rules(&routes)?;
+
+        assert_eq!(compiled[0].hostnames, vec![String::from("example.com")]);
+        Ok(())
     }
 }

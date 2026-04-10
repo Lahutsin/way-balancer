@@ -77,5 +77,7 @@ fn upgrade_and_rollback_path_is_smoke_tested() -> Result<(), Box<dyn std::error:
     assert_eq!(rollback.last_known_good_version, rollback.active_version);
     assert_eq!(dataplane.metrics().apply_success_count, 3);
     assert!(release_metadata.supports_config_api_version(stable_snapshot.metadata().api_version()));
+    assert_eq!(release_metadata.supported_release_line, "0.1.x");
+    assert_eq!(release_metadata.stability_contract_path, "docs/runbooks/stability-contract.md");
     Ok(())
 }

@@ -7,7 +7,10 @@
 - `EVID-005`: `docs/runbooks/cache-performance.md`
 - `EVID-006`: `artifacts/sbom/README.md` and `artifacts/provenance/README.md`
 - `EVID-007`: security review and secret-scanning outputs
-- `EVID-008`: `docs/runbooks/ga-readiness-review-template.md`# Release Evidence Inventory
+- `EVID-008`: `docs/runbooks/ga-readiness-review-template.md`
+- `EVID-009`: `docs/runbooks/stability-contract.md`
+
+# Release Evidence Inventory
 
 | Evidence ID | Artifact path | Purpose |
 | --- | --- | --- |
@@ -19,5 +22,6 @@
 | `EVID-006` | `artifacts/sbom/README.md` | SBOM artifact location |
 | `EVID-007` | `artifacts/provenance/README.md` | Provenance artifact location |
 | `EVID-008` | `docs/runbooks/ga-readiness-review-template.md` | Final GA decision record |
+| `EVID-009` | `docs/runbooks/stability-contract.md` | Stability boundaries, deprecation policy, and breaking-change contract |
 
 The release owner should attach generated outputs or references for each artifact path before declaring GA readiness.

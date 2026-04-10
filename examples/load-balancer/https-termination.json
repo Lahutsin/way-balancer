@@ -20,7 +20,11 @@
   "routes": [
     {
       "name": "web",
-      "match": { "type": "path_prefix", "prefix": "/" },
+      "match": {
+        "type": "path_prefix",
+        "prefix": "/",
+        "hostnames": ["localhost:8443", "127.0.0.1:8443"]
+      },
       "upstream_cluster": "frontend",
       "policies": {
         "cache_policy": "public-cache"

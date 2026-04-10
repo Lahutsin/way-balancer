@@ -44,6 +44,9 @@ pub struct ListenerResourceConfig {
     /// Attached named policy references.
     #[serde(default)]
     pub policies: PolicyBindingConfig,
+    /// Admin-plane hardening policy for privileged listeners.
+    #[serde(default, skip_serializing_if = "AdminListenerPolicyConfig::is_default")]
+    pub admin: AdminListenerPolicyConfig,
 }
 
 impl ListenerResourceConfig {
@@ -63,6 +66,7 @@ impl ListenerResourceConfig {
             drain_timeout_ms: None,
             routes: Vec::new(),
             policies: PolicyBindingConfig::default(),
+            admin: AdminListenerPolicyConfig::default(),
         }
     }
 
@@ -98,11 +102,255 @@ impl ListenerResourceConfig {
     }
 }
 
+/// Declarative admin-plane hardening policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AdminListenerPolicyConfig {
+    /// Authentication and authorization model for admin requests.
+    pub auth: AdminAuthPolicyConfig,
+    /// Optional CIDR allow-list for admin-plane source addresses.
+    pub allowed_source_cidrs: Vec<String>,
+    /// Per-source request shaping for the admin plane.
+    pub rate_limit: AdminRateLimitConfig,
+    /// Audit retention controls for recent admin actions.
+    pub audit: AdminAuditConfig,
+}
+
+impl Default for AdminListenerPolicyConfig {
+    fn default() -> Self {
+        Self {
+            auth: AdminAuthPolicyConfig::default(),
+            allowed_source_cidrs: Vec::new(),
+            rate_limit: AdminRateLimitConfig::default(),
+            audit: AdminAuditConfig::default(),
+        }
+    }
+}
+
+impl AdminListenerPolicyConfig {
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+/// Declarative admin-plane authn/authz model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum AdminAuthPolicyConfig {
+    /// Legacy shared bearer secret with explicit permissions.
+    Bearer {
+        #[serde(default = "default_admin_secret_env")]
+        secret_env: String,
+        #[serde(default = "default_admin_permissions")]
+        permissions: Vec<AdminAuthorizationScopeConfig>,
+    },
+    /// Replay-resistant signed headers with per-operator permissions.
+    SignedHeaders {
+        operators: Vec<AdminOperatorConfig>,
+        #[serde(default = "default_admin_clock_skew_secs")]
+        max_clock_skew_secs: u64,
+        #[serde(default = "default_admin_nonce_ttl_secs")]
+        nonce_ttl_secs: u64,
+    },
+}
+
+impl Default for AdminAuthPolicyConfig {
+    fn default() -> Self {
+        Self::Bearer {
+            secret_env: default_admin_secret_env(),
+            permissions: default_admin_permissions(),
+        }
+    }
+}
+
+/// Declarative admin operator for signed requests.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminOperatorConfig {
+    /// Stable operator identifier carried in signed requests.
+    pub id: String,
+    /// Environment variable name used to resolve the shared signing secret.
+    pub secret_env: String,
+    /// Permissions granted to this operator.
+    #[serde(default = "default_admin_permissions")]
+    pub permissions: Vec<AdminAuthorizationScopeConfig>,
+}
+
+/// Declarative admin-plane permission scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdminAuthorizationScopeConfig {
+    Read,
+    Audit,
+    Write,
+}
+
+/// Declarative admin-plane per-source rate limiting.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AdminRateLimitConfig {
+    /// Steady-state requests allowed per minute for each source.
+    pub requests_per_minute: u32,
+    /// Maximum short-term burst allowed for each source.
+    pub burst: u32,
+}
+
+impl Default for AdminRateLimitConfig {
+    fn default() -> Self {
+        Self {
+            requests_per_minute: 120,
+            burst: 10,
+        }
+    }
+}
+
+/// Declarative admin-plane audit retention settings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AdminAuditConfig {
+    /// Number of recent audit events retained in-memory for inspection.
+    pub max_retained_events: usize,
+}
+
+impl Default for AdminAuditConfig {
+    fn default() -> Self {
+        Self {
+            max_retained_events: 64,
+        }
+    }
+}
+
+fn default_admin_secret_env() -> String {
+    String::from("LB_CTL_ADMIN_SECRET")
+}
+
+fn default_admin_permissions() -> Vec<AdminAuthorizationScopeConfig> {
+    vec![
+        AdminAuthorizationScopeConfig::Read,
+        AdminAuthorizationScopeConfig::Audit,
+        AdminAuthorizationScopeConfig::Write,
+    ]
+}
+
+const fn default_admin_clock_skew_secs() -> u64 {
+    30
+}
+
+const fn default_admin_nonce_ttl_secs() -> u64 {
+    120
+}
+
 /// Declarative local TLS termination for HTTPS listeners.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ListenerTlsTerminationConfig {
     /// Source of certificate material.
+    pub certificate_source: ListenerCertificateSourceConfig,
+    /// Additional SNI-targeted certificates layered on top of the default certificate.
+    #[serde(default)]
+    pub sni_certificates: Vec<ListenerTlsSniCertificateConfig>,
+    /// TLS session resumption strategy for this listener.
+    #[serde(default = "default_tls_session_resumption")]
+    pub session_resumption: ListenerTlsSessionResumptionConfig,
+    /// Minimum TLS version admitted by the listener.
+    #[serde(default = "default_tls_minimum_version")]
+    pub minimum_version: ListenerTlsMinimumVersionConfig,
+    /// Ordered ALPN protocols advertised by the listener.
+    #[serde(default = "default_tls_alpn_protocols")]
+    pub alpn_protocols: Vec<ListenerAlpnProtocolConfig>,
+}
+
+fn default_tls_minimum_version() -> ListenerTlsMinimumVersionConfig {
+    ListenerTlsMinimumVersionConfig::Tls12
+}
+
+fn default_tls_alpn_protocols() -> Vec<ListenerAlpnProtocolConfig> {
+    vec![
+        ListenerAlpnProtocolConfig::Http2,
+        ListenerAlpnProtocolConfig::Http11,
+    ]
+}
+
+fn default_tls_session_resumption() -> ListenerTlsSessionResumptionConfig {
+    ListenerTlsSessionResumptionConfig::default()
+}
+
+/// Declarative TLS session resumption strategy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ListenerTlsSessionResumptionConfig {
+    /// Whether resumption is disabled, stateful, ticket-based, or both.
+    pub mode: ListenerTlsSessionResumptionModeConfig,
+    /// Stateful cache size when the selected mode uses in-memory session storage.
+    pub session_cache_size: usize,
+    /// Number of TLS 1.3 tickets sent when the selected mode issues tickets.
+    pub tls13_ticket_count: usize,
+}
+
+impl Default for ListenerTlsSessionResumptionConfig {
+    fn default() -> Self {
+        Self {
+            mode: ListenerTlsSessionResumptionModeConfig::Hybrid,
+            session_cache_size: 256,
+            tls13_ticket_count: 2,
+        }
+    }
+}
+
+/// Declarative session resumption mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ListenerTlsSessionResumptionModeConfig {
+    /// Disable stateful and ticket-based resumption.
+    Disabled,
+    /// Allow only in-memory stateful resumption.
+    Stateful,
+    /// Allow only ticket-based stateless resumption.
+    Tickets,
+    /// Allow both stateful and ticket-based resumption.
+    #[default]
+    Hybrid,
+}
+
+/// Declarative minimum TLS protocol version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ListenerTlsMinimumVersionConfig {
+    /// Allow TLS 1.2 and TLS 1.3 handshakes.
+    #[default]
+    Tls12,
+    /// Require TLS 1.3 handshakes.
+    Tls13,
+}
+
+/// Declarative ALPN protocol advertisement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ListenerAlpnProtocolConfig {
+    /// Advertise HTTP/2 via ALPN.
+    Http2,
+    /// Advertise HTTP/1.1 via ALPN.
+    Http11,
+}
+
+impl ListenerAlpnProtocolConfig {
+    #[must_use]
+    pub fn wire_id(self) -> &'static [u8] {
+        match self {
+            Self::Http2 => b"h2",
+            Self::Http11 => b"http/1.1",
+        }
+    }
+}
+
+/// Declarative SNI-targeted certificate mapping.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ListenerTlsSniCertificateConfig {
+    /// Hostnames that should use this certificate during SNI resolution.
+    pub server_names: Vec<String>,
+    /// Source of certificate material for those hostnames.
     pub certificate_source: ListenerCertificateSourceConfig,
 }
 
@@ -111,19 +359,30 @@ pub struct ListenerTlsTerminationConfig {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ListenerCertificateSourceConfig {
     /// PEM certificate chain and PEM private key loaded from files.
-    Files { cert_path: String, key_path: String },
+    Files {
+        cert_path: String,
+        key_path: String,
+        #[serde(default)]
+        ocsp_path: Option<String>,
+    },
 }
 
 impl ListenerCertificateSourceConfig {
-    pub(crate) fn cert_path(&self) -> &str {
+    pub fn cert_path(&self) -> &str {
         match self {
             Self::Files { cert_path, .. } => cert_path,
         }
     }
 
-    pub(crate) fn key_path(&self) -> &str {
+    pub fn key_path(&self) -> &str {
         match self {
             Self::Files { key_path, .. } => key_path,
+        }
+    }
+
+    pub fn ocsp_path(&self) -> Option<&str> {
+        match self {
+            Self::Files { ocsp_path, .. } => ocsp_path.as_deref(),
         }
     }
 }
@@ -187,8 +446,11 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     use super::{
-        compile_listeners, ListenerCertificateSourceConfig, ListenerClassConfig,
-        ListenerResourceConfig, ListenerTlsTerminationConfig,
+        AdminListenerPolicyConfig, compile_listeners, ListenerAlpnProtocolConfig,
+        ListenerCertificateSourceConfig, ListenerClassConfig, ListenerResourceConfig,
+        ListenerTlsMinimumVersionConfig, ListenerTlsSessionResumptionConfig,
+        ListenerTlsSessionResumptionModeConfig, ListenerTlsSniCertificateConfig,
+        ListenerTlsTerminationConfig,
     };
     use crate::{WorkspaceConfigError, WorkspaceDefaultsConfig};
 
@@ -222,6 +484,7 @@ mod tests {
             drain_timeout_ms: None,
             routes: Vec::new(),
             policies: crate::PolicyBindingConfig::default(),
+            admin: AdminListenerPolicyConfig::default(),
         };
 
         let compiled = compile_listeners(&[listener], &WorkspaceDefaultsConfig::default())?;
@@ -242,7 +505,23 @@ mod tests {
                 certificate_source: ListenerCertificateSourceConfig::Files {
                     cert_path: String::from("certs/server.pem"),
                     key_path: String::from("certs/server.key"),
+                    ocsp_path: Some(String::from("certs/server.ocsp")),
                 },
+                sni_certificates: vec![ListenerTlsSniCertificateConfig {
+                    server_names: vec![String::from("tenant.example")],
+                    certificate_source: ListenerCertificateSourceConfig::Files {
+                        cert_path: String::from("certs/tenant.pem"),
+                        key_path: String::from("certs/tenant.key"),
+                        ocsp_path: None,
+                    },
+                }],
+                session_resumption: ListenerTlsSessionResumptionConfig {
+                    mode: ListenerTlsSessionResumptionModeConfig::Stateful,
+                    session_cache_size: 64,
+                    tls13_ticket_count: 0,
+                },
+                minimum_version: ListenerTlsMinimumVersionConfig::Tls13,
+                alpn_protocols: vec![ListenerAlpnProtocolConfig::Http11],
             }),
             allow_unspecified_bind: false,
             max_connections: None,
@@ -251,6 +530,7 @@ mod tests {
             drain_timeout_ms: None,
             routes: vec![String::from("api")],
             policies: crate::PolicyBindingConfig::default(),
+            admin: AdminListenerPolicyConfig::default(),
         };
 
         let compiled = compile_listeners(&[listener], &WorkspaceDefaultsConfig::default())?;
@@ -264,5 +544,36 @@ mod tests {
             Some("certs/server.key")
         );
         Ok(())
+    }
+
+    #[test]
+    fn tls_termination_defaults_preserve_modern_compatibility() {
+        let config = ListenerTlsTerminationConfig {
+            certificate_source: ListenerCertificateSourceConfig::Files {
+                cert_path: String::from("certs/server.pem"),
+                key_path: String::from("certs/server.key"),
+                ocsp_path: None,
+            },
+            sni_certificates: Vec::new(),
+            session_resumption: ListenerTlsSessionResumptionConfig::default(),
+            minimum_version: ListenerTlsMinimumVersionConfig::Tls12,
+            alpn_protocols: vec![
+                ListenerAlpnProtocolConfig::Http2,
+                ListenerAlpnProtocolConfig::Http11,
+            ],
+        };
+
+        assert_eq!(config.minimum_version, ListenerTlsMinimumVersionConfig::Tls12);
+        assert_eq!(
+            config.alpn_protocols,
+            vec![
+                ListenerAlpnProtocolConfig::Http2,
+                ListenerAlpnProtocolConfig::Http11,
+            ]
+        );
+        assert_eq!(
+            config.session_resumption,
+            ListenerTlsSessionResumptionConfig::default()
+        );
     }
 }

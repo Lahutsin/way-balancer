@@ -19,7 +19,11 @@
   "routes": [
     {
       "name": "catalog",
-      "match": { "type": "path_prefix", "prefix": "/catalog" },
+      "match": {
+        "type": "path_prefix",
+        "prefix": "/catalog",
+        "hostnames": ["localhost:8080", "127.0.0.1:8080"]
+      },
       "upstream_cluster": "catalog-api",
       "policies": {
         "cache_policy": "public-cache"

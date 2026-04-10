@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::fmt;
-use std::net::SocketAddr;
+use std::net::IpAddr;
 
 use tokio::io::{AsyncRead, AsyncReadExt};
 
@@ -56,13 +56,22 @@ pub struct RoutePrefixRule {
     pub label: String,
     /// Path prefix matched against request targets.
     pub prefix: String,
+    /// Optional normalized hostnames matched against Host or :authority.
+    pub hostnames: Vec<String>,
 }
 
 impl RoutePrefixRule {
     /// Builds a prefix rule for basic route matching.
     #[must_use]
     pub fn new(label: impl Into<String>, prefix: impl Into<String>) -> Self {
-        Self { label: label.into(), prefix: prefix.into() }
+        Self { label: label.into(), prefix: prefix.into(), hostnames: Vec::new() }
+    }
+
+    /// Restricts a prefix rule to the provided normalized hostnames.
+    #[must_use]
+    pub fn with_hostnames(mut self, hostnames: Vec<String>) -> Self {
+        self.hostnames = hostnames;
+        self
     }
 }
 
@@ -197,6 +206,8 @@ pub enum Http1ParseError {
 pub enum ProtocolHardeningError {
     /// `content-length` and `transfer-encoding` were both present.
     AmbiguousMessageLength,
+    /// Request carried an unsupported `transfer-encoding` chain.
+    UnsupportedTransferEncoding,
     /// HTTP/1.1 requests must carry exactly one `host` header.
     MissingHost,
     /// Multiple `host` headers were present.
@@ -208,6 +219,9 @@ impl fmt::Display for ProtocolHardeningError {
         match self {
             Self::AmbiguousMessageLength => {
                 formatter.write_str("ambiguous content-length and transfer-encoding")
+            }
+            Self::UnsupportedTransferEncoding => {
+                formatter.write_str("unsupported transfer-encoding chain")
             }
             Self::MissingHost => formatter.write_str("missing required host header"),
             Self::MultipleHostHeaders => {
@@ -289,7 +303,7 @@ where
         .map_err(|error| Http1ParseError::Invalid(hardening_message(error)))?;
     let body_kind = detect_request_body_kind(&headers)?;
     let keep_alive = detect_keep_alive(&headers, version);
-    let route = match_route(&target, routes);
+    let route = match_route(&target, extract_host_header(&headers), routes);
     buffer.drain(..consumed);
 
     Ok(Some(Http1RequestHead { method, target, version, headers, body_kind, keep_alive, route }))
@@ -332,14 +346,14 @@ where
 #[must_use]
 pub fn normalize_request_headers(
     headers: &[HttpHeader],
-    downstream_addr: SocketAddr,
+    client_ip: IpAddr,
     keep_alive: bool,
     body_kind: &BodyKind,
 ) -> Vec<HttpHeader> {
     let mut normalized = filter_headers(headers, body_kind, false);
     normalized.push(HttpHeader {
         name: String::from("x-forwarded-for"),
-        value: downstream_addr.ip().to_string(),
+        value: client_ip.to_string(),
     });
 
     if !keep_alive {
@@ -522,7 +536,17 @@ fn detect_keep_alive(headers: &[HttpHeader], version: SupportedHttpVersion) -> b
 /// Matches a target path against shared route-prefix rules.
 #[must_use]
 pub fn match_route_prefix(target: &str, rules: &[RoutePrefixRule]) -> Option<RouteMatch> {
-    match_route(target, rules)
+    match_route(target, None, rules)
+}
+
+/// Matches a target path and optional host against shared route-prefix rules.
+#[must_use]
+pub fn match_route_request(
+    target: &str,
+    host: Option<&str>,
+    rules: &[RoutePrefixRule],
+) -> Option<RouteMatch> {
+    match_route(target, host, rules)
 }
 
 /// Returns whether the request should be treated as a gRPC request.
@@ -567,6 +591,21 @@ pub fn validate_http1_request_hardening(
         return Err(ProtocolHardeningError::AmbiguousMessageLength);
     }
 
+    let transfer_encoding_tokens: Vec<&str> = headers
+        .iter()
+        .filter(|header| header.name.eq_ignore_ascii_case("transfer-encoding"))
+        .flat_map(|header| header.value.split(','))
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .collect();
+    if !transfer_encoding_tokens.is_empty()
+        && transfer_encoding_tokens
+            .iter()
+            .any(|token| !token.eq_ignore_ascii_case("chunked"))
+    {
+        return Err(ProtocolHardeningError::UnsupportedTransferEncoding);
+    }
+
     Ok(())
 }
 
@@ -582,7 +621,12 @@ pub fn extract_host_header(headers: &[HttpHeader]) -> Option<&str> {
 /// Canonicalizes a host/authority value for cache key material.
 pub fn canonicalize_host(value: &str) -> Result<String, RequestTargetError> {
     let normalized = value.trim().to_ascii_lowercase();
-    if normalized.is_empty() || normalized.contains('/') || normalized.contains('@') {
+    if normalized.is_empty()
+        || normalized.contains('/')
+        || normalized.contains('@')
+        || normalized.contains(',')
+        || normalized.chars().any(|character| character.is_ascii_whitespace())
+    {
         return Err(RequestTargetError::InvalidAuthority);
     }
     let normalized = normalized.strip_suffix('.').unwrap_or(&normalized);
@@ -632,12 +676,36 @@ pub fn canonicalize_request_target(target: &str) -> Result<CanonicalRequestTarge
     })
 }
 
-fn match_route(target: &str, rules: &[RoutePrefixRule]) -> Option<RouteMatch> {
-    let path = target.split('?').next().unwrap_or(target);
-    rules
-        .iter()
-        .find(|rule| path.starts_with(&rule.prefix))
-        .map(|rule| RouteMatch { label: rule.label.clone(), prefix: rule.prefix.clone() })
+fn match_route(target: &str, host: Option<&str>, rules: &[RoutePrefixRule]) -> Option<RouteMatch> {
+    let canonical_target = canonicalize_request_target(target).ok();
+    let path = canonical_target
+        .as_ref()
+        .map(|target| target.path.as_str())
+        .unwrap_or_else(|| target.split('?').next().unwrap_or(target));
+    let canonical_host = host
+        .and_then(|value| canonicalize_host(value).ok())
+        .or_else(|| canonical_target.as_ref().and_then(|target| target.authority.clone()));
+    let mut best_match: Option<&RoutePrefixRule> = None;
+    for rule in rules.iter().filter(|rule| {
+        path.starts_with(&rule.prefix)
+            && (rule.hostnames.is_empty()
+                || canonical_host
+                    .as_deref()
+                    .is_some_and(|value| rule.hostnames.iter().any(|hostname| hostname == value)))
+    }) {
+        let should_replace = best_match
+            .map(|matched| {
+                let matched_specificity = (matched.prefix.len(), !matched.hostnames.is_empty());
+                let rule_specificity = (rule.prefix.len(), !rule.hostnames.is_empty());
+                rule_specificity > matched_specificity
+            })
+            .unwrap_or(true);
+        if should_replace {
+            best_match = Some(rule);
+        }
+    }
+
+    best_match.map(|rule| RouteMatch { label: rule.label.clone(), prefix: rule.prefix.clone() })
 }
 
 fn split_path_and_query(path_and_query: &str) -> (&str, &str) {
@@ -771,6 +839,9 @@ const fn hardening_message(error: ProtocolHardeningError) -> &'static str {
         ProtocolHardeningError::AmbiguousMessageLength => {
             "ambiguous content-length and transfer-encoding"
         }
+        ProtocolHardeningError::UnsupportedTransferEncoding => {
+            "unsupported transfer-encoding chain"
+        }
         ProtocolHardeningError::MissingHost => "missing required host header",
         ProtocolHardeningError::MultipleHostHeaders => "multiple host headers are not allowed",
     }
@@ -790,6 +861,7 @@ fn default_reason(status: u16) -> &'static str {
         202 => "Accepted",
         204 => "No Content",
         400 => "Bad Request",
+        403 => "Forbidden",
         404 => "Not Found",
         413 => "Payload Too Large",
         500 => "Internal Server Error",
@@ -803,9 +875,10 @@ fn default_reason(status: u16) -> &'static str {
 mod tests {
     use super::{
         canonicalize_host, canonicalize_request_target, encode_request_head,
-        is_grpc_content_type, is_grpc_request, match_route_prefix, normalize_request_headers,
-        validate_http1_request_hardening, BodyKind, Http1Limits, Http2Limits, HttpHeader,
-        ProtocolHardeningError, RequestTargetError, RoutePrefixRule, SupportedHttpVersion,
+        is_grpc_content_type, is_grpc_request, match_route_prefix, match_route_request,
+        normalize_request_headers, validate_http1_request_hardening, BodyKind, Http1Limits,
+        Http2Limits, HttpHeader, ProtocolHardeningError, RequestTargetError, RoutePrefixRule,
+        SupportedHttpVersion,
     };
 
     #[test]
@@ -813,6 +886,53 @@ mod tests {
         let routes = vec![RoutePrefixRule::new("api", "/api")];
 
         let matched = match_route_prefix("/api/v1/items?limit=1", &routes);
+
+        assert_eq!(matched.map(|route| route.label), Some(String::from("api")));
+    }
+
+    #[test]
+    fn route_matching_can_filter_by_host() {
+        let routes = vec![RoutePrefixRule::new("api", "/api")
+            .with_hostnames(vec![String::from("example.com")])];
+
+        let matched = match_route_request("/api/v1/items?limit=1", Some("Example.COM"), &routes);
+        let rejected = match_route_request("/api/v1/items?limit=1", Some("other.example"), &routes);
+
+        assert_eq!(matched.map(|route| route.label), Some(String::from("api")));
+        assert_eq!(rejected, None);
+    }
+
+    #[test]
+    fn route_matching_prefers_most_specific_prefix() {
+        let routes = vec![
+            RoutePrefixRule::new("catch-all", "/"),
+            RoutePrefixRule::new("api", "/api"),
+        ];
+
+        let matched = match_route_prefix("/api/v1/items?limit=1", &routes);
+
+        assert_eq!(matched.map(|route| route.label), Some(String::from("api")));
+    }
+
+    #[test]
+    fn route_matching_prefers_host_specific_rule_for_equal_prefix() {
+        let routes = vec![
+            RoutePrefixRule::new("generic-api", "/api"),
+            RoutePrefixRule::new("tenant-api", "/api")
+                .with_hostnames(vec![String::from("example.com")]),
+        ];
+
+        let matched = match_route_request("/api/v1/items", Some("example.com"), &routes);
+
+        assert_eq!(matched.map(|route| route.label), Some(String::from("tenant-api")));
+    }
+
+    #[test]
+    fn route_matching_uses_absolute_form_authority_and_path() {
+        let routes = vec![RoutePrefixRule::new("api", "/api")
+            .with_hostnames(vec![String::from("example.com")])];
+
+        let matched = match_route_request("http://Example.com/api?q=1", None, &routes);
 
         assert_eq!(matched.map(|route| route.label), Some(String::from("api")));
     }
@@ -828,11 +948,50 @@ mod tests {
             HttpHeader { name: String::from("x-extra"), value: String::from("remove-me") },
         ];
         let normalized =
-            normalize_request_headers(&headers, "127.0.0.1:8080".parse()?, true, &BodyKind::None);
+            normalize_request_headers(&headers, "127.0.0.1".parse()?, true, &BodyKind::None);
 
         assert_eq!(normalized.len(), 2);
         assert!(normalized.iter().any(|header| header.name == "host"));
         assert!(normalized.iter().any(|header| header.name == "x-forwarded-for"));
+        Ok(())
+    }
+
+    #[test]
+    fn request_normalization_strips_framing_and_forwarding_override_headers(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let headers = vec![
+            HttpHeader { name: String::from("host"), value: String::from("example.com") },
+            HttpHeader { name: String::from("transfer-encoding"), value: String::from("chunked") },
+            HttpHeader { name: String::from("te"), value: String::from("trailers") },
+            HttpHeader { name: String::from("trailer"), value: String::from("x-checksum") },
+            HttpHeader { name: String::from("x-forwarded-for"), value: String::from("198.51.100.7") },
+        ];
+        let normalized = normalize_request_headers(
+            &headers,
+            "127.0.0.1".parse()?,
+            true,
+            &BodyKind::Chunked,
+        );
+
+        assert!(normalized.iter().any(|header| header.name == "host"));
+        assert_eq!(
+            normalized
+                .iter()
+                .filter(|header| header.name == "transfer-encoding")
+                .map(|header| header.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["chunked"]
+        );
+        assert!(!normalized.iter().any(|header| header.name == "te"));
+        assert!(!normalized.iter().any(|header| header.name == "trailer"));
+        assert_eq!(
+            normalized
+                .iter()
+                .filter(|header| header.name == "x-forwarded-for")
+                .map(|header| header.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["127.0.0.1"]
+        );
         Ok(())
     }
 
@@ -871,6 +1030,30 @@ mod tests {
         let result = validate_http1_request_hardening(&headers);
 
         assert_eq!(result, Err(ProtocolHardeningError::AmbiguousMessageLength));
+    }
+
+    #[test]
+    fn hardening_rejects_unsupported_transfer_encoding_chain() {
+        let headers = vec![
+            HttpHeader { name: String::from("host"), value: String::from("example.test") },
+            HttpHeader { name: String::from("transfer-encoding"), value: String::from("gzip, chunked") },
+        ];
+
+        let result = validate_http1_request_hardening(&headers);
+
+        assert_eq!(result, Err(ProtocolHardeningError::UnsupportedTransferEncoding));
+    }
+
+    #[test]
+    fn hardening_allows_chunked_transfer_encoding_chain_only() {
+        let headers = vec![
+            HttpHeader { name: String::from("host"), value: String::from("example.test") },
+            HttpHeader { name: String::from("transfer-encoding"), value: String::from("chunked") },
+        ];
+
+        let result = validate_http1_request_hardening(&headers);
+
+        assert_eq!(result, Ok(()));
     }
 
     #[test]
@@ -917,6 +1100,10 @@ mod tests {
         );
         assert_eq!(
             canonicalize_host("bad/host").expect_err("must fail"),
+            RequestTargetError::InvalidAuthority
+        );
+        assert_eq!(
+            canonicalize_host("bad host").expect_err("must fail"),
             RequestTargetError::InvalidAuthority
         );
     }

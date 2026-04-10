@@ -10,6 +10,7 @@
 - `EVID-006`
 - `EVID-007`
 - `EVID-008`
+- `EVID-009`
 
 ## Decision
 
@@ -19,7 +20,9 @@
 
 ## Notes
 
-- summarize release blockers, exceptions, and cache-specific operational guidance for the candidate# GA Readiness Review Template
+- summarize release blockers, exceptions, and cache-specific operational guidance for the candidate
+
+# GA Readiness Review Template
 
 ## Release Summary
 
@@ -38,6 +41,7 @@
 - `EVID-006` SBOM artifact location attached:
 - `EVID-007` Provenance artifact location attached:
 - `EVID-008` Final review record completed:
+- `EVID-009` Stability contract reviewed and aligned with the candidate:
 
 ## Readiness Questions
 

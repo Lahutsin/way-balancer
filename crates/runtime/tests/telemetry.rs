@@ -1,4 +1,5 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::time::Duration;
 
 use lb_net_core::ListenerClass;
 use lb_observability::{FailureManagementEventKind, OverloadEvent, OverloadEventKind};
@@ -7,6 +8,7 @@ use lb_runtime::{
     ListenerEvent, ListenerEventKind, ListenerSnapshot, ListenerState, OverloadSnapshot,
     OverloadState, RuntimeTelemetry,
 };
+use lb_observability::TraceHookPhase;
 
 #[test]
 fn runtime_telemetry_emits_structured_logs_and_metrics() -> Result<(), Box<dyn std::error::Error>> {
@@ -84,10 +86,26 @@ fn runtime_telemetry_emits_structured_logs_and_metrics() -> Result<(), Box<dyn s
         "origin confirmed cached object",
     )?;
     telemetry.record_http_cache_purge("public-http", "purged", 3)?;
+    telemetry.record_request_latency(
+        "http1/request",
+        TraceHookPhase::ResponseCompleted,
+        Duration::from_millis(7),
+    )?;
+    telemetry.record_request_latency(
+        "http1/request",
+        TraceHookPhase::ResponseCompleted,
+        Duration::from_millis(180),
+    )?;
 
     let metrics = telemetry.export_metrics();
     assert!(metrics.contains(
         "runtime_listener_active_connections{listener=\"ingress_tcp\",state=\"running\"} 3"
+    ));
+    assert!(metrics.contains(
+        "runtime_listener_accepted_connections{listener=\"ingress_tcp\"} 5"
+    ));
+    assert!(metrics.contains(
+        "runtime_listener_rejected_connections{listener=\"ingress_tcp\"} 1"
     ));
     assert!(metrics.contains("runtime_listener_events_total{listener=\"ingress_tcp\",event_code=\"runtime.listener.started\"} 1"));
     assert!(metrics.contains(
@@ -95,6 +113,12 @@ fn runtime_telemetry_emits_structured_logs_and_metrics() -> Result<(), Box<dyn s
     ));
     assert!(metrics.contains("runtime_overload_state{scope=\"dataplane\"} 2"));
     assert!(metrics.contains("runtime_shed_requests_total{scope=\"dataplane\"} 7"));
+    assert!(metrics.contains("runtime_overload_active_signals{scope=\"dataplane\"} 4"));
+    assert!(metrics.contains("runtime_overload_rate_limited{scope=\"dataplane\"} 2"));
+    assert!(metrics.contains("runtime_overload_concurrency_limited{scope=\"dataplane\"} 1"));
+    assert!(metrics.contains("runtime_overload_breaker_open{scope=\"dataplane\"} 1"));
+    assert!(metrics.contains("runtime_overload_retry_budget_exhausted{scope=\"dataplane\"} 0"));
+    assert!(metrics.contains("runtime_overload_brownout_features{scope=\"dataplane\"} 1"));
     assert!(metrics.contains("runtime_http_cache_entries{scope=\"public-http\"} 2"));
     assert!(metrics.contains("runtime_http_cache_bytes{scope=\"public-http\"} 128"));
     assert!(metrics.contains("runtime_http_cache_max_object_bytes{scope=\"public-http\"} 96"));
@@ -114,6 +138,12 @@ fn runtime_telemetry_emits_structured_logs_and_metrics() -> Result<(), Box<dyn s
         "runtime_http_cache_purge_requests_total{scope=\"public-http\",result=\"purged\"} 1"
     ));
     assert!(metrics.contains("runtime_http_cache_purged_entries_total{scope=\"public-http\"} 3"));
+    assert!(metrics.contains(
+        "runtime_request_latency_samples_total{scope=\"http1_request\",bucket=\"le_10ms\",phase=\"response_completed\"} 1"
+    ));
+    assert!(metrics.contains(
+        "runtime_request_latency_samples_total{scope=\"http1_request\",bucket=\"le_250ms\",phase=\"response_completed\"} 1"
+    ));
 
     let snapshot = telemetry.snapshot();
     assert_eq!(snapshot.events.len(), 8);

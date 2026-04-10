@@ -10,5 +10,8 @@ publish.workspace = true
 httparse = "1.9"
 tokio = { version = "1.37", features = ["io-util"] }
 
+[dev-dependencies]
+proptest = "1.5"
+
 [lints]
 workspace = true

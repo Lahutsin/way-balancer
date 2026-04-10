@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 8b1cf5fd966df26d3d84350bfd9dc3c48b873b9fc063287fbf5ff0a728238e46 # shrinks to path = ["a"], pairs = [("a", "%")]
+cc 594172aa3571041dad3cf7e7c85cd0073f1fe46500b96748e552bf3243bf0a15 # shrinks to path = ["a"], pairs = [("n", "a"), ("n0", "a")]

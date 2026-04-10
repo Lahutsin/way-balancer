@@ -1,0 +1,33 @@
+[package]
+name = "way-balancer-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+lb-config-model = { path = "../crates/config-model" }
+lb-proto-http = { path = "../crates/proto-http" }
+lb-runtime = { path = "../crates/runtime" }
+tokio = { version = "1", features = ["rt", "time", "io-util", "net"] }
+
+[[bin]]
+name = "http1_head_parse"
+path = "fuzz_targets/http1_head_parse.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "request_target_canonicalization"
+path = "fuzz_targets/request_target_canonicalization.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "cache_key_material"
+path = "fuzz_targets/cache_key_material.rs"
+test = false
+doc = false

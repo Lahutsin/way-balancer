@@ -13,7 +13,11 @@
   "routes": [
     {
       "name": "api",
-      "match": { "type": "path_prefix", "prefix": "/api" },
+      "match": {
+        "type": "path_prefix",
+        "prefix": "/api",
+        "hostnames": ["localhost:8080", "127.0.0.1:8080"]
+      },
       "upstream_cluster": "payments",
       "policies": {
         "cache_policy": "public-cache"

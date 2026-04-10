@@ -2,6 +2,7 @@
 set -eu
 
 compatibility_doc="docs/runbooks/compatibility-matrix.md"
+stability_doc="docs/runbooks/stability-contract.md"
 upgrade_doc="docs/runbooks/upgrade-rollback-policy.md"
 dr_doc="docs/runbooks/disaster-recovery.md"
 evidence_doc="docs/runbooks/release-evidence-checklist.md"
@@ -11,6 +12,7 @@ sbom_doc="artifacts/sbom/README.md"
 provenance_doc="artifacts/provenance/README.md"
 
 test -f "$compatibility_doc"
+test -f "$stability_doc"
 test -f "$upgrade_doc"
 test -f "$dr_doc"
 test -f "$evidence_doc"
@@ -23,6 +25,12 @@ grep -q '^# Compatibility Matrix$' "$compatibility_doc"
 grep -q '^## Skew Policy$' "$compatibility_doc"
 grep -q 'Security Patch Process' "$compatibility_doc"
 grep -q 'check-release-artifacts.sh' "$compatibility_doc"
+
+grep -q '^# Stability Contract$' "$stability_doc"
+grep -q '^## Stable Surfaces$' "$stability_doc"
+grep -q '^## Experimental Surfaces$' "$stability_doc"
+grep -q '^## Breaking-Change Process$' "$stability_doc"
+grep -q 'RuntimeMetadata' "$stability_doc"
 
 grep -q '^# Upgrade and Rollback Policy$' "$upgrade_doc"
 grep -q '^## Upgrade Flow$' "$upgrade_doc"
@@ -41,18 +49,22 @@ grep -q '^# Release Evidence Checklist$' "$evidence_doc"
 grep -q '^## Required Evidence$' "$evidence_doc"
 grep -q '^## Release Candidate Sign-Off Checklist$' "$evidence_doc"
 grep -q 'EVID-008' "$evidence_doc"
+grep -q 'EVID-009' "$evidence_doc"
 
 grep -q '^# GA Readiness Review Template$' "$ga_template"
 grep -q '^## Evidence Inventory$' "$ga_template"
 grep -q 'go_with_exceptions' "$ga_template"
 grep -q 'EVID-008' "$ga_template"
+grep -q 'EVID-009' "$ga_template"
 
 grep -q '^# Release Evidence Inventory$' "$inventory_doc"
 grep -q 'EVID-001' "$inventory_doc"
 grep -q 'EVID-008' "$inventory_doc"
+grep -q 'EVID-009' "$inventory_doc"
 grep -q 'ga-readiness-review-template.md' "$inventory_doc"
+grep -q 'stability-contract.md' "$inventory_doc"
 
-for evid in EVID-001 EVID-002 EVID-003 EVID-004 EVID-005 EVID-006 EVID-007 EVID-008; do
+for evid in EVID-001 EVID-002 EVID-003 EVID-004 EVID-005 EVID-006 EVID-007 EVID-008 EVID-009; do
 	grep -q "$evid" "$evidence_doc"
 	grep -q "$evid" "$ga_template"
 	grep -q "$evid" "$inventory_doc"

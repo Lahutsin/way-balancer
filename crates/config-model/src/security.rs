@@ -12,6 +12,55 @@ const ED25519_PUBLIC_KEY_HEX_LEN: usize = 64;
 pub struct WorkspaceSecurityConfig {
     pub insecure_dev_mode: InsecureDevModeConfig,
     pub artifact_verification: ArtifactVerificationConfig,
+    #[serde(skip_serializing_if = "TrustedClientIpConfig::is_default")]
+    pub trusted_client_ip: TrustedClientIpConfig,
+    #[serde(skip_serializing_if = "AnonymousSourceFilterConfig::is_default")]
+    pub anonymous_source_filter: AnonymousSourceFilterConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct TrustedClientIpConfig {
+    pub enabled: bool,
+    pub trusted_proxy_cidrs: Vec<String>,
+}
+
+impl TrustedClientIpConfig {
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        !self.enabled && self.trusted_proxy_cidrs.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct AnonymousSourceFilterConfig {
+    pub enabled: bool,
+    pub deny_cidrs: Vec<String>,
+    pub deny_vpn: bool,
+    pub deny_proxy: bool,
+    pub deny_socks: bool,
+    pub deny_tor: bool,
+    pub vpn_cidrs: Vec<String>,
+    pub proxy_cidrs: Vec<String>,
+    pub socks_cidrs: Vec<String>,
+    pub tor_exit_cidrs: Vec<String>,
+}
+
+impl AnonymousSourceFilterConfig {
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        !self.enabled
+            && self.deny_cidrs.is_empty()
+            && !self.deny_vpn
+            && !self.deny_proxy
+            && !self.deny_socks
+            && !self.deny_tor
+            && self.vpn_cidrs.is_empty()
+            && self.proxy_cidrs.is_empty()
+            && self.socks_cidrs.is_empty()
+            && self.tor_exit_cidrs.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]

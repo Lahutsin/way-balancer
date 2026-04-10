@@ -21,13 +21,31 @@
       "class": "admin",
       "bind_address": "0.0.0.0:9900",
       "protocol": "http1",
-      "allow_unspecified_bind": true
+      "allow_unspecified_bind": true,
+      "admin": {
+        "auth": {
+          "mode": "bearer",
+          "secret_env": "LB_CTL_ADMIN_SECRET",
+          "permissions": ["read", "audit", "write"]
+        },
+        "rate_limit": {
+          "requests_per_minute": 60,
+          "burst": 10
+        },
+        "audit": {
+          "max_retained_events": 64
+        }
+      }
     }
   ],
   "routes": [
     {
       "name": "web",
-      "match": { "type": "path_prefix", "prefix": "/" },
+      "match": {
+        "type": "path_prefix",
+        "prefix": "/",
+        "hostnames": ["localhost:8080", "127.0.0.1:8080"]
+      },
       "upstream_cluster": "frontend",
       "policies": {
         "cache_policy": "public-cache"

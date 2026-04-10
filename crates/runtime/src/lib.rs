@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod anonymous_sources;
 mod config_application;
 mod emergency_protection;
 mod failure_management;
@@ -10,9 +11,11 @@ mod local_limits;
 mod overload_management;
 mod probe_semantics;
 mod protocol_protection;
+mod route_enumeration;
 mod source_guards;
 mod tcp_proxy;
 mod telemetry;
+mod trusted_client_ip;
 mod upstream_balancer;
 mod upstream_health;
 mod upstream_registry;
@@ -23,6 +26,10 @@ pub use config_application::{
     SnapshotActivationError, SnapshotActivationHook, SnapshotApplyAck, SnapshotApplyError,
     SnapshotApplyFailure, SnapshotApplyFailureCategory, SnapshotApplyLifecycle,
     SnapshotApplyMetrics, SnapshotApplyOutcome, SnapshotApplyRequest,
+};
+pub use anonymous_sources::{
+    AnonymousSourceCategory, AnonymousSourceFilterPolicy, AnonymousSourceFilterSnapshot,
+    AnonymousSourceFilterState,
 };
 pub use emergency_protection::{
     AbuseEventCategory, AbuseEventInput, AbuseEventLabel, AbuseForensicsError,
@@ -48,12 +55,14 @@ pub use http_cache::{
     HttpCacheStoreSnapshot,
 };
 pub use http1_proxy::{
-    proxy_http1_connection, Http1ConnectionMetrics, Http1ConnectionReport, Http1ProxyConfig,
-    Http1ProxyError, Http1ResponseCacheConfig,
+    proxy_http1_connection, proxy_http1_connection_with_downstream_addr,
+    Http1ConnectionMetrics, Http1ConnectionReport, Http1ProxyConfig, Http1ProxyError,
+    Http1ResponseCacheConfig, Http1RouteUpstream,
 };
 pub use http2_proxy::{
-    proxy_http2_connection, Http2ConnectionMetrics, Http2ConnectionReport, Http2ProxyConfig,
-    Http2ProxyError,
+    proxy_http2_connection, proxy_http2_connection_with_downstream_addr,
+    Http2ConnectionMetrics, Http2ConnectionReport, Http2ProxyConfig, Http2ProxyError,
+    Http2RouteUpstream,
 };
 pub use local_limits::{
     LimitContext, LocalConcurrencyLease, LocalConcurrencyLimitConfig, LocalConcurrencyLimiter,
@@ -70,6 +79,10 @@ pub use probe_semantics::{
     ReadinessProbeState, RuntimeProbeInput, StartupProbeState,
 };
 pub use protocol_protection::{ProtocolAnomalyCategory, SlowClientStage};
+pub use route_enumeration::{
+    RouteEnumerationProtectionPolicy, RouteEnumerationProtectionSnapshot,
+    RouteEnumerationProtectionState,
+};
 pub use source_guards::{
     AbuseRejectionReason, HandshakeGuardPolicy, ListenerAbuseProtectionPolicy,
     ListenerAbuseProtectionSnapshot, ListenerAbuseProtectionState, SourceAggregation,
@@ -82,10 +95,13 @@ pub use tcp_proxy::{
 pub use telemetry::{
     HttpCacheRequestOutcome, HttpCacheRevalidationResult, RuntimeTelemetry,
 };
+pub use trusted_client_ip::{TrustedClientIpError, TrustedClientIpPolicy};
 pub use upstream_balancer::{
-    EndpointSelectionCandidate, LoadBalancingAlgorithm, LocalityRoutingPolicy, NoHealthyFallback,
-    SelectedEndpoint, SelectionContext, UpstreamBalancer, UpstreamSelectionError,
-    UpstreamSelectionMetrics, UpstreamSelectionPolicy,
+    ActiveProbeTarget, EndpointSelectionCandidate, LoadBalancingAlgorithm,
+    LocalityRoutingPolicy, NoHealthyFallback, RouteBackendPool, SelectedEndpoint,
+    SelectedRouteBackend, SelectionContext,
+    UpstreamBalancer, UpstreamSelectionError, UpstreamSelectionMetrics,
+    UpstreamSelectionPolicy,
 };
 pub use upstream_health::{
     EndpointHealthPolicy, EndpointHealthSnapshot, EndpointHealthStatus, UpstreamHealthError,
@@ -108,7 +124,9 @@ use tokio::time;
 /// Returns the crate identifier for the runtime layer.
 pub const CRATE_ID: &str = "lb-runtime";
 const COMPATIBILITY_MATRIX_PATH: &str = "docs/runbooks/compatibility-matrix.md";
+const STABILITY_CONTRACT_PATH: &str = "docs/runbooks/stability-contract.md";
 const UPGRADE_POLICY_PATH: &str = "docs/runbooks/upgrade-rollback-policy.md";
+const SUPPORTED_RELEASE_LINE: &str = "0.1.x";
 const SUPPORTED_CONFIG_API_VERSIONS: [lb_config_model::ConfigApiVersion; 1] =
     [lb_config_model::ConfigApiVersion::V1Alpha1];
 
@@ -121,8 +139,12 @@ pub struct RuntimeMetadata {
     pub release_version: &'static str,
     /// Supported typed config API versions for this release.
     pub supported_config_api_versions: &'static [lb_config_model::ConfigApiVersion],
+    /// Supported workspace release line for this binary.
+    pub supported_release_line: &'static str,
     /// Canonical compatibility matrix artifact for this release line.
     pub compatibility_matrix_path: &'static str,
+    /// Canonical stability contract artifact for this release line.
+    pub stability_contract_path: &'static str,
     /// Canonical upgrade and rollback policy artifact for this release line.
     pub upgrade_policy_path: &'static str,
 }
@@ -135,7 +157,9 @@ impl RuntimeMetadata {
             service_name: lb_observability::SERVICE_NAME,
             release_version: env!("CARGO_PKG_VERSION"),
             supported_config_api_versions: &SUPPORTED_CONFIG_API_VERSIONS,
+            supported_release_line: SUPPORTED_RELEASE_LINE,
             compatibility_matrix_path: COMPATIBILITY_MATRIX_PATH,
+            stability_contract_path: STABILITY_CONTRACT_PATH,
             upgrade_policy_path: UPGRADE_POLICY_PATH,
         }
     }
@@ -611,7 +635,9 @@ mod tests {
 
         assert_eq!(metadata.release_version, env!("CARGO_PKG_VERSION"));
         assert!(metadata.supports_config_api_version(lb_config_model::ConfigApiVersion::V1Alpha1));
+        assert_eq!(metadata.supported_release_line, "0.1.x");
         assert_eq!(metadata.compatibility_matrix_path, "docs/runbooks/compatibility-matrix.md");
+        assert_eq!(metadata.stability_contract_path, "docs/runbooks/stability-contract.md");
         assert_eq!(metadata.upgrade_policy_path, "docs/runbooks/upgrade-rollback-policy.md");
     }
 }

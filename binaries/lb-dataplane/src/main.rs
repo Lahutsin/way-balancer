@@ -1,3 +1,5 @@
+mod workspace_serve;
+
 use std::error::Error;
 use std::fs;
 use std::io;
@@ -14,8 +16,32 @@ use tokio::sync::Mutex;
 struct DemoRequestHead {
     method: String,
     target: String,
+    headers: Vec<DemoHeader>,
     authorization_bearer: Option<String>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DemoHeader {
+    name: String,
+    value: String,
+}
+
+impl DemoRequestHead {
+    fn header_value(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|header| header.name.eq_ignore_ascii_case(name))
+            .map(|header| header.value.as_str())
+    }
+}
+
+const UNIQUE_SECURITY_HEADERS: &[&str] = &[
+    "authorization",
+    "x-lb-admin-actor",
+    "x-lb-admin-timestamp",
+    "x-lb-admin-nonce",
+    "x-lb-admin-signature",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct ServeArgs {
@@ -27,6 +53,10 @@ struct ServeRuntimeConfig {
     public_addr: SocketAddr,
     admin_addr: SocketAddr,
     upstream_addr: SocketAddr,
+    route_rules: Vec<lb_proto_http::RoutePrefixRule>,
+    route_upstreams: Vec<lb_runtime::Http1RouteUpstream>,
+    trusted_client_ip: Option<lb_runtime::TrustedClientIpPolicy>,
+    anonymous_source_filter: Option<lb_runtime::AnonymousSourceFilterPolicy>,
     spawn_demo_upstream: bool,
     source_label: String,
 }
@@ -283,32 +313,118 @@ fn serve_runtime_config_from_workspace(
         )
         .into());
     }
-    let route_name = public_listener
-        .routes
+    let compiled_routes = config.compile_http_route_rules()?;
+    let mut route_rules = Vec::with_capacity(public_listener.routes.len());
+    let mut route_upstreams = Vec::with_capacity(public_listener.routes.len());
+
+    for route_name in &public_listener.routes {
+        let route = config
+            .routes
+            .iter()
+            .find(|route| route.name == *route_name)
+            .ok_or_else(|| format!("public listener references unknown route {route_name}"))?;
+        let compiled_route = compiled_routes
+            .iter()
+            .find(|compiled| compiled.label == *route_name)
+            .ok_or_else(|| format!("compiled route {route_name} is missing"))?;
+        let cluster = config
+            .upstream_clusters
+            .iter()
+            .find(|cluster| cluster.name == route.upstream_cluster)
+            .ok_or_else(|| format!("route {} references unknown upstream cluster {}", route.name, route.upstream_cluster))?;
+        if cluster.endpoints.is_empty() {
+            return Err(
+                format!("upstream cluster {} must declare at least one endpoint", cluster.name)
+                    .into(),
+            );
+        }
+
+        route_rules.push(compiled_route.clone());
+        route_upstreams.extend(cluster.endpoints.iter().map(|endpoint| lb_runtime::Http1RouteUpstream {
+            route_label: route.name.clone(),
+            upstream: lb_net_core::UpstreamTarget::new(
+                format!("{}:{}", cluster.name, endpoint.id),
+                endpoint.address,
+            ),
+        }));
+    }
+
+    let upstream_addr = route_upstreams
         .first()
+        .map(|route_upstream| route_upstream.upstream.address)
         .ok_or("public listener must reference at least one route")?;
-    let route = config
-        .routes
-        .iter()
-        .find(|route| route.name == *route_name)
-        .ok_or_else(|| format!("public listener references unknown route {route_name}"))?;
-    let cluster = config
-        .upstream_clusters
-        .iter()
-        .find(|cluster| cluster.name == route.upstream_cluster)
-        .ok_or_else(|| format!("route {} references unknown upstream cluster {}", route.name, route.upstream_cluster))?;
-    let endpoint = cluster
-        .endpoints
-        .first()
-        .ok_or_else(|| format!("upstream cluster {} must declare at least one endpoint", cluster.name))?;
 
     Ok(ServeRuntimeConfig {
         public_addr: public_listener.bind_address,
         admin_addr: admin_listener.bind_address,
-        upstream_addr: endpoint.address,
+        upstream_addr,
+        route_rules,
+        route_upstreams,
+        trusted_client_ip: compile_trusted_client_ip(&config.security.trusted_client_ip)?,
+        anonymous_source_filter: compile_anonymous_source_filter(
+            &config.security.anonymous_source_filter,
+        )?,
         spawn_demo_upstream: false,
         source_label: format!("config={}", config.name),
     })
+}
+
+fn compile_trusted_client_ip(
+    config: &lb_config_model::TrustedClientIpConfig,
+) -> Result<Option<lb_runtime::TrustedClientIpPolicy>, Box<dyn Error>> {
+    if !config.enabled {
+        return Ok(None);
+    }
+
+    Ok(Some(lb_runtime::TrustedClientIpPolicy {
+        enabled: true,
+        trusted_proxy_cidrs: config
+            .trusted_proxy_cidrs
+            .iter()
+            .map(|cidr| cidr.parse::<ipnet::IpNet>())
+            .collect::<Result<Vec<_>, _>>()?,
+    }))
+}
+
+fn compile_anonymous_source_filter(
+    filter: &lb_config_model::AnonymousSourceFilterConfig,
+) -> Result<Option<lb_runtime::AnonymousSourceFilterPolicy>, Box<dyn Error>> {
+    if !filter.enabled {
+        return Ok(None);
+    }
+
+    Ok(Some(lb_runtime::AnonymousSourceFilterPolicy {
+        enabled: true,
+        deny_cidrs: filter
+            .deny_cidrs
+            .iter()
+            .map(|cidr| cidr.parse::<ipnet::IpNet>())
+            .collect::<Result<Vec<_>, _>>()?,
+        deny_vpn: filter.deny_vpn,
+        deny_proxy: filter.deny_proxy,
+        deny_socks: filter.deny_socks,
+        deny_tor: filter.deny_tor,
+        vpn_cidrs: filter
+            .vpn_cidrs
+            .iter()
+            .map(|cidr| cidr.parse::<ipnet::IpNet>())
+            .collect::<Result<Vec<_>, _>>()?,
+        proxy_cidrs: filter
+            .proxy_cidrs
+            .iter()
+            .map(|cidr| cidr.parse::<ipnet::IpNet>())
+            .collect::<Result<Vec<_>, _>>()?,
+        socks_cidrs: filter
+            .socks_cidrs
+            .iter()
+            .map(|cidr| cidr.parse::<ipnet::IpNet>())
+            .collect::<Result<Vec<_>, _>>()?,
+        tor_exit_cidrs: filter
+            .tor_exit_cidrs
+            .iter()
+            .map(|cidr| cidr.parse::<ipnet::IpNet>())
+            .collect::<Result<Vec<_>, _>>()?,
+    }))
 }
 
 fn resolve_serve_runtime_config(serve_args: &ServeArgs) -> Result<ServeRuntimeConfig, Box<dyn Error>> {
@@ -323,6 +439,10 @@ fn resolve_serve_runtime_config(serve_args: &ServeArgs) -> Result<ServeRuntimeCo
         public_addr: local_addr(parse_port_env("LB_PUBLIC_PORT", 8080)?),
         admin_addr: local_addr(parse_port_env("LB_ADMIN_PORT", 9900)?),
         upstream_addr: local_addr(parse_port_env("LB_DEMO_UPSTREAM_PORT", 18080)?),
+        route_rules: Vec::new(),
+        route_upstreams: Vec::new(),
+        trusted_client_ip: None,
+        anonymous_source_filter: None,
         spawn_demo_upstream: true,
         source_label: String::from("built-in demo topology"),
     })
@@ -336,6 +456,12 @@ fn curl_hint_addr(address: SocketAddr) -> SocketAddr {
 }
 
 async fn serve_main(serve_args: &ServeArgs) -> Result<(), Box<dyn Error>> {
+    if serve_args.config_path.is_some() {
+        return workspace_serve::serve_workspace_main(serve_args)
+            .await
+            .map_err(|error| -> Box<dyn Error> { error });
+    }
+
     let runtime_config = resolve_serve_runtime_config(serve_args)?;
     let admin_secret = Arc::new(admin_bearer_secret()?);
     let public_listener = TcpListener::bind(runtime_config.public_addr).await?;
@@ -351,10 +477,31 @@ async fn serve_main(serve_args: &ServeArgs) -> Result<(), Box<dyn Error>> {
     };
 
     let state = Arc::new(DemoServeState::new(public_addr, admin_addr, runtime_config.upstream_addr));
-    let proxy_config = lb_runtime::Http1ProxyConfig::new(lb_net_core::UpstreamTarget::new(
+    let mut proxy_config = lb_runtime::Http1ProxyConfig::new(lb_net_core::UpstreamTarget::new(
         "demo-upstream",
         runtime_config.upstream_addr,
     ));
+    proxy_config.routes = runtime_config.route_rules.clone();
+    if !runtime_config.route_upstreams.is_empty() {
+        proxy_config = proxy_config
+            .with_route_upstreams(runtime_config.route_upstreams.clone())
+            .with_route_enumeration_protection(lb_runtime::RouteEnumerationProtectionPolicy {
+                source_aggregation: lb_runtime::SourceAggregation::ExactIp,
+                evaluation_window: std::time::Duration::from_secs(30),
+                max_unmatched_route_events: 3,
+                max_distinct_query_signatures_per_route: 6,
+                base_ban_duration: std::time::Duration::from_secs(60),
+                max_ban_duration: std::time::Duration::from_secs(15 * 60),
+                max_tracked_sources: 4096,
+            })
+            .rejecting_unmatched_routes();
+    }
+    if let Some(policy) = runtime_config.trusted_client_ip.clone() {
+        proxy_config = proxy_config.with_trusted_client_ip(policy);
+    }
+    if let Some(filter) = runtime_config.anonymous_source_filter.clone() {
+        proxy_config = proxy_config.with_anonymous_source_filter(filter);
+    }
 
     let public_task = tokio::spawn(run_public_proxy_listener(
         public_listener,
@@ -588,12 +735,37 @@ fn parse_request_head(head: &str) -> io::Result<DemoRequestHead> {
         return Err(io::Error::other("unsupported request version"));
     }
 
-    let authorization_bearer = lines.find_map(parse_authorization_bearer);
+    let mut headers = Vec::new();
+    for line in lines {
+        if line.trim().is_empty() {
+            continue;
+        }
+        headers.push(parse_header_line(line)?);
+    }
+    reject_duplicate_security_headers(&headers)?;
+    let authorization_bearer = headers.iter().find_map(|header| {
+        parse_authorization_bearer(&format!("{}: {}", header.name, header.value))
+    });
 
     Ok(DemoRequestHead {
         method: String::from(method),
         target: String::from(target),
+        headers,
         authorization_bearer,
+    })
+}
+
+fn parse_header_line(header_line: &str) -> io::Result<DemoHeader> {
+    let (name, value) = header_line
+        .split_once(':')
+        .ok_or_else(|| io::Error::other("invalid request header line"))?;
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(io::Error::other("request header name must not be empty"));
+    }
+    Ok(DemoHeader {
+        name: String::from(name),
+        value: String::from(value.trim()),
     })
 }
 
@@ -615,6 +787,24 @@ fn parse_authorization_bearer(header_line: &str) -> Option<String> {
     }
 
     Some(String::from(token))
+}
+
+fn reject_duplicate_security_headers(headers: &[DemoHeader]) -> io::Result<()> {
+    let mut seen = std::collections::BTreeSet::new();
+    for header in headers {
+        if UNIQUE_SECURITY_HEADERS
+            .iter()
+            .any(|candidate| header.name.eq_ignore_ascii_case(candidate))
+        {
+            let normalized = header.name.to_ascii_lowercase();
+            if !seen.insert(normalized.clone()) {
+                return Err(io::Error::other(format!(
+                    "duplicate security-sensitive header {normalized}"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
@@ -770,6 +960,20 @@ mod tests {
     }
 
     #[test]
+    fn parse_request_head_rejects_duplicate_security_sensitive_headers() {
+        let error = parse_request_head(
+            concat!(
+                "GET /status HTTP/1.1\r\n",
+                "Host: localhost\r\n",
+                "Authorization: Bearer one\r\n",
+                "Authorization: Bearer two"
+            ),
+        )
+        .expect_err("duplicate authorization header must be rejected");
+        assert!(error.to_string().contains("duplicate security-sensitive header authorization"));
+    }
+
+    #[test]
     fn constant_time_eq_requires_exact_match() {
         assert!(constant_time_eq(b"admin-secret", b"admin-secret"));
         assert!(!constant_time_eq(b"admin-secret", b"admin-secreu"));
@@ -777,7 +981,7 @@ mod tests {
     }
 
     #[test]
-    fn serve_runtime_config_from_workspace_uses_public_route_and_first_endpoint(
+    fn serve_runtime_config_from_workspace_builds_route_dispatch_table(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let config = lb_config_model::WorkspaceConfig::parse_json_str(
             r#"{
@@ -803,7 +1007,11 @@ mod tests {
                 "routes": [
                     {
                         "name": "web",
-                        "match": { "type": "path_prefix", "prefix": "/" },
+                        "match": {
+                            "type": "path_prefix",
+                            "prefix": "/",
+                            "hostnames": ["example.com"]
+                        },
                         "upstream_cluster": "frontend"
                     }
                 ],
@@ -829,6 +1037,11 @@ mod tests {
         assert_eq!(runtime_config.public_addr, "0.0.0.0:8080".parse()?);
         assert_eq!(runtime_config.admin_addr, "0.0.0.0:9900".parse()?);
         assert_eq!(runtime_config.upstream_addr, "172.28.0.10:8080".parse()?);
+        assert_eq!(runtime_config.route_rules.len(), 1);
+        assert_eq!(runtime_config.route_rules[0].hostnames, vec![String::from("example.com")]);
+        assert_eq!(runtime_config.route_upstreams.len(), 1);
+        assert_eq!(runtime_config.route_upstreams[0].route_label, "web");
+        assert_eq!(runtime_config.route_upstreams[0].upstream.address, "172.28.0.10:8080".parse()?);
         assert!(!runtime_config.spawn_demo_upstream);
         Ok(())
     }
@@ -844,7 +1057,72 @@ mod tests {
         assert_eq!(runtime_config.public_addr, "127.0.0.1:8080".parse()?);
         assert_eq!(runtime_config.admin_addr, "127.0.0.1:9900".parse()?);
         assert_eq!(runtime_config.upstream_addr, "127.0.0.1:18080".parse()?);
+        assert!(runtime_config.route_rules.is_empty());
+        assert!(runtime_config.route_upstreams.is_empty());
         assert!(runtime_config.spawn_demo_upstream);
+        Ok(())
+    }
+
+    #[test]
+    fn serve_runtime_config_from_workspace_keeps_all_cluster_endpoints(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let config = lb_config_model::WorkspaceConfig::parse_json_str(
+            r#"{
+                "api_version": "v1_alpha1",
+                "name": "multi-endpoint-demo",
+                "listeners": [
+                    {
+                        "name": "public-web",
+                        "class": "public",
+                        "bind_address": "127.0.0.1:8080",
+                        "protocol": "http1",
+                        "routes": ["web"]
+                    },
+                    {
+                        "name": "admin-http",
+                        "class": "admin",
+                        "bind_address": "127.0.0.1:9900",
+                        "protocol": "http1"
+                    }
+                ],
+                "routes": [
+                    {
+                        "name": "web",
+                        "match": { "type": "path_prefix", "prefix": "/" },
+                        "upstream_cluster": "frontend"
+                    }
+                ],
+                "upstream_clusters": [
+                    {
+                        "name": "frontend",
+                        "endpoints": [
+                            {
+                                "id": "frontend-a",
+                                "address": "127.0.0.1:8081",
+                                "state": "ready",
+                                "zone": null,
+                                "locality": null,
+                                "weight": 1
+                            },
+                            {
+                                "id": "frontend-b",
+                                "address": "127.0.0.1:8082",
+                                "state": "ready",
+                                "zone": null,
+                                "locality": null,
+                                "weight": 1
+                            }
+                        ]
+                    }
+                ]
+            }"#,
+        )?;
+
+        let runtime_config = serve_runtime_config_from_workspace(&config)?;
+
+        assert_eq!(runtime_config.route_upstreams.len(), 2);
+        assert_eq!(runtime_config.route_upstreams[0].upstream.address, "127.0.0.1:8081".parse()?);
+        assert_eq!(runtime_config.route_upstreams[1].upstream.address, "127.0.0.1:8082".parse()?);
         Ok(())
     }
 

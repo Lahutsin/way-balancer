@@ -160,6 +160,8 @@ pub enum WorkspaceConfigError {
     EmptyRouteName,
     /// Path-prefix routes must provide a non-empty prefix.
     EmptyRoutePrefix(String),
+    /// Route hostname filters must be syntactically valid.
+    InvalidRouteHostname(String),
     /// Strong upstream model validation failed.
     InvalidUpstreamModel(lb_net_core::UpstreamModelError),
 }
@@ -183,6 +185,9 @@ impl fmt::Display for WorkspaceConfigError {
             Self::EmptyRoutePrefix(route_name) => {
                 write!(formatter, "route {route_name} must declare a non-empty path prefix")
             }
+            Self::InvalidRouteHostname(route_name) => {
+                write!(formatter, "route {route_name} must declare only valid hostnames")
+            }
             Self::InvalidUpstreamModel(error) => {
                 write!(formatter, "invalid upstream model: {error}")
             }
@@ -199,7 +204,8 @@ impl std::error::Error for WorkspaceConfigError {
             | Self::DuplicateClusterName(_)
             | Self::DuplicateRouteName(_)
             | Self::EmptyRouteName
-            | Self::EmptyRoutePrefix(_) => None,
+            | Self::EmptyRoutePrefix(_)
+            | Self::InvalidRouteHostname(_) => None,
         }
     }
 }

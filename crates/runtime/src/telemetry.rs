@@ -1,4 +1,5 @@
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use lb_observability::{
     CorrelationId, DiagnosticsLimits, IncomingTraceContext, LoggingPolicy, MetricDescriptor,
@@ -91,6 +92,18 @@ impl RuntimeTelemetry {
                     allowed_labels: vec![TelemetryLabelKey::EventCode, TelemetryLabelKey::Listener],
                 },
                 MetricDescriptor {
+                    name: String::from("runtime_listener_accepted_connections"),
+                    kind: MetricKind::Gauge,
+                    help: String::from("Total accepted listener connections observed in the latest snapshot"),
+                    allowed_labels: vec![TelemetryLabelKey::Listener],
+                },
+                MetricDescriptor {
+                    name: String::from("runtime_listener_rejected_connections"),
+                    kind: MetricKind::Gauge,
+                    help: String::from("Total rejected listener connections observed in the latest snapshot"),
+                    allowed_labels: vec![TelemetryLabelKey::Listener],
+                },
+                MetricDescriptor {
                     name: String::from("runtime_breaker_events_total"),
                     kind: MetricKind::Counter,
                     help: String::from("Total failure-management breaker events"),
@@ -109,10 +122,56 @@ impl RuntimeTelemetry {
                     allowed_labels: vec![TelemetryLabelKey::Scope],
                 },
                 MetricDescriptor {
+                    name: String::from("runtime_overload_active_signals"),
+                    kind: MetricKind::Gauge,
+                    help: String::from("Current active overload signal count"),
+                    allowed_labels: vec![TelemetryLabelKey::Scope],
+                },
+                MetricDescriptor {
+                    name: String::from("runtime_overload_rate_limited"),
+                    kind: MetricKind::Gauge,
+                    help: String::from("Current rate-limit saturation indicator count"),
+                    allowed_labels: vec![TelemetryLabelKey::Scope],
+                },
+                MetricDescriptor {
+                    name: String::from("runtime_overload_concurrency_limited"),
+                    kind: MetricKind::Gauge,
+                    help: String::from("Current concurrency-limit saturation indicator count"),
+                    allowed_labels: vec![TelemetryLabelKey::Scope],
+                },
+                MetricDescriptor {
+                    name: String::from("runtime_overload_breaker_open"),
+                    kind: MetricKind::Gauge,
+                    help: String::from("Current open breaker saturation indicator count"),
+                    allowed_labels: vec![TelemetryLabelKey::Scope],
+                },
+                MetricDescriptor {
+                    name: String::from("runtime_overload_retry_budget_exhausted"),
+                    kind: MetricKind::Gauge,
+                    help: String::from("Current exhausted retry-budget saturation indicator count"),
+                    allowed_labels: vec![TelemetryLabelKey::Scope],
+                },
+                MetricDescriptor {
+                    name: String::from("runtime_overload_brownout_features"),
+                    kind: MetricKind::Gauge,
+                    help: String::from("Current number of brownout-disabled features"),
+                    allowed_labels: vec![TelemetryLabelKey::Scope],
+                },
+                MetricDescriptor {
                     name: String::from("runtime_tracing_enabled"),
                     kind: MetricKind::Gauge,
                     help: String::from("Whether runtime tracing hooks are enabled"),
                     allowed_labels: vec![TelemetryLabelKey::Component],
+                },
+                MetricDescriptor {
+                    name: String::from("runtime_request_latency_samples_total"),
+                    kind: MetricKind::Counter,
+                    help: String::from("Latency bucket samples for critical request-flow phases"),
+                    allowed_labels: vec![
+                        TelemetryLabelKey::Bucket,
+                        TelemetryLabelKey::Phase,
+                        TelemetryLabelKey::Scope,
+                    ],
                 },
                 MetricDescriptor {
                     name: String::from("runtime_trace_hooks_total"),
@@ -220,6 +279,16 @@ impl RuntimeTelemetry {
                 TelemetryLabel::new(TelemetryLabelKey::State, &format!("{:?}", snapshot.state)),
             ],
             snapshot.active_connections as f64,
+        )?;
+        self.metrics.set_gauge(
+            "runtime_listener_accepted_connections",
+            vec![TelemetryLabel::new(TelemetryLabelKey::Listener, &snapshot.name)],
+            snapshot.accepted_connections as f64,
+        )?;
+        self.metrics.set_gauge(
+            "runtime_listener_rejected_connections",
+            vec![TelemetryLabel::new(TelemetryLabelKey::Listener, &snapshot.name)],
+            snapshot.rejected_connections as f64,
         )
     }
 
@@ -292,6 +361,53 @@ impl RuntimeTelemetry {
             "runtime_shed_requests_total",
             vec![TelemetryLabel::new(TelemetryLabelKey::Scope, scope)],
             snapshot.shed_request_count as f64,
+        )?;
+        self.metrics.set_gauge(
+            "runtime_overload_active_signals",
+            vec![TelemetryLabel::new(TelemetryLabelKey::Scope, scope)],
+            snapshot.active_signal_count as f64,
+        )?;
+        self.metrics.set_gauge(
+            "runtime_overload_rate_limited",
+            vec![TelemetryLabel::new(TelemetryLabelKey::Scope, scope)],
+            snapshot.rate_limited_count as f64,
+        )?;
+        self.metrics.set_gauge(
+            "runtime_overload_concurrency_limited",
+            vec![TelemetryLabel::new(TelemetryLabelKey::Scope, scope)],
+            snapshot.concurrency_limited_count as f64,
+        )?;
+        self.metrics.set_gauge(
+            "runtime_overload_breaker_open",
+            vec![TelemetryLabel::new(TelemetryLabelKey::Scope, scope)],
+            snapshot.breaker_open_count as f64,
+        )?;
+        self.metrics.set_gauge(
+            "runtime_overload_retry_budget_exhausted",
+            vec![TelemetryLabel::new(TelemetryLabelKey::Scope, scope)],
+            snapshot.retry_budget_exhausted_count as f64,
+        )?;
+        self.metrics.set_gauge(
+            "runtime_overload_brownout_features",
+            vec![TelemetryLabel::new(TelemetryLabelKey::Scope, scope)],
+            snapshot.brownout_feature_count as f64,
+        )
+    }
+
+    pub fn record_request_latency(
+        &self,
+        scope: &str,
+        phase: TraceHookPhase,
+        latency: Duration,
+    ) -> Result<(), TelemetryError> {
+        self.metrics.increment_counter(
+            "runtime_request_latency_samples_total",
+            vec![
+                TelemetryLabel::new(TelemetryLabelKey::Bucket, latency_bucket_label(latency)),
+                TelemetryLabel::new(TelemetryLabelKey::Phase, phase.as_str()),
+                TelemetryLabel::new(TelemetryLabelKey::Scope, scope),
+            ],
+            1,
         )
     }
 
@@ -552,4 +668,29 @@ fn trace_labels(context: &TraceContext, phase: Option<TraceHookPhase>) -> Vec<Te
         labels.push(TelemetryLabel::new(TelemetryLabelKey::Phase, phase.as_str()));
     }
     labels
+}
+
+fn latency_bucket_label(latency: Duration) -> &'static str {
+    let millis = latency.as_millis();
+    if millis <= 1 {
+        "le_1ms"
+    } else if millis <= 5 {
+        "le_5ms"
+    } else if millis <= 10 {
+        "le_10ms"
+    } else if millis <= 25 {
+        "le_25ms"
+    } else if millis <= 50 {
+        "le_50ms"
+    } else if millis <= 100 {
+        "le_100ms"
+    } else if millis <= 250 {
+        "le_250ms"
+    } else if millis <= 500 {
+        "le_500ms"
+    } else if millis <= 1000 {
+        "le_1000ms"
+    } else {
+        "gt_1000ms"
+    }
 }

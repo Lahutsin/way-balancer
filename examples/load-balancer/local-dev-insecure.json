@@ -23,7 +23,11 @@
   "routes": [
     {
       "name": "dev-api",
-      "match": { "type": "path_prefix", "prefix": "/dev" },
+      "match": {
+        "type": "path_prefix",
+        "prefix": "/dev",
+        "hostnames": ["localhost:8088", "127.0.0.1:8088"]
+      },
       "upstream_cluster": "dev-backend"
     }
   ],

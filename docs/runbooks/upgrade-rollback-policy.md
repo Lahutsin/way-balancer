@@ -23,6 +23,7 @@
 - Use a workspace release from the supported `0.1.x` line.
 - Publish snapshots with matching digest and artifact attestation.
 - Confirm the target snapshot uses a supported config API version exposed by `lb_runtime::RuntimeMetadata`.
+- Confirm the release still matches the documented stability and breaking-change contract in `docs/runbooks/stability-contract.md`.
 
 ## Upgrade Flow
 

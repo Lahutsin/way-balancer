@@ -435,6 +435,7 @@ pub fn translate_gateway_api(
                 drain_timeout_ms: None,
                 routes: Vec::new(),
                 policies: PolicyBindingConfig::default(),
+                admin: lb_config_model::AdminListenerPolicyConfig::default(),
             });
         }
     }

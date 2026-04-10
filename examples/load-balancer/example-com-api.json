@@ -1,0 +1,53 @@
+{
+  "api_version": "v1_alpha1",
+  "name": "edge-example-com-api",
+  "security": {
+    "anonymous_source_filter": {
+      "enabled": true,
+      "deny_cidrs": ["198.19.0.0/16", "2001:db8:feed::/48"],
+      "deny_vpn": true,
+      "deny_proxy": true,
+      "deny_socks": true,
+      "deny_tor": true,
+      "vpn_cidrs": ["203.0.113.0/24"],
+      "proxy_cidrs": ["198.51.100.0/24"],
+      "socks_cidrs": ["192.0.2.0/24"],
+      "tor_exit_cidrs": ["198.18.0.0/15"]
+    }
+  },
+  "listeners": [
+    {
+      "name": "public-http",
+      "class": "public",
+      "bind_address": "127.0.0.1:8080",
+      "protocol": "http1",
+      "routes": ["example-api"]
+    }
+  ],
+  "routes": [
+    {
+      "name": "example-api",
+      "match": {
+        "type": "path_prefix",
+        "prefix": "/api",
+        "hostnames": ["example.com", "example.com:8080"]
+      },
+      "upstream_cluster": "example-api-backend"
+    }
+  ],
+  "upstream_clusters": [
+    {
+      "name": "example-api-backend",
+      "endpoints": [
+        {
+          "id": "example-api-a",
+          "address": "127.0.0.1:9000",
+          "state": "ready",
+          "zone": null,
+          "locality": null,
+          "weight": 1
+        }
+      ]
+    }
+  ]
+}

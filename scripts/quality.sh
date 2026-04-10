@@ -3,6 +3,7 @@ set -eu
 
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
+./scripts/check-fuzz.sh
 ./scripts/check-coverage.sh
 cargo doc --workspace --no-deps
 

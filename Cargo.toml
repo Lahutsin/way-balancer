@@ -12,6 +12,7 @@ members = [
   "binaries/lb-dataplane",
   "binaries/lb-ctl",
 ]
+exclude = ["fuzz"]
 resolver = "2"
 
 [workspace.package]

@@ -46,6 +46,7 @@ pub struct ListenerSnapshot {
     name: String,
     class: ListenerClassConfig,
     protocol: ListenerProtocolConfig,
+    admin: crate::AdminListenerPolicyConfig,
     tls_termination: Option<ListenerTlsTerminationSnapshot>,
     bind_address: SocketAddr,
     max_connections: usize,
@@ -67,22 +68,37 @@ impl ListenerSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ListenerTlsTerminationSnapshot {
     certificate_source: ListenerCertificateSourceSnapshot,
+    sni_certificates: Vec<ListenerTlsSniCertificateSnapshot>,
+    session_resumption: crate::ListenerTlsSessionResumptionConfig,
+    minimum_version: crate::ListenerTlsMinimumVersionConfig,
+    alpn_protocols: Vec<crate::ListenerAlpnProtocolConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ListenerTlsSniCertificateSnapshot {
+    server_names: Vec<String>,
+    certificate_source: ListenerCertificateSourceSnapshot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ListenerCertificateSourceSnapshot {
-    Files { cert_path: String, key_path: String },
+    Files { cert_path: String, key_path: String, ocsp_path: Option<String> },
 }
 
 fn snapshot_certificate_source(
     source: &ListenerCertificateSourceConfig,
 ) -> ListenerCertificateSourceSnapshot {
     match source {
-        ListenerCertificateSourceConfig::Files { cert_path, key_path } => {
+        ListenerCertificateSourceConfig::Files {
+            cert_path,
+            key_path,
+            ocsp_path,
+        } => {
             ListenerCertificateSourceSnapshot::Files {
                 cert_path: cert_path.clone(),
                 key_path: key_path.clone(),
+                ocsp_path: ocsp_path.clone(),
             }
         }
     }
@@ -369,11 +385,25 @@ pub(crate) fn compile_workspace_snapshot(
             name: listener.name.clone(),
             class: listener.class,
             protocol: listener.protocol,
+            admin: listener.admin.clone(),
             tls_termination: listener.tls_termination.as_ref().map(|tls_termination| {
                 ListenerTlsTerminationSnapshot {
                     certificate_source: snapshot_certificate_source(
                         &tls_termination.certificate_source,
                     ),
+                    sni_certificates: tls_termination
+                        .sni_certificates
+                        .iter()
+                        .map(|certificate| ListenerTlsSniCertificateSnapshot {
+                            server_names: certificate.server_names.clone(),
+                            certificate_source: snapshot_certificate_source(
+                                &certificate.certificate_source,
+                            ),
+                        })
+                        .collect(),
+                    session_resumption: tls_termination.session_resumption.clone(),
+                    minimum_version: tls_termination.minimum_version,
+                    alpn_protocols: tls_termination.alpn_protocols.clone(),
                 }
             }),
             bind_address: compiled.bind_address,
@@ -560,9 +590,11 @@ mod tests {
         WorkspaceSnapshotCompiler,
     };
     use crate::{
-        ListenerClassConfig, ListenerProtocolConfig, ListenerResourceConfig, PolicyBindingConfig,
-        RouteConfig, UpstreamClusterConfig, UpstreamEndpointConfig, UpstreamTrafficPolicyConfig,
-        WorkspaceConfig,
+        AdminAuditConfig, AdminAuthPolicyConfig, AdminAuthorizationScopeConfig,
+        AdminListenerPolicyConfig, AdminOperatorConfig, AdminRateLimitConfig,
+        ListenerClassConfig, ListenerProtocolConfig, ListenerResourceConfig,
+        PolicyBindingConfig, RouteConfig, UpstreamClusterConfig, UpstreamEndpointConfig,
+        UpstreamTrafficPolicyConfig, WorkspaceConfig,
     };
 
     fn valid_workspace() -> WorkspaceConfig {
@@ -581,6 +613,7 @@ mod tests {
                 drain_timeout_ms: None,
                 routes: vec![String::from("api")],
                 policies: PolicyBindingConfig::default(),
+                admin: AdminListenerPolicyConfig::default(),
             }],
             routes: vec![RouteConfig::foundation_path_prefix("api", "/api", "payments")],
             upstream_clusters: vec![UpstreamClusterConfig {
@@ -622,7 +655,7 @@ mod tests {
                 "  \"metadata\": {\n",
                 "    \"format_version\": \"v1\",\n",
                 "    \"api_version\": \"v1_alpha1\",\n",
-                "    \"digest_sha256\": \"c473ffd16a90211d17edaa08c85904c308dd850e66240319f2971412a4ba18b8\"\n",
+                "    \"digest_sha256\": \"b88f3c2e0cef791c8a20c365f396c73cd3834fa07ebe7ed60c7306d1b4933fb7\"\n",
                 "  },\n",
                 "  \"workspace_name\": \"edge\",\n",
                 "  \"security\": {\n",
@@ -649,6 +682,25 @@ mod tests {
                 "      \"name\": \"public\",\n",
                 "      \"class\": \"public\",\n",
                 "      \"protocol\": \"http1\",\n",
+                "      \"admin\": {\n",
+                "        \"auth\": {\n",
+                "          \"mode\": \"bearer\",\n",
+                "          \"secret_env\": \"LB_CTL_ADMIN_SECRET\",\n",
+                "          \"permissions\": [\n",
+                "            \"read\",\n",
+                "            \"audit\",\n",
+                "            \"write\"\n",
+                "          ]\n",
+                "        },\n",
+                "        \"allowed_source_cidrs\": [],\n",
+                "        \"rate_limit\": {\n",
+                "          \"requests_per_minute\": 120,\n",
+                "          \"burst\": 10\n",
+                "        },\n",
+                "        \"audit\": {\n",
+                "          \"max_retained_events\": 64\n",
+                "        }\n",
+                "      },\n",
                 "      \"tls_termination\": null,\n",
                 "      \"bind_address\": \"127.0.0.1:8080\",\n",
                 "      \"max_connections\": 128,\n",
@@ -721,6 +773,91 @@ mod tests {
                 "}"
             )
         );
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_accessors_expose_compiled_resources_and_metadata(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let snapshot = compile_workspace_snapshot(&valid_workspace())?;
+
+        assert_eq!(snapshot.workspace_name(), "edge");
+        assert_eq!(snapshot.listeners().len(), 1);
+        assert_eq!(snapshot.listeners()[0].name(), "public");
+        assert_eq!(snapshot.routes().len(), 1);
+        assert_eq!(snapshot.upstream_clusters().len(), 1);
+        assert_eq!(snapshot.compiled_listeners().len(), 1);
+        assert_eq!(snapshot.compiled_route_rules().len(), 1);
+        assert_eq!(snapshot.compiled_upstream_clusters().len(), 1);
+        assert_eq!(snapshot.view().metadata().digest_sha256(), snapshot.metadata().digest_sha256());
+        assert_eq!(snapshot.security(), &valid_workspace().security);
+        assert_eq!(snapshot.policies(), &valid_workspace().policies);
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_diff_is_empty_for_identical_snapshots(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let left = compile_workspace_snapshot(&valid_workspace())?;
+        let right = compile_workspace_snapshot(&valid_workspace())?;
+
+        let diff = left.diff(&right);
+        assert!(diff.listener_changes.is_empty());
+        assert!(diff.route_changes.is_empty());
+        assert!(diff.upstream_cluster_changes.is_empty());
+        assert_eq!(diff.previous_digest_sha256, diff.next_digest_sha256);
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_preserves_custom_signed_admin_policy(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = valid_workspace();
+        config.listeners[0].class = ListenerClassConfig::Admin;
+        config.listeners[0].routes.clear();
+        config.listeners[0].admin = AdminListenerPolicyConfig {
+            auth: AdminAuthPolicyConfig::SignedHeaders {
+                operators: vec![
+                    AdminOperatorConfig {
+                        id: String::from("auditor"),
+                        secret_env: String::from("LB_CTL_OPERATOR_AUDIT_SECRET"),
+                        permissions: vec![AdminAuthorizationScopeConfig::Audit],
+                    },
+                    AdminOperatorConfig {
+                        id: String::from("writer"),
+                        secret_env: String::from("LB_CTL_OPERATOR_WRITE_SECRET"),
+                        permissions: vec![
+                            AdminAuthorizationScopeConfig::Read,
+                            AdminAuthorizationScopeConfig::Audit,
+                            AdminAuthorizationScopeConfig::Write,
+                        ],
+                    },
+                ],
+                max_clock_skew_secs: 45,
+                nonce_ttl_secs: 180,
+            },
+            allowed_source_cidrs: vec![String::from("127.0.0.1/32")],
+            rate_limit: AdminRateLimitConfig {
+                requests_per_minute: 30,
+                burst: 5,
+            },
+            audit: AdminAuditConfig {
+                max_retained_events: 8,
+            },
+        };
+
+        let snapshot = compile_workspace_snapshot(&config)?;
+
+        assert_eq!(snapshot.listeners[0].class, ListenerClassConfig::Admin);
+        assert_eq!(snapshot.listeners[0].admin, config.listeners[0].admin);
+        assert!(matches!(
+            snapshot.listeners[0].admin.auth,
+            AdminAuthPolicyConfig::SignedHeaders { .. }
+        ));
+        assert_eq!(snapshot.listeners[0].admin.allowed_source_cidrs, vec![String::from("127.0.0.1/32")]);
+        assert_eq!(snapshot.listeners[0].admin.rate_limit.requests_per_minute, 30);
+        assert_eq!(snapshot.listeners[0].admin.rate_limit.burst, 5);
+        assert_eq!(snapshot.listeners[0].admin.audit.max_retained_events, 8);
         Ok(())
     }
 

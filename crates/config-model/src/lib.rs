@@ -30,8 +30,12 @@ pub use limits::{
     LocalRateLimitPolicyConfig,
 };
 pub use listener::{
-    ListenerCertificateSourceConfig, ListenerClassConfig, ListenerProtocolConfig,
-    ListenerResourceConfig, ListenerTlsTerminationConfig,
+    AdminAuditConfig, AdminAuthPolicyConfig, AdminAuthorizationScopeConfig,
+    AdminListenerPolicyConfig, AdminOperatorConfig, AdminRateLimitConfig,
+    ListenerAlpnProtocolConfig, ListenerCertificateSourceConfig, ListenerClassConfig,
+    ListenerProtocolConfig, ListenerResourceConfig, ListenerTlsMinimumVersionConfig,
+    ListenerTlsSessionResumptionConfig, ListenerTlsSessionResumptionModeConfig,
+    ListenerTlsSniCertificateConfig, ListenerTlsTerminationConfig,
 };
 pub use overload_policy::{
     BrownoutFeatureConfig, OverloadResponsePolicyConfig, TrafficClassConfig,
@@ -47,10 +51,10 @@ pub use policy::{
 };
 pub use route::{RouteConfig, RouteMatchConfig};
 pub use security::{
-    verify_snapshot_artifact_integrity, ArtifactAttestation, ArtifactIntegrityError,
-    ArtifactSigner, ArtifactSigningError, ArtifactVerificationConfig,
-    ArtifactVerificationMode, InsecureDevModeConfig, TrustedArtifactSignerConfig,
-    WorkspaceSecurityConfig,
+    verify_snapshot_artifact_integrity, AnonymousSourceFilterConfig, ArtifactAttestation,
+    ArtifactIntegrityError, ArtifactSigner, ArtifactSigningError,
+    ArtifactVerificationConfig, ArtifactVerificationMode, InsecureDevModeConfig,
+    TrustedArtifactSignerConfig, TrustedClientIpConfig, WorkspaceSecurityConfig,
 };
 pub use upstream::{
     EndpointStateConfig, LoadBalancingAlgorithmConfig, LocalityRoutingConfig,
@@ -221,11 +225,13 @@ mod tests {
 
     use super::{
         AuthorizationCacheBehaviorConfig, CacheQueryKeyBehaviorConfig, HttpCacheStorageConfig,
-        ConfigApiVersion, EndpointStateConfig, ListenerCertificateSourceConfig,
-        ListenerClassConfig, ListenerProtocolConfig, ListenerResourceConfig,
-        ListenerTlsTerminationConfig, PolicyBindingConfig, RouteConfig, UpstreamClusterConfig,
-        UpstreamEndpointConfig, UpstreamTrafficPolicyConfig, WorkspaceConfig,
-        WorkspaceConfigParser,
+        ConfigApiVersion, EndpointStateConfig, ListenerAlpnProtocolConfig,
+        ListenerCertificateSourceConfig, ListenerClassConfig, ListenerProtocolConfig,
+        ListenerResourceConfig, ListenerTlsMinimumVersionConfig,
+        ListenerTlsSessionResumptionConfig, ListenerTlsSessionResumptionModeConfig,
+        ListenerTlsSniCertificateConfig, ListenerTlsTerminationConfig, PolicyBindingConfig, RouteConfig,
+        UpstreamClusterConfig, UpstreamEndpointConfig, UpstreamTrafficPolicyConfig,
+        WorkspaceConfig, WorkspaceConfigParser,
     };
 
     #[test]
@@ -420,10 +426,29 @@ mod tests {
                         "bind_address": "127.0.0.1:8443",
                         "protocol": "https",
                         "tls_termination": {
+                            "sni_certificates": [
+                                {
+                                    "server_names": ["tenant.example"],
+                                    "certificate_source": {
+                                        "type": "files",
+                                        "cert_path": "certs/tenant.pem",
+                                        "key_path": "certs/tenant.key",
+                                        "ocsp_path": null
+                                    }
+                                }
+                            ],
+                            "session_resumption": {
+                                "mode": "tickets",
+                                "session_cache_size": 128,
+                                "tls13_ticket_count": 4
+                            },
+                            "minimum_version": "tls13",
+                            "alpn_protocols": ["http2"],
                             "certificate_source": {
                                 "type": "files",
                                 "cert_path": "certs/server.pem",
-                                "key_path": "certs/server.key"
+                                "key_path": "certs/server.key",
+                                "ocsp_path": "certs/server.ocsp"
                             }
                         },
                         "routes": ["web"]
@@ -459,7 +484,23 @@ mod tests {
                 certificate_source: ListenerCertificateSourceConfig::Files {
                     cert_path: String::from("certs/server.pem"),
                     key_path: String::from("certs/server.key"),
+                    ocsp_path: Some(String::from("certs/server.ocsp")),
                 },
+                sni_certificates: vec![ListenerTlsSniCertificateConfig {
+                    server_names: vec![String::from("tenant.example")],
+                    certificate_source: ListenerCertificateSourceConfig::Files {
+                        cert_path: String::from("certs/tenant.pem"),
+                        key_path: String::from("certs/tenant.key"),
+                        ocsp_path: None,
+                    },
+                }],
+                session_resumption: ListenerTlsSessionResumptionConfig {
+                    mode: ListenerTlsSessionResumptionModeConfig::Tickets,
+                    session_cache_size: 128,
+                    tls13_ticket_count: 4,
+                },
+                minimum_version: ListenerTlsMinimumVersionConfig::Tls13,
+                alpn_protocols: vec![ListenerAlpnProtocolConfig::Http2],
             })
         );
         Ok(())

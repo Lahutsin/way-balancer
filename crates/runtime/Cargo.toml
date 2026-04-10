@@ -11,6 +11,7 @@ bytes = "1.6"
 h2 = "0.3.27"
 http = "0.2"
 httpdate = "1.0"
+ipnet = "2.10"
 lb-config-model = { path = "../config-model" }
 lb-net-core = { path = "../net-core" }
 lb-observability = { path = "../observability" }
@@ -20,16 +21,25 @@ tokio = { version = "1.37", features = ["io-util", "macros", "net", "rt-multi-th
 
 [dev-dependencies]
 bytes = "1.6"
-criterion = "0.5"
+criterion = { version = "0.5", features = ["html_reports"] }
 h2 = "0.3.27"
 http = "0.2"
 httpdate = "1.0"
 lb-config-model = { path = "../config-model" }
 lb-test-support = { path = "../test-support" }
+proptest = "1.5"
+rcgen = "0.13"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 tokio = { version = "1.37", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-rustls = "0.26"
 
 [[bench]]
 name = "http_cache"
+harness = false
+
+[[bench]]
+name = "dataplane_envelope"
 harness = false
 
 [lints]

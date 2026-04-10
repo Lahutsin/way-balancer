@@ -4,13 +4,15 @@ These examples target the typed JSON configuration accepted by `lb_config_model:
 
 ## Files
 
-- `basic-http.json`: minimal HTTP/1.1 edge listener with a single upstream cluster and a conservative public-cache policy
-- `http-cache-public.json`: public HTTP example with a named shared-cache policy and route-level cache binding
-- `docker-compose-public-admin.json`: container-friendly public plus admin listeners for `docker compose up` with cache enabled on the public route
-- `grpc-retries.json`: HTTP/2 or gRPC-style listener with retry-budget policy wiring
-- `https-termination.json`: HTTPS listener with file-backed TLS termination material and a conservative public-cache policy
-- `public-admin.json`: public application listener plus a separate admin TCP listener, with cache enabled on the public route
-- `local-dev-insecure.json`: development-only example showing explicit insecure override gating
+- `basic-http.json`: minimal HTTP/1.1 edge listener with a single upstream cluster, local-friendly hostname filters, and a conservative public-cache policy
+- `http-cache-public.json`: public HTTP example with a named shared-cache policy, local-friendly hostname filters, and route-level cache binding
+- `docker-compose-public-admin.json`: container-friendly public plus admin HTTP listener for `docker compose up`, with cache enabled on the public route, hostname filters matching local Docker Compose curls, and explicit bearer-auth admin policy for `healthz`, `status`, `validate`, `audit`, and `reload`
+- `grpc-retries.json`: HTTP/2 or gRPC-style listener with retry-budget policy wiring and hostname-aware route matching
+- `https-termination.json`: HTTPS listener with file-backed TLS termination material, hostname-aware route matching, and a conservative public-cache policy
+- `public-admin.json`: public application listener plus a separate localhost-only admin HTTP listener, with cache enabled on the public route, local-friendly hostname filters, and explicit admin auth, rate-limit, and audit retention settings
+- `local-dev-insecure.json`: development-only example showing explicit insecure override gating with hostname-aware route matching
+- `virtual-hosts.json`: virtual-host example that routes `shop.localhost` and `api.localhost` to different upstream clusters on the same listener
+- `example-com-api.json`: focused hostname-aware API example for `example.com/api?auth=user`, where query forwarding stays automatic, only host plus path are configured, and the shared security section demonstrates the full anonymous-source filter shape
 
 ## Important Note
 
@@ -22,7 +24,23 @@ Examples that keep `security.artifact_verification.mode` set to `enforced` are i
 
 The HTTPS example uses file paths for PEM certificate and key material. Those files are operator-provided deployment inputs rather than repository fixtures.
 
-The Docker Compose example binds `0.0.0.0` explicitly and points at a fixed backend IP on the compose network so the current `SocketAddr`-based upstream model can resolve the demo backend without extra service discovery. The admin listener is intended to be used only with `LB_CTL_ADMIN_SECRET` bearer authorization, and the compose file publishes port `9900` on `127.0.0.1` only.
+The Docker Compose example binds `0.0.0.0` explicitly and points at a fixed backend IP on the compose network so the current `SocketAddr`-based upstream model can resolve the demo backend without extra service discovery. The admin listener is HTTP/1, is intended to be used with `LB_CTL_ADMIN_SECRET` bearer authorization, exposes `GET /healthz`, `GET /status`, `GET /validate`, `GET /audit`, and `POST /reload`, and the compose file publishes port `9900` on `127.0.0.1` only.
+
+The HTTP examples now include `match.hostnames` filters. Query parameters are still not configured in route rules; they pass through automatically as part of the forwarded request target and continue to participate in cache key construction when the selected cache policy includes query strings.
+
+If multiple routes match the same host, the runtime prefers the most specific path prefix.
+
+For the current `lb-dataplane serve --config ...` demo path, each matched route keeps the full endpoint list from its referenced upstream cluster and dispatches over that route-local pool.
+
+The shared `security.anonymous_source_filter` block is optional. When enabled in serve mode, it blocks client source IPs that fall inside configured direct `deny_cidrs` entries or VPN, proxy, SOCKS, and Tor CIDR lists and returns a local `403` before proxying. The checked-in examples include both IPv4 and IPv6 `deny_cidrs` entries.
+
+For the focused `example.com/api?auth=user` case, use `example-com-api.json` and send a request like:
+
+```sh
+curl -H 'Host: example.com' 'http://127.0.0.1:8080/api?auth=user'
+```
+
+The route match checks `Host` plus the `/api` path prefix. The `?auth=user` query string is forwarded automatically and does not need to be declared in the config.
 
 The cache example is intentionally conservative for a shared cache: it limits methods to `GET` and `HEAD`, keeps `allow_set_cookie_storage` disabled, enables validator-based revalidation, and uses bounded in-memory storage. Cookie-bearing requests still bypass the shared cache at runtime even if the config itself does not mention cookies.
 

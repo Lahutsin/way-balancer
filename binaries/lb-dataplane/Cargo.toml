@@ -7,6 +7,10 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+bytes = "1.10"
+h2 = "0.3.27"
+http = "0.2"
+ipnet = "2.10"
 lb-admin-api = { path = "../../crates/admin-api" }
 lb-config-model = { path = "../../crates/config-model" }
 lb-runtime = { path = "../../crates/runtime" }
@@ -14,10 +18,16 @@ lb-net-core = { path = "../../crates/net-core" }
 lb-proto-http = { path = "../../crates/proto-http" }
 lb-proto-tls = { path = "../../crates/proto-tls" }
 lb-observability = { path = "../../crates/observability" }
+rustls = "0.23"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
 tokio = { version = "1.37", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-rustls = "0.26"
 
 [dev-dependencies]
 lb-test-support = { path = "../../crates/test-support" }
+rcgen = "0.13"
 
 [lints]
 workspace = true

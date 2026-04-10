@@ -52,6 +52,7 @@ Security-sensitive runtime behavior changes, especially around cache keying, aut
 - Compatibility artifacts are verified by `./scripts/check-release-artifacts.sh`.
 - Runtime release metadata is asserted in `cargo test -p lb-runtime` and `cargo test -p lb-test-support --test upgrade_rollback_smoke`.
 - DR restore validation is documented in `docs/runbooks/disaster-recovery.md` and asserted by `cargo test -p lb-test-support --test snapshot_restore_smoke`.
+- Stability boundaries, deprecation policy, and experimental labels are defined in `docs/runbooks/stability-contract.md`.
 
 ## Release Gate Reference
 
