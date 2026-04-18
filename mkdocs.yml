@@ -1,0 +1,75 @@
+site_name: way-balancer
+site_description: Production-oriented Rust load balancer documentation
+docs_dir: docs
+site_dir: site
+
+theme:
+  name: material
+  language: en
+  features:
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - content.code.copy
+    - content.tabs.link
+    - toc.follow
+  palette:
+    - scheme: default
+      primary: blue grey
+      accent: teal
+
+plugins:
+  - search
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+
+extra_css:
+  - stylesheets/extra.css
+
+extra_javascript:
+  - https://unpkg.com/mermaid@10/dist/mermaid.min.js
+  - javascripts/mermaid-init.js
+
+nav:
+  - Overview: index.md
+  - Getting Started: getting-started.md
+  - Architecture: architecture.md
+  - Configuration: configuration.md
+  - Publishing: publishing.md
+  - Runbooks:
+      - Admin Plane Hardening: runbooks/admin-plane-hardening.md
+      - Cache Operations: runbooks/cache-operations.md
+      - Cache Invalidation: runbooks/cache-invalidation.md
+      - Cache Performance: runbooks/cache-performance.md
+      - Compatibility Matrix: runbooks/compatibility-matrix.md
+      - Config Safety Workflow: runbooks/config-safety-workflow.md
+      - Disaster Recovery: runbooks/disaster-recovery.md
+      - Fuzzing And Property Tests: runbooks/fuzzing-property-tests.md
+      - GA Readiness Review Template: runbooks/ga-readiness-review-template.md
+      - Kubernetes Controller Operations: runbooks/kubernetes-controller-operations.md
+      - Observability Stack: runbooks/observability-stack.md
+      - Performance Envelope: runbooks/performance-envelope.md
+      - Release Evidence Checklist: runbooks/release-evidence-checklist.md
+      - Security Hardening: runbooks/security-hardening.md
+      - Soak And Chaos Failure Injection: runbooks/soak-chaos-failure-injection.md
+      - Stability Contract: runbooks/stability-contract.md
+      - TLS Operations: runbooks/tls-operations.md
+      - Upgrade And Rollback Policy: runbooks/upgrade-rollback-policy.md

@@ -80,6 +80,26 @@ flowchart LR
 - `scripts/`: local developer and CI helper scripts
 - `docs/`: contributor guides plus compatibility, DR, and release runbooks
 - `artifacts/`: release-evidence inventory and SBOM/provenance artifact locations
+- `plan/`: implementation and documentation roadmaps
+
+## Documentation Site
+
+The repository now includes a GitHub Pages-ready documentation site built with MkDocs Material.
+
+Preview it locally with:
+
+```sh
+python3 -m pip install -r requirements-docs.txt
+python3 -m mkdocs serve
+```
+
+Build the same static output used in CI with:
+
+```sh
+python3 -m mkdocs build --strict
+```
+
+The publishing workflow lives in `.github/workflows/docs-pages.yml`. To make the site live on GitHub, set the repository `Pages` source to `GitHub Actions` once in repository settings.
 
 ## Build
 

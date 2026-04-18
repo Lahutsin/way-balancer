@@ -28,4 +28,5 @@ output.txt
 #.idea/
 
 .coverage
+site/
 .venv
