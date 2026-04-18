@@ -2,6 +2,8 @@
 
 This directory contains a checked-in deployment example for the current `lb-k8s-controller` runtime.
 
+If you prefer Helm packaging instead of applying the raw manifest directly, use the chart at `charts/lb-k8s-controller`.
+
 ## Current Assumptions
 
 - single replica only
@@ -21,6 +23,19 @@ Replace the image reference in `deployment.yaml` before applying it.
 
 ```sh
 kubectl apply -f examples/kubernetes/lb-k8s-controller/deployment.yaml
+kubectl rollout status deployment/lb-k8s-controller -n way-balancer-system
+kubectl logs deployment/lb-k8s-controller -n way-balancer-system
+```
+
+## Install With Helm
+
+```sh
+helm upgrade --install lb-k8s-controller ./charts/lb-k8s-controller \
+	-n way-balancer-system \
+	--create-namespace \
+	--set image.repository=ghcr.io/your-org/way-balancer-k8s-controller \
+	--set image.tag=0.1.0 \
+	--set controller.namespaceScope=edge
 kubectl rollout status deployment/lb-k8s-controller -n way-balancer-system
 kubectl logs deployment/lb-k8s-controller -n way-balancer-system
 ```

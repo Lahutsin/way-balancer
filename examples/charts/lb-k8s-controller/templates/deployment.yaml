@@ -1,0 +1,79 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "lb-k8s-controller.fullname" . }}
+  namespace: {{ include "lb-k8s-controller.namespace" . }}
+  labels:
+    {{- include "lb-k8s-controller.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  revisionHistoryLimit: {{ .Values.revisionHistoryLimit }}
+  selector:
+    matchLabels:
+      {{- include "lb-k8s-controller.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "lb-k8s-controller.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "lb-k8s-controller.serviceAccountName" . }}
+      {{- if .Values.priorityClassName }}
+      priorityClassName: {{ .Values.priorityClassName }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: controller
+          image: {{ printf "%s:%s" .Values.image.repository (.Values.image.tag | default .Chart.AppVersion) | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          env:
+            - name: LB_K8S_CONTROLLER_NAME
+              value: {{ .Values.controller.name | quote }}
+            {{- if .Values.controller.namespaceScope }}
+            - name: LB_K8S_CONTROLLER_NAMESPACE
+              value: {{ .Values.controller.namespaceScope | quote }}
+            {{- end }}
+            - name: LB_K8S_CONTROLLER_BIND_IP
+              value: {{ .Values.controller.bindIP | quote }}
+            - name: LB_K8S_CONTROLLER_LISTENER_CLASS
+              value: {{ .Values.controller.listenerClass | quote }}
+            - name: LB_K8S_CONTROLLER_LISTENER_PROTOCOL
+              value: {{ .Values.controller.listenerProtocol | quote }}
+            - name: LB_K8S_CONTROLLER_RECONCILE_DEBOUNCE_MS
+              value: {{ .Values.controller.reconcileDebounceMs | quote }}
+            - name: LB_K8S_CONTROLLER_MAX_REQUEUE_MS
+              value: {{ .Values.controller.maxRequeueMs | quote }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

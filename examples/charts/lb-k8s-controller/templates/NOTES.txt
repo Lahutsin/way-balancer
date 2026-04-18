@@ -1,0 +1,10 @@
+1. The controller is intentionally single-replica in the current pre-GA runtime. Do not scale it above one replica until leader election exists.
+
+2. Check rollout state:
+   kubectl rollout status deployment/{{ include "lb-k8s-controller.fullname" . }} -n {{ include "lb-k8s-controller.namespace" . }}
+
+3. Inspect startup logs:
+   kubectl logs deployment/{{ include "lb-k8s-controller.fullname" . }} -n {{ include "lb-k8s-controller.namespace" . }}
+
+4. Render manifests locally before applying changes:
+   helm template {{ .Release.Name }} {{ .Chart.Name }} -n {{ include "lb-k8s-controller.namespace" . }}

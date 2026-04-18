@@ -79,6 +79,7 @@ flowchart LR
 - `crates/`: shared libraries and architecture layers
 - `binaries/`: deployable dataplane and control-plane entrypoints
 - `examples/`: typed configuration examples for load balancer workspaces
+- `charts/`: Helm packaging for supported Kubernetes deployment surfaces
 - `tests/`: integration, property, and fuzz scaffolding
 - `scripts/`: local developer and CI helper scripts
 - `docs/`: contributor guides plus compatibility, DR, and release runbooks

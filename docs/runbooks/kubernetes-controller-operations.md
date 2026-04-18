@@ -2,7 +2,7 @@
 
 ## Scope
 
-This runbook covers packaging and operating the checked-in `lb-k8s-controller` deployment example.
+This runbook covers packaging and operating the checked-in `lb-k8s-controller` deployment example and the Helm chart at `charts/lb-k8s-controller`.
 
 ## Current Deployment Model
 
@@ -40,6 +40,40 @@ The example sets:
 
 Adjust the image reference and `LB_K8S_CONTROLLER_NAMESPACE` value before production use.
 
+## Deploy With Helm
+
+The repository also ships a Helm chart at `charts/lb-k8s-controller`.
+
+Install it with:
+
+```sh
+helm upgrade --install lb-k8s-controller ./charts/lb-k8s-controller \
+	-n way-balancer-system \
+	--create-namespace \
+	--set image.repository=ghcr.io/your-org/way-balancer-k8s-controller \
+	--set image.tag=0.1.0 \
+	--set controller.namespaceScope=edge
+```
+
+The chart templates the same core objects as the raw example:
+
+- optional `Namespace`
+- `ServiceAccount`
+- `ClusterRole`
+- `ClusterRoleBinding`
+- single-replica `Deployment`
+
+Key values to review before production use:
+
+- `image.repository`
+- `image.tag`
+- `controller.name`
+- `controller.namespaceScope`
+- `controller.listenerClass`
+- `controller.listenerProtocol`
+
+The current chart intentionally defaults to a single replica for the same reason as the raw example: leader election is not implemented yet.
+
 ## Verify Startup
 
 Confirm the deployment rolled out:
@@ -54,7 +88,7 @@ At startup the binary logs the configured controller name, namespace scope, bind
 ## Upgrade
 
 1. Build and push the new controller image.
-2. Update the deployment image tag.
+2. Update the deployment image tag or the Helm values.
 3. Wait for `kubectl rollout status` to report success.
 4. Confirm startup logs still show the expected controller name, namespace scope, and watched resources.
 
@@ -63,7 +97,7 @@ Prefer immutable image tags rather than mutable `latest` tags.
 ## Rollback
 
 1. Inspect the current ReplicaSet and rollout history.
-2. Run `kubectl rollout undo deployment/lb-k8s-controller -n way-balancer-system` or pin the previous image tag explicitly.
+2. Run `kubectl rollout undo deployment/lb-k8s-controller -n way-balancer-system`, or roll back the Helm release with `helm rollback`, or pin the previous image tag explicitly.
 3. Re-check startup logs after rollback.
 
 Rollback of the controller deployment does not roll back dataplane snapshots. Dataplane snapshot rollback still follows `docs/runbooks/upgrade-rollback-policy.md`.

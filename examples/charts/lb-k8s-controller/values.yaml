@@ -1,0 +1,66 @@
+replicaCount: 1
+
+nameOverride: ""
+fullnameOverride: ""
+namespaceOverride: ""
+revisionHistoryLimit: 3
+
+image:
+  repository: ghcr.io/your-org/way-balancer-k8s-controller
+  pullPolicy: IfNotPresent
+  tag: "0.1.0"
+
+imagePullSecrets: []
+
+namespace:
+  create: false
+  annotations: {}
+
+rbac:
+  create: true
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+controller:
+  name: infra.way-balancer.io/gateway-controller
+  namespaceScope: ""
+  bindIP: 127.0.0.1
+  listenerClass: public
+  listenerProtocol: http1
+  reconcileDebounceMs: 250
+  maxRequeueMs: 30000
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  capabilities:
+    drop:
+      - ALL
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+topologySpreadConstraints: []
+priorityClassName: ""
+
+extraEnv: []
