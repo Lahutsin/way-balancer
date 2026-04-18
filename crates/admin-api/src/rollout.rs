@@ -525,6 +525,7 @@ fn current_unix_ms() -> Result<u64, SystemTimeError> {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use lb_config_model::WorkspaceConfig;
     use lb_test_support::{configure_test_trusted_signers, test_artifact_attestation};
@@ -757,8 +758,8 @@ mod tests {
     }
 
     #[test]
-    fn invalid_rollout_requests_are_rejected_and_counted(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn invalid_rollout_requests_are_rejected_and_counted() -> Result<(), Box<dyn std::error::Error>>
+    {
         let control = crate::SnapshotControlService::new();
         let mut dataplane = lb_runtime::DataplaneSnapshotManager::new();
         let mut coordinator = RolloutCoordinator::new();

@@ -2,13 +2,13 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use lb_net_core::ListenerClass;
+use lb_observability::TraceHookPhase;
 use lb_observability::{FailureManagementEventKind, OverloadEvent, OverloadEventKind};
 use lb_runtime::{
-    HttpCacheRequestOutcome, HttpCacheRevalidationResult, HttpCacheStoreMetrics,
-    ListenerEvent, ListenerEventKind, ListenerSnapshot, ListenerState, OverloadSnapshot,
-    OverloadState, RuntimeTelemetry,
+    HttpCacheRequestOutcome, HttpCacheRevalidationResult, HttpCacheStoreMetrics, ListenerEvent,
+    ListenerEventKind, ListenerSnapshot, ListenerState, OverloadSnapshot, OverloadState,
+    RuntimeTelemetry,
 };
-use lb_observability::TraceHookPhase;
 
 #[test]
 fn runtime_telemetry_emits_structured_logs_and_metrics() -> Result<(), Box<dyn std::error::Error>> {
@@ -86,6 +86,8 @@ fn runtime_telemetry_emits_structured_logs_and_metrics() -> Result<(), Box<dyn s
         "origin confirmed cached object",
     )?;
     telemetry.record_http_cache_purge("public-http", "purged", 3)?;
+    telemetry.record_http_cache_invalidation_delivery("public-http", "http_peer", "success", 2)?;
+    telemetry.record_http_cache_invalidation_delivery("public-http", "http_peer", "failed", 1)?;
     telemetry.record_request_latency(
         "http1/request",
         TraceHookPhase::ResponseCompleted,
@@ -101,12 +103,8 @@ fn runtime_telemetry_emits_structured_logs_and_metrics() -> Result<(), Box<dyn s
     assert!(metrics.contains(
         "runtime_listener_active_connections{listener=\"ingress_tcp\",state=\"running\"} 3"
     ));
-    assert!(metrics.contains(
-        "runtime_listener_accepted_connections{listener=\"ingress_tcp\"} 5"
-    ));
-    assert!(metrics.contains(
-        "runtime_listener_rejected_connections{listener=\"ingress_tcp\"} 1"
-    ));
+    assert!(metrics.contains("runtime_listener_accepted_connections{listener=\"ingress_tcp\"} 5"));
+    assert!(metrics.contains("runtime_listener_rejected_connections{listener=\"ingress_tcp\"} 1"));
     assert!(metrics.contains("runtime_listener_events_total{listener=\"ingress_tcp\",event_code=\"runtime.listener.started\"} 1"));
     assert!(metrics.contains(
         "runtime_breaker_events_total{scope=\"payments\",event_code=\"failure.breaker.opened\"} 1"
@@ -138,6 +136,12 @@ fn runtime_telemetry_emits_structured_logs_and_metrics() -> Result<(), Box<dyn s
         "runtime_http_cache_purge_requests_total{scope=\"public-http\",result=\"purged\"} 1"
     ));
     assert!(metrics.contains("runtime_http_cache_purged_entries_total{scope=\"public-http\"} 3"));
+    assert!(metrics.contains(
+        "runtime_http_cache_invalidation_peer_deliveries_total{scope=\"public-http\",result=\"success\",reason=\"http_peer\"} 2"
+    ));
+    assert!(metrics.contains(
+        "runtime_http_cache_invalidation_peer_deliveries_total{scope=\"public-http\",result=\"failed\",reason=\"http_peer\"} 1"
+    ));
     assert!(metrics.contains(
         "runtime_request_latency_samples_total{scope=\"http1_request\",bucket=\"le_10ms\",phase=\"response_completed\"} 1"
     ));

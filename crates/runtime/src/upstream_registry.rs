@@ -206,15 +206,22 @@ mod tests {
 
     use super::{EndpointRegistry, EndpointRegistryError};
 
-    fn cluster_name(name: &str) -> Result<lb_net_core::UpstreamClusterName, Box<dyn std::error::Error>> {
+    fn cluster_name(
+        name: &str,
+    ) -> Result<lb_net_core::UpstreamClusterName, Box<dyn std::error::Error>> {
         Ok(lb_net_core::UpstreamClusterName::new(String::from(name))?)
     }
 
-    fn endpoint_id(id: &str) -> Result<lb_net_core::UpstreamEndpointId, Box<dyn std::error::Error>> {
+    fn endpoint_id(
+        id: &str,
+    ) -> Result<lb_net_core::UpstreamEndpointId, Box<dyn std::error::Error>> {
         Ok(lb_net_core::UpstreamEndpointId::new(String::from(id))?)
     }
 
-    fn endpoint(id: &str, port: u16) -> Result<lb_net_core::UpstreamEndpoint, Box<dyn std::error::Error>> {
+    fn endpoint(
+        id: &str,
+        port: u16,
+    ) -> Result<lb_net_core::UpstreamEndpoint, Box<dyn std::error::Error>> {
         Ok(lb_net_core::UpstreamEndpoint::new(
             endpoint_id(id)?,
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),

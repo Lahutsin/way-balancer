@@ -480,20 +480,15 @@ impl UpstreamClientRegistry {
         let upstream_stream =
             time::timeout(timeouts.connect_timeout, TcpStream::connect(target.address))
                 .await
-                .map_err(|_| UpstreamClientConnectError::ConnectTimeout {
-                    target: target.address,
-                })?
+                .map_err(|_| UpstreamClientConnectError::ConnectTimeout { target: target.address })?
                 .map_err(|source| UpstreamClientConnectError::Connect {
                     target: target.address,
                     source,
                 })?;
         let connect_duration = connect_started.elapsed();
-        let upstream_addr = upstream_stream
-            .peer_addr()
-            .map_err(|source| UpstreamClientConnectError::Connect {
-                target: target.address,
-                source,
-            })?;
+        let upstream_addr = upstream_stream.peer_addr().map_err(|source| {
+            UpstreamClientConnectError::Connect { target: target.address, source }
+        })?;
 
         let upstream_builder = client::Builder::new();
         let (send_request, upstream_connection) = upstream_builder
@@ -558,7 +553,6 @@ pub async fn proxy_http2_connection_with_downstream_addr<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-
     let downstream_builder = server::Builder::new();
     let mut downstream_connection = downstream_builder
         .handshake(downstream)
@@ -646,6 +640,7 @@ fn map_upstream_client_connect_error(error: UpstreamClientConnectError) -> Http2
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic)]
 mod tests {
     use std::io;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -677,14 +672,12 @@ mod tests {
             target: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080),
             source: io::Error::other("connect failed"),
         };
-        let handshake = Http2ProxyError::DownstreamHandshake(h2::Error::from(h2::Reason::PROTOCOL_ERROR));
+        let handshake =
+            Http2ProxyError::DownstreamHandshake(h2::Error::from(h2::Reason::PROTOCOL_ERROR));
 
         assert!(connect.to_string().contains("failed to connect HTTP/2 upstream"));
         assert!(std::error::Error::source(&connect).is_some());
-        assert_eq!(
-            handshake.anomaly_category(),
-            Some(ProtocolAnomalyCategory::MalformedPreface)
-        );
+        assert_eq!(handshake.anomaly_category(), Some(ProtocolAnomalyCategory::MalformedPreface));
     }
 
     #[test]
@@ -734,7 +727,7 @@ mod tests {
         headers.insert("x-lb-zone", HeaderValue::from_static(" zone-west "));
         headers.insert("x-empty", HeaderValue::from_static("   "));
 
-        let context = selection_context_for_request("/api?q=1", &headers);
+        let context = selection_context_for_request("/api?q=1", &headers, None);
 
         assert_eq!(context.preferred_locality.as_deref(), Some("edge-west"));
         assert_eq!(context.preferred_zone.as_deref(), Some("zone-west"));
@@ -748,27 +741,23 @@ mod tests {
         let upstream_b = lb_net_core::UpstreamTarget::new("b", localhost_socket(9002));
         let fallback = lb_net_core::UpstreamTarget::new("fallback", localhost_socket(9000));
         let mut config = Http2ProxyConfig::new(fallback.clone()).with_route_upstreams([
-            Http2RouteUpstream {
-                route_label: String::from("api"),
-                upstream: upstream_a.clone(),
-            },
-            Http2RouteUpstream {
-                route_label: String::from("api"),
-                upstream: upstream_b.clone(),
-            },
+            Http2RouteUpstream { route_label: String::from("api"), upstream: upstream_a.clone() },
+            Http2RouteUpstream { route_label: String::from("api"), upstream: upstream_b.clone() },
         ]);
         config.routes = vec![lb_proto_http::RoutePrefixRule::new("api", "/api")];
 
         let route = lb_proto_http::match_route_request("/api", None, &config.routes)
             .expect("route should match");
-        let selected_one = match resolve_stream_upstream(&config, Some(&route), &Default::default()) {
-            RequestUpstreamResolution::Selected(selected) => selected.target,
-            RequestUpstreamResolution::Reject(status) => panic!("unexpected reject: {status}"),
-        };
-        let selected_two = match resolve_stream_upstream(&config, Some(&route), &Default::default()) {
-            RequestUpstreamResolution::Selected(selected) => selected.target,
-            RequestUpstreamResolution::Reject(status) => panic!("unexpected reject: {status}"),
-        };
+        let selected_one =
+            match resolve_stream_upstream(&config, Some(&route), "/api", &HeaderMap::new()) {
+                RequestUpstreamResolution::Selected(selected) => selected.target,
+                RequestUpstreamResolution::Reject(status) => panic!("unexpected reject: {status}"),
+            };
+        let selected_two =
+            match resolve_stream_upstream(&config, Some(&route), "/api", &HeaderMap::new()) {
+                RequestUpstreamResolution::Selected(selected) => selected.target,
+                RequestUpstreamResolution::Reject(status) => panic!("unexpected reject: {status}"),
+            };
         let selected_three = select_http2_route_upstream(
             &config,
             "api",
@@ -779,18 +768,20 @@ mod tests {
         assert_eq!(selected_two.address, upstream_b.address);
         assert_eq!(selected_three.address, upstream_a.address);
 
-        let matched_none = match resolve_stream_upstream(&config, None, &Default::default()) {
+        let matched_none = match resolve_stream_upstream(&config, None, "/", &HeaderMap::new()) {
             RequestUpstreamResolution::Selected(selected) => selected.target,
             RequestUpstreamResolution::Reject(status) => panic!("unexpected reject: {status}"),
         };
         assert_eq!(matched_none.address, fallback.address);
 
-        let rejecting = Http2ProxyConfig::new(fallback).with_route_upstreams([Http2RouteUpstream {
-            route_label: String::from("api"),
-            upstream: upstream_a,
-        }]).rejecting_unmatched_routes();
+        let rejecting = Http2ProxyConfig::new(fallback)
+            .with_route_upstreams([Http2RouteUpstream {
+                route_label: String::from("api"),
+                upstream: upstream_a,
+            }])
+            .rejecting_unmatched_routes();
         assert!(matches!(
-            resolve_stream_upstream(&rejecting, None, &Default::default()),
+            resolve_stream_upstream(&rejecting, None, "/", &HeaderMap::new()),
             RequestUpstreamResolution::Reject(StatusCode::FORBIDDEN)
         ));
     }
@@ -852,9 +843,15 @@ mod tests {
             .expect("trusted forwarded client ip should resolve");
         assert_eq!(effective, "198.51.100.7".parse::<IpAddr>().expect("ip"));
 
-        assert!(should_skip_http2_header(&http::header::HOST, &HeaderValue::from_static("example.test")));
+        assert!(should_skip_http2_header(
+            &http::header::HOST,
+            &HeaderValue::from_static("example.test")
+        ));
         assert!(should_skip_http2_header(&http::header::TE, &HeaderValue::from_static("gzip")));
-        assert!(!should_skip_http2_header(&http::header::TE, &HeaderValue::from_static("trailers")));
+        assert!(!should_skip_http2_header(
+            &http::header::TE,
+            &HeaderValue::from_static("trailers")
+        ));
     }
 
     #[test]
@@ -995,19 +992,13 @@ async fn proxy_one_http2_stream(
         metrics.increment_grpc_request_count();
     }
 
-    let authority = request
-        .uri()
-        .authority()
-        .map(|authority| authority.as_str())
-        .or_else(|| request.headers().get(http::header::HOST).and_then(|value| value.to_str().ok()));
+    let authority = request.uri().authority().map(|authority| authority.as_str()).or_else(|| {
+        request.headers().get(http::header::HOST).and_then(|value| value.to_str().ok())
+    });
     let route_match = lb_proto_http::match_route_request(
         request.uri().path_and_query().map(|value| value.as_str()).unwrap_or("/"),
         authority,
         &config.routes,
-    );
-    let selection_context = selection_context_for_request(
-        request.uri().path_and_query().map(|value| value.as_str()).unwrap_or("/"),
-        request.headers(),
     );
     if route_match.is_some()
         && record_query_probe(
@@ -1026,7 +1017,8 @@ async fn proxy_one_http2_stream(
     let selected_upstream = match resolve_stream_upstream(
         config,
         route_match.as_ref(),
-        &selection_context,
+        request.uri().path_and_query().map(|value| value.as_str()).unwrap_or("/"),
+        request.headers(),
     ) {
         RequestUpstreamResolution::Selected(upstream) => upstream,
         RequestUpstreamResolution::Reject(status) => {
@@ -1048,16 +1040,21 @@ async fn proxy_one_http2_stream(
                 effective_client_ip,
                 selected_upstream.target.address,
             )
-            .map_err(|error| {
+            .inspect_err(|_| {
                 let _ = send_local_response(respond, StatusCode::BAD_GATEWAY);
                 metrics.record_response_status(StatusCode::BAD_GATEWAY.as_u16());
-                error
             })?,
         )
     } else {
         None
     };
-    let (upstream_client, had_prior_successful_stream, retried_stale_client, response_future, mut upstream_send_stream) = {
+    let (
+        upstream_client,
+        had_prior_successful_stream,
+        retried_stale_client,
+        response_future,
+        mut upstream_send_stream,
+    ) = {
         let mut retried_stale_client = false;
         loop {
             let (upstream_client, had_prior_successful_stream) = match upstream_clients
@@ -1073,9 +1070,7 @@ async fn proxy_one_http2_stream(
                         &selected_upstream,
                         &Err(StreamForwardError::IdleTimeout(StreamIdlePhase::UpstreamResponse)),
                     );
-                    return Err(StreamForwardError::IdleTimeout(
-                        StreamIdlePhase::UpstreamResponse,
-                    ));
+                    return Err(StreamForwardError::IdleTimeout(StreamIdlePhase::UpstreamResponse));
                 }
                 Err(_) => {
                     send_local_response(respond, StatusCode::BAD_GATEWAY)
@@ -1089,23 +1084,24 @@ async fn proxy_one_http2_stream(
                 }
             };
 
-            let upstream_request = if let Some(upstream_request) = retryable_upstream_request.clone() {
-                upstream_request.into_request()?
-            } else {
-                match build_upstream_request(
-                    &request,
-                    effective_client_ip,
-                    selected_upstream.target.address,
-                ) {
-                    Ok(upstream_request) => upstream_request,
-                    Err(error) => {
-                        send_local_response(respond, StatusCode::BAD_GATEWAY)
-                            .map_err(|_| StreamForwardError::SendResponse)?;
-                        metrics.record_response_status(StatusCode::BAD_GATEWAY.as_u16());
-                        return Err(error);
+            let upstream_request =
+                if let Some(upstream_request) = retryable_upstream_request.clone() {
+                    upstream_request.into_request()?
+                } else {
+                    match build_upstream_request(
+                        &request,
+                        effective_client_ip,
+                        selected_upstream.target.address,
+                    ) {
+                        Ok(upstream_request) => upstream_request,
+                        Err(error) => {
+                            send_local_response(respond, StatusCode::BAD_GATEWAY)
+                                .map_err(|_| StreamForwardError::SendResponse)?;
+                            metrics.record_response_status(StatusCode::BAD_GATEWAY.as_u16());
+                            return Err(error);
+                        }
                     }
-                }
-            };
+                };
             let retry_stale_reuse =
                 had_prior_successful_stream && safe_stale_reuse_retry && !retried_stale_client;
 
@@ -1120,7 +1116,8 @@ async fn proxy_one_http2_stream(
                 send_local_response(respond, StatusCode::BAD_GATEWAY)
                     .map_err(|_| StreamForwardError::SendResponse)?;
                 metrics.record_response_status(StatusCode::BAD_GATEWAY.as_u16());
-                let classified_error = classify_http2_upstream_error(&error, StreamForwardError::UpstreamReady);
+                let classified_error =
+                    classify_http2_upstream_error(&error, StreamForwardError::UpstreamReady);
                 record_passive_health_result(&selected_upstream, &Err(classified_error));
                 return Err(classified_error);
             }
@@ -1229,9 +1226,13 @@ async fn proxy_one_http2_stream(
                         metrics.record_response_status(StatusCode::GATEWAY_TIMEOUT.as_u16());
                         record_passive_health_result(
                             &selected_upstream,
-                            &Err(StreamForwardError::IdleTimeout(StreamIdlePhase::UpstreamResponse)),
+                            &Err(StreamForwardError::IdleTimeout(
+                                StreamIdlePhase::UpstreamResponse,
+                            )),
                         );
-                        return Err(StreamForwardError::IdleTimeout(StreamIdlePhase::UpstreamResponse));
+                        return Err(StreamForwardError::IdleTimeout(
+                            StreamIdlePhase::UpstreamResponse,
+                        ));
                     }
                     Err(_) => {
                         send_local_response(respond, StatusCode::BAD_GATEWAY)
@@ -1246,10 +1247,10 @@ async fn proxy_one_http2_stream(
                     }
                 };
 
-                let retry_request = retryable_upstream_request
-                    .clone()
-                    .expect("safe stale-reuse retry should prebuild a retryable HTTP/2 request")
-                    .into_request()?;
+                let Some(retry_request_template) = retryable_upstream_request.clone() else {
+                    return Err(StreamForwardError::UpstreamResponse);
+                };
+                let retry_request = retry_request_template.into_request()?;
 
                 let retry_response = {
                     let mut retry_send_request = retry_upstream_client.send_request.lock().await;
@@ -1280,7 +1281,10 @@ async fn proxy_one_http2_stream(
                                     &error,
                                     StreamForwardError::UpstreamRequest,
                                 );
-                                record_passive_health_result(&selected_upstream, &Err(classified_error));
+                                record_passive_health_result(
+                                    &selected_upstream,
+                                    &Err(classified_error),
+                                );
                                 return Err(classified_error);
                             }
                         };
@@ -1295,9 +1299,13 @@ async fn proxy_one_http2_stream(
                             metrics.record_response_status(StatusCode::GATEWAY_TIMEOUT.as_u16());
                             record_passive_health_result(
                                 &selected_upstream,
-                                &Err(StreamForwardError::IdleTimeout(StreamIdlePhase::UpstreamResponse)),
+                                &Err(StreamForwardError::IdleTimeout(
+                                    StreamIdlePhase::UpstreamResponse,
+                                )),
                             );
-                            return Err(StreamForwardError::IdleTimeout(StreamIdlePhase::UpstreamResponse));
+                            return Err(StreamForwardError::IdleTimeout(
+                                StreamIdlePhase::UpstreamResponse,
+                            ));
                         }
                         Ok(Ok(response)) => response,
                         Ok(Err(error)) => {
@@ -1309,7 +1317,10 @@ async fn proxy_one_http2_stream(
                                 &error,
                                 StreamForwardError::UpstreamResponse,
                             );
-                            record_passive_health_result(&selected_upstream, &Err(classified_error));
+                            record_passive_health_result(
+                                &selected_upstream,
+                                &Err(classified_error),
+                            );
                             return Err(classified_error);
                         }
                     }
@@ -1322,7 +1333,10 @@ async fn proxy_one_http2_stream(
                 send_local_response(respond, StatusCode::BAD_GATEWAY)
                     .map_err(|_| StreamForwardError::SendResponse)?;
                 metrics.record_response_status(StatusCode::BAD_GATEWAY.as_u16());
-                record_passive_health_result(&selected_upstream, &Err(StreamForwardError::UpstreamResponse));
+                record_passive_health_result(
+                    &selected_upstream,
+                    &Err(StreamForwardError::UpstreamResponse),
+                );
                 return Err(StreamForwardError::UpstreamResponse);
             }
         }
@@ -1381,7 +1395,7 @@ async fn proxy_one_http2_stream(
 }
 
 enum RequestUpstreamResolution {
-    Selected(SelectedUpstream),
+    Selected(Box<SelectedUpstream>),
     Reject(StatusCode),
 }
 
@@ -1393,42 +1407,45 @@ struct SelectedUpstream {
 fn resolve_stream_upstream(
     config: &Http2ProxyConfig,
     route: Option<&lb_proto_http::RouteMatch>,
-    selection_context: &crate::SelectionContext,
+    path_and_query: &str,
+    headers: &http::HeaderMap,
 ) -> RequestUpstreamResolution {
     if config.route_upstreams.is_empty() && config.route_backend_pools.is_empty() {
-        return RequestUpstreamResolution::Selected(SelectedUpstream {
+        return RequestUpstreamResolution::Selected(Box::new(SelectedUpstream {
             target: config.upstream.clone(),
             route_backend: None,
-        });
+        }));
     }
 
     let Some(route) = route else {
         return if config.reject_unmatched_routes {
             RequestUpstreamResolution::Reject(StatusCode::FORBIDDEN)
         } else {
-            RequestUpstreamResolution::Selected(SelectedUpstream {
+            RequestUpstreamResolution::Selected(Box::new(SelectedUpstream {
                 target: config.upstream.clone(),
                 route_backend: None,
-            })
+            }))
         };
     };
 
     if let Some(pool) = config.route_backend_pools.get(&route.label) {
-        return match pool.select_backend_with_context(selection_context) {
-            Ok(route_backend) => RequestUpstreamResolution::Selected(SelectedUpstream {
+        let selection_context =
+            selection_context_for_request(path_and_query, headers, pool.affinity_policy());
+        return match pool.select_backend_with_context(&selection_context) {
+            Ok(route_backend) => RequestUpstreamResolution::Selected(Box::new(SelectedUpstream {
                 target: route_backend.upstream().clone(),
                 route_backend: Some(route_backend),
-            }),
+            })),
             Err(_) => RequestUpstreamResolution::Reject(StatusCode::BAD_GATEWAY),
         };
     }
 
     match config.route_upstreams.get(&route.label) {
         Some(upstreams) if !upstreams.is_empty() => {
-            RequestUpstreamResolution::Selected(SelectedUpstream {
+            RequestUpstreamResolution::Selected(Box::new(SelectedUpstream {
                 target: select_http2_route_upstream(config, &route.label, upstreams),
                 route_backend: None,
-            })
+            }))
         }
         _ => RequestUpstreamResolution::Reject(StatusCode::BAD_GATEWAY),
     }
@@ -1443,16 +1460,57 @@ fn stable_request_hash(input: &[u8]) -> u64 {
 fn selection_context_for_request(
     path_and_query: &str,
     headers: &http::HeaderMap,
+    affinity_policy: Option<&crate::AffinityPolicy>,
 ) -> crate::SelectionContext {
     crate::SelectionContext {
         preferred_locality: header_value(headers, "x-lb-locality").map(String::from),
         preferred_zone: header_value(headers, "x-lb-zone").map(String::from),
+        affinity_key: request_affinity_key(headers, affinity_policy),
         request_hash: stable_request_hash(path_and_query.as_bytes()),
     }
 }
 
+fn request_affinity_key(
+    headers: &http::HeaderMap,
+    affinity_policy: Option<&crate::AffinityPolicy>,
+) -> Option<String> {
+    match affinity_policy {
+        Some(crate::AffinityPolicy::HeaderHash { header_name, .. }) => {
+            header_value(headers, header_name).map(String::from)
+        }
+        Some(crate::AffinityPolicy::CookieHash { cookie_name, .. }) => {
+            request_cookie_value(headers, cookie_name).map(String::from)
+        }
+        None => None,
+    }
+}
+
 fn header_value<'a>(headers: &'a http::HeaderMap, name: &str) -> Option<&'a str> {
-    headers.get(name).and_then(|value| value.to_str().ok()).map(str::trim).filter(|value| !value.is_empty())
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn request_cookie_value<'a>(headers: &'a http::HeaderMap, cookie_name: &str) -> Option<&'a str> {
+    headers
+        .get_all(http::header::COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .find_map(|value| cookie_value_from_header(value, cookie_name))
+}
+
+fn cookie_value_from_header<'a>(header_value: &'a str, cookie_name: &str) -> Option<&'a str> {
+    header_value.split(';').filter_map(|cookie| cookie.split_once('=')).find_map(|(name, value)| {
+        let name = name.trim();
+        if name == cookie_name {
+            let value = value.trim();
+            (!value.is_empty()).then_some(value)
+        } else {
+            None
+        }
+    })
 }
 
 fn select_http2_route_upstream(
@@ -1464,10 +1522,8 @@ fn select_http2_route_upstream(
         return upstreams[0].clone();
     }
 
-    let mut cursors = config
-        .route_upstream_cursors
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut cursors =
+        config.route_upstream_cursors.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let cursor = cursors.entry(route_label.to_string()).or_insert(0);
     let index = *cursor % upstreams.len();
     *cursor = (*cursor + 1) % upstreams.len();
@@ -1514,9 +1570,10 @@ fn resolve_effective_client_ip(
 }
 
 fn anonymous_source_blocked(config: &Http2ProxyConfig, client_ip: IpAddr) -> bool {
-    config.anonymous_source_filter.as_ref().is_some_and(|filter| {
-        filter.classify_and_record(client_ip).is_some()
-    })
+    config
+        .anonymous_source_filter
+        .as_ref()
+        .is_some_and(|filter| filter.classify_and_record(client_ip).is_some())
 }
 
 fn record_passive_health_result(
@@ -1529,7 +1586,9 @@ fn record_passive_health_result(
 
     let feedback_result = match result {
         Ok(status) if *status < 500 => route_backend.note_passive_success(),
-        Err(error) if error_is_upstream_passive_failure(error) => route_backend.note_passive_failure(),
+        Err(error) if error_is_upstream_passive_failure(error) => {
+            route_backend.note_passive_failure()
+        }
         _ => return,
     };
     let _ = feedback_result;
@@ -1724,7 +1783,6 @@ fn classify_http2_upstream_error(
         fallback
     }
 }
-
 
 fn build_downstream_response(
     response: &Response<RecvStream>,

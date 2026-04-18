@@ -5,8 +5,8 @@ fn required_env(name: &str) -> Result<String, Box<dyn std::error::Error>> {
 }
 
 fn control_plane_signer() -> Result<lb_config_model::ArtifactSigner, Box<dyn std::error::Error>> {
-    let signer_identity =
-        std::env::var("LB_CONTROL_PLANE_SIGNER_IDENTITY").unwrap_or_else(|_| String::from("control-plane"));
+    let signer_identity = std::env::var("LB_CONTROL_PLANE_SIGNER_IDENTITY")
+        .unwrap_or_else(|_| String::from("control-plane"));
     let signing_key = required_env("LB_CONTROL_PLANE_SIGNING_KEY_ED25519")?;
 
     lb_config_model::ArtifactSigner::from_signing_key_hex(signer_identity, &signing_key)

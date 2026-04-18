@@ -1,0 +1,20 @@
+[package]
+name = "lb-k8s-controller"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+lb-admin-api = { path = "../../crates/admin-api" }
+lb-config-model = { path = "../../crates/config-model" }
+lb-k8s-integration = { path = "../../crates/k8s-integration" }
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1.37", features = ["macros", "rt-multi-thread", "signal"] }
+
+[dev-dependencies]
+lb-test-support = { path = "../../crates/test-support" }
+
+[lints]
+workspace = true

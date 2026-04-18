@@ -6,10 +6,9 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    ConfigApiVersion, EndpointStateConfig, ListenerCertificateSourceConfig,
-    ListenerClassConfig, ListenerProtocolConfig, PolicyBindingConfig, RouteMatchConfig,
-    PolicyResourcesConfig, UpstreamTrafficPolicyConfig, ValidationReport, WorkspaceConfig,
-    WorkspaceConfigError,
+    ConfigApiVersion, EndpointStateConfig, ListenerCertificateSourceConfig, ListenerClassConfig,
+    ListenerProtocolConfig, PolicyBindingConfig, PolicyResourcesConfig, RouteMatchConfig,
+    UpstreamTrafficPolicyConfig, ValidationReport, WorkspaceConfig, WorkspaceConfigError,
     WorkspaceSecurityConfig,
 };
 
@@ -90,11 +89,7 @@ fn snapshot_certificate_source(
     source: &ListenerCertificateSourceConfig,
 ) -> ListenerCertificateSourceSnapshot {
     match source {
-        ListenerCertificateSourceConfig::Files {
-            cert_path,
-            key_path,
-            ocsp_path,
-        } => {
+        ListenerCertificateSourceConfig::Files { cert_path, key_path, ocsp_path } => {
             ListenerCertificateSourceSnapshot::Files {
                 cert_path: cert_path.clone(),
                 key_path: key_path.clone(),
@@ -591,10 +586,10 @@ mod tests {
     };
     use crate::{
         AdminAuditConfig, AdminAuthPolicyConfig, AdminAuthorizationScopeConfig,
-        AdminListenerPolicyConfig, AdminOperatorConfig, AdminRateLimitConfig,
-        ListenerClassConfig, ListenerProtocolConfig, ListenerResourceConfig,
-        PolicyBindingConfig, RouteConfig, UpstreamClusterConfig, UpstreamEndpointConfig,
-        UpstreamTrafficPolicyConfig, WorkspaceConfig,
+        AdminListenerPolicyConfig, AdminOperatorConfig, AdminRateLimitConfig, ListenerClassConfig,
+        ListenerProtocolConfig, ListenerResourceConfig, PolicyBindingConfig, RouteConfig,
+        UpstreamClusterConfig, UpstreamEndpointConfig, UpstreamTrafficPolicyConfig,
+        WorkspaceConfig,
     };
 
     fn valid_workspace() -> WorkspaceConfig {
@@ -796,8 +791,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_diff_is_empty_for_identical_snapshots(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn snapshot_diff_is_empty_for_identical_snapshots() -> Result<(), Box<dyn std::error::Error>> {
         let left = compile_workspace_snapshot(&valid_workspace())?;
         let right = compile_workspace_snapshot(&valid_workspace())?;
 
@@ -810,8 +804,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_preserves_custom_signed_admin_policy(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn snapshot_preserves_custom_signed_admin_policy() -> Result<(), Box<dyn std::error::Error>> {
         let mut config = valid_workspace();
         config.listeners[0].class = ListenerClassConfig::Admin;
         config.listeners[0].routes.clear();
@@ -837,13 +830,8 @@ mod tests {
                 nonce_ttl_secs: 180,
             },
             allowed_source_cidrs: vec![String::from("127.0.0.1/32")],
-            rate_limit: AdminRateLimitConfig {
-                requests_per_minute: 30,
-                burst: 5,
-            },
-            audit: AdminAuditConfig {
-                max_retained_events: 8,
-            },
+            rate_limit: AdminRateLimitConfig { requests_per_minute: 30, burst: 5 },
+            audit: AdminAuditConfig { max_retained_events: 8 },
         };
 
         let snapshot = compile_workspace_snapshot(&config)?;
@@ -854,7 +842,10 @@ mod tests {
             snapshot.listeners[0].admin.auth,
             AdminAuthPolicyConfig::SignedHeaders { .. }
         ));
-        assert_eq!(snapshot.listeners[0].admin.allowed_source_cidrs, vec![String::from("127.0.0.1/32")]);
+        assert_eq!(
+            snapshot.listeners[0].admin.allowed_source_cidrs,
+            vec![String::from("127.0.0.1/32")]
+        );
         assert_eq!(snapshot.listeners[0].admin.rate_limit.requests_per_minute, 30);
         assert_eq!(snapshot.listeners[0].admin.rate_limit.burst, 5);
         assert_eq!(snapshot.listeners[0].admin.audit.max_retained_events, 8);

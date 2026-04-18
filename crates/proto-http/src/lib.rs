@@ -110,13 +110,15 @@ impl CanonicalRequestTarget {
     pub fn canonical_query(&self) -> String {
         self.query_pairs
             .iter()
-            .map(|(name, value)| {
-                if value.is_empty() {
-                    name.clone()
-                } else {
-                    format!("{name}={value}")
-                }
-            })
+            .map(
+                |(name, value)| {
+                    if value.is_empty() {
+                        name.clone()
+                    } else {
+                        format!("{name}={value}")
+                    }
+                },
+            )
             .collect::<Vec<_>>()
             .join("&")
     }
@@ -237,10 +239,18 @@ impl fmt::Display for RequestTargetError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::UnsupportedForm => formatter.write_str("unsupported HTTP request-target form"),
-            Self::EmptyAuthority => formatter.write_str("absolute-form request-target must include authority"),
-            Self::FragmentNotAllowed => formatter.write_str("request-target fragments are not allowed"),
-            Self::InvalidPercentEncoding => formatter.write_str("request-target contains invalid percent-encoding"),
-            Self::InvalidQuery => formatter.write_str("request-target contains an invalid query shape"),
+            Self::EmptyAuthority => {
+                formatter.write_str("absolute-form request-target must include authority")
+            }
+            Self::FragmentNotAllowed => {
+                formatter.write_str("request-target fragments are not allowed")
+            }
+            Self::InvalidPercentEncoding => {
+                formatter.write_str("request-target contains invalid percent-encoding")
+            }
+            Self::InvalidQuery => {
+                formatter.write_str("request-target contains an invalid query shape")
+            }
             Self::InvalidAuthority => formatter.write_str("request-target authority is invalid"),
         }
     }
@@ -351,10 +361,8 @@ pub fn normalize_request_headers(
     body_kind: &BodyKind,
 ) -> Vec<HttpHeader> {
     let mut normalized = filter_headers(headers, body_kind, false);
-    normalized.push(HttpHeader {
-        name: String::from("x-forwarded-for"),
-        value: client_ip.to_string(),
-    });
+    normalized
+        .push(HttpHeader { name: String::from("x-forwarded-for"), value: client_ip.to_string() });
 
     if !keep_alive {
         normalized
@@ -599,9 +607,7 @@ pub fn validate_http1_request_hardening(
         .filter(|token| !token.is_empty())
         .collect();
     if !transfer_encoding_tokens.is_empty()
-        && transfer_encoding_tokens
-            .iter()
-            .any(|token| !token.eq_ignore_ascii_case("chunked"))
+        && transfer_encoding_tokens.iter().any(|token| !token.eq_ignore_ascii_case("chunked"))
     {
         return Err(ProtocolHardeningError::UnsupportedTransferEncoding);
     }
@@ -637,7 +643,9 @@ pub fn canonicalize_host(value: &str) -> Result<String, RequestTargetError> {
 }
 
 /// Canonicalizes an origin-form or absolute-form request target.
-pub fn canonicalize_request_target(target: &str) -> Result<CanonicalRequestTarget, RequestTargetError> {
+pub fn canonicalize_request_target(
+    target: &str,
+) -> Result<CanonicalRequestTarget, RequestTargetError> {
     let target = target.trim();
     if target.is_empty() || target == "*" {
         return Err(RequestTargetError::UnsupportedForm);
@@ -660,7 +668,13 @@ pub fn canonicalize_request_target(target: &str) -> Result<CanonicalRequestTarge
         let tail = &remainder[split_index..];
         (
             Some(canonicalize_host(authority)?),
-            if tail.is_empty() { "/" } else if tail.starts_with('?') { "" } else { tail },
+            if tail.is_empty() {
+                "/"
+            } else if tail.starts_with('?') {
+                ""
+            } else {
+                tail
+            },
         )
     } else if target.starts_with('/') {
         (None, target)
@@ -874,11 +888,10 @@ fn default_reason(status: u16) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        canonicalize_host, canonicalize_request_target, encode_request_head,
-        is_grpc_content_type, is_grpc_request, match_route_prefix, match_route_request,
-        normalize_request_headers, validate_http1_request_hardening, BodyKind, Http1Limits,
-        Http2Limits, HttpHeader, ProtocolHardeningError, RequestTargetError, RoutePrefixRule,
-        SupportedHttpVersion,
+        canonicalize_host, canonicalize_request_target, encode_request_head, is_grpc_content_type,
+        is_grpc_request, match_route_prefix, match_route_request, normalize_request_headers,
+        validate_http1_request_hardening, BodyKind, Http1Limits, Http2Limits, HttpHeader,
+        ProtocolHardeningError, RequestTargetError, RoutePrefixRule, SupportedHttpVersion,
     };
 
     #[test]
@@ -892,8 +905,9 @@ mod tests {
 
     #[test]
     fn route_matching_can_filter_by_host() {
-        let routes = vec![RoutePrefixRule::new("api", "/api")
-            .with_hostnames(vec![String::from("example.com")])];
+        let routes =
+            vec![RoutePrefixRule::new("api", "/api")
+                .with_hostnames(vec![String::from("example.com")])];
 
         let matched = match_route_request("/api/v1/items?limit=1", Some("Example.COM"), &routes);
         let rejected = match_route_request("/api/v1/items?limit=1", Some("other.example"), &routes);
@@ -904,10 +918,8 @@ mod tests {
 
     #[test]
     fn route_matching_prefers_most_specific_prefix() {
-        let routes = vec![
-            RoutePrefixRule::new("catch-all", "/"),
-            RoutePrefixRule::new("api", "/api"),
-        ];
+        let routes =
+            vec![RoutePrefixRule::new("catch-all", "/"), RoutePrefixRule::new("api", "/api")];
 
         let matched = match_route_prefix("/api/v1/items?limit=1", &routes);
 
@@ -929,8 +941,9 @@ mod tests {
 
     #[test]
     fn route_matching_uses_absolute_form_authority_and_path() {
-        let routes = vec![RoutePrefixRule::new("api", "/api")
-            .with_hostnames(vec![String::from("example.com")])];
+        let routes =
+            vec![RoutePrefixRule::new("api", "/api")
+                .with_hostnames(vec![String::from("example.com")])];
 
         let matched = match_route_request("http://Example.com/api?q=1", None, &routes);
 
@@ -964,14 +977,13 @@ mod tests {
             HttpHeader { name: String::from("transfer-encoding"), value: String::from("chunked") },
             HttpHeader { name: String::from("te"), value: String::from("trailers") },
             HttpHeader { name: String::from("trailer"), value: String::from("x-checksum") },
-            HttpHeader { name: String::from("x-forwarded-for"), value: String::from("198.51.100.7") },
+            HttpHeader {
+                name: String::from("x-forwarded-for"),
+                value: String::from("198.51.100.7"),
+            },
         ];
-        let normalized = normalize_request_headers(
-            &headers,
-            "127.0.0.1".parse()?,
-            true,
-            &BodyKind::Chunked,
-        );
+        let normalized =
+            normalize_request_headers(&headers, "127.0.0.1".parse()?, true, &BodyKind::Chunked);
 
         assert!(normalized.iter().any(|header| header.name == "host"));
         assert_eq!(
@@ -1036,7 +1048,10 @@ mod tests {
     fn hardening_rejects_unsupported_transfer_encoding_chain() {
         let headers = vec![
             HttpHeader { name: String::from("host"), value: String::from("example.test") },
-            HttpHeader { name: String::from("transfer-encoding"), value: String::from("gzip, chunked") },
+            HttpHeader {
+                name: String::from("transfer-encoding"),
+                value: String::from("gzip, chunked"),
+            },
         ];
 
         let result = validate_http1_request_hardening(&headers);
@@ -1078,8 +1093,7 @@ mod tests {
     }
 
     #[test]
-    fn absolute_form_request_target_extracts_authority(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn absolute_form_request_target_extracts_authority() -> Result<(), Box<dyn std::error::Error>> {
         let canonical = canonicalize_request_target("http://Example.TEST/api?q=1")?;
 
         assert_eq!(canonical.authority.as_deref(), Some("example.test"));
@@ -1091,20 +1105,14 @@ mod tests {
     #[test]
     fn canonicalization_rejects_ambiguous_shapes() {
         assert_eq!(
-            canonicalize_request_target("/items?x=1&&y=2").expect_err("must fail"),
-            RequestTargetError::InvalidQuery
+            canonicalize_request_target("/items?x=1&&y=2"),
+            Err(RequestTargetError::InvalidQuery)
         );
         assert_eq!(
-            canonicalize_request_target("/items?x=%zz").expect_err("must fail"),
-            RequestTargetError::InvalidPercentEncoding
+            canonicalize_request_target("/items?x=%zz"),
+            Err(RequestTargetError::InvalidPercentEncoding)
         );
-        assert_eq!(
-            canonicalize_host("bad/host").expect_err("must fail"),
-            RequestTargetError::InvalidAuthority
-        );
-        assert_eq!(
-            canonicalize_host("bad host").expect_err("must fail"),
-            RequestTargetError::InvalidAuthority
-        );
+        assert_eq!(canonicalize_host("bad/host"), Err(RequestTargetError::InvalidAuthority));
+        assert_eq!(canonicalize_host("bad host"), Err(RequestTargetError::InvalidAuthority));
     }
 }

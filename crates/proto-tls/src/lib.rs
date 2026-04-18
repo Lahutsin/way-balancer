@@ -1,10 +1,10 @@
 #![forbid(unsafe_code)]
 
 use std::fmt;
-use std::io::Cursor;
 use std::path::Path;
 use std::time::Duration;
 
+use pem::Pem;
 use sha2::{Digest, Sha256};
 use x509_parser::extensions::GeneralName;
 use x509_parser::prelude::{FromDer, X509Certificate};
@@ -265,24 +265,29 @@ impl CertificateValidator {
 }
 
 pub fn load_certificates_from_pem(pem: &str) -> Result<Vec<Vec<u8>>, CertificateLoadError> {
-    let mut cursor = Cursor::new(pem.as_bytes());
-    let certificates = rustls_pemfile::certs(&mut cursor)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| CertificateLoadError::InvalidPem)?;
+    let certificates = parse_pem_blocks(pem)?
+        .into_iter()
+        .filter(|block| block.tag() == "CERTIFICATE")
+        .map(Pem::into_contents)
+        .collect::<Vec<_>>();
     if certificates.is_empty() {
         return Err(CertificateLoadError::NoCertificatesFound);
     }
-    Ok(certificates.into_iter().map(|certificate| certificate.as_ref().to_vec()).collect())
+    Ok(certificates)
 }
 
 pub fn load_private_key_from_pem(pem: &str) -> Result<Vec<u8>, CertificateLoadError> {
-    let mut cursor = Cursor::new(pem.as_bytes());
-    let key = rustls_pemfile::private_key(&mut cursor)
-        .map_err(|_| CertificateLoadError::InvalidPrivateKey)?;
+    let key = parse_pem_blocks(pem)?
+        .into_iter()
+        .find(|block| matches!(block.tag(), "PRIVATE KEY" | "RSA PRIVATE KEY" | "EC PRIVATE KEY"));
     let Some(key) = key else {
         return Err(CertificateLoadError::InvalidPrivateKey);
     };
-    Ok(key.secret_der().to_vec())
+    Ok(key.into_contents())
+}
+
+fn parse_pem_blocks(pem_text: &str) -> Result<Vec<Pem>, CertificateLoadError> {
+    pem::parse_many(pem_text).map_err(|_| CertificateLoadError::InvalidPem)
 }
 
 pub fn load_tls_identity_from_files(

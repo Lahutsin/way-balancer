@@ -11,8 +11,12 @@ These examples target the typed JSON configuration accepted by `lb_config_model:
 - `https-termination.json`: HTTPS listener with file-backed TLS termination material, hostname-aware route matching, and a conservative public-cache policy
 - `public-admin.json`: public application listener plus a separate localhost-only admin HTTP listener, with cache enabled on the public route, local-friendly hostname filters, and explicit admin auth, rate-limit, and audit retention settings
 - `local-dev-insecure.json`: development-only example showing explicit insecure override gating with hostname-aware route matching
+- `sticky-sessions-cookie.json`: opt-in stateful app example that hashes a `session_id` cookie to a deterministic backend and falls back to healthy balancing when the preferred backend is unavailable
 - `virtual-hosts.json`: virtual-host example that routes `shop.localhost` and `api.localhost` to different upstream clusters on the same listener
 - `example-com-api.json`: focused hostname-aware API example for `example.com/api?auth=user`, where query forwarding stays automatic, only host plus path are configured, and the shared security section demonstrates the full anonymous-source filter shape
+- `cache-peer-node-a.json`: node A of a two-node cache topology, using signed admin headers and a listener-scoped shared-cache policy suitable for HTTP peer invalidation
+- `cache-peer-node-b.json`: node B companion config for the same two-node cache topology, using the same signed peer secret contract on a different public/admin bind pair
+- `cache-peer-topology.md`: operational note for wiring `HttpCachePeerTransport` across the two checked-in node configs without inventing unsupported config schema
 
 ## Important Note
 
@@ -29,6 +33,8 @@ The Docker Compose example binds `0.0.0.0` explicitly and points at a fixed back
 The HTTP examples now include `match.hostnames` filters. Query parameters are still not configured in route rules; they pass through automatically as part of the forwarded request target and continue to participate in cache key construction when the selected cache policy includes query strings.
 
 If multiple routes match the same host, the runtime prefers the most specific path prefix.
+
+The opt-in affinity policy lives under `upstream_clusters[].traffic_policy.affinity`. Missing affinity keys fall back to the configured balancing algorithm, and `fallback: balance_healthy` re-routes to a healthy backend instead of pinning to an unhealthy or ejected endpoint. Use affinity only for workloads that truly need backend-local state, because it can create hot spots and reduce balancing flexibility.
 
 For the current `lb-dataplane serve --config ...` demo path, each matched route keeps the full endpoint list from its referenced upstream cluster and dispatches over that route-local pool.
 
@@ -50,4 +56,12 @@ The repository validates these examples with:
 
 ```sh
 cargo test -p lb-test-support --test example_configs
+
+The checked-in multi-node cache peer example uses signed admin headers instead of bearer auth and expects a shared peer secret:
+
+```sh
+export LB_CACHE_PEER_SECRET=<shared-peer-secret>
+```
+
+See `cache-peer-topology.md` for the two-node layout and the current boundary between workspace config and admin-service peer transport wiring.
 ```

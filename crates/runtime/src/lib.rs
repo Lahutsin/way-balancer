@@ -4,9 +4,9 @@ mod anonymous_sources;
 mod config_application;
 mod emergency_protection;
 mod failure_management;
-mod http_cache;
 mod http1_proxy;
 mod http2_proxy;
+mod http_cache;
 mod local_limits;
 mod overload_management;
 mod probe_semantics;
@@ -20,16 +20,16 @@ mod upstream_balancer;
 mod upstream_health;
 mod upstream_registry;
 
+pub use anonymous_sources::{
+    AnonymousSourceCategory, AnonymousSourceFilterPolicy, AnonymousSourceFilterSnapshot,
+    AnonymousSourceFilterState,
+};
 pub use config_application::{
     AppliedSnapshotRecord, AppliedSnapshotSummary, DataplaneSnapshotManager,
     DataplaneSnapshotStatus, InvalidApplyRequest, NoopSnapshotActivationHook,
     SnapshotActivationError, SnapshotActivationHook, SnapshotApplyAck, SnapshotApplyError,
     SnapshotApplyFailure, SnapshotApplyFailureCategory, SnapshotApplyLifecycle,
     SnapshotApplyMetrics, SnapshotApplyOutcome, SnapshotApplyRequest,
-};
-pub use anonymous_sources::{
-    AnonymousSourceCategory, AnonymousSourceFilterPolicy, AnonymousSourceFilterSnapshot,
-    AnonymousSourceFilterState,
 };
 pub use emergency_protection::{
     AbuseEventCategory, AbuseEventInput, AbuseEventLabel, AbuseForensicsError,
@@ -44,25 +44,26 @@ pub use failure_management::{
     RetryBudgetPolicy, RetryBudgetSnapshot, TimeoutCategory, TimeoutHierarchy,
     UpstreamFailureClass,
 };
-pub use http_cache::{
-    build_http_cache_key_material, HttpCacheEntry, HttpCacheEntrySnapshot,
-    HttpCacheFreshness, HttpCacheHeader, HttpCacheInsertResult, HttpCacheInvalidationApplyResult,
-    HttpCacheInvalidationBus, HttpCacheInvalidationError, HttpCacheInvalidationEvent,
-    HttpCacheInvalidationPublishResult, HttpCacheInvalidationSubscriber,
-    HttpCacheInvalidationTarget, HttpCacheKey, HttpCacheKeyMaterial, HttpCacheLookup,
-    HttpCacheMetadata, HttpCacheRequest, HttpCacheStore, HttpCacheStoreConfig,
-    HttpCacheStoreError, HttpCacheStoreInvalidationSubscriber, HttpCacheStoreMetrics,
-    HttpCacheStoreSnapshot,
-};
 pub use http1_proxy::{
-    proxy_http1_connection, proxy_http1_connection_with_downstream_addr,
-    Http1ConnectionMetrics, Http1ConnectionReport, Http1ProxyConfig, Http1ProxyError,
-    Http1ResponseCacheConfig, Http1RouteUpstream,
+    proxy_http1_connection, proxy_http1_connection_with_downstream_addr, Http1ConnectionMetrics,
+    Http1ConnectionReport, Http1ProxyConfig, Http1ProxyError, Http1ResponseCacheConfig,
+    Http1RouteUpstream,
 };
 pub use http2_proxy::{
-    proxy_http2_connection, proxy_http2_connection_with_downstream_addr,
-    Http2ConnectionMetrics, Http2ConnectionReport, Http2ProxyConfig, Http2ProxyError,
-    Http2RouteUpstream,
+    proxy_http2_connection, proxy_http2_connection_with_downstream_addr, Http2ConnectionMetrics,
+    Http2ConnectionReport, Http2ProxyConfig, Http2ProxyError, Http2RouteUpstream,
+};
+pub use http_cache::{
+    build_http_cache_key_material, HttpCacheEntry, HttpCacheEntrySnapshot, HttpCacheFreshness,
+    HttpCacheHeader, HttpCacheInsertResult, HttpCacheInvalidationApplyResult,
+    HttpCacheInvalidationBus, HttpCacheInvalidationBusTransport, HttpCacheInvalidationError,
+    HttpCacheInvalidationEvent, HttpCacheInvalidationPublishResult,
+    HttpCacheInvalidationSubscriber, HttpCacheInvalidationTarget, HttpCacheInvalidationTransport,
+    HttpCacheInvalidationTransportError, HttpCacheKey, HttpCacheKeyMaterial, HttpCacheLookup,
+    HttpCacheMetadata, HttpCacheRequest, HttpCacheStore, HttpCacheStoreConfig, HttpCacheStoreError,
+    HttpCacheStoreInvalidationSubscriber, HttpCacheStoreMetrics, HttpCacheStoreSnapshot,
+    HTTP_CACHE_INVALIDATION_MAX_EVENT_ID_LEN, HTTP_CACHE_INVALIDATION_MAX_ISSUER_LEN,
+    HTTP_CACHE_INVALIDATION_MAX_PATH_PREFIX_LEN, HTTP_CACHE_INVALIDATION_MAX_SCOPE_LEN,
 };
 pub use local_limits::{
     LimitContext, LocalConcurrencyLease, LocalConcurrencyLimitConfig, LocalConcurrencyLimiter,
@@ -92,16 +93,13 @@ pub use tcp_proxy::{
     proxy_tcp_stream, ConnectionContext, ConnectionEventKind, ConnectionMetadata,
     ProxySessionReport, TcpProxyConfig, TcpProxyError,
 };
-pub use telemetry::{
-    HttpCacheRequestOutcome, HttpCacheRevalidationResult, RuntimeTelemetry,
-};
+pub use telemetry::{HttpCacheRequestOutcome, HttpCacheRevalidationResult, RuntimeTelemetry};
 pub use trusted_client_ip::{TrustedClientIpError, TrustedClientIpPolicy};
 pub use upstream_balancer::{
-    ActiveProbeTarget, EndpointSelectionCandidate, LoadBalancingAlgorithm,
-    LocalityRoutingPolicy, NoHealthyFallback, RouteBackendPool, SelectedEndpoint,
-    SelectedRouteBackend, SelectionContext,
-    UpstreamBalancer, UpstreamSelectionError, UpstreamSelectionMetrics,
-    UpstreamSelectionPolicy,
+    ActiveProbeTarget, AffinityFallbackPolicy, AffinityPolicy, EndpointSelectionCandidate,
+    LoadBalancingAlgorithm, LocalityRoutingPolicy, NoHealthyFallback, RouteBackendPool,
+    SelectedEndpoint, SelectedRouteBackend, SelectionContext, UpstreamBalancer,
+    UpstreamSelectionError, UpstreamSelectionMetrics, UpstreamSelectionPolicy,
 };
 pub use upstream_health::{
     EndpointHealthPolicy, EndpointHealthSnapshot, EndpointHealthStatus, UpstreamHealthError,

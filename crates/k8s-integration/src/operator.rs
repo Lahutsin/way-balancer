@@ -297,16 +297,76 @@ where
 
                 match config.compile_snapshot() {
                     Ok(snapshot) => {
-                    let desired_digest_sha256 = snapshot.metadata().digest_sha256().to_owned();
-                    let desired_version =
-                        derive_desired_version(&config.name, &desired_digest_sha256);
-                    if self.backend.active_digest_sha256() == Some(desired_digest_sha256.as_str())
-                        && self.status.desired_version.as_deref() == Some(desired_version.as_str())
-                    {
+                        let desired_digest_sha256 = snapshot.metadata().digest_sha256().to_owned();
+                        let desired_version =
+                            derive_desired_version(&config.name, &desired_digest_sha256);
+                        if self.backend.active_digest_sha256()
+                            == Some(desired_digest_sha256.as_str())
+                            && self.status.desired_version.as_deref()
+                                == Some(desired_version.as_str())
+                        {
+                            self.consecutive_backend_failures = 0;
+                            self.metrics.success_count =
+                                self.metrics.success_count.saturating_add(1);
+                            self.metrics.total_reconcile_duration_ms =
+                                self.metrics.total_reconcile_duration_ms.saturating_add(0);
+                            let status = self.set_status(
+                                OperatorStatus {
+                                    state: OperatorState::Ready,
+                                    observed_generation: request.observed_generation,
+                                    desired_version: Some(desired_version.clone()),
+                                    active_version: self.backend.active_version().map(String::from),
+                                    last_known_good_version: self
+                                        .backend
+                                        .last_known_good_version()
+                                        .map(String::from),
+                                    conditions: ready_conditions_with_reason(
+                                        String::from("Converged"),
+                                        String::from("desired state already converged"),
+                                    ),
+                                },
+                                request.observed_generation,
+                                String::from("reconcile detected no desired-state change"),
+                            );
+                            return Ok(ReconcileResult {
+                                changed: false,
+                                desired_digest_sha256: Some(desired_digest_sha256),
+                                requeue: RequeueDecision::None,
+                                status,
+                            });
+                        }
+
+                        if let Err(error) = self.backend.publish_snapshot(
+                            &desired_version,
+                            snapshot,
+                            request.actor.clone(),
+                            Some(String::from("operator reconcile publish")),
+                            occurred_at_unix_ms,
+                        ) {
+                            return Err(self.handle_backend_error(
+                                error,
+                                request.observed_generation,
+                                desired_version,
+                                String::from("publish failed during reconcile"),
+                            ));
+                        }
+
+                        if let Err(error) = self.backend.rollout_version(
+                            &desired_version,
+                            request.actor,
+                            Some(String::from("operator reconcile rollout")),
+                            occurred_at_unix_ms,
+                        ) {
+                            return Err(self.handle_backend_error(
+                                error,
+                                request.observed_generation,
+                                desired_version,
+                                String::from("rollout failed during reconcile"),
+                            ));
+                        }
+
                         self.consecutive_backend_failures = 0;
                         self.metrics.success_count = self.metrics.success_count.saturating_add(1);
-                        self.metrics.total_reconcile_duration_ms =
-                            self.metrics.total_reconcile_duration_ms.saturating_add(0);
                         let status = self.set_status(
                             OperatorStatus {
                                 state: OperatorState::Ready,
@@ -317,78 +377,27 @@ where
                                     .backend
                                     .last_known_good_version()
                                     .map(String::from),
-                                conditions: ready_conditions(String::from(
-                                    "desired state already converged",
-                                )),
+                                conditions: ready_conditions_with_reason(
+                                    String::from("Converged"),
+                                    String::from(
+                                        "desired state translated, published and rolled out",
+                                    ),
+                                ),
                             },
                             request.observed_generation,
-                            String::from("reconcile detected no desired-state change"),
+                            String::from("reconcile converged desired state"),
                         );
-                        return Ok(ReconcileResult {
-                            changed: false,
+
+                        Ok(ReconcileResult {
+                            changed: true,
                             desired_digest_sha256: Some(desired_digest_sha256),
                             requeue: RequeueDecision::None,
                             status,
-                        });
+                        })
                     }
-
-                    if let Err(error) = self.backend.publish_snapshot(
-                        &desired_version,
-                        snapshot,
-                        request.actor.clone(),
-                        Some(String::from("operator reconcile publish")),
-                        occurred_at_unix_ms,
-                    ) {
-                        return Err(self.handle_backend_error(
-                            error,
-                            request.observed_generation,
-                            desired_version,
-                            String::from("publish failed during reconcile"),
-                        ));
+                    Err(error) => {
+                        Err(self.handle_snapshot_error(error, request.observed_generation))
                     }
-
-                    if let Err(error) = self.backend.rollout_version(
-                        &desired_version,
-                        request.actor,
-                        Some(String::from("operator reconcile rollout")),
-                        occurred_at_unix_ms,
-                    ) {
-                        return Err(self.handle_backend_error(
-                            error,
-                            request.observed_generation,
-                            desired_version,
-                            String::from("rollout failed during reconcile"),
-                        ));
-                    }
-
-                    self.consecutive_backend_failures = 0;
-                    self.metrics.success_count = self.metrics.success_count.saturating_add(1);
-                    let status = self.set_status(
-                        OperatorStatus {
-                            state: OperatorState::Ready,
-                            observed_generation: request.observed_generation,
-                            desired_version: Some(desired_version.clone()),
-                            active_version: self.backend.active_version().map(String::from),
-                            last_known_good_version: self
-                                .backend
-                                .last_known_good_version()
-                                .map(String::from),
-                            conditions: ready_conditions(String::from(
-                                "desired state translated, published and rolled out",
-                            )),
-                        },
-                        request.observed_generation,
-                        String::from("reconcile converged desired state"),
-                    );
-
-                    Ok(ReconcileResult {
-                        changed: true,
-                        desired_digest_sha256: Some(desired_digest_sha256),
-                        requeue: RequeueDecision::None,
-                        status,
-                    })
-                    }
-                    Err(error) => Err(self.handle_snapshot_error(error, request.observed_generation)),
                 }
             }
             Err(error) => {
@@ -396,6 +405,10 @@ where
                 let message = match &error {
                     ReconcileError::Translation(report) => report.to_string(),
                     _ => String::from("unexpected reconcile translation state"),
+                };
+                let reason = match &error {
+                    ReconcileError::Translation(report) => translation_condition_reason(report),
+                    _ => "InvalidDesiredState",
                 };
                 let status = self.set_status(
                     OperatorStatus {
@@ -407,7 +420,7 @@ where
                             .backend
                             .last_known_good_version()
                             .map(String::from),
-                        conditions: invalid_conditions(message),
+                        conditions: invalid_conditions_with_reason(String::from(reason), message),
                     },
                     request.observed_generation,
                     String::from("translation invalidated desired state"),
@@ -462,7 +475,10 @@ where
                 desired_version: Some(desired_version),
                 active_version: self.backend.active_version().map(String::from),
                 last_known_good_version: self.backend.last_known_good_version().map(String::from),
-                conditions: progressing_conditions(format!("{detail}; retry in {delay_ms}ms")),
+                conditions: progressing_conditions_with_reason(
+                    String::from(backend_condition_reason(&error)),
+                    format!("{detail}; retry in {delay_ms}ms"),
+                ),
             },
             observed_generation,
             format!("reconcile scheduled retry after backend error: {error}"),
@@ -483,7 +499,10 @@ where
                 desired_version: None,
                 active_version: self.backend.active_version().map(String::from),
                 last_known_good_version: self.backend.last_known_good_version().map(String::from),
-                conditions: invalid_conditions(error.to_string()),
+                conditions: invalid_conditions_with_reason(
+                    String::from("SnapshotInvalid"),
+                    error.to_string(),
+                ),
             },
             observed_generation,
             String::from("snapshot compilation invalidated desired state"),
@@ -517,76 +536,102 @@ fn derive_desired_version(workspace_name: &str, digest_sha256: &str) -> String {
     format!("k8s-{}-{}", workspace_name.replace(['_', '.'], "-"), &digest_sha256[..12])
 }
 
-fn ready_conditions(message: String) -> Vec<StatusCondition> {
+fn ready_conditions_with_reason(reason: String, message: String) -> Vec<StatusCondition> {
     vec![
         StatusCondition {
             condition_type: StatusConditionType::Ready,
             status: ConditionStatus::True,
-            reason: String::from("Converged"),
+            reason: reason.clone(),
             message: message.clone(),
         },
         StatusCondition {
             condition_type: StatusConditionType::Progressing,
             status: ConditionStatus::False,
-            reason: String::from("Converged"),
+            reason: reason.clone(),
             message: message.clone(),
         },
         StatusCondition {
             condition_type: StatusConditionType::Invalid,
             status: ConditionStatus::False,
-            reason: String::from("Converged"),
+            reason,
             message,
         },
     ]
 }
 
 fn progressing_conditions(message: String) -> Vec<StatusCondition> {
+    progressing_conditions_with_reason(String::from("Progressing"), message)
+}
+
+fn progressing_conditions_with_reason(reason: String, message: String) -> Vec<StatusCondition> {
     vec![
         StatusCondition {
             condition_type: StatusConditionType::Ready,
             status: ConditionStatus::False,
-            reason: String::from("Progressing"),
+            reason: reason.clone(),
             message: message.clone(),
         },
         StatusCondition {
             condition_type: StatusConditionType::Progressing,
             status: ConditionStatus::True,
-            reason: String::from("RetryScheduled"),
+            reason: reason.clone(),
             message: message.clone(),
         },
         StatusCondition {
             condition_type: StatusConditionType::Invalid,
             status: ConditionStatus::False,
-            reason: String::from("Progressing"),
+            reason,
             message,
         },
     ]
 }
 
-fn invalid_conditions(message: String) -> Vec<StatusCondition> {
+fn invalid_conditions_with_reason(reason: String, message: String) -> Vec<StatusCondition> {
     vec![
         StatusCondition {
             condition_type: StatusConditionType::Ready,
             status: ConditionStatus::False,
-            reason: String::from("InvalidDesiredState"),
+            reason: reason.clone(),
             message: message.clone(),
         },
         StatusCondition {
             condition_type: StatusConditionType::Progressing,
             status: ConditionStatus::False,
-            reason: String::from("InvalidDesiredState"),
+            reason: reason.clone(),
             message: message.clone(),
         },
         StatusCondition {
             condition_type: StatusConditionType::Invalid,
             status: ConditionStatus::True,
-            reason: String::from("InvalidDesiredState"),
+            reason,
             message,
         },
     ]
+}
+
+fn translation_condition_reason(report: &TranslationReport) -> &'static str {
+    if report.errors.iter().any(|error| error.category == crate::TranslationCategory::Unsupported) {
+        "UnsupportedDesiredState"
+    } else if report
+        .errors
+        .iter()
+        .any(|error| error.category == crate::TranslationCategory::InvalidReference)
+    {
+        "InvalidReferences"
+    } else {
+        "InvalidDesiredState"
+    }
+}
+
+fn backend_condition_reason(error: &ReconcileBackendError) -> &'static str {
+    match error {
+        ReconcileBackendError::Publish(_) => "PublishFailed",
+        ReconcileBackendError::Rollout(_) => "RolloutFailed",
+    }
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use lb_admin_api::RolloutError;
     use lb_test_support::test_artifact_signer;
@@ -614,9 +659,7 @@ mod tests {
 
     impl ReconcileBackend for FailingBackend {
         fn trusted_signers(&self) -> Vec<lb_config_model::TrustedArtifactSignerConfig> {
-            vec![test_artifact_signer()
-                .expect("test signer")
-                .trusted_signer()]
+            vec![test_artifact_signer().expect("test signer").trusted_signer()]
         }
 
         fn publish_snapshot(

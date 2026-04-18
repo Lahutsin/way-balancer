@@ -43,8 +43,7 @@ pub use overload_policy::{
 pub use policy::{
     AuthorizationCacheBehaviorConfig, CacheKeyPolicyConfig, CacheQueryKeyBehaviorConfig,
     HttpCacheMethodConfig, HttpCachePolicyConfig, HttpCacheStorageConfig,
-    NamedBrownoutFeatureConfig, NamedCircuitBreakerPolicyConfig,
-    NamedHttpCachePolicyConfig,
+    NamedBrownoutFeatureConfig, NamedCircuitBreakerPolicyConfig, NamedHttpCachePolicyConfig,
     NamedLocalConcurrencyLimitPolicyConfig, NamedLocalRateLimitPolicyConfig,
     NamedOverloadResponsePolicyConfig, NamedRetryBudgetPolicyConfig,
     NamedTimeoutHierarchyPolicyConfig, PolicyBindingConfig, PolicyResourcesConfig,
@@ -52,14 +51,15 @@ pub use policy::{
 pub use route::{RouteConfig, RouteMatchConfig};
 pub use security::{
     verify_snapshot_artifact_integrity, AnonymousSourceFilterConfig, ArtifactAttestation,
-    ArtifactIntegrityError, ArtifactSigner, ArtifactSigningError,
-    ArtifactVerificationConfig, ArtifactVerificationMode, InsecureDevModeConfig,
-    TrustedArtifactSignerConfig, TrustedClientIpConfig, WorkspaceSecurityConfig,
+    ArtifactIntegrityError, ArtifactSigner, ArtifactSigningError, ArtifactVerificationConfig,
+    ArtifactVerificationMode, InsecureDevModeConfig, TrustedArtifactSignerConfig,
+    TrustedClientIpConfig, WorkspaceSecurityConfig,
 };
 pub use upstream::{
-    EndpointStateConfig, LoadBalancingAlgorithmConfig, LocalityRoutingConfig,
-    NoHealthyFallbackConfig, UpstreamClusterConfig, UpstreamEndpointConfig,
-    UpstreamTrafficPolicyConfig, WorkspaceConfigError,
+    AffinityFallbackConfig, AffinityPolicyConfig, EndpointStateConfig,
+    LoadBalancingAlgorithmConfig, LocalityRoutingConfig, NoHealthyFallbackConfig,
+    UpstreamClusterConfig, UpstreamEndpointConfig, UpstreamTrafficPolicyConfig,
+    WorkspaceConfigError,
 };
 pub use validator::{
     ConfigValidationStats, ValidationCategory, ValidationCode, ValidationError, ValidationReport,
@@ -224,13 +224,13 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     use super::{
-        AuthorizationCacheBehaviorConfig, CacheQueryKeyBehaviorConfig, HttpCacheStorageConfig,
-        ConfigApiVersion, EndpointStateConfig, ListenerAlpnProtocolConfig,
+        AuthorizationCacheBehaviorConfig, CacheQueryKeyBehaviorConfig, ConfigApiVersion,
+        EndpointStateConfig, HttpCacheStorageConfig, ListenerAlpnProtocolConfig,
         ListenerCertificateSourceConfig, ListenerClassConfig, ListenerProtocolConfig,
         ListenerResourceConfig, ListenerTlsMinimumVersionConfig,
         ListenerTlsSessionResumptionConfig, ListenerTlsSessionResumptionModeConfig,
-        ListenerTlsSniCertificateConfig, ListenerTlsTerminationConfig, PolicyBindingConfig, RouteConfig,
-        UpstreamClusterConfig, UpstreamEndpointConfig, UpstreamTrafficPolicyConfig,
+        ListenerTlsSniCertificateConfig, ListenerTlsTerminationConfig, PolicyBindingConfig,
+        RouteConfig, UpstreamClusterConfig, UpstreamEndpointConfig, UpstreamTrafficPolicyConfig,
         WorkspaceConfig, WorkspaceConfigParser,
     };
 
@@ -388,9 +388,18 @@ mod tests {
         assert_eq!(config.routes[0].policies.cache_policy.as_deref(), Some("public-cache"));
         assert_eq!(config.upstream_clusters[0].endpoints[0].state, EndpointStateConfig::Ready);
         assert_eq!(config.policies.http_caches.len(), 1);
-        assert_eq!(config.policies.http_caches[0].spec.authorization, AuthorizationCacheBehaviorConfig::Bypass);
-        assert_eq!(config.policies.http_caches[0].spec.cache_key.query, CacheQueryKeyBehaviorConfig::IncludeAll);
-        assert_eq!(config.policies.http_caches[0].spec.storage, HttpCacheStorageConfig::Memory { max_entries: 1024, max_bytes: 1_048_576 });
+        assert_eq!(
+            config.policies.http_caches[0].spec.authorization,
+            AuthorizationCacheBehaviorConfig::Bypass
+        );
+        assert_eq!(
+            config.policies.http_caches[0].spec.cache_key.query,
+            CacheQueryKeyBehaviorConfig::IncludeAll
+        );
+        assert_eq!(
+            config.policies.http_caches[0].spec.storage,
+            HttpCacheStorageConfig::Memory { max_entries: 1024, max_bytes: 1_048_576 }
+        );
         Ok(())
     }
 

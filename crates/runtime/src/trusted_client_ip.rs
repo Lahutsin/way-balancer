@@ -15,7 +15,6 @@ pub enum TrustedClientIpError {
 }
 
 impl TrustedClientIpPolicy {
-    #[must_use]
     pub fn resolve_from_http1_headers(
         &self,
         peer_ip: IpAddr,
@@ -23,13 +22,10 @@ impl TrustedClientIpPolicy {
     ) -> Result<IpAddr, TrustedClientIpError> {
         self.resolve_from_header_iter(
             peer_ip,
-            headers
-                .iter()
-                .map(|header| (header.name.as_str(), header.value.as_str())),
+            headers.iter().map(|header| (header.name.as_str(), header.value.as_str())),
         )
     }
 
-    #[must_use]
     pub fn resolve_from_http2_headers(
         &self,
         peer_ip: IpAddr,
@@ -37,9 +33,9 @@ impl TrustedClientIpPolicy {
     ) -> Result<IpAddr, TrustedClientIpError> {
         self.resolve_from_header_iter(
             peer_ip,
-            headers
-                .iter()
-                .filter_map(|(name, value)| value.to_str().ok().map(|value| (name.as_str(), value))),
+            headers.iter().filter_map(|(name, value)| {
+                value.to_str().ok().map(|value| (name.as_str(), value))
+            }),
         )
     }
 
@@ -87,7 +83,11 @@ impl TrustedClientIpPolicy {
     }
 }
 
-fn resolve_client_from_chain(peer_ip: IpAddr, chain: &[IpAddr], trusted_proxy_cidrs: &[IpNet]) -> IpAddr {
+fn resolve_client_from_chain(
+    peer_ip: IpAddr,
+    chain: &[IpAddr],
+    trusted_proxy_cidrs: &[IpNet],
+) -> IpAddr {
     let mut current = peer_ip;
     for candidate in chain.iter().rev() {
         if trusted_proxy_cidrs.iter().any(|cidr| cidr.contains(&current)) {
@@ -166,6 +166,7 @@ fn parse_forwarded_ip_token(token: &str) -> Result<IpAddr, TrustedClientIpError>
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use std::net::IpAddr;
 
@@ -184,7 +185,8 @@ mod tests {
             value: String::from("198.51.100.10"),
         }];
 
-        let result = policy.resolve_from_http1_headers("198.51.100.20".parse().expect("ip"), &headers);
+        let result =
+            policy.resolve_from_http1_headers("198.51.100.20".parse().expect("ip"), &headers);
 
         assert_eq!(result, Err(TrustedClientIpError::UntrustedForwardingHeader));
     }

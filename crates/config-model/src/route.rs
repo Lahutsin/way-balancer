@@ -51,8 +51,9 @@ impl RouteConfig {
 
                 let mut normalized_hostnames = BTreeSet::new();
                 for hostname in hostnames {
-                    let normalized = lb_proto_http::canonicalize_host(hostname)
-                        .map_err(|_| WorkspaceConfigError::InvalidRouteHostname(self.name.clone()))?;
+                    let normalized = lb_proto_http::canonicalize_host(hostname).map_err(|_| {
+                        WorkspaceConfigError::InvalidRouteHostname(self.name.clone())
+                    })?;
                     normalized_hostnames.insert(normalized);
                 }
 

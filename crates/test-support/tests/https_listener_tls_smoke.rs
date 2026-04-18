@@ -86,9 +86,9 @@ fn https_listener_example_loads_tls_material_and_validates_certificate(
         lb_proto_tls::CertificateValidator::from_trust_anchors_pem(&fixtures.ca_pem)?;
     let identity = validator.validate_peer_certificates_pem(
         &fixtures.leaf_pem,
-        &lb_proto_tls::CertificateValidationPolicy::privileged_channel_server(Some(
-            String::from("edge.internal"),
-        )),
+        &lb_proto_tls::CertificateValidationPolicy::privileged_channel_server(Some(String::from(
+            "edge.internal",
+        ))),
         fixtures.now_unix_secs,
     )?;
 

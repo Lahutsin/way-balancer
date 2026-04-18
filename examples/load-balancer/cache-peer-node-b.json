@@ -1,0 +1,109 @@
+{
+  "api_version": "v1_alpha1",
+  "name": "edge-cache-peer-node-b",
+  "security": {
+    "artifact_verification": {
+      "mode": "enforced",
+      "trusted_signers": []
+    }
+  },
+  "listeners": [
+    {
+      "name": "public-web",
+      "class": "public",
+      "bind_address": "127.0.0.1:8081",
+      "protocol": "http1",
+      "routes": ["catalog"]
+    },
+    {
+      "name": "admin-http",
+      "class": "admin",
+      "bind_address": "127.0.0.1:9901",
+      "protocol": "http1",
+      "admin": {
+        "auth": {
+          "mode": "signed_headers",
+          "operators": [
+            {
+              "id": "cache-peer",
+              "secret_env": "LB_CACHE_PEER_SECRET",
+              "permissions": ["read", "audit", "write"]
+            }
+          ],
+          "max_clock_skew_secs": 30,
+          "nonce_ttl_secs": 120
+        },
+        "allowed_source_cidrs": ["127.0.0.1/32"],
+        "rate_limit": {
+          "requests_per_minute": 120,
+          "burst": 20
+        },
+        "audit": {
+          "max_retained_events": 64
+        }
+      }
+    }
+  ],
+  "routes": [
+    {
+      "name": "catalog",
+      "match": {
+        "type": "path_prefix",
+        "prefix": "/catalog",
+        "hostnames": ["node-b.local", "localhost:8081", "127.0.0.1:8081"]
+      },
+      "upstream_cluster": "catalog-b",
+      "policies": {
+        "cache_policy": "public-cache"
+      }
+    }
+  ],
+  "upstream_clusters": [
+    {
+      "name": "catalog-b",
+      "endpoints": [
+        {
+          "id": "catalog-b-1",
+          "address": "127.0.0.1:18081",
+          "state": "ready",
+          "zone": null,
+          "locality": "edge-b",
+          "weight": 1
+        }
+      ]
+    }
+  ],
+  "policies": {
+    "http_caches": [
+      {
+        "name": "public-cache",
+        "spec": {
+          "methods": ["get", "head"],
+          "default_ttl_secs": 60,
+          "max_ttl_secs": 300,
+          "stale_while_revalidate_secs": 30,
+          "stale_if_error_secs": 120,
+          "cacheable_status_codes": [200, 203, 204, 300, 301, 404, 410],
+          "vary_headers": ["accept-encoding"],
+          "max_object_bytes": 262144,
+          "honor_cache_control": true,
+          "allow_set_cookie_storage": false,
+          "authorization": "bypass",
+          "revalidation_enabled": true,
+          "purge_enabled": true,
+          "cache_key": {
+            "include_host": true,
+            "include_method": false,
+            "query": "include_all",
+            "headers": ["accept-language"]
+          },
+          "storage": {
+            "type": "memory",
+            "max_entries": 2048,
+            "max_bytes": 16777216
+          }
+        }
+      }
+    ]
+  }
+}

@@ -5,6 +5,7 @@
 - typed `WorkspaceConfig` snapshots using `api_version: v1_alpha1`
 - runtime dataplane activation through published, attested snapshots
 - shared HTTP cache policies configured through `policies.http_caches`
+- opt-in upstream affinity policies configured through `upstream_clusters[].traffic_policy.affinity`
 
 ## Skew Policy
 
@@ -31,6 +32,7 @@ Security-sensitive runtime behavior changes, especially around cache keying, aut
 | --- | --- | --- |
 | Runtime and admin API | Same workspace release line only | Mixed release lines are not supported for GA evidence in `0.1.x`. |
 | Control-plane snapshot artifacts | Same config API version only | Published and applied snapshots must keep the compiled `api_version` within the supported set exposed by `RuntimeMetadata`. |
+| Upstream affinity policy | Same `v1_alpha1` schema and `0.1.x` release line | `header_hash` and `cookie_hash` remain opt-in and preserve healthy fallback semantics only. |
 | Kubernetes translation output | Same workspace release line only | Generated `WorkspaceConfig` must remain on supported config API versions and secure defaults. |
 | Artifact attestation | Required by default | Unsigned artifacts are rejected unless `security.insecure_dev_mode` is explicitly acknowledged. |
 

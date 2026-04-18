@@ -50,12 +50,14 @@ The current serve-mode apply path is rollback-safe in these ways:
 
 - the candidate config is fully parsed, validated, and compiled before apply
 - new listeners are started before old listeners are retired
+- supported bind or protocol changes are staged through overlap-and-drain replacement when the new listener can bind on a fresh socket first
 - if reload fails before the swap completes, the active runtime stays unchanged
 - same-bind protocol or listener-class swaps are rejected instead of risking a partial in-place rebind
 
 This means a failed reload should be treated as a rejected candidate, not as a partially applied rollout.
 
 If a reload is rejected because of authz, source policy, replay detection, or rate limiting, inspect `GET /audit` before retrying. That gives you the exact admin-plane outcome instead of inferring it only from the HTTP status code.
+If a reload is accepted and needs overlap-and-drain replacement, `GET /audit` records a `started` entry before apply completes, and `GET /status` shows which listener is desired, which prior listener is draining, and whether a failed replacement start was preserved.
 
 ## Rollback Workflow
 
@@ -64,7 +66,8 @@ If a validated candidate still proves undesirable after apply:
 1. Restore the previously known-good config file.
 2. Run `GET /validate` again and confirm the preview matches the expected rollback snapshot.
 3. Run `POST /reload` to return the process to the prior state.
-4. Confirm with `GET /status` and live probes.
+4. Confirm with `GET /status` that listener `replacement.state` has returned to `stable` and that no unexpected `draining` entries remain.
+5. Confirm with live probes.
 
 Because the active snapshot metadata includes the current digest and API version, operators can compare the rollback candidate against the running state before applying it.
 
@@ -86,7 +89,8 @@ The current migration strategy is strict compatibility, not live auto-migration.
 ## Operational Notes
 
 - `GET /status` remains the runtime state endpoint.
+- `GET /status` now includes per-listener replacement lifecycle data under `replacement`, including `state`, `desired`, `draining`, recent retired identities, and any preserved failed-start detail.
 - `GET /validate` is the preflight and diff endpoint.
-- `GET /audit` is the recent admin activity endpoint and is especially useful after denied reload attempts.
+- `GET /audit` is the recent admin activity endpoint and is especially useful after denied reload attempts or while a replacement-capable reload is still in progress.
 - `POST /reload` is the only state-mutating config action.
 - A successful validate preview does not replace post-apply smoke checks; it only reduces rollout risk before mutation.

@@ -283,17 +283,14 @@ impl SupportBundleBuilder {
             &mut warnings,
         );
 
-        let mut artifacts = vec![summary_artifact, metrics_artifact, logs_artifact, events_artifact];
+        let mut artifacts =
+            vec![summary_artifact, metrics_artifact, logs_artifact, events_artifact];
         if let Some(cache_artifact) = cache_artifact {
             artifacts.push(cache_artifact);
         }
 
         self.success_count.fetch_add(1, Ordering::SeqCst);
-        Ok(SupportBundle {
-            bundle_name: bundle_name.trim().to_string(),
-            artifacts,
-            warnings,
-        })
+        Ok(SupportBundle { bundle_name: bundle_name.trim().to_string(), artifacts, warnings })
     }
 
     #[must_use]

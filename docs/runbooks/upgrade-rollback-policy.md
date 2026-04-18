@@ -31,14 +31,16 @@
 2. Publish the candidate snapshot with digest verification and trusted attestation.
 3. Roll out the candidate through `RolloutCoordinator`.
 4. Confirm dataplane activation succeeded and the active digest matches the published digest.
-5. Record the upgrade outcome in release evidence.
+5. For config-driven listener changes, inspect `GET /status` until each affected listener reports `replacement.state = stable` and no unexpected `draining` entries remain.
+6. Record the upgrade outcome in release evidence.
 
 ## Rollback Flow
 
 1. Identify the prior known-good version recorded by `DataplaneSnapshotManager`.
 2. Roll back only to a previously successful version on the same supported config API version.
 3. Confirm the active digest returned to the known-good digest.
-4. Keep the failed candidate in audit history for investigation.
+4. Inspect `GET /audit` for the rollback request so the start and completion or failure outcome is preserved alongside the failed candidate.
+5. Keep the failed candidate in audit history for investigation.
 
 ## Validation Hooks
 
@@ -56,6 +58,7 @@
 
 - Digest mismatch or missing attestation blocks rollout before activation.
 - Activation failures keep the previous last-known-good snapshot available for rollback.
+- Supported listener replacements stay rollback-safe because failed replacement startup preserves the prior active listener and surfaces the failure in `GET /status` and `GET /audit`.
 - Any accepted dependency advisory or tooling gap must be recorded in the release evidence package.
 
 ## Release Gate Reference

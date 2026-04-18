@@ -1,0 +1,57 @@
+{
+  "api_version": "v1_alpha1",
+  "name": "edge-sticky-sessions-cookie",
+  "listeners": [
+    {
+      "name": "public-http",
+      "class": "public",
+      "bind_address": "127.0.0.1:8080",
+      "protocol": "http1",
+      "routes": ["app"]
+    }
+  ],
+  "routes": [
+    {
+      "name": "app",
+      "match": {
+        "type": "path_prefix",
+        "prefix": "/app",
+        "hostnames": ["localhost:8080", "127.0.0.1:8080"]
+      },
+      "upstream_cluster": "session-app"
+    }
+  ],
+  "upstream_clusters": [
+    {
+      "name": "session-app",
+      "endpoints": [
+        {
+          "id": "session-a",
+          "address": "127.0.0.1:9000",
+          "state": "ready",
+          "zone": null,
+          "locality": null,
+          "weight": 1
+        },
+        {
+          "id": "session-b",
+          "address": "127.0.0.1:9001",
+          "state": "ready",
+          "zone": null,
+          "locality": null,
+          "weight": 1
+        }
+      ],
+      "traffic_policy": {
+        "algorithm": "round_robin",
+        "locality": "disabled",
+        "no_healthy_fallback": "fail",
+        "affinity": {
+          "type": "cookie_hash",
+          "cookie_name": "session_id",
+          "fallback": "balance_healthy"
+        }
+      }
+    }
+  ]
+}

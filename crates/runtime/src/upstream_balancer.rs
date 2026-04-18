@@ -1,8 +1,9 @@
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::BTreeMap;
 use std::fmt;
-use std::sync::Arc;
+use std::hash::Hasher;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::sync::Mutex;
 
 use crate::{
@@ -42,6 +43,32 @@ pub enum NoHealthyFallback {
     IncludeUnhealthy,
 }
 
+/// Explicit fallback semantics when the preferred affinity endpoint is unavailable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AffinityFallbackPolicy {
+    /// Fall back to normal healthy endpoint selection.
+    BalanceHealthy,
+}
+
+/// Runtime affinity source and fallback configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AffinityPolicy {
+    /// Hash a request header value to a deterministic endpoint.
+    HeaderHash {
+        /// Header name used to source the affinity key.
+        header_name: String,
+        /// Behavior when the preferred endpoint is unavailable.
+        fallback: AffinityFallbackPolicy,
+    },
+    /// Hash a request cookie value to a deterministic endpoint.
+    CookieHash {
+        /// Cookie name used to source the affinity key.
+        cookie_name: String,
+        /// Behavior when the preferred endpoint is unavailable.
+        fallback: AffinityFallbackPolicy,
+    },
+}
+
 /// Runtime selection policy for a cluster.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpstreamSelectionPolicy {
@@ -51,6 +78,8 @@ pub struct UpstreamSelectionPolicy {
     pub locality: LocalityRoutingPolicy,
     /// Explicit no-healthy fallback behavior.
     pub no_healthy_fallback: NoHealthyFallback,
+    /// Optional deterministic affinity behavior.
+    pub affinity: Option<AffinityPolicy>,
 }
 
 impl Default for UpstreamSelectionPolicy {
@@ -59,6 +88,7 @@ impl Default for UpstreamSelectionPolicy {
             algorithm: LoadBalancingAlgorithm::RoundRobin,
             locality: LocalityRoutingPolicy::Disabled,
             no_healthy_fallback: NoHealthyFallback::Fail,
+            affinity: None,
         }
     }
 }
@@ -70,6 +100,8 @@ pub struct SelectionContext {
     pub preferred_locality: Option<String>,
     /// Preferred zone of the caller.
     pub preferred_zone: Option<String>,
+    /// Optional deterministic affinity key supplied by the caller.
+    pub affinity_key: Option<String>,
     /// Stable request hash used for deterministic selection.
     pub request_hash: u64,
 }
@@ -121,6 +153,10 @@ pub struct UpstreamSelectionMetrics {
     pub no_healthy_endpoint_count: u64,
     /// Number of fallback selections performed against unhealthy endpoints.
     pub unhealthy_fallback_selection_count: u64,
+    /// Number of selections satisfied directly by affinity.
+    pub affinity_hit_count: u64,
+    /// Number of affinity preferences that fell back to normal selection.
+    pub affinity_fallback_count: u64,
 }
 
 /// Reusable route backend pool that applies selection policy over a health-aware cluster view.
@@ -194,8 +230,7 @@ impl RouteBackendPool {
         &self,
         request_hash: u64,
     ) -> Result<lb_net_core::UpstreamTarget, UpstreamSelectionError> {
-        self.select_backend(request_hash)
-            .map(SelectedRouteBackend::into_upstream)
+        self.select_backend(request_hash).map(SelectedRouteBackend::into_upstream)
     }
 
     /// Selects a route backend for a request hash using the configured policy.
@@ -214,8 +249,7 @@ impl RouteBackendPool {
         &self,
         context: &SelectionContext,
     ) -> Result<lb_net_core::UpstreamTarget, UpstreamSelectionError> {
-        self.select_backend_with_context(context)
-            .map(SelectedRouteBackend::into_upstream)
+        self.select_backend_with_context(context).map(SelectedRouteBackend::into_upstream)
     }
 
     /// Selects a route backend using the configured policy and full selection context.
@@ -259,19 +293,22 @@ impl RouteBackendPool {
         &self.cluster_name
     }
 
+    #[must_use]
+    pub fn affinity_policy(&self) -> Option<&AffinityPolicy> {
+        self.selection_policy.affinity.as_ref()
+    }
+
     pub fn active_probe_targets(&self) -> Result<Vec<ActiveProbeTarget>, UpstreamHealthError> {
-        self.registry
-            .selection_candidates(&self.cluster_name, true)
-            .map(|candidates| {
-                candidates
-                    .into_iter()
-                    .map(|candidate| ActiveProbeTarget {
-                        endpoint_id: candidate.endpoint_id,
-                        address: candidate.address,
-                        health: candidate.health,
-                    })
-                    .collect()
-            })
+        self.registry.selection_candidates(&self.cluster_name, true).map(|candidates| {
+            candidates
+                .into_iter()
+                .map(|candidate| ActiveProbeTarget {
+                    endpoint_id: candidate.endpoint_id,
+                    address: candidate.address,
+                    health: candidate.health,
+                })
+                .collect()
+        })
     }
 
     pub fn note_active_success(
@@ -286,6 +323,11 @@ impl RouteBackendPool {
         endpoint_id: &lb_net_core::UpstreamEndpointId,
     ) -> Result<EndpointHealthSnapshot, UpstreamHealthError> {
         self.registry.note_active_failure(&self.cluster_name, endpoint_id)
+    }
+
+    #[must_use]
+    pub fn selection_metrics(&self) -> UpstreamSelectionMetrics {
+        self.balancer.metrics()
     }
 
     pub fn advance_time(&self, elapsed: std::time::Duration) {
@@ -348,6 +390,8 @@ struct MetricsState {
     locality_preference_hit_count: AtomicU64,
     no_healthy_endpoint_count: AtomicU64,
     unhealthy_fallback_selection_count: AtomicU64,
+    affinity_hit_count: AtomicU64,
+    affinity_fallback_count: AtomicU64,
 }
 
 impl MetricsState {
@@ -365,6 +409,8 @@ impl MetricsState {
             unhealthy_fallback_selection_count: self
                 .unhealthy_fallback_selection_count
                 .load(Ordering::SeqCst),
+            affinity_hit_count: self.affinity_hit_count.load(Ordering::SeqCst),
+            affinity_fallback_count: self.affinity_fallback_count.load(Ordering::SeqCst),
         }
     }
 }
@@ -411,18 +457,30 @@ impl UpstreamBalancer {
             self.metrics.locality_preference_hit_count.fetch_add(1, Ordering::SeqCst);
         }
 
-        let selected = match policy.algorithm {
-            LoadBalancingAlgorithm::RoundRobin => {
-                self.metrics.round_robin_selection_count.fetch_add(1, Ordering::SeqCst);
-                self.select_round_robin(cluster_name, &candidates, fallback_used)
-            }
-            LoadBalancingAlgorithm::WeightedRoundRobin => {
-                self.metrics.weighted_round_robin_selection_count.fetch_add(1, Ordering::SeqCst);
-                self.select_weighted_round_robin(cluster_name, &candidates, fallback_used)
-            }
-            LoadBalancingAlgorithm::PowerOfTwoChoices => {
-                self.metrics.power_of_two_selection_count.fetch_add(1, Ordering::SeqCst);
-                self.select_power_of_two(&candidates, context.request_hash)
+        let selected = if let Some(selected) = self.try_select_affinity_candidate(
+            registry,
+            cluster_name,
+            policy,
+            context,
+            &candidates,
+        )? {
+            selected
+        } else {
+            match policy.algorithm {
+                LoadBalancingAlgorithm::RoundRobin => {
+                    self.metrics.round_robin_selection_count.fetch_add(1, Ordering::SeqCst);
+                    self.select_round_robin(cluster_name, &candidates, fallback_used)
+                }
+                LoadBalancingAlgorithm::WeightedRoundRobin => {
+                    self.metrics
+                        .weighted_round_robin_selection_count
+                        .fetch_add(1, Ordering::SeqCst);
+                    self.select_weighted_round_robin(cluster_name, &candidates, fallback_used)
+                }
+                LoadBalancingAlgorithm::PowerOfTwoChoices => {
+                    self.metrics.power_of_two_selection_count.fetch_add(1, Ordering::SeqCst);
+                    self.select_power_of_two(&candidates, context.request_hash)
+                }
             }
         };
 
@@ -529,6 +587,79 @@ impl UpstreamBalancer {
             second.clone()
         }
     }
+
+    fn try_select_affinity_candidate(
+        &self,
+        registry: &UpstreamHealthRegistry,
+        cluster_name: &lb_net_core::UpstreamClusterName,
+        policy: &UpstreamSelectionPolicy,
+        context: &SelectionContext,
+        eligible_candidates: &[EndpointSelectionCandidate],
+    ) -> Result<Option<EndpointSelectionCandidate>, UpstreamSelectionError> {
+        let Some(affinity_policy) = policy.affinity.as_ref() else {
+            return Ok(None);
+        };
+        let Some(affinity_key) = context.affinity_key.as_deref() else {
+            return Ok(None);
+        };
+
+        let affinity_candidates = registry.selection_candidates(cluster_name, true)?;
+        let (affinity_candidates, _) =
+            apply_locality_preference(affinity_candidates, policy, context);
+        if affinity_candidates.is_empty() {
+            return Ok(None);
+        }
+
+        let preferred = select_affinity_candidate(&affinity_candidates, affinity_key);
+        if let Some(selected) = eligible_candidates
+            .iter()
+            .find(|candidate| candidate.endpoint_id == preferred.endpoint_id)
+        {
+            self.metrics.affinity_hit_count.fetch_add(1, Ordering::SeqCst);
+            return Ok(Some(selected.clone()));
+        }
+
+        self.metrics.affinity_fallback_count.fetch_add(1, Ordering::SeqCst);
+        match affinity_policy {
+            AffinityPolicy::HeaderHash { fallback, .. }
+            | AffinityPolicy::CookieHash { fallback, .. } => match fallback {
+                AffinityFallbackPolicy::BalanceHealthy => Ok(None),
+            },
+        }
+    }
+}
+
+fn select_affinity_candidate(
+    candidates: &[EndpointSelectionCandidate],
+    affinity_key: &str,
+) -> EndpointSelectionCandidate {
+    let mut best_index = 0_usize;
+    let mut best_score = f64::NEG_INFINITY;
+
+    for (index, candidate) in candidates.iter().enumerate() {
+        let score = affinity_score(affinity_key, candidate);
+        let ordering = score.total_cmp(&best_score);
+        if ordering == CmpOrdering::Greater
+            || (ordering == CmpOrdering::Equal
+                && candidate.endpoint_id < candidates[best_index].endpoint_id)
+        {
+            best_index = index;
+            best_score = score;
+        }
+    }
+
+    candidates[best_index].clone()
+}
+
+fn affinity_score(affinity_key: &str, candidate: &EndpointSelectionCandidate) -> f64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    hasher.write(affinity_key.as_bytes());
+    hasher.write_u8(0xff);
+    hasher.write(candidate.endpoint_id.as_str().as_bytes());
+    let hash = hasher.finish();
+    let unit_interval = (hash as f64 + 1.0) / (u64::MAX as f64 + 2.0);
+    let effective_weight = f64::from(candidate.health.effective_weight.max(1));
+    effective_weight / (-unit_interval.ln())
 }
 
 fn apply_locality_preference(

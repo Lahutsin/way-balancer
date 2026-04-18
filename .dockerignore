@@ -1,0 +1,9 @@
+.coverage
+.git
+.venv
+artifacts
+target
+fuzz/target
+**/*.profraw
+**/*.profdata
+**/*.lcov

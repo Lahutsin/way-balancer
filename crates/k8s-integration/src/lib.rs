@@ -1,8 +1,12 @@
 #![forbid(unsafe_code)]
 
+mod controller_pipeline;
 mod endpoint_slices;
 mod operator;
 
+pub use controller_pipeline::{
+    GatewayControllerPipeline, GatewaySnapshotCandidate, PublishedGatewaySnapshot,
+};
 pub use endpoint_slices::{
     DiscoveryApiVersion, EndpointAddressType, EndpointSliceApplyError, EndpointSliceConditions,
     EndpointSliceController, EndpointSliceEndpoint, EndpointSliceResource, EndpointSliceStats,
@@ -995,17 +999,22 @@ mod tests {
     fn translator_stats_track_success_and_multiple_failure_categories(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut translator = GatewayApiTranslator::new();
-        let success = translator.translate(&sample_resources(GatewayApiVersion::V1), GatewayTranslationOptions::default());
+        let success = translator.translate(
+            &sample_resources(GatewayApiVersion::V1),
+            GatewayTranslationOptions::default(),
+        );
         assert!(success.is_ok());
 
         let mut unsupported = sample_resources(GatewayApiVersion::V1);
         unsupported.gateways[0].listeners[0].protocol = GatewayListenerProtocol::Tcp;
-        let unsupported_result = translator.translate(&unsupported, GatewayTranslationOptions::default());
+        let unsupported_result =
+            translator.translate(&unsupported, GatewayTranslationOptions::default());
         assert!(unsupported_result.is_err());
 
         let mut invalid_shape = sample_resources(GatewayApiVersion::V1);
         invalid_shape.http_routes[0].rules.clear();
-        let invalid_shape_result = translator.translate(&invalid_shape, GatewayTranslationOptions::default());
+        let invalid_shape_result =
+            translator.translate(&invalid_shape, GatewayTranslationOptions::default());
         assert!(invalid_shape_result.is_err());
 
         let stats = translator.stats();
@@ -1017,8 +1026,12 @@ mod tests {
     }
 
     #[test]
-    fn empty_resource_set_translates_to_empty_workspace_name() -> Result<(), Box<dyn std::error::Error>> {
-        let config = translate_gateway_api(&GatewayApiResourceSet::default(), GatewayTranslationOptions::default())?;
+    fn empty_resource_set_translates_to_empty_workspace_name(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let config = translate_gateway_api(
+            &GatewayApiResourceSet::default(),
+            GatewayTranslationOptions::default(),
+        )?;
 
         assert_eq!(config.name, "k8s-gateway-api");
         assert!(config.listeners.is_empty());

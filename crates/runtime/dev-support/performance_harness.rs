@@ -11,10 +11,9 @@ use h2::{client, server, Reason};
 use http::{Request, Response, StatusCode};
 use lb_net_core::{ListenerClass, ListenerConfig, UpstreamTarget};
 use lb_runtime::{
-    proxy_http1_connection, proxy_http1_connection_with_downstream_addr,
-    proxy_http2_connection, start_listener, Http1ConnectionReport, Http1ProxyConfig,
-    Http1ProxyError, Http2ConnectionReport, Http2ProxyConfig, Http2ProxyError,
-    ListenerHandle,
+    proxy_http1_connection, proxy_http1_connection_with_downstream_addr, proxy_http2_connection,
+    start_listener, Http1ConnectionReport, Http1ProxyConfig, Http1ProxyError,
+    Http2ConnectionReport, Http2ProxyConfig, Http2ProxyError, ListenerHandle,
 };
 use rcgen::generate_simple_self_signed;
 use serde::Serialize;
@@ -23,7 +22,9 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 use tokio::task::JoinSet;
 use tokio::time;
-use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
+use tokio_rustls::rustls::pki_types::{
+    CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName,
+};
 use tokio_rustls::rustls::{ClientConfig, RootCertStore, ServerConfig};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
@@ -178,11 +179,11 @@ pub async fn run_performance_envelope(
     })
 }
 
-pub async fn measure_http1_throughput(
-    requests: usize,
-) -> Result<ThroughputMeasurement, DynError> {
-    let (upstream_addr, captures_rx) = spawn_repeating_http1_upstream(requests, HTTP1_BENCH_BODY).await?;
-    let (proxy_addr, report_rx) = spawn_one_shot_http1_proxy_listener(http1_proxy_config(upstream_addr)).await?;
+pub async fn measure_http1_throughput(requests: usize) -> Result<ThroughputMeasurement, DynError> {
+    let (upstream_addr, captures_rx) =
+        spawn_repeating_http1_upstream(requests, HTTP1_BENCH_BODY).await?;
+    let (proxy_addr, report_rx) =
+        spawn_one_shot_http1_proxy_listener(http1_proxy_config(upstream_addr)).await?;
     let mut client = TcpStream::connect(proxy_addr).await?;
 
     let started_at = Instant::now();
@@ -203,9 +204,13 @@ pub async fn measure_http1_tls_throughput(
     requests: usize,
 ) -> Result<ThroughputMeasurement, DynError> {
     let identity = tls_identity()?;
-    let (upstream_addr, captures_rx) = spawn_repeating_http1_upstream(requests, HTTP1_BENCH_BODY).await?;
-    let (proxy_addr, report_rx) =
-        spawn_one_shot_tls_http1_proxy_listener(http1_proxy_config(upstream_addr), identity.clone()).await?;
+    let (upstream_addr, captures_rx) =
+        spawn_repeating_http1_upstream(requests, HTTP1_BENCH_BODY).await?;
+    let (proxy_addr, report_rx) = spawn_one_shot_tls_http1_proxy_listener(
+        http1_proxy_config(upstream_addr),
+        identity.clone(),
+    )
+    .await?;
 
     let stream = TcpStream::connect(proxy_addr).await?;
     let server_name = ServerName::try_from("localhost")?.to_owned();
@@ -225,11 +230,10 @@ pub async fn measure_http1_tls_throughput(
     Ok(throughput_measurement("http1_proxy_batch_tls", requests, elapsed))
 }
 
-pub async fn measure_http2_throughput(
-    streams: usize,
-) -> Result<ThroughputMeasurement, DynError> {
+pub async fn measure_http2_throughput(streams: usize) -> Result<ThroughputMeasurement, DynError> {
     let upstream_addr = spawn_basic_h2_upstream(HTTP2_BENCH_BODY).await?;
-    let (proxy_addr, report_rx) = spawn_one_shot_http2_proxy_listener(http2_proxy_config(upstream_addr)).await?;
+    let (proxy_addr, report_rx) =
+        spawn_one_shot_http2_proxy_listener(http2_proxy_config(upstream_addr)).await?;
     let mut client = connect_h2_client(proxy_addr).await?;
 
     let started_at = Instant::now();
@@ -255,9 +259,7 @@ pub async fn measure_http2_throughput(
     Ok(throughput_measurement("http2_proxy_stream_batch", streams, elapsed))
 }
 
-pub async fn measure_mixed_latency(
-    operations: usize,
-) -> Result<LatencySummary, DynError> {
+pub async fn measure_mixed_latency(operations: usize) -> Result<LatencySummary, DynError> {
     let http1_requests = operations / 2;
     let http2_requests = operations - http1_requests;
 
@@ -290,7 +292,8 @@ pub async fn measure_mixed_latency(
 
         if http2_seen < http2_requests {
             let started_at = Instant::now();
-            let response = send_h2_request(&mut http2_client, &format!("/mixed-http2-{index}"), None).await?;
+            let response =
+                send_h2_request(&mut http2_client, &format!("/mixed-http2-{index}"), None).await?;
             let received = receive_h2_response(response).await?;
             if received.0 != StatusCode::OK || received.1 != HTTP2_BENCH_BODY {
                 return Err(io::Error::other("unexpected mixed HTTP/2 response").into());
@@ -344,7 +347,10 @@ pub async fn measure_idle_connection_memory(
     handle.shutdown().await?;
 
     if snapshot.active_connections < connections {
-        return Err(io::Error::other("listener memory harness did not retain all idle connections").into());
+        return Err(io::Error::other(
+            "listener memory harness did not retain all idle connections",
+        )
+        .into());
     }
 
     Ok(memory_measurement(
@@ -356,12 +362,12 @@ pub async fn measure_idle_connection_memory(
     ))
 }
 
-pub async fn measure_http2_stream_memory(
-    streams: usize,
-) -> Result<MemoryMeasurement, DynError> {
+pub async fn measure_http2_stream_memory(streams: usize) -> Result<MemoryMeasurement, DynError> {
     let baseline_rss_kib = current_rss_kib();
-    let upstream_addr = spawn_delayed_h2_upstream(Duration::from_millis(250), HTTP2_BENCH_BODY).await?;
-    let (proxy_addr, report_rx) = spawn_one_shot_http2_proxy_listener(http2_proxy_config(upstream_addr)).await?;
+    let upstream_addr =
+        spawn_delayed_h2_upstream(Duration::from_millis(250), HTTP2_BENCH_BODY).await?;
+    let (proxy_addr, report_rx) =
+        spawn_one_shot_http2_proxy_listener(http2_proxy_config(upstream_addr)).await?;
     let mut client = connect_h2_client(proxy_addr).await?;
 
     let mut responses = Vec::with_capacity(streams);
@@ -382,7 +388,10 @@ pub async fn measure_http2_stream_memory(
 
     let report = receive_http2_proxy_result(report_rx).await?;
     if report.metrics.peak_active_streams < streams {
-        return Err(io::Error::other("HTTP/2 memory harness did not reach target active stream count").into());
+        return Err(io::Error::other(
+            "HTTP/2 memory harness did not reach target active stream count",
+        )
+        .into());
     }
 
     Ok(memory_measurement(
@@ -417,11 +426,7 @@ fn latency_summary(scenario: &str, mut samples_us: Vec<u64>) -> LatencySummary {
     samples_us.sort_unstable();
     let samples = samples_us.len();
     let sum: u128 = samples_us.iter().map(|sample| u128::from(*sample)).sum();
-    let mean_us = if samples == 0 {
-        0.0
-    } else {
-        sum as f64 / samples as f64
-    };
+    let mean_us = if samples == 0 { 0.0 } else { sum as f64 / samples as f64 };
 
     LatencySummary {
         scenario: scenario.to_string(),
@@ -441,14 +446,10 @@ fn memory_measurement(
     peak_rss_kib: Option<u64>,
     note: String,
 ) -> MemoryMeasurement {
-    let delta_rss_kib = baseline_rss_kib.zip(peak_rss_kib).map(|(baseline, peak)| peak.saturating_sub(baseline));
-    let per_unit_rss_kib = delta_rss_kib.map(|delta| {
-        if units == 0 {
-            0.0
-        } else {
-            delta as f64 / units as f64
-        }
-    });
+    let delta_rss_kib =
+        baseline_rss_kib.zip(peak_rss_kib).map(|(baseline, peak)| peak.saturating_sub(baseline));
+    let per_unit_rss_kib =
+        delta_rss_kib.map(|delta| if units == 0 { 0.0 } else { delta as f64 / units as f64 });
 
     MemoryMeasurement {
         scenario: scenario.to_string(),
@@ -495,11 +496,8 @@ fn tls_identity() -> Result<TlsIdentity, DynError> {
 
     let mut roots = RootCertStore::empty();
     roots.add(CertificateDer::from(cert_der_bytes))?;
-    let client = Arc::new(
-        ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth(),
-    );
+    let client =
+        Arc::new(ClientConfig::builder().with_root_certificates(roots).with_no_client_auth());
 
     Ok(TlsIdentity { server, client })
 }
@@ -551,10 +549,8 @@ async fn spawn_repeating_http1_upstream(
                     Err(_) => break,
                 };
                 captures.push(capture);
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
-                    body.len()
-                );
+                let response =
+                    format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len());
                 if stream.write_all(response.as_bytes()).await.is_err() {
                     break;
                 }
@@ -606,7 +602,8 @@ where
     S: AsyncRead + Unpin,
 {
     loop {
-        if let Some(position) = buffer.windows(sequence.len()).position(|window| window == sequence) {
+        if let Some(position) = buffer.windows(sequence.len()).position(|window| window == sequence)
+        {
             return Ok(position + sequence.len());
         }
 
@@ -620,9 +617,8 @@ where
 }
 
 fn parse_content_length(head: &str) -> io::Result<usize> {
-    let Some(line) = head
-        .lines()
-        .find(|line| line.to_ascii_lowercase().starts_with("content-length:"))
+    let Some(line) =
+        head.lines().find(|line| line.to_ascii_lowercase().starts_with("content-length:"))
     else {
         return Ok(0);
     };
@@ -671,7 +667,9 @@ async fn spawn_one_shot_tls_http1_proxy_listener(
                         proxy_http1_connection_with_downstream_addr(tls_stream, peer_addr, &config)
                             .await
                     }
-                    Err(error) => Err(Http1ProxyError::RequestIo(io::Error::other(error.to_string()))),
+                    Err(error) => {
+                        Err(Http1ProxyError::RequestIo(io::Error::other(error.to_string())))
+                    }
                 }
             }
             Err(error) => Err(Http1ProxyError::RequestIo(error)),
@@ -730,10 +728,7 @@ async fn spawn_basic_h2_upstream(body: &'static str) -> io::Result<SocketAddr> {
     Ok(address)
 }
 
-async fn spawn_delayed_h2_upstream(
-    delay: Duration,
-    body: &'static str,
-) -> io::Result<SocketAddr> {
+async fn spawn_delayed_h2_upstream(delay: Duration, body: &'static str) -> io::Result<SocketAddr> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
 
@@ -775,7 +770,9 @@ async fn spawn_one_shot_http2_proxy_listener(
     tokio::spawn(async move {
         let result = match listener.accept().await {
             Ok((downstream, _)) => proxy_http2_connection(downstream, &config).await,
-            Err(error) => Err(Http2ProxyError::Connect { target: config.upstream.address, source: error }),
+            Err(error) => {
+                Err(Http2ProxyError::Connect { target: config.upstream.address, source: error })
+            }
         };
         let _ = result_tx.send(result);
     });
@@ -783,18 +780,13 @@ async fn spawn_one_shot_http2_proxy_listener(
     Ok((address, result_rx))
 }
 
-async fn connect_h2_client(
-    proxy_addr: SocketAddr,
-) -> Result<H2Client, DynError> {
+async fn connect_h2_client(proxy_addr: SocketAddr) -> Result<H2Client, DynError> {
     let stream = TcpStream::connect(proxy_addr).await?;
     let (send_request, connection) = client::handshake(stream).await?;
     let connection_task = tokio::spawn(async move {
         let _ = connection.await;
     });
-    Ok(H2Client {
-        send_request,
-        connection_task,
-    })
+    Ok(H2Client { send_request, connection_task })
 }
 
 async fn send_h2_request(
@@ -803,14 +795,18 @@ async fn send_h2_request(
     body: Option<Bytes>,
 ) -> Result<h2::client::ResponseFuture, h2::Error> {
     poll_h2_ready(&mut client.send_request).await?;
-    let request = Request::builder().method("GET").uri(path).body(())
+    let request = Request::builder()
+        .method("GET")
+        .uri(path)
+        .body(())
         .map_err(|_| h2::Error::from(Reason::INTERNAL_ERROR))?;
     let end_stream = body.is_none();
     let (response, mut send_stream) = client.send_request.send_request(request, end_stream)?;
     if let Some(mut body) = body {
         const MAX_FRAME_CHUNK: usize = 16 * 1024;
         while body.remaining() != 0 {
-            let capacity = poll_h2_capacity(&mut send_stream, body.remaining().min(MAX_FRAME_CHUNK)).await?;
+            let capacity =
+                poll_h2_capacity(&mut send_stream, body.remaining().min(MAX_FRAME_CHUNK)).await?;
             let chunk = body.split_to(body.remaining().min(MAX_FRAME_CHUNK).min(capacity));
             let end = body.remaining() == 0;
             send_stream.send_data(chunk, end)?;
@@ -820,18 +816,13 @@ async fn send_h2_request(
 }
 
 async fn shutdown_h2_client(client: H2Client) {
-    let H2Client {
-        send_request,
-        connection_task,
-    } = client;
+    let H2Client { send_request, connection_task } = client;
     drop(send_request);
     connection_task.abort();
     let _ = connection_task.await;
 }
 
-async fn poll_h2_ready(
-    client: &mut client::SendRequest<Bytes>,
-) -> Result<(), h2::Error> {
+async fn poll_h2_ready(client: &mut client::SendRequest<Bytes>) -> Result<(), h2::Error> {
     use std::future::poll_fn;
     poll_fn(|cx| client.poll_ready(cx)).await
 }
@@ -894,10 +885,7 @@ fn http2_proxy_config(upstream_addr: SocketAddr) -> Http2ProxyConfig {
 
 fn current_rss_kib() -> Option<u64> {
     let pid = std::process::id().to_string();
-    let output = Command::new("ps")
-        .args(["-o", "rss=", "-p", pid.as_str()])
-        .output()
-        .ok()?;
+    let output = Command::new("ps").args(["-o", "rss=", "-p", pid.as_str()]).output().ok()?;
     if !output.status.success() {
         return None;
     }

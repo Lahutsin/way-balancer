@@ -3,13 +3,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AdminAuthPolicyConfig, AdminAuthorizationScopeConfig, AnonymousSourceFilterConfig,
-    ArtifactVerificationMode, CacheKeyPolicyConfig,
-    HttpCachePolicyConfig, HttpCacheStorageConfig, ListenerAlpnProtocolConfig,
-    ListenerClassConfig, ListenerProtocolConfig, LocalConcurrencyLimitPolicyConfig,
-    LocalLimitScopeConfig, LocalRateLimitPolicyConfig, NamedOverloadResponsePolicyConfig,
-    OverloadResponsePolicyConfig, PolicyBindingConfig, PolicyResourcesConfig, RouteConfig,
-    RouteMatchConfig, TrustedClientIpConfig, WorkspaceConfig,
+    AdminAuthPolicyConfig, AdminAuthorizationScopeConfig, AffinityPolicyConfig,
+    AnonymousSourceFilterConfig, ArtifactVerificationMode, CacheKeyPolicyConfig,
+    HttpCachePolicyConfig, HttpCacheStorageConfig, ListenerAlpnProtocolConfig, ListenerClassConfig,
+    ListenerProtocolConfig, LocalConcurrencyLimitPolicyConfig, LocalLimitScopeConfig,
+    LocalRateLimitPolicyConfig, NamedOverloadResponsePolicyConfig, OverloadResponsePolicyConfig,
+    PolicyBindingConfig, PolicyResourcesConfig, RouteConfig, RouteMatchConfig,
+    TrustedClientIpConfig, WorkspaceConfig,
 };
 
 /// Stable validation error category.
@@ -430,7 +430,8 @@ fn validate_listener(
             }
 
             let mut seen_sni_names = BTreeSet::new();
-            for (sni_index, sni_certificate) in tls_termination.sni_certificates.iter().enumerate() {
+            for (sni_index, sni_certificate) in tls_termination.sni_certificates.iter().enumerate()
+            {
                 let certificate_path =
                     format!("{base_path}.tls_termination.sni_certificates[{sni_index}]");
                 if sni_certificate.server_names.is_empty() {
@@ -641,13 +642,13 @@ fn validate_admin_listener_policy(
                     "admin bearer auth must declare a non-empty secret_env",
                 ));
             }
-            validate_admin_permissions(permissions, &format!("{base_path}.admin.auth.permissions"), report);
+            validate_admin_permissions(
+                permissions,
+                &format!("{base_path}.admin.auth.permissions"),
+                report,
+            );
         }
-        AdminAuthPolicyConfig::SignedHeaders {
-            operators,
-            max_clock_skew_secs,
-            nonce_ttl_secs,
-        } => {
+        AdminAuthPolicyConfig::SignedHeaders { operators, max_clock_skew_secs, nonce_ttl_secs } => {
             if operators.is_empty() {
                 report.errors.push(ValidationError::schema(
                     ValidationCode::InvalidListenerField,
@@ -859,6 +860,35 @@ fn validate_upstream_cluster(
         }
     }
 
+    if let Some(affinity) = &cluster.traffic_policy.affinity {
+        match affinity {
+            AffinityPolicyConfig::HeaderHash { header_name, .. } => {
+                if !is_valid_affinity_token(header_name) {
+                    report.errors.push(ValidationError::schema(
+                        ValidationCode::InvalidUpstreamField,
+                        format!("{base_path}.traffic_policy.affinity.header_name"),
+                        format!(
+                            "upstream cluster {} must use a non-empty HTTP token for affinity header_name",
+                            cluster.name
+                        ),
+                    ));
+                }
+            }
+            AffinityPolicyConfig::CookieHash { cookie_name, .. } => {
+                if !is_valid_affinity_token(cookie_name) {
+                    report.errors.push(ValidationError::schema(
+                        ValidationCode::InvalidUpstreamField,
+                        format!("{base_path}.traffic_policy.affinity.cookie_name"),
+                        format!(
+                            "upstream cluster {} must use a non-empty cookie token for affinity cookie_name",
+                            cluster.name
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+
     validate_policy_binding(
         &cluster.policies,
         &format!("{base_path}.policies"),
@@ -866,6 +896,34 @@ fn validate_upstream_cluster(
         policy_registry,
         report,
     );
+}
+
+fn is_valid_affinity_token(value: &str) -> bool {
+    !value.is_empty()
+        && value == value.trim()
+        && value.bytes().all(|byte| {
+            matches!(
+                byte,
+                b'!'
+                    | b'#'
+                    | b'$'
+                    | b'%'
+                    | b'&'
+                    | b'\''
+                    | b'*'
+                    | b'+'
+                    | b'-'
+                    | b'.'
+                    | b'^'
+                    | b'_'
+                    | b'`'
+                    | b'|'
+                    | b'~'
+                    | b'0'..=b'9'
+                    | b'A'..=b'Z'
+                    | b'a'..=b'z'
+            )
+        })
 }
 
 fn validate_policy_binding(
@@ -1184,10 +1242,7 @@ fn validate_http_cache_policy(
     }
 
     if policy.cacheable_status_codes.is_empty()
-        || policy
-            .cacheable_status_codes
-            .iter()
-            .any(|status| !(100..=599).contains(status))
+        || policy.cacheable_status_codes.iter().any(|status| !(100..=599).contains(status))
     {
         report.errors.push(ValidationError::schema(
             ValidationCode::InvalidPolicyField,
@@ -1196,7 +1251,11 @@ fn validate_http_cache_policy(
         ));
     }
 
-    validate_named_header_list(&policy.vary_headers, &format!("{base_path}.spec.vary_headers"), report);
+    validate_named_header_list(
+        &policy.vary_headers,
+        &format!("{base_path}.spec.vary_headers"),
+        report,
+    );
     validate_cache_key_policy(&policy.cache_key, &format!("{base_path}.spec.cache_key"), report);
 
     match policy.storage {
@@ -1250,9 +1309,7 @@ fn validate_named_header_list(headers: &[String], path: &str, report: &mut Valid
             report.errors.push(ValidationError::schema(
                 ValidationCode::InvalidPolicyField,
                 format!("{path}[{index}]"),
-                format!(
-                    "header {normalized} is not allowed in cache key or vary configuration"
-                ),
+                format!("header {normalized} is not allowed in cache key or vary configuration"),
             ));
         }
     }
@@ -1589,12 +1646,12 @@ mod tests {
         validate_workspace_config, ValidationCategory, ValidationCode, WorkspaceConfigValidator,
     };
     use crate::{
-        AdminListenerPolicyConfig, AuthorizationCacheBehaviorConfig, CacheKeyPolicyConfig,
-        CacheQueryKeyBehaviorConfig, HttpCacheMethodConfig, HttpCachePolicyConfig,
-        HttpCacheStorageConfig, ListenerCertificateSourceConfig, ListenerClassConfig,
-        ListenerResourceConfig, ListenerTlsTerminationConfig,
-        LocalConcurrencyLimitPolicyConfig, LocalLimitKeyKindConfig, LocalLimitScopeConfig,
-        LocalRateLimitPolicyConfig, NamedHttpCachePolicyConfig,
+        AdminListenerPolicyConfig, AffinityFallbackConfig, AffinityPolicyConfig,
+        AuthorizationCacheBehaviorConfig, CacheKeyPolicyConfig, CacheQueryKeyBehaviorConfig,
+        HttpCacheMethodConfig, HttpCachePolicyConfig, HttpCacheStorageConfig,
+        ListenerCertificateSourceConfig, ListenerClassConfig, ListenerResourceConfig,
+        ListenerTlsTerminationConfig, LocalConcurrencyLimitPolicyConfig, LocalLimitKeyKindConfig,
+        LocalLimitScopeConfig, LocalRateLimitPolicyConfig, NamedHttpCachePolicyConfig,
         NamedLocalConcurrencyLimitPolicyConfig, NamedLocalRateLimitPolicyConfig,
         NamedOverloadResponsePolicyConfig, NamedRetryBudgetPolicyConfig,
         OverloadResponsePolicyConfig, PolicyBindingConfig, PolicyResourcesConfig, RouteConfig,
@@ -1758,6 +1815,35 @@ mod tests {
     }
 
     #[test]
+    fn validator_rejects_invalid_affinity_key_names() -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = valid_workspace()?;
+        config.upstream_clusters[0].traffic_policy.affinity =
+            Some(AffinityPolicyConfig::HeaderHash {
+                header_name: String::from("bad header"),
+                fallback: AffinityFallbackConfig::BalanceHealthy,
+            });
+
+        let report = validate_workspace_config(&config);
+        assert!(report.errors.iter().any(|error| {
+            error.code == ValidationCode::InvalidUpstreamField
+                && error.path == "upstream_clusters[0].traffic_policy.affinity.header_name"
+        }));
+
+        config.upstream_clusters[0].traffic_policy.affinity =
+            Some(AffinityPolicyConfig::CookieHash {
+                cookie_name: String::from(" session_id"),
+                fallback: AffinityFallbackConfig::BalanceHealthy,
+            });
+
+        let report = validate_workspace_config(&config);
+        assert!(report.errors.iter().any(|error| {
+            error.code == ValidationCode::InvalidUpstreamField
+                && error.path == "upstream_clusters[0].traffic_policy.affinity.cookie_name"
+        }));
+        Ok(())
+    }
+
+    #[test]
     fn validator_rejects_invalid_references() -> Result<(), Box<dyn std::error::Error>> {
         let mut config = valid_workspace()?;
         config.listeners[0].routes.push(String::from("missing-route"));
@@ -1791,8 +1877,7 @@ mod tests {
     }
 
     #[test]
-    fn validator_rejects_invalid_anonymous_source_cidr(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn validator_rejects_invalid_anonymous_source_cidr() -> Result<(), Box<dyn std::error::Error>> {
         let mut config = valid_workspace()?;
         config.security.anonymous_source_filter.enabled = true;
         config.security.anonymous_source_filter.deny_tor = true;
@@ -1808,8 +1893,7 @@ mod tests {
     }
 
     #[test]
-    fn validator_rejects_invalid_trusted_proxy_cidr(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn validator_rejects_invalid_trusted_proxy_cidr() -> Result<(), Box<dyn std::error::Error>> {
         let mut config = valid_workspace()?;
         config.security.trusted_client_ip.enabled = true;
         config.security.trusted_client_ip.trusted_proxy_cidrs = vec![String::from("bad-cidr")];
@@ -1877,8 +1961,8 @@ mod tests {
     }
 
     #[test]
-    fn validator_rejects_invalid_http_cache_policy_shapes(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn validator_rejects_invalid_http_cache_policy_shapes() -> Result<(), Box<dyn std::error::Error>>
+    {
         let mut config = valid_workspace()?;
         config.policies.http_caches[0].spec.methods.clear();
         config.policies.http_caches[0].spec.default_ttl_secs = 0;
@@ -1995,8 +2079,8 @@ mod tests {
     }
 
     #[test]
-    fn validator_rejects_duplicate_https_alpn_protocols(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn validator_rejects_duplicate_https_alpn_protocols() -> Result<(), Box<dyn std::error::Error>>
+    {
         let mut config = valid_workspace()?;
         config.listeners[0].protocol = crate::ListenerProtocolConfig::Https;
         config.listeners[0].tls_termination = Some(ListenerTlsTerminationConfig {
@@ -2016,9 +2100,7 @@ mod tests {
 
         let report = validate_workspace_config(&config);
 
-        assert!(report
-            .to_string()
-            .contains("https listeners must not repeat ALPN protocol http2"));
+        assert!(report.to_string().contains("https listeners must not repeat ALPN protocol http2"));
         Ok(())
     }
 
@@ -2054,8 +2136,8 @@ mod tests {
     }
 
     #[test]
-    fn validator_rejects_duplicate_https_sni_server_names(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn validator_rejects_duplicate_https_sni_server_names() -> Result<(), Box<dyn std::error::Error>>
+    {
         let mut config = valid_workspace()?;
         config.listeners[0].protocol = crate::ListenerProtocolConfig::Https;
         config.listeners[0].tls_termination = Some(ListenerTlsTerminationConfig {
@@ -2095,8 +2177,8 @@ mod tests {
     }
 
     #[test]
-    fn validator_rejects_zero_stateful_session_cache_size(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn validator_rejects_zero_stateful_session_cache_size() -> Result<(), Box<dyn std::error::Error>>
+    {
         let mut config = valid_workspace()?;
         config.listeners[0].protocol = crate::ListenerProtocolConfig::Https;
         config.listeners[0].tls_termination = Some(ListenerTlsTerminationConfig {
@@ -2144,9 +2226,9 @@ mod tests {
         });
 
         let report = validate_workspace_config(&config);
-        assert!(report
-            .to_string()
-            .contains("https listeners issuing TLS tickets must use a non-zero tls13_ticket_count"));
+        assert!(report.to_string().contains(
+            "https listeners issuing TLS tickets must use a non-zero tls13_ticket_count"
+        ));
         Ok(())
     }
 
@@ -2167,9 +2249,9 @@ mod tests {
         });
 
         let report = validate_workspace_config(&config);
-        assert!(report
-            .to_string()
-            .contains("https listeners must use a non-empty ocsp_path when OCSP stapling is configured"));
+        assert!(report.to_string().contains(
+            "https listeners must use a non-empty ocsp_path when OCSP stapling is configured"
+        ));
         Ok(())
     }
 

@@ -69,7 +69,8 @@ impl AnonymousSourceFilterState {
             return Some(AnonymousSourceCategory::Direct);
         }
 
-        if self.policy.deny_tor && self.policy.tor_exit_cidrs.iter().any(|cidr| cidr.contains(&ip)) {
+        if self.policy.deny_tor && self.policy.tor_exit_cidrs.iter().any(|cidr| cidr.contains(&ip))
+        {
             self.blocked_tor_count.fetch_add(1, Ordering::SeqCst);
             return Some(AnonymousSourceCategory::Tor);
         }
@@ -102,14 +103,13 @@ impl AnonymousSourceFilterState {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
     use ipnet::IpNet;
 
-    use super::{
-        AnonymousSourceCategory, AnonymousSourceFilterPolicy, AnonymousSourceFilterState,
-    };
+    use super::{AnonymousSourceCategory, AnonymousSourceFilterPolicy, AnonymousSourceFilterState};
 
     #[test]
     fn blocks_direct_cidr_before_category_matches() {

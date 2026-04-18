@@ -327,6 +327,7 @@ fn current_unix_ms() -> Result<u64, SystemTimeError> {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::{
         AbuseForensicsExportRequest, AbuseProtectionAdminService, EmergencyModeAdminRequest,
@@ -425,8 +426,8 @@ mod tests {
     }
 
     #[test]
-    fn invalid_bundle_name_and_error_sources_are_explicit(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn invalid_bundle_name_and_error_sources_are_explicit() -> Result<(), Box<dyn std::error::Error>>
+    {
         let diagnostics =
             lb_observability::SupportBundleBuilder::new(lb_observability::RedactionEngine)
                 .collect_runtime_diagnostics(
@@ -464,8 +465,7 @@ mod tests {
     }
 
     #[test]
-    fn switch_mode_tracks_unchanged_and_rejected_paths(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn switch_mode_tracks_unchanged_and_rejected_paths() -> Result<(), Box<dyn std::error::Error>> {
         let mut controller = lb_runtime::EmergencyProtectionController::new();
         let mut service = AbuseProtectionAdminService::new();
 
@@ -504,7 +504,10 @@ mod tests {
         assert_eq!(unchanged.result, super::AbuseControlResultKind::Unchanged);
         assert!(matches!(rejected, super::AbuseControlError::ModeSwitch(_)));
         assert_eq!(service.metrics().rejected_mode_switch_count, 1);
-        assert_eq!(service.history().last().map(|entry| entry.result), Some(super::AbuseControlResultKind::Rejected));
+        assert_eq!(
+            service.history().last().map(|entry| entry.result),
+            Some(super::AbuseControlResultKind::Rejected)
+        );
         Ok(())
     }
 

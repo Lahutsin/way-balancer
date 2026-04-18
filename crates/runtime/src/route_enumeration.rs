@@ -210,7 +210,11 @@ impl RouteEnumerationProtectionState {
             sources.insert(key.to_string(), SourceState::new(now));
         }
 
-        sources.get_mut(key).expect("source state must exist")
+        if let Some(source) = sources.get_mut(key) {
+            source
+        } else {
+            unreachable!("source state must exist")
+        }
     }
 
     fn activate_ban(&self, source: &mut SourceState, now: Instant) {
@@ -243,10 +247,8 @@ fn prune_source_state(source: &mut SourceState, now: Instant, window: Duration) 
 }
 
 fn evict_oldest_source(sources: &mut BTreeMap<String, SourceState>) {
-    let oldest_key = sources
-        .iter()
-        .min_by_key(|(_, state)| state.last_seen)
-        .map(|(key, _)| key.clone());
+    let oldest_key =
+        sources.iter().min_by_key(|(_, state)| state.last_seen).map(|(key, _)| key.clone());
     if let Some(oldest_key) = oldest_key {
         sources.remove(&oldest_key);
     }
@@ -269,16 +271,8 @@ fn normalize_source_key(ip: IpAddr, aggregation: SourceAggregation) -> String {
         (SourceAggregation::Ipv4Subnet24, IpAddr::V6(ipv6)) => ipv6.to_string(),
         (SourceAggregation::Ipv6Subnet64, IpAddr::V6(ipv6)) => {
             let segments = ipv6.segments();
-            let masked = Ipv6Addr::new(
-                segments[0],
-                segments[1],
-                segments[2],
-                segments[3],
-                0,
-                0,
-                0,
-                0,
-            );
+            let masked =
+                Ipv6Addr::new(segments[0], segments[1], segments[2], segments[3], 0, 0, 0, 0);
             format!("{masked}/64")
         }
         (SourceAggregation::Ipv6Subnet64, IpAddr::V4(ipv4)) => ipv4.to_string(),
@@ -291,8 +285,8 @@ mod tests {
     use std::thread;
 
     use super::{
-        RouteEnumerationProtectionPolicy, RouteEnumerationProtectionState,
-        RouteEnumerationProtectionSnapshot,
+        RouteEnumerationProtectionPolicy, RouteEnumerationProtectionSnapshot,
+        RouteEnumerationProtectionState,
     };
     use crate::SourceAggregation;
 

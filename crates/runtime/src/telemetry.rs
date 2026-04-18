@@ -231,6 +231,16 @@ impl RuntimeTelemetry {
                     help: String::from("Total HTTP cache entries removed by purge actions"),
                     allowed_labels: vec![TelemetryLabelKey::Scope],
                 },
+                MetricDescriptor {
+                    name: String::from("runtime_http_cache_invalidation_peer_deliveries_total"),
+                    kind: MetricKind::Counter,
+                    help: String::from("Total peer delivery outcomes for distributed HTTP cache invalidation by transport"),
+                    allowed_labels: vec![
+                        TelemetryLabelKey::Scope,
+                        TelemetryLabelKey::Result,
+                        TelemetryLabelKey::Reason,
+                    ],
+                },
             ])?,
             tracing_policy,
             sequence: AtomicU64::new(1),
@@ -445,14 +455,8 @@ impl RuntimeTelemetry {
             TelemetryLabel::new(TelemetryLabelKey::Result, outcome.metric_result()),
             TelemetryLabel::new(TelemetryLabelKey::Reason, reason),
         ];
-        self.metrics
-            .increment_counter("runtime_http_cache_requests_total", labels.clone(), 1)?;
-        self.collector.push_event(TelemetryEvent::new(
-            outcome.event_code(),
-            scope,
-            detail,
-            labels,
-        ));
+        self.metrics.increment_counter("runtime_http_cache_requests_total", labels.clone(), 1)?;
+        self.collector.push_event(TelemetryEvent::new(outcome.event_code(), scope, detail, labels));
         Ok(())
     }
 
@@ -503,10 +507,28 @@ impl RuntimeTelemetry {
         self.collector.push_event(TelemetryEvent::new(
             TelemetryEventCode::CachePurged,
             scope,
-            &format!("purged {purged_entries} cache entries"),
+            format!("purged {purged_entries} cache entries"),
             labels,
         ));
         Ok(())
+    }
+
+    pub fn record_http_cache_invalidation_delivery(
+        &self,
+        scope: &str,
+        transport: &str,
+        result: &str,
+        peer_count: usize,
+    ) -> Result<(), TelemetryError> {
+        self.metrics.increment_counter(
+            "runtime_http_cache_invalidation_peer_deliveries_total",
+            vec![
+                TelemetryLabel::new(TelemetryLabelKey::Scope, scope),
+                TelemetryLabel::new(TelemetryLabelKey::Result, result),
+                TelemetryLabel::new(TelemetryLabelKey::Reason, transport),
+            ],
+            peer_count as u64,
+        )
     }
 
     #[must_use]

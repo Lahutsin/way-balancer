@@ -18,7 +18,7 @@ fi
 
 mkdir -p "$coverage_dir"
 
-cargo llvm-cov --workspace --all-features --lcov --output-path "$lcov_path"
+cargo llvm-cov --workspace --all-features --jobs 1 --lcov --output-path "$lcov_path" -- --test-threads=1
 
 awk -v threshold="$min_file_coverage" -v root="$workspace_root" '
 function normalize(path) {

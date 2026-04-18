@@ -4,8 +4,8 @@ use std::error::Error;
 use std::fs;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -130,8 +130,9 @@ fn control_plane_signer() -> Result<lb_config_model::ArtifactSigner, Box<dyn Err
 }
 
 fn required_env(name: &str) -> Result<String, Box<dyn Error>> {
-    std::env::var(name)
-        .map_err(|error| format!("required environment variable {name} is missing or invalid: {error}").into())
+    std::env::var(name).map_err(|error| {
+        format!("required environment variable {name} is missing or invalid: {error}").into()
+    })
 }
 
 fn admin_bearer_secret() -> Result<String, Box<dyn Error>> {
@@ -172,9 +173,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         RunMode::Smoke => smoke_main(),
         RunMode::Serve => {
             let serve_args = parse_serve_args(&arguments[1..])?;
-            let runtime = tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()?;
+            let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
             runtime.block_on(serve_main(&serve_args))
         }
     }
@@ -197,9 +196,7 @@ fn parse_serve_args(arguments: &[String]) -> Result<ServeArgs, Box<dyn Error>> {
 
         match argument.as_str() {
             "--config" => {
-                let path = arguments
-                    .get(index + 1)
-                    .ok_or("--config requires a path argument")?;
+                let path = arguments.get(index + 1).ok_or("--config requires a path argument")?;
                 serve_args.config_path = Some(path.clone());
                 index += 2;
             }
@@ -331,21 +328,29 @@ fn serve_runtime_config_from_workspace(
             .upstream_clusters
             .iter()
             .find(|cluster| cluster.name == route.upstream_cluster)
-            .ok_or_else(|| format!("route {} references unknown upstream cluster {}", route.name, route.upstream_cluster))?;
+            .ok_or_else(|| {
+                format!(
+                    "route {} references unknown upstream cluster {}",
+                    route.name, route.upstream_cluster
+                )
+            })?;
         if cluster.endpoints.is_empty() {
-            return Err(
-                format!("upstream cluster {} must declare at least one endpoint", cluster.name)
-                    .into(),
-            );
+            return Err(format!(
+                "upstream cluster {} must declare at least one endpoint",
+                cluster.name
+            )
+            .into());
         }
 
         route_rules.push(compiled_route.clone());
-        route_upstreams.extend(cluster.endpoints.iter().map(|endpoint| lb_runtime::Http1RouteUpstream {
-            route_label: route.name.clone(),
-            upstream: lb_net_core::UpstreamTarget::new(
-                format!("{}:{}", cluster.name, endpoint.id),
-                endpoint.address,
-            ),
+        route_upstreams.extend(cluster.endpoints.iter().map(|endpoint| {
+            lb_runtime::Http1RouteUpstream {
+                route_label: route.name.clone(),
+                upstream: lb_net_core::UpstreamTarget::new(
+                    format!("{}:{}", cluster.name, endpoint.id),
+                    endpoint.address,
+                ),
+            }
         }));
     }
 
@@ -427,7 +432,9 @@ fn compile_anonymous_source_filter(
     }))
 }
 
-fn resolve_serve_runtime_config(serve_args: &ServeArgs) -> Result<ServeRuntimeConfig, Box<dyn Error>> {
+fn resolve_serve_runtime_config(
+    serve_args: &ServeArgs,
+) -> Result<ServeRuntimeConfig, Box<dyn Error>> {
     if let Some(config_path) = serve_args.config_path.as_deref() {
         let config = load_workspace_config(config_path)?;
         let mut runtime_config = serve_runtime_config_from_workspace(&config)?;
@@ -450,7 +457,9 @@ fn resolve_serve_runtime_config(serve_args: &ServeArgs) -> Result<ServeRuntimeCo
 
 fn curl_hint_addr(address: SocketAddr) -> SocketAddr {
     match address.ip() {
-        IpAddr::V4(ip) if ip.is_unspecified() => SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), address.port()),
+        IpAddr::V4(ip) if ip.is_unspecified() => {
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), address.port())
+        }
         _ => address,
     }
 }
@@ -476,7 +485,8 @@ async fn serve_main(serve_args: &ServeArgs) -> Result<(), Box<dyn Error>> {
         None
     };
 
-    let state = Arc::new(DemoServeState::new(public_addr, admin_addr, runtime_config.upstream_addr));
+    let state =
+        Arc::new(DemoServeState::new(public_addr, admin_addr, runtime_config.upstream_addr));
     let mut proxy_config = lb_runtime::Http1ProxyConfig::new(lb_net_core::UpstreamTarget::new(
         "demo-upstream",
         runtime_config.upstream_addr,
@@ -503,11 +513,8 @@ async fn serve_main(serve_args: &ServeArgs) -> Result<(), Box<dyn Error>> {
         proxy_config = proxy_config.with_anonymous_source_filter(filter);
     }
 
-    let public_task = tokio::spawn(run_public_proxy_listener(
-        public_listener,
-        proxy_config,
-        Arc::clone(&state),
-    ));
+    let public_task =
+        tokio::spawn(run_public_proxy_listener(public_listener, proxy_config, Arc::clone(&state)));
     let admin_task = tokio::spawn(run_admin_listener(
         admin_listener,
         Arc::clone(&state),
@@ -516,10 +523,7 @@ async fn serve_main(serve_args: &ServeArgs) -> Result<(), Box<dyn Error>> {
 
     println!(
         "lb-dataplane serve mode ready ({}): public=http://{} admin=http://{} upstream={}",
-        runtime_config.source_label,
-        public_addr,
-        admin_addr,
-        runtime_config.upstream_addr
+        runtime_config.source_label, public_addr, admin_addr, runtime_config.upstream_addr
     );
     println!("try: curl http://{}/", curl_hint_addr(public_addr));
     println!(
@@ -652,11 +656,7 @@ where
     let (status, content_type, body) = match request.target.as_str() {
         "/healthz" => ("200 OK", "text/plain; charset=utf-8", String::from("ok\n")),
         "/status" => ("200 OK", "application/json", state.status_body().await),
-        _ => (
-            "404 Not Found",
-            "text/plain; charset=utf-8",
-            String::from("not found\n"),
-        ),
+        _ => ("404 Not Found", "text/plain; charset=utf-8", String::from("not found\n")),
     };
     write_http_response_with_headers(stream, status, content_type, &[], body.as_bytes()).await
 }
@@ -687,6 +687,15 @@ async fn read_http_request_head<S>(stream: &mut S) -> io::Result<Option<DemoRequ
 where
     S: AsyncRead + Unpin,
 {
+    read_http_request_head_and_body(stream).await.map(|request| request.map(|(head, _body)| head))
+}
+
+async fn read_http_request_head_and_body<S>(
+    stream: &mut S,
+) -> io::Result<Option<(DemoRequestHead, Vec<u8>)>>
+where
+    S: AsyncRead + Unpin,
+{
     let mut buffer = Vec::new();
     let mut chunk = [0_u8; 1024];
 
@@ -703,7 +712,22 @@ where
         if let Some(index) = find_double_crlf(&buffer) {
             let head = std::str::from_utf8(&buffer[..index])
                 .map_err(|_| io::Error::other("request head is not valid UTF-8"))?;
-            return parse_request_head(head).map(Some);
+            let request = parse_request_head(head)?;
+            let header_len = index + 4;
+            let content_length = request_content_length(&request)?;
+            let mut body = buffer[header_len..].to_vec();
+            while body.len() < content_length {
+                let bytes_read = stream.read(&mut chunk).await?;
+                if bytes_read == 0 {
+                    return Err(io::Error::other("unexpected EOF while reading HTTP request body"));
+                }
+                body.extend_from_slice(&chunk[..bytes_read]);
+                if body.len() > 64 * 1024 {
+                    return Err(io::Error::other("HTTP request body exceeded demo limit"));
+                }
+            }
+            body.truncate(content_length);
+            return Ok(Some((request, body)));
         }
 
         if buffer.len() > 16 * 1024 {
@@ -718,19 +742,11 @@ fn find_double_crlf(buffer: &[u8]) -> Option<usize> {
 
 fn parse_request_head(head: &str) -> io::Result<DemoRequestHead> {
     let mut lines = head.split("\r\n");
-    let request_line = lines
-        .next()
-        .ok_or_else(|| io::Error::other("missing request line"))?;
+    let request_line = lines.next().ok_or_else(|| io::Error::other("missing request line"))?;
     let mut parts = request_line.split_whitespace();
-    let method = parts
-        .next()
-        .ok_or_else(|| io::Error::other("missing request method"))?;
-    let target = parts
-        .next()
-        .ok_or_else(|| io::Error::other("missing request target"))?;
-    let version = parts
-        .next()
-        .ok_or_else(|| io::Error::other("missing request version"))?;
+    let method = parts.next().ok_or_else(|| io::Error::other("missing request method"))?;
+    let target = parts.next().ok_or_else(|| io::Error::other("missing request target"))?;
+    let version = parts.next().ok_or_else(|| io::Error::other("missing request version"))?;
     if version != "HTTP/1.1" && version != "HTTP/1.0" {
         return Err(io::Error::other("unsupported request version"));
     }
@@ -763,10 +779,7 @@ fn parse_header_line(header_line: &str) -> io::Result<DemoHeader> {
     if name.is_empty() {
         return Err(io::Error::other("request header name must not be empty"));
     }
-    Ok(DemoHeader {
-        name: String::from(name),
-        value: String::from(value.trim()),
-    })
+    Ok(DemoHeader { name: String::from(name), value: String::from(value.trim()) })
 }
 
 fn parse_authorization_bearer(header_line: &str) -> Option<String> {
@@ -787,6 +800,13 @@ fn parse_authorization_bearer(header_line: &str) -> Option<String> {
     }
 
     Some(String::from(token))
+}
+
+fn request_content_length(request: &DemoRequestHead) -> io::Result<usize> {
+    let Some(value) = request.header_value("content-length") else {
+        return Ok(0);
+    };
+    value.parse::<usize>().map_err(|_| io::Error::other("invalid content-length header"))
 }
 
 fn reject_duplicate_security_headers(headers: &[DemoHeader]) -> io::Result<()> {
@@ -857,24 +877,22 @@ where
 }
 
 fn escape_json_string(input: &str) -> String {
-    input
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
+    input.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        DemoServeState, RunMode, ServeArgs, constant_time_eq, curl_hint_addr,
-        escape_json_string, parse_authorization_bearer, parse_port_env, parse_request_head,
-        parse_serve_args, read_http_request_head, resolve_serve_runtime_config,
-        run_admin_listener, run_demo_upstream_listener, run_mode, run_public_proxy_listener,
-        serve_admin_http, serve_demo_upstream_http, serve_runtime_config_from_workspace,
+        constant_time_eq, curl_hint_addr, escape_json_string, parse_authorization_bearer,
+        parse_port_env, parse_request_head, parse_serve_args, read_http_request_head,
+        read_http_request_head_and_body, resolve_serve_runtime_config, run_admin_listener,
+        run_demo_upstream_listener, run_mode, run_public_proxy_listener, serve_admin_http,
+        serve_demo_upstream_http, serve_runtime_config_from_workspace, DemoServeState, RunMode,
+        ServeArgs,
     };
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-    use std::sync::Arc;
     use std::sync::atomic::Ordering;
+    use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
 
@@ -886,8 +904,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_serve_args_supports_flag_and_env_override(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn parse_serve_args_supports_flag_and_env_override() -> Result<(), Box<dyn std::error::Error>> {
         std::env::remove_var("LB_CONFIG_PATH");
         assert_eq!(parse_serve_args(&[])?, ServeArgs { config_path: None });
 
@@ -961,16 +978,15 @@ mod tests {
 
     #[test]
     fn parse_request_head_rejects_duplicate_security_sensitive_headers() {
-        let error = parse_request_head(
-            concat!(
-                "GET /status HTTP/1.1\r\n",
-                "Host: localhost\r\n",
-                "Authorization: Bearer one\r\n",
-                "Authorization: Bearer two"
-            ),
-        )
-        .expect_err("duplicate authorization header must be rejected");
-        assert!(error.to_string().contains("duplicate security-sensitive header authorization"));
+        let result = parse_request_head(concat!(
+            "GET /status HTTP/1.1\r\n",
+            "Host: localhost\r\n",
+            "Authorization: Bearer one\r\n",
+            "Authorization: Bearer two"
+        ));
+        assert!(result.as_ref().is_err_and(|error| {
+            error.to_string().contains("duplicate security-sensitive header authorization")
+        }));
     }
 
     #[test]
@@ -1148,6 +1164,28 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn read_http_request_head_and_body_reads_json_payload(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        let request = async {
+            tokio::io::AsyncWriteExt::write_all(
+                &mut client,
+                b"POST /cache/purge HTTP/1.1\r\nHost: localhost\r\nContent-Length: 11\r\n\r\n{\"scope\":1}",
+            )
+            .await?;
+            tokio::io::AsyncWriteExt::shutdown(&mut client).await
+        };
+        let read = read_http_request_head_and_body(&mut server);
+        let ((), parsed) = tokio::try_join!(request, read)?;
+
+        let (parsed, body) = parsed.ok_or("request should be present")?;
+        assert_eq!(parsed.method, "POST");
+        assert_eq!(parsed.target, "/cache/purge");
+        assert_eq!(std::str::from_utf8(&body)?, "{\"scope\":1}");
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn admin_http_requires_authorization_and_exposes_status(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let state = Arc::new(DemoServeState::new(
@@ -1170,11 +1208,8 @@ mod tests {
         let unauthorized_serve = serve_admin_http(&mut unauthorized_server, &state, "admin-secret");
         let ((), ()) = tokio::try_join!(unauthorized_write, unauthorized_serve)?;
         let mut unauthorized_response = Vec::new();
-        tokio::io::AsyncReadExt::read_to_end(
-            &mut unauthorized_client,
-            &mut unauthorized_response,
-        )
-        .await?;
+        tokio::io::AsyncReadExt::read_to_end(&mut unauthorized_client, &mut unauthorized_response)
+            .await?;
         let unauthorized_response = String::from_utf8(unauthorized_response)?;
         assert!(unauthorized_response.starts_with("HTTP/1.1 401 Unauthorized"));
         assert!(unauthorized_response.contains("WWW-Authenticate: Bearer"));

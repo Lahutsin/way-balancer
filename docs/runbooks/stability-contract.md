@@ -17,6 +17,7 @@ The project does not claim cross-release-line compatibility in production eviden
 The following surfaces are considered stable within `0.1.x` unless this document and the compatibility runbooks are updated explicitly:
 
 - typed `WorkspaceConfig` input using supported `api_version` values exposed by `RuntimeMetadata`
+- opt-in upstream affinity policies under `upstream_clusters[].traffic_policy.affinity`
 - compiled snapshot publication, attestation, rollout, and rollback flows
 - operator runbooks referenced by release evidence and runtime metadata
 - admin and dataplane behaviors already documented as required production workflows

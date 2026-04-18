@@ -1,3 +1,5 @@
+#![allow(clippy::never_loop)]
+
 use std::fs;
 use std::future::poll_fn;
 use std::io;
@@ -17,6 +19,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 use tokio::time;
+
+const SOAK_IDLE_TIMEOUT: Duration = Duration::from_millis(150);
+const SOAK_STALL_DELAY: Duration = Duration::from_millis(300);
 
 #[derive(Clone, Copy, Debug)]
 enum Http1ChaosScenario {
@@ -52,7 +57,7 @@ async fn http1_upstream_flap_chaos_soak_keeps_fd_growth_bounded(
         };
         let upstream_addr = spawn_http1_chaos_upstream(scenario).await?;
         let mut config = http1_proxy_config(upstream_addr);
-        config.timeouts.idle_timeout = Duration::from_millis(75);
+        config.timeouts.idle_timeout = SOAK_IDLE_TIMEOUT;
         let (proxy_addr, report_rx) = spawn_one_shot_http1_proxy_listener(config).await?;
 
         let mut client = TcpStream::connect(proxy_addr).await?;
@@ -138,7 +143,7 @@ async fn http2_upstream_flap_chaos_soak_keeps_fd_growth_bounded(
             _ => spawn_http2_chaos_upstream(scenario).await?,
         };
         let mut config = http2_proxy_config(upstream_addr);
-        config.timeouts.idle_timeout = Duration::from_millis(75);
+        config.timeouts.idle_timeout = SOAK_IDLE_TIMEOUT;
         let (proxy_addr, report_rx) = spawn_one_shot_http2_proxy_listener(config).await?;
 
         let mut client = connect_h2_client(proxy_addr).await?;
@@ -225,7 +230,7 @@ async fn spawn_http1_chaos_upstream(scenario: Http1ChaosScenario) -> io::Result<
                 drop(stream);
             }
             Http1ChaosScenario::StallBeforeResponse => {
-                time::sleep(Duration::from_millis(125)).await;
+                time::sleep(SOAK_STALL_DELAY).await;
             }
             Http1ChaosScenario::DegradedResponse => {
                 let _ = write_http1_in_chunks(
@@ -284,7 +289,7 @@ async fn spawn_http2_chaos_upstream(scenario: Http2ChaosScenario) -> io::Result<
                     respond.send_reset(Reason::CANCEL);
                 }
                 Http2ChaosScenario::StallBeforeResponse => {
-                    time::sleep(Duration::from_millis(125)).await;
+                    time::sleep(SOAK_STALL_DELAY).await;
                 }
                 Http2ChaosScenario::DegradedResponse => unreachable!("handled by stable helper"),
             }
@@ -341,10 +346,7 @@ async fn read_http_response(stream: &mut TcpStream) -> io::Result<String> {
         let mut chunk = vec![0_u8; (content_length - body.len()).min(8192)];
         let bytes_read = stream.read(&mut chunk).await?;
         if bytes_read == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "response body truncated",
-            ));
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "response body truncated"));
         }
         body.extend_from_slice(&chunk[..bytes_read]);
     }
@@ -376,9 +378,7 @@ async fn read_until_sequence(
 }
 
 fn parse_content_length(head: &str) -> io::Result<usize> {
-    let line = head
-        .lines()
-        .find(|line| line.to_ascii_lowercase().starts_with("content-length:"));
+    let line = head.lines().find(|line| line.to_ascii_lowercase().starts_with("content-length:"));
     let Some(line) = line else {
         return Ok(0);
     };
@@ -434,10 +434,9 @@ async fn spawn_one_shot_http2_proxy_listener(
     tokio::spawn(async move {
         let result = match listener.accept().await {
             Ok((downstream, _)) => proxy_http2_connection(downstream, &config).await,
-            Err(error) => Err(Http2ProxyError::Connect {
-                target: config.upstream.address,
-                source: error,
-            }),
+            Err(error) => {
+                Err(Http2ProxyError::Connect { target: config.upstream.address, source: error })
+            }
         };
         let _ = result_tx.send(result);
     });
@@ -462,11 +461,8 @@ async fn send_h2_request(
     body: Option<Bytes>,
 ) -> Result<h2::client::ResponseFuture, h2::Error> {
     poll_fn(|cx| client.poll_ready(cx)).await?;
-    let request = Request::builder()
-        .method("GET")
-        .uri(path)
-        .body(())
-        .map_err(|_| Reason::INTERNAL_ERROR)?;
+    let request =
+        Request::builder().method("GET").uri(path).body(()).map_err(|_| Reason::INTERNAL_ERROR)?;
     let end_stream = body.is_none();
     let (response, mut send_stream) = client.send_request(request, end_stream)?;
     if let Some(mut body) = body {
@@ -476,7 +472,9 @@ async fn send_h2_request(
             let capacity = loop {
                 send_stream.reserve_capacity(next_len);
                 let capacity = poll_fn(|cx| match send_stream.poll_capacity(cx) {
-                    std::task::Poll::Ready(Some(Ok(capacity))) => std::task::Poll::Ready(Ok(capacity)),
+                    std::task::Poll::Ready(Some(Ok(capacity))) => {
+                        std::task::Poll::Ready(Ok(capacity))
+                    }
                     std::task::Poll::Ready(Some(Err(error))) => std::task::Poll::Ready(Err(error)),
                     std::task::Poll::Ready(None) => {
                         std::task::Poll::Ready(Err(h2::Error::from(Reason::INTERNAL_ERROR)))
@@ -517,12 +515,12 @@ async fn receive_http2_proxy_result(
 ) -> Result<Http2ConnectionReport, Http2ProxyError> {
     match time::timeout(Duration::from_secs(2), result_rx).await {
         Ok(Ok(result)) => result,
-        Ok(Err(_)) => Err(Http2ProxyError::DownstreamConnection(h2::Error::from(
-            Reason::INTERNAL_ERROR,
-        ))),
-        Err(_) => Err(Http2ProxyError::DownstreamConnection(h2::Error::from(
-            Reason::INTERNAL_ERROR,
-        ))),
+        Ok(Err(_)) => {
+            Err(Http2ProxyError::DownstreamConnection(h2::Error::from(Reason::INTERNAL_ERROR)))
+        }
+        Err(_) => {
+            Err(Http2ProxyError::DownstreamConnection(h2::Error::from(Reason::INTERNAL_ERROR)))
+        }
     }
 }
 

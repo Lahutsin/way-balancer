@@ -7,9 +7,9 @@ use lb_net_core::{
     UpstreamEndpointId,
 };
 use lb_runtime::{
-    EndpointHealthPolicy, EndpointHealthStatus, LoadBalancingAlgorithm, LocalityRoutingPolicy,
-    NoHealthyFallback, SelectionContext, UpstreamBalancer, UpstreamHealthRegistry,
-    UpstreamSelectionError, UpstreamSelectionPolicy,
+    AffinityFallbackPolicy, AffinityPolicy, EndpointHealthPolicy, EndpointHealthStatus,
+    LoadBalancingAlgorithm, LocalityRoutingPolicy, NoHealthyFallback, SelectionContext,
+    UpstreamBalancer, UpstreamHealthRegistry, UpstreamSelectionError, UpstreamSelectionPolicy,
 };
 
 fn endpoint(
@@ -88,6 +88,7 @@ fn weighted_round_robin_respects_effective_weights() -> Result<(), Box<dyn std::
         algorithm: LoadBalancingAlgorithm::WeightedRoundRobin,
         locality: LocalityRoutingPolicy::Disabled,
         no_healthy_fallback: NoHealthyFallback::Fail,
+        affinity: None,
     };
     let context = SelectionContext::default();
     let mut counts = BTreeMap::new();
@@ -120,10 +121,12 @@ fn locality_preference_narrows_candidate_pool() -> Result<(), Box<dyn std::error
         algorithm: LoadBalancingAlgorithm::RoundRobin,
         locality: LocalityRoutingPolicy::PreferLocalityThenZone,
         no_healthy_fallback: NoHealthyFallback::Fail,
+        affinity: None,
     };
     let context = SelectionContext {
         preferred_locality: Some(String::from("l1")),
         preferred_zone: Some(String::from("z1")),
+        affinity_key: None,
         request_hash: 7,
     };
 
@@ -133,6 +136,93 @@ fn locality_preference_narrows_candidate_pool() -> Result<(), Box<dyn std::error
     assert!(selected.locality_matched);
     assert_eq!(balancer.metrics().locality_preference_hit_count, 1);
 
+    Ok(())
+}
+
+#[test]
+fn affinity_selection_is_deterministic_for_same_key() -> Result<(), Box<dyn std::error::Error>> {
+    let registry = UpstreamHealthRegistry::new(health_policy());
+    let balancer = UpstreamBalancer::new();
+    let cluster_name = UpstreamClusterName::new("sessions")?;
+    registry.insert_cluster(UpstreamCluster::new(
+        cluster_name.clone(),
+        vec![endpoint("a", 8080, 1, None, None)?, endpoint("b", 8081, 1, None, None)?],
+    )?)?;
+
+    let policy = UpstreamSelectionPolicy {
+        algorithm: LoadBalancingAlgorithm::RoundRobin,
+        locality: LocalityRoutingPolicy::Disabled,
+        no_healthy_fallback: NoHealthyFallback::Fail,
+        affinity: Some(AffinityPolicy::HeaderHash {
+            header_name: String::from("x-session"),
+            fallback: AffinityFallbackPolicy::BalanceHealthy,
+        }),
+    };
+
+    let first = balancer.select_endpoint(
+        &registry,
+        &cluster_name,
+        &policy,
+        &SelectionContext {
+            affinity_key: Some(String::from("session-a")),
+            request_hash: 7,
+            ..SelectionContext::default()
+        },
+    )?;
+    let second = balancer.select_endpoint(
+        &registry,
+        &cluster_name,
+        &policy,
+        &SelectionContext {
+            affinity_key: Some(String::from("session-a")),
+            request_hash: 11,
+            ..SelectionContext::default()
+        },
+    )?;
+
+    assert_eq!(first.endpoint_id, second.endpoint_id);
+    assert_eq!(balancer.metrics().affinity_hit_count, 2);
+    assert_eq!(balancer.metrics().affinity_fallback_count, 0);
+    Ok(())
+}
+
+#[test]
+fn affinity_falls_back_when_preferred_endpoint_is_unhealthy(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let registry = UpstreamHealthRegistry::new(health_policy());
+    let balancer = UpstreamBalancer::new();
+    let cluster_name = UpstreamClusterName::new("sessions")?;
+    registry.insert_cluster(UpstreamCluster::new(
+        cluster_name.clone(),
+        vec![endpoint("a", 8080, 1, None, None)?, endpoint("b", 8081, 1, None, None)?],
+    )?)?;
+
+    let policy = UpstreamSelectionPolicy {
+        algorithm: LoadBalancingAlgorithm::RoundRobin,
+        locality: LocalityRoutingPolicy::Disabled,
+        no_healthy_fallback: NoHealthyFallback::Fail,
+        affinity: Some(AffinityPolicy::HeaderHash {
+            header_name: String::from("x-session"),
+            fallback: AffinityFallbackPolicy::BalanceHealthy,
+        }),
+    };
+    let context = SelectionContext {
+        affinity_key: Some(String::from("session-a")),
+        request_hash: 7,
+        ..SelectionContext::default()
+    };
+
+    let preferred = balancer.select_endpoint(&registry, &cluster_name, &policy, &context)?;
+    let _ = registry.note_active_failure(&cluster_name, &preferred.endpoint_id)?;
+    let _ = registry.note_active_failure(&cluster_name, &preferred.endpoint_id)?;
+
+    let selected = balancer.select_endpoint(&registry, &cluster_name, &policy, &context)?;
+
+    assert_ne!(selected.endpoint_id, preferred.endpoint_id);
+    assert_eq!(selected.health_status, EndpointHealthStatus::Healthy);
+    assert_eq!(balancer.metrics().affinity_hit_count, 1);
+    assert_eq!(balancer.metrics().affinity_fallback_count, 1);
+    assert_eq!(balancer.metrics().round_robin_selection_count, 1);
     Ok(())
 }
 
@@ -158,6 +248,7 @@ fn all_unhealthy_fallback_is_explicit() -> Result<(), Box<dyn std::error::Error>
         algorithm: LoadBalancingAlgorithm::RoundRobin,
         locality: LocalityRoutingPolicy::Disabled,
         no_healthy_fallback: NoHealthyFallback::IncludeUnhealthy,
+        affinity: None,
     };
     let selected =
         balancer.select_endpoint(&registry, &cluster_name, &fallback_policy, &context)?;
@@ -187,13 +278,19 @@ fn power_of_two_choices_prefers_stronger_candidate() -> Result<(), Box<dyn std::
         algorithm: LoadBalancingAlgorithm::PowerOfTwoChoices,
         locality: LocalityRoutingPolicy::Disabled,
         no_healthy_fallback: NoHealthyFallback::Fail,
+        affinity: None,
     };
 
     let selected = balancer.select_endpoint(
         &registry,
         &cluster_name,
         &policy,
-        &SelectionContext { preferred_locality: None, preferred_zone: None, request_hash: 42 },
+        &SelectionContext {
+            preferred_locality: None,
+            preferred_zone: None,
+            affinity_key: None,
+            request_hash: 42,
+        },
     )?;
 
     assert_ne!(selected.endpoint_id.as_str(), "a");

@@ -49,15 +49,25 @@ The runtime is fail-closed for request `Cookie` and unsafe origin `Vary` handlin
 
 If you need multi-node convergence, use the distributed invalidation flow described in `docs/runbooks/cache-invalidation.md`. Without that opt-in wiring, purge remains local to the current process.
 
+For cross-process or cross-host deployments, the current production-oriented path is HTTP peer fan-out from `HttpCacheAdminService`. That path is best-effort: the initiating node purges locally first, then pushes a signed invalidation event to each configured peer, and reports any partial failure back to the operator instead of pretending the cluster converged.
+
 ## Observability And Diagnostics
 
 The cache emits bounded metrics and events only. Operators should rely on:
 
 - request outcomes such as hit, miss, stale-hit, fill, bypass, purge, and revalidation
 - occupancy counters and object-size gauges
+- invalidation fan-out counters such as `runtime_http_cache_invalidation_peer_deliveries_total` with `result=success|duplicate|failed` and `reason=http_peer|in_memory_bus`
 - support-bundle `cache.txt` diagnostics when cache diagnostics collection is enabled
 
 Do not expect per-key metrics or raw cache-key dumps. That limitation is intentional to prevent high-cardinality telemetry and accidental exposure of sensitive request material.
+
+For purge workflows, treat the admin response as part of the operator contract:
+
+- `purged_entries` is the initiating node's local purge result.
+- `fanout_delivery_success_count` and `fanout_delivery_failure_count` indicate whether remote convergence was complete.
+- `fanout_failed_targets` provides bounded peer failure detail suitable for tickets and paging notes.
+- `degraded = true` means retry or follow-up is required before considering the cluster converged.
 
 ## Capacity Pressure And Failure Modes
 
@@ -70,6 +80,7 @@ Do not expect per-key metrics or raw cache-key dumps. That limitation is intenti
 
 - Roll out cache policy changes conservatively and prefer one named policy per traffic class rather than one global catch-all cache.
 - Enable purge only where the operating team actually has a purge workflow.
+- For multi-instance caches, start with a small peer set and verify signed invalidation delivery plus degraded alert handling before broad rollout.
 - Change storage bounds and TTL policy before enabling broader traffic classes, not after observing memory pressure in production.
 - Re-run `cargo test -p lb-test-support --test example_configs` after editing checked-in cache examples.
 - Examples that keep `security.artifact_verification.mode = enforced` still require trusted signer injection during the real publish/apply flow; they are not production-complete until the control plane supplies `trusted_signers`.

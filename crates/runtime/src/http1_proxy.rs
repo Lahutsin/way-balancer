@@ -6,10 +6,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::{
-    AnonymousSourceFilterPolicy, AnonymousSourceFilterState, build_http_cache_key_material,
-    HttpCacheEntry, HttpCacheHeader, HttpCacheKey,
-    HttpCacheMetadata, HttpCacheRequest, HttpCacheRequestOutcome,
-    HttpCacheRevalidationResult, HttpCacheStore, ProtocolAnomalyCategory,
+    build_http_cache_key_material, AnonymousSourceFilterPolicy, AnonymousSourceFilterState,
+    HttpCacheEntry, HttpCacheHeader, HttpCacheKey, HttpCacheMetadata, HttpCacheRequest,
+    HttpCacheRequestOutcome, HttpCacheRevalidationResult, HttpCacheStore, ProtocolAnomalyCategory,
     RouteEnumerationProtectionPolicy, RouteEnumerationProtectionState, RuntimeTelemetry,
     SlowClientStage, TrustedClientIpPolicy,
 };
@@ -74,10 +73,7 @@ pub struct HttpCacheTelemetryConfig {
 impl Http1ResponseCacheConfig {
     /// Creates a reusable HTTP/1 response-cache runtime.
     #[must_use]
-    pub fn new(
-        policy: lb_config_model::HttpCachePolicyConfig,
-        store: Arc<HttpCacheStore>,
-    ) -> Self {
+    pub fn new(policy: lb_config_model::HttpCachePolicyConfig, store: Arc<HttpCacheStore>) -> Self {
         Self { policy, store, telemetry: None }
     }
 
@@ -87,10 +83,7 @@ impl Http1ResponseCacheConfig {
         scope: impl Into<String>,
         telemetry: Arc<RuntimeTelemetry>,
     ) -> Self {
-        self.telemetry = Some(HttpCacheTelemetryConfig {
-            scope: scope.into(),
-            telemetry,
-        });
+        self.telemetry = Some(HttpCacheTelemetryConfig { scope: scope.into(), telemetry });
         self
     }
 }
@@ -345,23 +338,26 @@ where
             break;
         };
 
-        let effective_client_ip = match resolve_effective_client_ip(config, downstream_addr, &request)
-        {
-            Ok(ip) => ip,
-            Err(_) => {
-                write_local_response(
-                    &mut downstream,
-                    false,
-                    StatusCode::BAD_REQUEST,
-                    "invalid forwarding headers\n",
-                )
-                .await
-                .map_err(Http1ProxyError::ResponseIo)?;
-                metrics.request_count += 1;
-                *metrics.response_status_counts.entry(StatusCode::BAD_REQUEST.as_u16()).or_insert(0) += 1;
-                break;
-            }
-        };
+        let effective_client_ip =
+            match resolve_effective_client_ip(config, downstream_addr, &request) {
+                Ok(ip) => ip,
+                Err(_) => {
+                    write_local_response(
+                        &mut downstream,
+                        false,
+                        StatusCode::BAD_REQUEST,
+                        "invalid forwarding headers\n",
+                    )
+                    .await
+                    .map_err(Http1ProxyError::ResponseIo)?;
+                    metrics.request_count += 1;
+                    *metrics
+                        .response_status_counts
+                        .entry(StatusCode::BAD_REQUEST.as_u16())
+                        .or_insert(0) += 1;
+                    break;
+                }
+            };
         let effective_downstream_addr =
             SocketAddr::new(effective_client_ip, downstream_addr.port());
 
@@ -419,14 +415,15 @@ where
             RequestUpstreamResolution::Reject(status, reason) => {
                 let blocked = status == StatusCode::FORBIDDEN
                     && record_unmatched_route(config, effective_downstream_addr);
-                let response_reason = if blocked {
-                    "source temporarily blocked\n"
-                } else {
-                    reason
-                };
-                write_local_response(&mut downstream, request.keep_alive && !blocked, status, response_reason)
-                    .await
-                    .map_err(Http1ProxyError::ResponseIo)?;
+                let response_reason = if blocked { "source temporarily blocked\n" } else { reason };
+                write_local_response(
+                    &mut downstream,
+                    request.keep_alive && !blocked,
+                    status,
+                    response_reason,
+                )
+                .await
+                .map_err(Http1ProxyError::ResponseIo)?;
                 metrics.request_count += 1;
                 *metrics.response_status_counts.entry(status.as_u16()).or_insert(0) += 1;
                 if blocked || !request.keep_alive {
@@ -440,19 +437,29 @@ where
             .response_cache
             .as_ref()
             .map_or(Duration::ZERO, |response_cache| response_cache.store.now());
-        if let Some(cache_result) = resolve_cache_request(config.response_cache.as_ref(), &request, now) {
+        if let Some(cache_result) =
+            resolve_cache_request(config.response_cache.as_ref(), &request, now)
+        {
             match cache_result {
                 CacheRequestOutcome::CacheHit { entry, outcome, reason } => {
-                    write_cached_response(&mut downstream, &request.method, request.keep_alive, &entry)
-                        .await
-                        .map_err(Http1ProxyError::ResponseIo)?;
+                    write_cached_response(
+                        &mut downstream,
+                        &request.method,
+                        request.keep_alive,
+                        entry.as_ref(),
+                    )
+                    .await
+                    .map_err(Http1ProxyError::ResponseIo)?;
                     metrics.request_count += 1;
                     metrics.cache_hit_count += 1;
                     record_cache_request_telemetry(
                         config.response_cache.as_ref(),
                         outcome,
                         reason,
-                        &format!("served cached response with status {}", entry.metadata.status.as_u16()),
+                        &format!(
+                            "served cached response with status {}",
+                            entry.metadata.status.as_u16()
+                        ),
                     );
                     *metrics
                         .response_status_counts
@@ -463,12 +470,7 @@ where
                     }
                     continue;
                 }
-                CacheRequestOutcome::Fetch {
-                    key,
-                    stale_fallback,
-                    revalidation_entry,
-                    reason,
-                } => {
+                CacheRequestOutcome::Fetch { key, stale_fallback, revalidation_entry, reason } => {
                     metrics.cache_miss_count += 1;
                     record_cache_request_telemetry(
                         config.response_cache.as_ref(),
@@ -491,8 +493,8 @@ where
                         &selected_upstream.target,
                         &request,
                         key,
-                        stale_fallback.as_ref(),
-                        revalidation_entry.as_ref(),
+                        stale_fallback.as_deref(),
+                        revalidation_entry.as_deref(),
                         &mut metrics,
                         now,
                     )
@@ -501,31 +503,31 @@ where
                     match result {
                         Ok(_) => {}
                         Err(error)
-                            if stale_fallback.is_some()
-                                && error_allows_stale_if_error(&error) => {
-                                let stale_entry = stale_fallback.unwrap_or_else(|| unreachable!());
-                                let _ = upstream.take();
-                                write_cached_response(
-                                    &mut downstream,
-                                    &request.method,
-                                    request.keep_alive,
-                                    &stale_entry,
-                                )
-                                .await
-                                .map_err(Http1ProxyError::ResponseIo)?;
-                                metrics.request_count += 1;
-                                metrics.cache_hit_count += 1;
-                                record_cache_request_telemetry(
-                                    config.response_cache.as_ref(),
-                                    HttpCacheRequestOutcome::StaleHit,
-                                    "stale_if_error",
-                                    "served stale cached response after upstream failure",
-                                );
-                                *metrics
-                                    .response_status_counts
-                                    .entry(stale_entry.metadata.status.as_u16())
-                                    .or_insert(0) += 1;
-                            }
+                            if stale_fallback.is_some() && error_allows_stale_if_error(&error) =>
+                        {
+                            let stale_entry = stale_fallback.unwrap_or_else(|| unreachable!());
+                            let _ = upstream.take();
+                            write_cached_response(
+                                &mut downstream,
+                                &request.method,
+                                request.keep_alive,
+                                &stale_entry,
+                            )
+                            .await
+                            .map_err(Http1ProxyError::ResponseIo)?;
+                            metrics.request_count += 1;
+                            metrics.cache_hit_count += 1;
+                            record_cache_request_telemetry(
+                                config.response_cache.as_ref(),
+                                HttpCacheRequestOutcome::StaleHit,
+                                "stale_if_error",
+                                "served stale cached response after upstream failure",
+                            );
+                            *metrics
+                                .response_status_counts
+                                .entry(stale_entry.metadata.status.as_u16())
+                                .or_insert(0) += 1;
+                        }
                         Err(error) => return Err(error),
                     }
                 }
@@ -637,7 +639,10 @@ fn resolve_request_upstream(
     };
 
     if let Some(pool) = config.route_backend_pools.get(&route.label) {
-        return match pool.select_backend_with_context(&selection_context_for_request(request)) {
+        return match pool.select_backend_with_context(&selection_context_for_request(
+            request,
+            pool.affinity_policy(),
+        )) {
             Ok(route_backend) => RequestUpstreamResolution::Selected(SelectedUpstream {
                 target: route_backend.upstream().clone(),
                 route_backend: Some(route_backend),
@@ -678,10 +683,8 @@ fn select_route_upstream(
         return upstreams[0].clone();
     }
 
-    let mut cursors = config
-        .route_upstream_cursors
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut cursors =
+        config.route_upstream_cursors.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let cursor = cursors.entry(route_label.to_string()).or_insert(0);
     let index = *cursor % upstreams.len();
     *cursor = (*cursor + 1) % upstreams.len();
@@ -698,11 +701,28 @@ fn request_authority(request: &lb_proto_http::Http1RequestHead) -> Option<&str> 
 
 fn selection_context_for_request(
     request: &lb_proto_http::Http1RequestHead,
+    affinity_policy: Option<&crate::AffinityPolicy>,
 ) -> crate::SelectionContext {
     crate::SelectionContext {
         preferred_locality: request_header_value(request, "x-lb-locality").map(String::from),
         preferred_zone: request_header_value(request, "x-lb-zone").map(String::from),
+        affinity_key: request_affinity_key(request, affinity_policy),
         request_hash: stable_request_hash(request.target.as_bytes()),
+    }
+}
+
+fn request_affinity_key(
+    request: &lb_proto_http::Http1RequestHead,
+    affinity_policy: Option<&crate::AffinityPolicy>,
+) -> Option<String> {
+    match affinity_policy {
+        Some(crate::AffinityPolicy::HeaderHash { header_name, .. }) => {
+            request_header_value(request, header_name).map(String::from)
+        }
+        Some(crate::AffinityPolicy::CookieHash { cookie_name, .. }) => {
+            request_cookie_value(&request.headers, cookie_name).map(String::from)
+        }
+        None => None,
     }
 }
 
@@ -716,6 +736,28 @@ fn request_header_value<'a>(
         .find(|header| header.name.eq_ignore_ascii_case(name))
         .map(|header| header.value.trim())
         .filter(|value| !value.is_empty())
+}
+
+fn request_cookie_value<'a>(
+    headers: &'a [lb_proto_http::HttpHeader],
+    cookie_name: &str,
+) -> Option<&'a str> {
+    headers
+        .iter()
+        .filter(|header| header.name.eq_ignore_ascii_case("cookie"))
+        .find_map(|header| cookie_value_from_header(&header.value, cookie_name))
+}
+
+fn cookie_value_from_header<'a>(header_value: &'a str, cookie_name: &str) -> Option<&'a str> {
+    header_value.split(';').filter_map(|cookie| cookie.split_once('=')).find_map(|(name, value)| {
+        let name = name.trim();
+        if name == cookie_name {
+            let value = value.trim();
+            (!value.is_empty()).then_some(value)
+        } else {
+            None
+        }
+    })
 }
 
 fn resolve_effective_client_ip(
@@ -758,9 +800,10 @@ fn record_query_probe(
 }
 
 fn anonymous_source_blocked(config: &Http1ProxyConfig, client_ip: IpAddr) -> bool {
-    config.anonymous_source_filter.as_ref().is_some_and(|filter| {
-        filter.classify_and_record(client_ip).is_some()
-    })
+    config
+        .anonymous_source_filter
+        .as_ref()
+        .is_some_and(|filter| filter.classify_and_record(client_ip).is_some())
 }
 
 fn record_passive_health_result(
@@ -773,7 +816,9 @@ fn record_passive_health_result(
 
     let feedback_result = match result {
         Ok(status) if *status < 500 => route_backend.note_passive_success(),
-        Err(error) if error_is_upstream_passive_failure(error) => route_backend.note_passive_failure(),
+        Err(error) if error_is_upstream_passive_failure(error) => {
+            route_backend.note_passive_failure()
+        }
         _ => return,
     };
     let _ = feedback_result;
@@ -792,14 +837,14 @@ fn error_is_upstream_passive_failure(error: &Http1ProxyError) -> bool {
 
 enum CacheRequestOutcome {
     CacheHit {
-        entry: HttpCacheEntry,
+        entry: Box<HttpCacheEntry>,
         outcome: HttpCacheRequestOutcome,
         reason: &'static str,
     },
     Fetch {
         key: Option<HttpCacheKey>,
-        stale_fallback: Option<HttpCacheEntry>,
-        revalidation_entry: Option<HttpCacheEntry>,
+        stale_fallback: Option<Box<HttpCacheEntry>>,
+        revalidation_entry: Option<Box<HttpCacheEntry>>,
         reason: &'static str,
     },
     Bypass(&'static str),
@@ -811,8 +856,7 @@ fn resolve_cache_request(
     now: Duration,
 ) -> Option<CacheRequestOutcome> {
     let response_cache = response_cache?;
-    if !request_method_is_cache_lookup_eligible(&response_cache.policy, &request.method)
-    {
+    if !request_method_is_cache_lookup_eligible(&response_cache.policy, &request.method) {
         return Some(CacheRequestOutcome::Bypass("method_ineligible"));
     }
     if !matches!(request.body_kind, lb_proto_http::BodyKind::None) {
@@ -857,16 +901,17 @@ fn resolve_cache_request(
     match response_cache.store.lookup(now, &storage_key) {
         Some(lookup) if matches!(lookup.freshness, crate::HttpCacheFreshness::Fresh) => {
             Some(CacheRequestOutcome::CacheHit {
-                entry: lookup.entry,
+                entry: Box::new(lookup.entry),
                 outcome: HttpCacheRequestOutcome::Hit,
                 reason: "fresh",
             })
         }
         Some(lookup)
             if matches!(lookup.freshness, crate::HttpCacheFreshness::StaleWhileRevalidate)
-                && !should_revalidate_entry(&response_cache.policy, &lookup.entry) => {
+                && !should_revalidate_entry(&response_cache.policy, &lookup.entry) =>
+        {
             Some(CacheRequestOutcome::CacheHit {
-                entry: lookup.entry,
+                entry: Box::new(lookup.entry),
                 outcome: HttpCacheRequestOutcome::StaleHit,
                 reason: "stale_while_revalidate",
             })
@@ -874,15 +919,15 @@ fn resolve_cache_request(
         Some(lookup) if should_revalidate_entry(&response_cache.policy, &lookup.entry) => {
             Some(CacheRequestOutcome::Fetch {
                 key: Some(storage_key),
-                stale_fallback: Some(lookup.entry.clone()),
-                revalidation_entry: Some(lookup.entry),
+                stale_fallback: Some(Box::new(lookup.entry.clone())),
+                revalidation_entry: Some(Box::new(lookup.entry)),
                 reason: "revalidation",
             })
         }
         Some(lookup) if matches!(lookup.freshness, crate::HttpCacheFreshness::StaleIfError) => {
             Some(CacheRequestOutcome::Fetch {
                 key: Some(storage_key),
-                stale_fallback: Some(lookup.entry),
+                stale_fallback: Some(Box::new(lookup.entry)),
                 revalidation_entry: None,
                 reason: "stale_if_error_revalidation",
             })
@@ -992,7 +1037,11 @@ where
                 Ok(Ok(response)) => response,
                 Ok(Err(source)) => {
                     let error = Http1ProxyError::ParseResponse(source);
-                    drop_upstream_connection(upstream, last_upstream_activity, upstream_connected_at);
+                    drop_upstream_connection(
+                        upstream,
+                        last_upstream_activity,
+                        upstream_connected_at,
+                    );
                     if retry_stale_reuse && http1_stale_reuse_retryable_response_error(&error) {
                         retried_stale_reuse = true;
                         continue;
@@ -1000,7 +1049,11 @@ where
                     break Err(error);
                 }
                 Err(_) => {
-                    drop_upstream_connection(upstream, last_upstream_activity, upstream_connected_at);
+                    drop_upstream_connection(
+                        upstream,
+                        last_upstream_activity,
+                        upstream_connected_at,
+                    );
                     break Err(Http1ProxyError::IdleTimeout("response head"));
                 }
             };
@@ -1011,9 +1064,10 @@ where
                 &response.body_kind,
             );
             let upstream_response_status = response.status;
-            let use_stale_if_error_response = stale_fallback.is_some()
-                && is_stale_if_error_response_status(response.status);
-            let use_not_modified_revalidation = response.status == 304 && revalidation_entry.is_some();
+            let use_stale_if_error_response =
+                stale_fallback.is_some() && is_stale_if_error_response_status(response.status);
+            let use_not_modified_revalidation =
+                response.status == 304 && revalidation_entry.is_some();
             if use_not_modified_revalidation {
                 if let Some(stale_entry) = revalidation_entry {
                     let refreshed_entry = refresh_revalidated_entry(
@@ -1066,9 +1120,14 @@ where
                 }
             } else if use_stale_if_error_response {
                 if let Some(stale_entry) = stale_fallback {
-                    write_cached_response(downstream, &request.method, request.keep_alive, stale_entry)
-                        .await
-                        .map_err(Http1ProxyError::ResponseIo)?;
+                    write_cached_response(
+                        downstream,
+                        &request.method,
+                        request.keep_alive,
+                        stale_entry,
+                    )
+                    .await
+                    .map_err(Http1ProxyError::ResponseIo)?;
                     metrics.request_count += 1;
                     metrics.cache_hit_count += 1;
                     record_cache_request_telemetry(
@@ -1098,10 +1157,7 @@ where
                     &response.reason,
                     &normalized_response_headers,
                 );
-                downstream
-                    .write_all(&response_head)
-                    .await
-                    .map_err(Http1ProxyError::ResponseIo)?;
+                downstream.write_all(&response_head).await.map_err(Http1ProxyError::ResponseIo)?;
 
                 let mut filled_cache = false;
                 if let Some(response_cache) = config.response_cache.as_ref() {
@@ -1184,6 +1240,7 @@ where
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn ensure_upstream_connection(
     upstream: &mut Option<TcpStream>,
     active_upstream: &mut Option<lb_net_core::UpstreamTarget>,
@@ -1236,11 +1293,11 @@ fn upstream_connection_reuse_expired(
     upstream_connected_at: Option<Instant>,
     reuse_timeout: Duration,
 ) -> bool {
-    last_upstream_activity.is_none_or(|last_used_at| {
-        now.saturating_duration_since(last_used_at) >= reuse_timeout
-    }) || upstream_connected_at.is_none_or(|connected_at| {
-        now.saturating_duration_since(connected_at) >= reuse_timeout
-    })
+    last_upstream_activity
+        .map_or(true, |last_used_at| now.saturating_duration_since(last_used_at) >= reuse_timeout)
+        || upstream_connected_at.map_or(true, |connected_at| {
+            now.saturating_duration_since(connected_at) >= reuse_timeout
+        })
 }
 
 fn drop_upstream_connection(
@@ -1408,11 +1465,7 @@ where
         None => return Ok(None),
     };
 
-    Ok(Some(HttpCacheEntry {
-        metadata,
-        headers,
-        body,
-    }))
+    Ok(Some(HttpCacheEntry { metadata, headers, body }))
 }
 
 fn request_method_is_cache_lookup_eligible(
@@ -1507,9 +1560,7 @@ fn derive_cache_metadata(
         stale_while_revalidate_until: freshness
             .stale_while_revalidate_for
             .map(|window| fresh_until + window),
-        stale_if_error_until: freshness
-            .stale_if_error_for
-            .map(|window| fresh_until + window),
+        stale_if_error_until: freshness.stale_if_error_for.map(|window| fresh_until + window),
         etag: response_header_value(headers, "etag"),
         last_modified: response_header_value(headers, "last-modified"),
     })
@@ -1557,7 +1608,8 @@ fn refresh_revalidated_entry(
 ) -> Option<HttpCacheEntry> {
     let policy = policy?;
     let mut refreshed = stale_entry.clone();
-    let metadata = derive_cache_metadata(policy, response_headers, stale_entry.metadata.status, now)?;
+    let metadata =
+        derive_cache_metadata(policy, response_headers, stale_entry.metadata.status, now)?;
     refreshed.metadata = HttpCacheMetadata {
         etag: metadata.etag.or_else(|| stale_entry.metadata.etag.clone()),
         last_modified: metadata
@@ -1580,7 +1632,11 @@ fn derive_freshness_windows_from_origin(
     headers: &[lb_proto_http::HttpHeader],
 ) -> Option<CacheFreshnessWindows> {
     let directives = parse_cache_control(headers)?;
-    if directives.no_store || directives.private || directives.no_cache || has_pragma_no_cache(headers) {
+    if directives.no_store
+        || directives.private
+        || directives.no_cache
+        || has_pragma_no_cache(headers)
+    {
         return None;
     }
 
@@ -1621,11 +1677,7 @@ fn derive_freshness_windows_from_origin(
             .min(policy.stale_if_error_secs),
     );
 
-    Some(CacheFreshnessWindows {
-        fresh_for,
-        stale_while_revalidate_for,
-        stale_if_error_for,
-    })
+    Some(CacheFreshnessWindows { fresh_for, stale_while_revalidate_for, stale_if_error_for })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1704,10 +1756,15 @@ fn record_cache_request_telemetry(
     reason: &str,
     detail: &str,
 ) {
-    if let Some(telemetry) = response_cache.and_then(|response_cache| response_cache.telemetry.as_ref()) {
-        let _ = telemetry
-            .telemetry
-            .record_http_cache_request(&telemetry.scope, outcome, reason, detail);
+    if let Some(telemetry) =
+        response_cache.and_then(|response_cache| response_cache.telemetry.as_ref())
+    {
+        let _ = telemetry.telemetry.record_http_cache_request(
+            &telemetry.scope,
+            outcome,
+            reason,
+            detail,
+        );
     }
 }
 
@@ -1716,10 +1773,11 @@ fn record_cache_revalidation_telemetry(
     result: HttpCacheRevalidationResult,
     detail: &str,
 ) {
-    if let Some(telemetry) = response_cache.and_then(|response_cache| response_cache.telemetry.as_ref()) {
-        let _ = telemetry
-            .telemetry
-            .record_http_cache_revalidation(&telemetry.scope, result, detail);
+    if let Some(telemetry) =
+        response_cache.and_then(|response_cache| response_cache.telemetry.as_ref())
+    {
+        let _ =
+            telemetry.telemetry.record_http_cache_revalidation(&telemetry.scope, result, detail);
     }
 }
 
@@ -1739,10 +1797,7 @@ fn error_allows_stale_if_error(error: &Http1ProxyError) -> bool {
     )
 }
 
-fn response_header_value(
-    headers: &[lb_proto_http::HttpHeader],
-    name: &str,
-) -> Option<HeaderValue> {
+fn response_header_value(headers: &[lb_proto_http::HttpHeader], name: &str) -> Option<HeaderValue> {
     headers
         .iter()
         .find(|header| header.name.eq_ignore_ascii_case(name))
@@ -2087,6 +2142,7 @@ fn classify_http1_request_parse_error(
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use std::io;
     use std::time::{Duration, Instant};
@@ -2096,10 +2152,10 @@ mod tests {
     use tokio::sync::oneshot;
 
     use super::{
-        body_limit_error, classify_http1_request_parse_error, idle_error, io_error,
-        parse_side_error, read_crlf_line, relay_body, relay_chunked, relay_content_length,
-        relay_content_length_collect, relay_exact_bytes, ensure_upstream_connection,
-        Http1ProxyError, RelayDirection,
+        body_limit_error, classify_http1_request_parse_error, ensure_upstream_connection,
+        idle_error, io_error, parse_side_error, read_crlf_line, relay_body, relay_chunked,
+        relay_content_length, relay_content_length_collect, relay_exact_bytes, Http1ProxyError,
+        RelayDirection,
     };
     use crate::{ProtocolAnomalyCategory, SlowClientStage};
 
@@ -2147,8 +2203,10 @@ mod tests {
             target: "127.0.0.1:8080".parse().expect("socket addr"),
             source: io::Error::other("connect failed"),
         };
-        let parse_request = Http1ProxyError::ParseRequest(lb_proto_http::Http1ParseError::HeadTooLarge);
-        let parse_response = Http1ProxyError::ParseResponse(lb_proto_http::Http1ParseError::IncompleteHead);
+        let parse_request =
+            Http1ProxyError::ParseRequest(lb_proto_http::Http1ParseError::HeadTooLarge);
+        let parse_response =
+            Http1ProxyError::ParseResponse(lb_proto_http::Http1ParseError::IncompleteHead);
         let response_io = Http1ProxyError::ResponseIo(io::Error::other("response failed"));
 
         assert_eq!(request_idle.slow_client_stage(), Some(SlowClientStage::RequestBody));
@@ -2417,10 +2475,8 @@ mod tests {
         )
         .await?;
 
-        let first_local_addr = upstream
-            .as_ref()
-            .expect("first upstream connection")
-            .local_addr()?;
+        let first_local_addr =
+            upstream.as_ref().expect("first upstream connection").local_addr()?;
         last_upstream_activity = Some(
             Instant::now()
                 .checked_sub(Duration::from_millis(50))
@@ -2439,10 +2495,8 @@ mod tests {
         )
         .await?;
 
-        let second_local_addr = upstream
-            .as_ref()
-            .expect("second upstream connection")
-            .local_addr()?;
+        let second_local_addr =
+            upstream.as_ref().expect("second upstream connection").local_addr()?;
         assert_ne!(first_local_addr, second_local_addr);
 
         drop(upstream.take());

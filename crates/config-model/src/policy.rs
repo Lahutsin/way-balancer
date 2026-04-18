@@ -160,10 +160,7 @@ impl Default for CacheKeyPolicyConfig {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum HttpCacheStorageConfig {
     /// In-memory bounded cache store.
-    Memory {
-        max_entries: usize,
-        max_bytes: u64,
-    },
+    Memory { max_entries: usize, max_bytes: u64 },
 }
 
 impl Default for HttpCacheStorageConfig {

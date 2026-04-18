@@ -1,0 +1,93 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: way-balancer-system
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: lb-k8s-controller
+  namespace: way-balancer-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: lb-k8s-controller
+rules:
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources:
+      - gatewayclasses
+      - gateways
+      - httproutes
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources:
+      - services
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources:
+      - endpointslices
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: lb-k8s-controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: lb-k8s-controller
+subjects:
+  - kind: ServiceAccount
+    name: lb-k8s-controller
+    namespace: way-balancer-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lb-k8s-controller
+  namespace: way-balancer-system
+spec:
+  replicas: 1
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: lb-k8s-controller
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: lb-k8s-controller
+    spec:
+      serviceAccountName: lb-k8s-controller
+      containers:
+        - name: controller
+          image: ghcr.io/your-org/way-balancer-k8s-controller:0.1.0
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: LB_K8S_CONTROLLER_NAME
+              value: infra.way-balancer.io/gateway-controller
+            - name: LB_K8S_CONTROLLER_NAMESPACE
+              value: edge
+            - name: LB_K8S_CONTROLLER_BIND_IP
+              value: 127.0.0.1
+            - name: LB_K8S_CONTROLLER_LISTENER_CLASS
+              value: public
+            - name: LB_K8S_CONTROLLER_LISTENER_PROTOCOL
+              value: http1
+            - name: LB_K8S_CONTROLLER_RECONCILE_DEBOUNCE_MS
+              value: "250"
+            - name: LB_K8S_CONTROLLER_MAX_REQUEUE_MS
+              value: "30000"
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]

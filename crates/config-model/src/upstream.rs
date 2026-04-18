@@ -32,6 +32,40 @@ pub struct UpstreamTrafficPolicyConfig {
     pub locality: LocalityRoutingConfig,
     /// Explicit no-healthy fallback mode.
     pub no_healthy_fallback: NoHealthyFallbackConfig,
+    /// Optional deterministic session-affinity policy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub affinity: Option<AffinityPolicyConfig>,
+}
+
+/// Declarative session-affinity policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AffinityPolicyConfig {
+    /// Hash a request header value to a deterministic upstream endpoint.
+    HeaderHash {
+        /// Header name to hash.
+        header_name: String,
+        /// Behavior when the preferred endpoint is unavailable.
+        #[serde(default)]
+        fallback: AffinityFallbackConfig,
+    },
+    /// Hash a cookie value to a deterministic upstream endpoint.
+    CookieHash {
+        /// Cookie name to hash.
+        cookie_name: String,
+        /// Behavior when the preferred endpoint is unavailable.
+        #[serde(default)]
+        fallback: AffinityFallbackConfig,
+    },
+}
+
+/// Declarative affinity fallback behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AffinityFallbackConfig {
+    /// Fall back to normal healthy endpoint selection.
+    #[default]
+    BalanceHealthy,
 }
 
 /// Declarative balancing algorithm.
@@ -247,8 +281,9 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     use super::{
-        compile_clusters, EndpointStateConfig, UpstreamClusterConfig, UpstreamEndpointConfig,
-        UpstreamTrafficPolicyConfig, WorkspaceConfigError,
+        compile_clusters, AffinityFallbackConfig, AffinityPolicyConfig, EndpointStateConfig,
+        UpstreamClusterConfig, UpstreamEndpointConfig, UpstreamTrafficPolicyConfig,
+        WorkspaceConfigError,
     };
 
     #[test]
@@ -308,7 +343,7 @@ mod tests {
 
     #[test]
     fn invalid_upstream_model_errors_surface_display_and_source() {
-        let error = UpstreamEndpointConfig {
+        let result = UpstreamEndpointConfig {
             id: String::new(),
             address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080),
             state: EndpointStateConfig::Ready,
@@ -316,10 +351,40 @@ mod tests {
             locality: None,
             weight: 0,
         }
-        .compile()
-        .expect_err("invalid endpoint should fail strong model validation");
+        .compile();
+
+        let error = result.err();
+        assert!(error.is_some(), "invalid endpoint should fail strong model validation");
+        let Some(error) = error else {
+            return;
+        };
 
         assert!(error.to_string().contains("invalid upstream model"));
         assert!(std::error::Error::source(&error).is_some());
+    }
+
+    #[test]
+    fn traffic_policy_parses_cookie_affinity() -> Result<(), Box<dyn std::error::Error>> {
+        let policy = serde_json::from_str::<UpstreamTrafficPolicyConfig>(
+            r#"{
+                "algorithm": "round_robin",
+                "locality": "disabled",
+                "no_healthy_fallback": "fail",
+                "affinity": {
+                    "type": "cookie_hash",
+                    "cookie_name": "session_id",
+                    "fallback": "balance_healthy"
+                }
+            }"#,
+        )?;
+
+        assert_eq!(
+            policy.affinity,
+            Some(AffinityPolicyConfig::CookieHash {
+                cookie_name: String::from("session_id"),
+                fallback: AffinityFallbackConfig::BalanceHealthy,
+            })
+        );
+        Ok(())
     }
 }

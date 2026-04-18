@@ -7,7 +7,7 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
-bytes = "1.6"
+bytes = { version = "1.6", features = ["serde"] }
 h2 = "0.3.27"
 http = "0.2"
 httpdate = "1.0"
@@ -17,10 +17,11 @@ lb-net-core = { path = "../net-core" }
 lb-observability = { path = "../observability" }
 lb-proto-http = { path = "../proto-http" }
 lb-proto-tls = { path = "../proto-tls" }
+serde = { version = "1", features = ["derive"] }
 tokio = { version = "1.37", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 
 [dev-dependencies]
-bytes = "1.6"
+bytes = { version = "1.6", features = ["serde"] }
 criterion = { version = "0.5", features = ["html_reports"] }
 h2 = "0.3.27"
 http = "0.2"

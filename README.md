@@ -92,10 +92,17 @@ cargo build --workspace
 Build the runnable entrypoints only:
 
 ```sh
-cargo build -p lb-dataplane -p lb-ctl
+cargo build -p lb-dataplane -p lb-ctl -p lb-k8s-controller
 ```
 
 `lb-dataplane` also supports a local live mode with `serve --config <file>` for the checked-in example topologies.
+
+Build OCI images from the checked-in `Dockerfile` by selecting the binary with `APP_BIN`:
+
+```sh
+docker build -t way-balancer-dataplane .
+docker build --build-arg APP_BIN=lb-k8s-controller -t way-balancer-k8s-controller .
+```
 
 ## Test
 
@@ -166,6 +173,7 @@ Example configuration files live in `examples/load-balancer/`:
 - `https-termination.json`: HTTPS listener with file-backed TLS termination material and a conservative public-cache policy
 - `public-admin.json`: public application traffic plus a separate localhost-only admin HTTP listener with explicit auth, rate limiting, audit retention, and a conservative public-cache policy on the public route
 - `local-dev-insecure.json`: explicit development-only insecure override
+- `sticky-sessions-cookie.json`: stateful app example that hashes a `session_id` cookie to a deterministic backend with explicit healthy fallback
 - `virtual-hosts.json`: hostname-aware virtual-host routing example for separate web and API upstreams on one listener
 - `example-com-api.json`: focused hostname-aware API routing example for `example.com/api?auth=user`
 
@@ -193,6 +201,8 @@ Admin listeners now use the typed `listeners[].admin` policy block. The default 
 
 HTTP route rules can now include `match.hostnames` alongside `match.prefix`. Hostnames are normalized against the incoming `Host` or `:authority` value, reject ambiguous whitespace-separated forms, and query parameters continue to flow through automatically as part of the forwarded request target instead of being configured in the route match itself.
 
+Upstream clusters may now opt into deterministic affinity with `upstream_clusters[].traffic_policy.affinity`. The current surface supports `header_hash` and `cookie_hash` sources. When the configured key is missing, the runtime keeps normal balancing behavior. When the preferred endpoint is unhealthy or ejected, `fallback: balance_healthy` explicitly re-enters healthy selection rather than pinning requests to a dead backend. This is intended for stateful workloads only and should be used sparingly because it can amplify hot spots.
+
 When multiple routes match the same hostname, the matcher selects the most specific path prefix rather than the first declared catch-all route.
 
 The current `lb-dataplane serve --config ...` demo wiring now preserves all endpoints declared in a matched route's referenced upstream cluster and dispatches traffic across that route-local upstream pool.
@@ -216,6 +226,12 @@ Operator-facing cache guidance lives in:
 - `docs/runbooks/cache-operations.md`
 - `docs/runbooks/cache-invalidation.md`
 - `docs/runbooks/cache-performance.md`
+
+Kubernetes controller packaging guidance lives in:
+
+- `examples/kubernetes/lb-k8s-controller/README.md`
+- `examples/kubernetes/lb-k8s-controller/deployment.yaml`
+- `docs/runbooks/kubernetes-controller-operations.md`
 
 The checked-in `serve --config` admin examples require an environment-provided bearer secret instead of embedded credentials:
 
@@ -244,6 +260,7 @@ The compose file now builds a generic `lb-dataplane` image and injects only runt
 - admin-plane security model: `docs/runbooks/admin-plane-hardening.md`
 - dataplane performance envelope: `docs/runbooks/performance-envelope.md`
 - cache configuration and operations: `docs/runbooks/cache-operations.md`, `docs/runbooks/cache-invalidation.md`, `docs/runbooks/cache-performance.md`
+- Kubernetes controller packaging and operations: `docs/runbooks/kubernetes-controller-operations.md`
 - disaster recovery: `docs/runbooks/disaster-recovery.md`
 - release evidence and GA gate: `docs/runbooks/release-evidence-checklist.md`, `docs/runbooks/ga-readiness-review-template.md`
 - evidence inventory: `artifacts/release-evidence-inventory.md`

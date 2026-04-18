@@ -14,6 +14,12 @@ use lb_proto_http::{
     canonicalize_host, canonicalize_request_target, extract_host_header, HttpHeader,
     RequestTargetError,
 };
+use serde::{Deserialize, Serialize};
+
+pub const HTTP_CACHE_INVALIDATION_MAX_EVENT_ID_LEN: usize = 256;
+pub const HTTP_CACHE_INVALIDATION_MAX_SCOPE_LEN: usize = 128;
+pub const HTTP_CACHE_INVALIDATION_MAX_ISSUER_LEN: usize = 128;
+pub const HTTP_CACHE_INVALIDATION_MAX_PATH_PREFIX_LEN: usize = 512;
 
 /// Store-level configuration for the bounded in-memory HTTP cache.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,7 +55,7 @@ impl HttpCacheStoreConfig {
 }
 
 /// Opaque cache key used by the runtime store.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct HttpCacheKey(Bytes);
 
 impl HttpCacheKey {
@@ -158,16 +164,10 @@ impl HttpCacheMetadata {
         if self.fresh_until < self.stored_at {
             return Err(HttpCacheStoreError::FreshnessBeforeStoredAt);
         }
-        if self
-            .stale_while_revalidate_until
-            .is_some_and(|deadline| deadline < self.fresh_until)
-        {
+        if self.stale_while_revalidate_until.is_some_and(|deadline| deadline < self.fresh_until) {
             return Err(HttpCacheStoreError::StaleWhileRevalidateBeforeFreshness);
         }
-        if self
-            .stale_if_error_until
-            .is_some_and(|deadline| deadline < self.fresh_until)
-        {
+        if self.stale_if_error_until.is_some_and(|deadline| deadline < self.fresh_until) {
             return Err(HttpCacheStoreError::StaleIfErrorBeforeFreshness);
         }
         Ok(())
@@ -176,10 +176,7 @@ impl HttpCacheMetadata {
     fn estimated_size(&self) -> usize {
         let mut size = std::mem::size_of::<Self>();
         size += self.etag.as_ref().map_or(0, |value| value.as_bytes().len());
-        size += self
-            .last_modified
-            .as_ref()
-            .map_or(0, |value| value.as_bytes().len());
+        size += self.last_modified.as_ref().map_or(0, |value| value.as_bytes().len());
         size
     }
 }
@@ -325,19 +322,44 @@ pub struct HttpCacheStoreSnapshot {
 }
 
 /// Distributed invalidation target for a cache event.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HttpCacheInvalidationTarget {
     ExactKey(HttpCacheKey),
     PathPrefix(String),
 }
 
 /// Replay-safe invalidation event that may be applied across multiple nodes.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HttpCacheInvalidationEvent {
     pub event_id: String,
     pub scope: String,
+    pub issuer: String,
     pub target: HttpCacheInvalidationTarget,
     pub occurred_at_unix_ms: u64,
+}
+
+impl HttpCacheInvalidationEvent {
+    pub fn new(
+        event_id: impl Into<String>,
+        scope: impl Into<String>,
+        issuer: impl Into<String>,
+        target: HttpCacheInvalidationTarget,
+        occurred_at_unix_ms: u64,
+    ) -> Result<Self, HttpCacheInvalidationError> {
+        let event = Self {
+            event_id: event_id.into(),
+            scope: scope.into(),
+            issuer: issuer.into(),
+            target,
+            occurred_at_unix_ms,
+        };
+        validate_invalidation_event(&event)?;
+        Ok(event)
+    }
+
+    pub fn validate(&self) -> Result<(), HttpCacheInvalidationError> {
+        validate_invalidation_event(self)
+    }
 }
 
 /// Result of applying one invalidation event to a local cache instance.
@@ -354,13 +376,82 @@ pub struct HttpCacheInvalidationPublishResult {
     pub applied_count: usize,
     pub duplicate_count: usize,
     pub purged_entries: usize,
+    pub delivery_success_count: usize,
+    pub delivery_failure_count: usize,
+    pub failed_targets: Vec<String>,
+}
+
+pub trait HttpCacheInvalidationTransport: Send + Sync {
+    fn name(&self) -> &str;
+
+    fn publish(
+        &self,
+        event: &HttpCacheInvalidationEvent,
+    ) -> Result<HttpCacheInvalidationPublishResult, HttpCacheInvalidationTransportError>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HttpCacheInvalidationTransportError {
+    InvalidEvent(HttpCacheInvalidationError),
+    PublishFailed { transport: String, detail: String },
+}
+
+impl fmt::Display for HttpCacheInvalidationTransportError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidEvent(error) => {
+                write!(formatter, "invalid cache invalidation event: {error}")
+            }
+            Self::PublishFailed { transport, detail } => {
+                write!(formatter, "cache invalidation publish failed via {transport}: {detail}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for HttpCacheInvalidationTransportError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidEvent(error) => Some(error),
+            Self::PublishFailed { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct HttpCacheInvalidationBusTransport {
+    bus: Arc<HttpCacheInvalidationBus>,
+}
+
+impl HttpCacheInvalidationBusTransport {
+    #[must_use]
+    pub fn new(bus: Arc<HttpCacheInvalidationBus>) -> Self {
+        Self { bus }
+    }
+}
+
+impl HttpCacheInvalidationTransport for HttpCacheInvalidationBusTransport {
+    fn name(&self) -> &str {
+        "in_memory_bus"
+    }
+
+    fn publish(
+        &self,
+        event: &HttpCacheInvalidationEvent,
+    ) -> Result<HttpCacheInvalidationPublishResult, HttpCacheInvalidationTransportError> {
+        self.bus.publish(event).map_err(HttpCacheInvalidationTransportError::InvalidEvent)
+    }
 }
 
 /// Errors returned by cache invalidation modeling and application.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HttpCacheInvalidationError {
     EmptyEventId,
+    EventIdTooLong,
     EmptyScope,
+    ScopeTooLong,
+    EmptyIssuer,
+    IssuerTooLong,
     InvalidPathPrefix,
 }
 
@@ -368,7 +459,11 @@ impl fmt::Display for HttpCacheInvalidationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptyEventId => formatter.write_str("cache invalidation event_id must not be empty"),
+            Self::EventIdTooLong => formatter.write_str("cache invalidation event_id exceeds max length"),
             Self::EmptyScope => formatter.write_str("cache invalidation scope must not be empty"),
+            Self::ScopeTooLong => formatter.write_str("cache invalidation scope exceeds max length"),
+            Self::EmptyIssuer => formatter.write_str("cache invalidation issuer must not be empty"),
+            Self::IssuerTooLong => formatter.write_str("cache invalidation issuer exceeds max length"),
             Self::InvalidPathPrefix => formatter.write_str("cache invalidation path prefix must start with '/' and contain no query or fragment"),
         }
     }
@@ -393,10 +488,7 @@ pub struct HttpCacheStoreInvalidationSubscriber {
 impl HttpCacheStoreInvalidationSubscriber {
     #[must_use]
     pub fn new(scope: impl Into<String>, store: Arc<HttpCacheStore>) -> Self {
-        Self {
-            scope: scope.into(),
-            store,
-        }
+        Self { scope: scope.into(), store }
     }
 }
 
@@ -420,11 +512,8 @@ pub struct HttpCacheInvalidationBus {
 
 impl fmt::Debug for HttpCacheInvalidationBus {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let subscriber_count = self
-            .subscribers
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .len();
+        let subscriber_count =
+            self.subscribers.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).len();
         formatter
             .debug_struct("HttpCacheInvalidationBus")
             .field("subscriber_count", &subscriber_count)
@@ -439,10 +528,8 @@ impl HttpCacheInvalidationBus {
     }
 
     pub fn register(&self, subscriber: Arc<dyn HttpCacheInvalidationSubscriber>) {
-        let mut subscribers = self
-            .subscribers
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut subscribers =
+            self.subscribers.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         subscribers.push(subscriber);
     }
 
@@ -451,20 +538,20 @@ impl HttpCacheInvalidationBus {
         event: &HttpCacheInvalidationEvent,
     ) -> Result<HttpCacheInvalidationPublishResult, HttpCacheInvalidationError> {
         validate_invalidation_event(event)?;
-        let subscribers = self
-            .subscribers
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let subscribers = self.subscribers.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut result = HttpCacheInvalidationPublishResult::default();
-        for subscriber in subscribers.iter().filter(|subscriber| subscriber.scope() == event.scope) {
+        for subscriber in subscribers.iter().filter(|subscriber| subscriber.scope() == event.scope)
+        {
             result.subscriber_count += 1;
             match subscriber.apply(event)? {
                 HttpCacheInvalidationApplyResult::Applied { purged_entries } => {
                     result.applied_count += 1;
+                    result.delivery_success_count += 1;
                     result.purged_entries += purged_entries;
                 }
                 HttpCacheInvalidationApplyResult::Duplicate => {
                     result.duplicate_count += 1;
+                    result.delivery_success_count += 1;
                 }
             }
         }
@@ -482,10 +569,7 @@ pub enum HttpCacheStoreError {
     /// Object byte capacity must be positive.
     ZeroMaxObjectBytes,
     /// Object capacity cannot exceed total store capacity.
-    MaxObjectBytesExceedsStoreBytes {
-        max_object_bytes: usize,
-        max_bytes: usize,
-    },
+    MaxObjectBytesExceedsStoreBytes { max_object_bytes: usize, max_bytes: usize },
     /// Cache keys must not be empty.
     EmptyKey,
     /// Freshness deadline must not precede storage time.
@@ -495,10 +579,7 @@ pub enum HttpCacheStoreError {
     /// SIE deadline must not precede freshness deadline.
     StaleIfErrorBeforeFreshness,
     /// Object exceeded the configured per-object byte limit.
-    ObjectTooLarge {
-        object_size: usize,
-        max_object_bytes: usize,
-    },
+    ObjectTooLarge { object_size: usize, max_object_bytes: usize },
     /// Cache key construction requires a host header.
     MissingHost,
     /// Request target or authority could not be canonicalized.
@@ -506,10 +587,7 @@ pub enum HttpCacheStoreError {
     /// Host header could not be canonicalized.
     InvalidHost(RequestTargetError),
     /// Absolute-form target authority did not match the host header.
-    HostAuthorityMismatch {
-        host_header: String,
-        target_authority: String,
-    },
+    HostAuthorityMismatch { host_header: String, target_authority: String },
 }
 
 impl fmt::Display for HttpCacheStoreError {
@@ -634,15 +712,9 @@ impl HttpCacheStore {
             Some(record) => {
                 record.last_accessed_tick = now_tick;
                 record.last_accessed_at = now;
-                let freshness = record
-                    .entry
-                    .metadata
-                    .freshness(now)
-                    .unwrap_or(HttpCacheFreshness::Fresh);
-                Some(HttpCacheLookup {
-                    entry: record.entry.clone(),
-                    freshness,
-                })
+                let freshness =
+                    record.entry.metadata.freshness(now).unwrap_or(HttpCacheFreshness::Fresh);
+                Some(HttpCacheLookup { entry: record.entry.clone(), freshness })
             }
             None => None,
         };
@@ -658,8 +730,9 @@ impl HttpCacheStore {
     /// Looks up only fresh entries, treating stale objects as misses for serving decisions.
     #[must_use]
     pub fn lookup_fresh(&self, now: Duration, key: &HttpCacheKey) -> Option<HttpCacheEntry> {
-        self.lookup(now, key)
-            .and_then(|lookup| (lookup.freshness == HttpCacheFreshness::Fresh).then_some(lookup.entry))
+        self.lookup(now, key).and_then(|lookup| {
+            (lookup.freshness == HttpCacheFreshness::Fresh).then_some(lookup.entry)
+        })
     }
 
     /// Inserts or replaces a cache object and evicts older objects to satisfy bounds.
@@ -706,13 +779,9 @@ impl HttpCacheStore {
         } else {
             self.insert_count.fetch_add(1, Ordering::SeqCst);
         }
-        self.eviction_count
-            .fetch_add(evicted_entries as u64, Ordering::SeqCst);
+        self.eviction_count.fetch_add(evicted_entries as u64, Ordering::SeqCst);
 
-        Ok(HttpCacheInsertResult {
-            replaced: replaced_record.is_some(),
-            evicted_entries,
-        })
+        Ok(HttpCacheInsertResult { replaced: replaced_record.is_some(), evicted_entries })
     }
 
     /// Removes a cache object explicitly.
@@ -736,10 +805,8 @@ impl HttpCacheStore {
     ) -> Result<HttpCacheInvalidationApplyResult, HttpCacheInvalidationError> {
         validate_invalidation_event(event)?;
 
-        let mut applied = self
-            .applied_invalidations
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut applied =
+            self.applied_invalidations.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if applied.iter().any(|event_id| event_id == &event.event_id) {
             return Ok(HttpCacheInvalidationApplyResult::Duplicate);
         }
@@ -770,9 +837,8 @@ impl HttpCacheStore {
         let keys_to_remove: Vec<_> = state
             .entries
             .iter()
-            .filter_map(|(key, record)| {
-                (now > record.entry.metadata.expires_at()).then(|| key.clone())
-            })
+            .filter(|(_, record)| now > record.entry.metadata.expires_at())
+            .map(|(key, _)| key.clone())
             .collect();
 
         for key in &keys_to_remove {
@@ -780,8 +846,7 @@ impl HttpCacheStore {
                 state.total_bytes = state.total_bytes.saturating_sub(record.size);
             }
         }
-        self.expiration_count
-            .fetch_add(keys_to_remove.len() as u64, Ordering::SeqCst);
+        self.expiration_count.fetch_add(keys_to_remove.len() as u64, Ordering::SeqCst);
         keys_to_remove.len()
     }
 
@@ -822,7 +887,12 @@ impl HttpCacheStore {
             metrics: HttpCacheStoreMetrics {
                 entry_count: state.entries.len(),
                 total_bytes: state.total_bytes,
-                max_object_bytes: state.entries.values().map(|record| record.size).max().unwrap_or(0),
+                max_object_bytes: state
+                    .entries
+                    .values()
+                    .map(|record| record.size)
+                    .max()
+                    .unwrap_or(0),
                 hit_count: self.hit_count.load(Ordering::SeqCst),
                 miss_count: self.miss_count.load(Ordering::SeqCst),
                 insert_count: self.insert_count.load(Ordering::SeqCst),
@@ -872,8 +942,10 @@ pub fn build_http_cache_key_material(
     request: &HttpCacheRequest<'_>,
     vary_headers: &[String],
 ) -> Result<Option<HttpCacheKeyMaterial>, HttpCacheStoreError> {
-    let host_header = extract_host_header(request.headers).ok_or(HttpCacheStoreError::MissingHost)?;
-    let canonical_host = canonicalize_host(host_header).map_err(HttpCacheStoreError::InvalidHost)?;
+    let host_header =
+        extract_host_header(request.headers).ok_or(HttpCacheStoreError::MissingHost)?;
+    let canonical_host =
+        canonicalize_host(host_header).map_err(HttpCacheStoreError::InvalidHost)?;
     let target = canonicalize_request_target(request.target)
         .map_err(HttpCacheStoreError::InvalidRequestTarget)?;
 
@@ -886,14 +958,10 @@ pub fn build_http_cache_key_material(
         }
     }
 
-    let authorization_header = request
-        .headers
-        .iter()
-        .find(|header| header.name.eq_ignore_ascii_case("authorization"));
-    let cookie_header_present = request
-        .headers
-        .iter()
-        .any(|header| header.name.eq_ignore_ascii_case("cookie"));
+    let authorization_header =
+        request.headers.iter().find(|header| header.name.eq_ignore_ascii_case("authorization"));
+    let cookie_header_present =
+        request.headers.iter().any(|header| header.name.eq_ignore_ascii_case("cookie"));
     if authorization_header.is_some()
         && matches!(policy.authorization, AuthorizationCacheBehaviorConfig::Bypass)
     {
@@ -980,11 +1048,24 @@ fn validate_invalidation_event(
     if event.event_id.trim().is_empty() {
         return Err(HttpCacheInvalidationError::EmptyEventId);
     }
+    if event.event_id.len() > HTTP_CACHE_INVALIDATION_MAX_EVENT_ID_LEN {
+        return Err(HttpCacheInvalidationError::EventIdTooLong);
+    }
     if event.scope.trim().is_empty() {
         return Err(HttpCacheInvalidationError::EmptyScope);
     }
+    if event.scope.len() > HTTP_CACHE_INVALIDATION_MAX_SCOPE_LEN {
+        return Err(HttpCacheInvalidationError::ScopeTooLong);
+    }
+    if event.issuer.trim().is_empty() {
+        return Err(HttpCacheInvalidationError::EmptyIssuer);
+    }
+    if event.issuer.len() > HTTP_CACHE_INVALIDATION_MAX_ISSUER_LEN {
+        return Err(HttpCacheInvalidationError::IssuerTooLong);
+    }
     if let HttpCacheInvalidationTarget::PathPrefix(prefix) = &event.target {
         if prefix.trim().is_empty()
+            || prefix.len() > HTTP_CACHE_INVALIDATION_MAX_PATH_PREFIX_LEN
             || !prefix.starts_with('/')
             || prefix.contains('?')
             || prefix.contains('#')
@@ -996,25 +1077,16 @@ fn validate_invalidation_event(
 }
 
 fn storage_key_matches_path_prefix(key: &HttpCacheKey, path_prefix: &str) -> bool {
-    let primary = key
-        .as_bytes()
-        .split(|byte| *byte == 0)
-        .next()
-        .unwrap_or_else(|| key.as_bytes());
+    let primary = key.as_bytes().split(|byte| *byte == 0).next().unwrap_or_else(|| key.as_bytes());
     let Ok(primary) = str::from_utf8(primary) else {
         return false;
     };
-    let Some(path) = primary
-        .lines()
-        .find_map(|line| line.strip_prefix("path="))
-    else {
+    let Some(path) = primary.lines().find_map(|line| line.strip_prefix("path=")) else {
         return false;
     };
     path == path_prefix
         || path_prefix == "/"
-        || path
-            .strip_prefix(path_prefix)
-            .is_some_and(|suffix| suffix.starts_with('/'))
+        || path.strip_prefix(path_prefix).is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 fn remove_from_state(state: &mut CacheStoreState, key: &HttpCacheKey) -> Option<HttpCacheEntry> {
@@ -1042,8 +1114,7 @@ fn canonical_header_values(headers: &[HttpHeader], name: &str) -> String {
     let mut values = headers
         .iter()
         .filter(|header| header.name.eq_ignore_ascii_case(name))
-        .map(|header| header.value.split(',').map(str::trim).filter(|value| !value.is_empty()))
-        .flatten()
+        .flat_map(|header| header.value.split(',').map(str::trim).filter(|value| !value.is_empty()))
         .map(|value| value.to_ascii_lowercase())
         .collect::<Vec<_>>();
     values.sort();
@@ -1072,6 +1143,7 @@ fn stable_hex_hash(value: &str) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use std::sync::{Arc, Barrier};
     use std::thread;
@@ -1086,11 +1158,14 @@ mod tests {
 
     use super::{
         build_http_cache_key_material, HttpCacheEntry, HttpCacheFreshness, HttpCacheHeader,
-        HttpCacheInvalidationApplyResult, HttpCacheInvalidationBus, HttpCacheInvalidationEvent,
-        HttpCacheInvalidationSubscriber, HttpCacheInvalidationTarget, HttpCacheKey,
-        HttpCacheMetadata, HttpCacheRequest, HttpCacheStore, HttpCacheStoreConfig,
-        HttpCacheStoreError,
-        HttpCacheStoreInvalidationSubscriber,
+        HttpCacheInvalidationApplyResult, HttpCacheInvalidationBus,
+        HttpCacheInvalidationBusTransport, HttpCacheInvalidationError, HttpCacheInvalidationEvent,
+        HttpCacheInvalidationSubscriber, HttpCacheInvalidationTarget,
+        HttpCacheInvalidationTransport, HttpCacheKey, HttpCacheMetadata, HttpCacheRequest,
+        HttpCacheStore, HttpCacheStoreConfig, HttpCacheStoreError,
+        HttpCacheStoreInvalidationSubscriber, HTTP_CACHE_INVALIDATION_MAX_EVENT_ID_LEN,
+        HTTP_CACHE_INVALIDATION_MAX_ISSUER_LEN, HTTP_CACHE_INVALIDATION_MAX_PATH_PREFIX_LEN,
+        HTTP_CACHE_INVALIDATION_MAX_SCOPE_LEN,
     };
 
     fn key(value: &str) -> Result<HttpCacheKey, HttpCacheStoreError> {
@@ -1106,9 +1181,7 @@ mod tests {
                 stale_while_revalidate_until: Some(fresh_until + Duration::from_secs(10)),
                 stale_if_error_until: Some(fresh_until + Duration::from_secs(20)),
                 etag: Some(HeaderValue::from_static("\"v1\"")),
-                last_modified: Some(HeaderValue::from_static(
-                    "Tue, 09 Apr 2026 09:00:00 GMT",
-                )),
+                last_modified: Some(HeaderValue::from_static("Tue, 09 Apr 2026 09:00:00 GMT")),
             },
             headers: vec![HttpCacheHeader::new(
                 HeaderName::from_static("content-type"),
@@ -1151,7 +1224,11 @@ mod tests {
             max_object_bytes: 1024,
         })?;
         let key = key("GET:/orders")?;
-        store.insert(Duration::from_secs(5), key.clone(), entry("body", Duration::from_secs(5), Duration::from_secs(10)))?;
+        store.insert(
+            Duration::from_secs(5),
+            key.clone(),
+            entry("body", Duration::from_secs(5), Duration::from_secs(10)),
+        )?;
 
         let fresh = store.lookup(Duration::from_secs(8), &key).expect("fresh hit");
         assert_eq!(fresh.freshness, HttpCacheFreshness::Fresh);
@@ -1159,7 +1236,8 @@ mod tests {
         let stale = store.lookup(Duration::from_secs(12), &key).expect("stale hit");
         assert_eq!(stale.freshness, HttpCacheFreshness::StaleWhileRevalidate);
 
-        let stale_if_error = store.lookup(Duration::from_secs(25), &key).expect("stale-if-error hit");
+        let stale_if_error =
+            store.lookup(Duration::from_secs(25), &key).expect("stale-if-error hit");
         assert_eq!(stale_if_error.freshness, HttpCacheFreshness::StaleIfError);
 
         let metrics = store.metrics();
@@ -1176,7 +1254,11 @@ mod tests {
             max_object_bytes: 1024,
         })?;
         let key = key("GET:/healthz")?;
-        store.insert(Duration::ZERO, key.clone(), entry("ok", Duration::ZERO, Duration::from_secs(2)))?;
+        store.insert(
+            Duration::ZERO,
+            key.clone(),
+            entry("ok", Duration::ZERO, Duration::from_secs(2)),
+        )?;
 
         assert!(store.lookup(Duration::from_secs(23), &key).is_none());
         assert_eq!(store.metrics().expiration_count, 1);
@@ -1193,14 +1275,25 @@ mod tests {
         })?;
         let key = key("GET:/config")?;
 
-        let inserted = store.insert(Duration::ZERO, key.clone(), entry("v1", Duration::ZERO, Duration::from_secs(30)))?;
+        let inserted = store.insert(
+            Duration::ZERO,
+            key.clone(),
+            entry("v1", Duration::ZERO, Duration::from_secs(30)),
+        )?;
         assert!(!inserted.replaced);
 
-        let replaced = store.insert(Duration::from_secs(1), key.clone(), entry("v2", Duration::from_secs(1), Duration::from_secs(30)))?;
+        let replaced = store.insert(
+            Duration::from_secs(1),
+            key.clone(),
+            entry("v2", Duration::from_secs(1), Duration::from_secs(30)),
+        )?;
         assert!(replaced.replaced);
         assert_eq!(replaced.evicted_entries, 0);
         assert_eq!(store.metrics().replace_count, 1);
-        assert_eq!(store.lookup(Duration::from_secs(2), &key).expect("entry").entry.body, Bytes::from_static(b"v2"));
+        assert_eq!(
+            store.lookup(Duration::from_secs(2), &key).expect("entry").entry.body,
+            Bytes::from_static(b"v2")
+        );
         Ok(())
     }
 
@@ -1216,10 +1309,22 @@ mod tests {
         let key_b = key("GET:/b")?;
         let key_c = key("GET:/c")?;
 
-        store.insert(Duration::from_secs(0), key_a.clone(), entry("a", Duration::ZERO, Duration::from_secs(30)))?;
-        store.insert(Duration::from_secs(1), key_b.clone(), entry("b", Duration::from_secs(1), Duration::from_secs(30)))?;
+        store.insert(
+            Duration::from_secs(0),
+            key_a.clone(),
+            entry("a", Duration::ZERO, Duration::from_secs(30)),
+        )?;
+        store.insert(
+            Duration::from_secs(1),
+            key_b.clone(),
+            entry("b", Duration::from_secs(1), Duration::from_secs(30)),
+        )?;
         let _ = store.lookup(Duration::from_secs(2), &key_a);
-        let result = store.insert(Duration::from_secs(3), key_c.clone(), entry("c", Duration::from_secs(3), Duration::from_secs(30)))?;
+        let result = store.insert(
+            Duration::from_secs(3),
+            key_c.clone(),
+            entry("c", Duration::from_secs(3), Duration::from_secs(30)),
+        )?;
 
         assert_eq!(result.evicted_entries, 1);
         assert!(store.lookup(Duration::from_secs(4), &key_a).is_some());
@@ -1244,10 +1349,7 @@ mod tests {
                 entry(&"x".repeat(128), Duration::ZERO, Duration::from_secs(10)),
             )
             .expect_err("insert must fail");
-        assert!(matches!(
-            error,
-            HttpCacheStoreError::ObjectTooLarge { .. }
-        ));
+        assert!(matches!(error, HttpCacheStoreError::ObjectTooLarge { .. }));
         assert_eq!(store.metrics().rejected_insert_count, 1);
         Ok(())
     }
@@ -1260,8 +1362,16 @@ mod tests {
             max_object_bytes: 1024,
         })?;
 
-        store.insert(Duration::ZERO, key("GET:/x")?, entry("x", Duration::ZERO, Duration::from_secs(1)))?;
-        store.insert(Duration::ZERO, key("GET:/y")?, entry("y", Duration::ZERO, Duration::from_secs(2)))?;
+        store.insert(
+            Duration::ZERO,
+            key("GET:/x")?,
+            entry("x", Duration::ZERO, Duration::from_secs(1)),
+        )?;
+        store.insert(
+            Duration::ZERO,
+            key("GET:/y")?,
+            entry("y", Duration::ZERO, Duration::from_secs(2)),
+        )?;
 
         assert_eq!(store.purge_expired(Duration::from_secs(25)), 2);
         assert_eq!(store.metrics().expiration_count, 2);
@@ -1274,7 +1384,11 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let policy = HttpCachePolicyConfig {
             authorization: AuthorizationCacheBehaviorConfig::Partition,
-            cache_key: CacheKeyPolicyConfig { include_host: true, include_method: true, ..CacheKeyPolicyConfig::default() },
+            cache_key: CacheKeyPolicyConfig {
+                include_host: true,
+                include_method: true,
+                ..CacheKeyPolicyConfig::default()
+            },
             ..HttpCachePolicyConfig::default()
         };
         let request = HttpCacheRequest {
@@ -1308,14 +1422,8 @@ mod tests {
             method: "GET",
             target: "/profile",
             headers: &[
-                HttpHeader {
-                    name: String::from("host"),
-                    value: String::from("example.test"),
-                },
-                HttpHeader {
-                    name: String::from("cookie"),
-                    value: String::from("session=secret"),
-                },
+                HttpHeader { name: String::from("host"), value: String::from("example.test") },
+                HttpHeader { name: String::from("cookie"), value: String::from("session=secret") },
             ],
         };
 
@@ -1348,16 +1456,10 @@ mod tests {
 
         assert_eq!(store.purge_path_prefix("/images"), 2);
         assert!(store
-            .lookup(
-                Duration::from_secs(1),
-                &key("path=/images/logo.png\nhost=example.test")?,
-            )
+            .lookup(Duration::from_secs(1), &key("path=/images/logo.png\nhost=example.test")?,)
             .is_none());
         assert!(store
-            .lookup(
-                Duration::from_secs(1),
-                &key("path=/images/banner.png\nhost=example.test")?,
-            )
+            .lookup(Duration::from_secs(1), &key("path=/images/banner.png\nhost=example.test")?,)
             .is_none());
         assert!(store
             .lookup(Duration::from_secs(1), &key("path=/api/items\nhost=example.test")?)
@@ -1366,8 +1468,8 @@ mod tests {
     }
 
     #[test]
-    fn purge_path_prefix_respects_path_segment_boundaries(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn purge_path_prefix_respects_path_segment_boundaries() -> Result<(), Box<dyn std::error::Error>>
+    {
         let store = HttpCacheStore::new(HttpCacheStoreConfig {
             max_entries: 8,
             max_bytes: 4096,
@@ -1434,12 +1536,13 @@ mod tests {
             Arc::clone(&second),
         )));
 
-        let event = HttpCacheInvalidationEvent {
-            event_id: String::from("evt-1"),
-            scope: String::from("public-http"),
-            target: HttpCacheInvalidationTarget::ExactKey(purge_key.clone()),
-            occurred_at_unix_ms: 1,
-        };
+        let event = HttpCacheInvalidationEvent::new(
+            "evt-1",
+            "public-http",
+            "node-a",
+            HttpCacheInvalidationTarget::ExactKey(purge_key.clone()),
+            1,
+        )?;
 
         let first_publish = bus.publish(&event)?;
         let duplicate_publish = bus.publish(&event)?;
@@ -1454,8 +1557,8 @@ mod tests {
     }
 
     #[test]
-    fn invalidation_prefix_fanout_converges_across_nodes(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn invalidation_prefix_fanout_converges_across_nodes() -> Result<(), Box<dyn std::error::Error>>
+    {
         let first = Arc::new(HttpCacheStore::new(HttpCacheStoreConfig {
             max_entries: 8,
             max_bytes: 4096,
@@ -1487,11 +1590,13 @@ mod tests {
             entry("api", Duration::from_secs(1), Duration::from_secs(60)),
         )?;
 
-        let subscriber = HttpCacheStoreInvalidationSubscriber::new("public-http", Arc::clone(&first));
+        let subscriber =
+            HttpCacheStoreInvalidationSubscriber::new("public-http", Arc::clone(&first));
         assert_eq!(
             subscriber.apply(&HttpCacheInvalidationEvent {
                 event_id: String::from("evt-local"),
                 scope: String::from("public-http"),
+                issuer: String::from("node-a"),
                 target: HttpCacheInvalidationTarget::PathPrefix(String::from("/assets")),
                 occurred_at_unix_ms: 1,
             })?,
@@ -1503,25 +1608,20 @@ mod tests {
             "public-http",
             Arc::clone(&second),
         )));
-        let publish = bus.publish(&HttpCacheInvalidationEvent {
-            event_id: String::from("evt-assets"),
-            scope: String::from("public-http"),
-            target: HttpCacheInvalidationTarget::PathPrefix(String::from("/assets")),
-            occurred_at_unix_ms: 2,
-        })?;
+        let publish = bus.publish(&HttpCacheInvalidationEvent::new(
+            "evt-assets",
+            "public-http",
+            "node-b",
+            HttpCacheInvalidationTarget::PathPrefix(String::from("/assets")),
+            2,
+        )?)?;
 
         assert_eq!(publish.applied_count, 1);
         assert!(first
-            .lookup(
-                Duration::from_secs(1),
-                &key("path=/assets/a.png\nhost=example.test")?,
-            )
+            .lookup(Duration::from_secs(1), &key("path=/assets/a.png\nhost=example.test")?,)
             .is_none());
         assert!(second
-            .lookup(
-                Duration::from_secs(1),
-                &key("path=/assets/a.png\nhost=example.test")?,
-            )
+            .lookup(Duration::from_secs(1), &key("path=/assets/a.png\nhost=example.test")?,)
             .is_none());
         assert!(second
             .lookup(Duration::from_secs(1), &key("path=/api/item\nhost=example.test")?)
@@ -1530,8 +1630,8 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_duplicate_invalidation_is_applied_once(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn concurrent_duplicate_invalidation_is_applied_once() -> Result<(), Box<dyn std::error::Error>>
+    {
         let store = Arc::new(HttpCacheStore::new(HttpCacheStoreConfig {
             max_entries: 8,
             max_bytes: 4096,
@@ -1555,6 +1655,7 @@ mod tests {
                 store.apply_invalidation_event(&HttpCacheInvalidationEvent {
                     event_id: String::from("evt-concurrent"),
                     scope: String::from("public-http"),
+                    issuer: String::from("node-a"),
                     target: HttpCacheInvalidationTarget::ExactKey(purge_key),
                     occurred_at_unix_ms: 1,
                 })
@@ -1577,6 +1678,142 @@ mod tests {
 
         assert_eq!(applied_count, 1);
         assert_eq!(duplicate_count, 7);
+        assert!(store.lookup(Duration::from_secs(1), &purge_key).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn invalidation_event_serializes_and_round_trips() -> Result<(), Box<dyn std::error::Error>> {
+        let event = HttpCacheInvalidationEvent::new(
+            "evt-serde",
+            "public-http",
+            "node-a",
+            HttpCacheInvalidationTarget::PathPrefix(String::from("/assets")),
+            42,
+        )?;
+
+        let encoded = serde_json::to_string(&event)?;
+        let decoded: HttpCacheInvalidationEvent = serde_json::from_str(&encoded)?;
+
+        assert_eq!(decoded, event);
+        Ok(())
+    }
+
+    #[test]
+    fn invalidation_event_validation_rejects_empty_or_oversized_metadata() {
+        assert_eq!(
+            HttpCacheInvalidationEvent::new(
+                " ",
+                "public-http",
+                "node-a",
+                HttpCacheInvalidationTarget::PathPrefix(String::from("/assets")),
+                1,
+            )
+            .expect_err("event_id must fail"),
+            HttpCacheInvalidationError::EmptyEventId
+        );
+        assert_eq!(
+            HttpCacheInvalidationEvent::new(
+                "evt",
+                " ",
+                "node-a",
+                HttpCacheInvalidationTarget::PathPrefix(String::from("/assets")),
+                1,
+            )
+            .expect_err("scope must fail"),
+            HttpCacheInvalidationError::EmptyScope
+        );
+        assert_eq!(
+            HttpCacheInvalidationEvent::new(
+                "evt",
+                "public-http",
+                " ",
+                HttpCacheInvalidationTarget::PathPrefix(String::from("/assets")),
+                1,
+            )
+            .expect_err("issuer must fail"),
+            HttpCacheInvalidationError::EmptyIssuer
+        );
+        assert_eq!(
+            HttpCacheInvalidationEvent::new(
+                "x".repeat(HTTP_CACHE_INVALIDATION_MAX_EVENT_ID_LEN + 1),
+                "public-http",
+                "node-a",
+                HttpCacheInvalidationTarget::PathPrefix(String::from("/assets")),
+                1,
+            )
+            .expect_err("event_id length must fail"),
+            HttpCacheInvalidationError::EventIdTooLong
+        );
+        assert_eq!(
+            HttpCacheInvalidationEvent::new(
+                "evt",
+                "x".repeat(HTTP_CACHE_INVALIDATION_MAX_SCOPE_LEN + 1),
+                "node-a",
+                HttpCacheInvalidationTarget::PathPrefix(String::from("/assets")),
+                1,
+            )
+            .expect_err("scope length must fail"),
+            HttpCacheInvalidationError::ScopeTooLong
+        );
+        assert_eq!(
+            HttpCacheInvalidationEvent::new(
+                "evt",
+                "public-http",
+                "x".repeat(HTTP_CACHE_INVALIDATION_MAX_ISSUER_LEN + 1),
+                HttpCacheInvalidationTarget::PathPrefix(String::from("/assets")),
+                1,
+            )
+            .expect_err("issuer length must fail"),
+            HttpCacheInvalidationError::IssuerTooLong
+        );
+        assert_eq!(
+            HttpCacheInvalidationEvent::new(
+                "evt",
+                "public-http",
+                "node-a",
+                HttpCacheInvalidationTarget::PathPrefix(
+                    "x".repeat(HTTP_CACHE_INVALIDATION_MAX_PATH_PREFIX_LEN + 1,)
+                ),
+                1,
+            )
+            .expect_err("path prefix length must fail"),
+            HttpCacheInvalidationError::InvalidPathPrefix
+        );
+    }
+
+    #[test]
+    fn bus_transport_preserves_local_publish_results() -> Result<(), Box<dyn std::error::Error>> {
+        let store = Arc::new(HttpCacheStore::new(HttpCacheStoreConfig {
+            max_entries: 8,
+            max_bytes: 4096,
+            max_object_bytes: 1024,
+        })?);
+        let purge_key = key("path=/shared/item\nhost=example.test")?;
+        store.insert(
+            Duration::from_secs(1),
+            purge_key.clone(),
+            entry("item", Duration::from_secs(1), Duration::from_secs(60)),
+        )?;
+
+        let bus = Arc::new(HttpCacheInvalidationBus::new());
+        bus.register(Arc::new(HttpCacheStoreInvalidationSubscriber::new(
+            "public-http",
+            Arc::clone(&store),
+        )));
+        let transport = HttpCacheInvalidationBusTransport::new(Arc::clone(&bus));
+
+        let publish = transport.publish(&HttpCacheInvalidationEvent::new(
+            "evt-transport",
+            "public-http",
+            "node-a",
+            HttpCacheInvalidationTarget::ExactKey(purge_key.clone()),
+            1,
+        )?)?;
+
+        assert_eq!(publish.subscriber_count, 1);
+        assert_eq!(publish.applied_count, 1);
+        assert_eq!(publish.purged_entries, 1);
         assert!(store.lookup(Duration::from_secs(1), &purge_key).is_none());
         Ok(())
     }
@@ -1626,35 +1863,33 @@ mod tests {
 
         for worker_id in 0..4 {
             let store = Arc::clone(&store);
-            workers.push(thread::spawn(
-                move || -> Result<(), HttpCacheStoreError> {
-                    for iteration in 0..128 {
-                        let key = HttpCacheKey::new(format!(
-                            "path=/concurrency/{worker_id}/{iteration}\nhost=example.test"
-                        ))?;
-                        let now = Duration::from_millis((worker_id * 1_000 + iteration) as u64);
-                        store.insert(
-                            now,
-                            key.clone(),
-                            HttpCacheEntry {
-                                metadata: HttpCacheMetadata {
-                                    status: StatusCode::OK,
-                                    stored_at: now,
-                                    fresh_until: now + Duration::from_secs(5),
-                                    stale_while_revalidate_until: Some(now + Duration::from_secs(10)),
-                                    stale_if_error_until: Some(now + Duration::from_secs(15)),
-                                    etag: None,
-                                    last_modified: None,
-                                },
-                                headers: Vec::new(),
-                                body: Bytes::from(vec![b'x'; 64]),
+            workers.push(thread::spawn(move || -> Result<(), HttpCacheStoreError> {
+                for iteration in 0..128 {
+                    let key = HttpCacheKey::new(format!(
+                        "path=/concurrency/{worker_id}/{iteration}\nhost=example.test"
+                    ))?;
+                    let now = Duration::from_millis((worker_id * 1_000 + iteration) as u64);
+                    store.insert(
+                        now,
+                        key.clone(),
+                        HttpCacheEntry {
+                            metadata: HttpCacheMetadata {
+                                status: StatusCode::OK,
+                                stored_at: now,
+                                fresh_until: now + Duration::from_secs(5),
+                                stale_while_revalidate_until: Some(now + Duration::from_secs(10)),
+                                stale_if_error_until: Some(now + Duration::from_secs(15)),
+                                etag: None,
+                                last_modified: None,
                             },
-                        )?;
-                        let _ = store.lookup(now + Duration::from_millis(1), &key);
-                    }
-                    Ok(())
-                },
-            ));
+                            headers: Vec::new(),
+                            body: Bytes::from(vec![b'x'; 64]),
+                        },
+                    )?;
+                    let _ = store.lookup(now + Duration::from_millis(1), &key);
+                }
+                Ok(())
+            }));
         }
 
         for worker in workers {

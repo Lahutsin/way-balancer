@@ -1,6 +1,4 @@
-use lb_proto_http::{
-    canonicalize_request_target, match_route_request, RoutePrefixRule,
-};
+use lb_proto_http::{canonicalize_request_target, match_route_request, RoutePrefixRule};
 use proptest::prelude::*;
 
 fn safe_path_segment() -> impl Strategy<Value = String> {

@@ -7,7 +7,17 @@ use proptest::prelude::*;
 
 fn host_label() -> impl Strategy<Value = String> {
     prop::collection::vec(
-        prop_oneof![Just('a'), Just('b'), Just('c'), Just('x'), Just('y'), Just('z'), Just('0'), Just('1'), Just('-')],
+        prop_oneof![
+            Just('a'),
+            Just('b'),
+            Just('c'),
+            Just('x'),
+            Just('y'),
+            Just('z'),
+            Just('0'),
+            Just('1'),
+            Just('-')
+        ],
         1..8,
     )
     .prop_map(|chars| chars.into_iter().collect::<String>())

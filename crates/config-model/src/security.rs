@@ -136,9 +136,8 @@ impl std::fmt::Display for ArtifactSigningError {
             Self::SignerIdentityTooLong => {
                 formatter.write_str("artifact signer identity exceeds max length")
             }
-            Self::InvalidPrivateKeyFormat => formatter.write_str(
-                "artifact signer private key must be a lowercase ed25519 hex seed",
-            ),
+            Self::InvalidPrivateKeyFormat => formatter
+                .write_str("artifact signer private key must be a lowercase ed25519 hex seed"),
         }
     }
 }
@@ -153,7 +152,9 @@ impl ArtifactSigner {
         let signer_identity = signer_identity.into();
         let signer_identity = signer_identity.trim().to_owned();
         validate_signer_identity(&signer_identity).map_err(|error| match error {
-            ArtifactIntegrityError::EmptySignerIdentity => ArtifactSigningError::EmptySignerIdentity,
+            ArtifactIntegrityError::EmptySignerIdentity => {
+                ArtifactSigningError::EmptySignerIdentity
+            }
             ArtifactIntegrityError::SignerIdentityTooLong => {
                 ArtifactSigningError::SignerIdentityTooLong
             }
@@ -223,17 +224,16 @@ impl std::fmt::Display for ArtifactIntegrityError {
             Self::ArtifactDigestMismatch => {
                 formatter.write_str("artifact attestation digest does not match snapshot digest")
             }
-            Self::InvalidTrustedSignerPublicKey => formatter.write_str(
-                "trusted signer public key must be a lowercase ed25519 hex string",
-            ),
-            Self::InvalidSignatureFormat => formatter.write_str(
-                "artifact attestation signature must be a lowercase ed25519 hex string",
-            ),
+            Self::InvalidTrustedSignerPublicKey => formatter
+                .write_str("trusted signer public key must be a lowercase ed25519 hex string"),
+            Self::InvalidSignatureFormat => formatter
+                .write_str("artifact attestation signature must be a lowercase ed25519 hex string"),
             Self::UntrustedSigner => {
                 formatter.write_str("artifact attestation signer is not trusted by snapshot policy")
             }
-            Self::SignatureVerificationFailed => formatter
-                .write_str("artifact attestation signature verification failed"),
+            Self::SignatureVerificationFailed => {
+                formatter.write_str("artifact attestation signature verification failed")
+            }
             Self::InsecureModeNotEnabled => formatter.write_str(
                 "artifact verification may only be disabled when insecure_dev_mode is enabled",
             ),
@@ -326,10 +326,8 @@ fn parse_signature(signature_ed25519: &str) -> Result<Signature, ArtifactIntegri
 }
 
 fn attestation_message(signer_identity: &str, artifact_digest_sha256: &str) -> Vec<u8> {
-    format!(
-        "way-balancer-artifact-attestation-v1\n{signer_identity}\n{artifact_digest_sha256}"
-    )
-    .into_bytes()
+    format!("way-balancer-artifact-attestation-v1\n{signer_identity}\n{artifact_digest_sha256}")
+        .into_bytes()
 }
 
 fn encode_hex(bytes: &[u8]) -> String {
@@ -396,10 +394,7 @@ mod tests {
         "1111111111111111111111111111111111111111111111111111111111111111";
 
     fn signer() -> Result<ArtifactSigner, Box<dyn std::error::Error>> {
-        Ok(ArtifactSigner::from_signing_key_hex(
-            TEST_SIGNER_IDENTITY,
-            TEST_SIGNING_KEY_ED25519,
-        )?)
+        Ok(ArtifactSigner::from_signing_key_hex(TEST_SIGNER_IDENTITY, TEST_SIGNING_KEY_ED25519)?)
     }
 
     fn signed_snapshot() -> Result<crate::WorkspaceSnapshot, Box<dyn std::error::Error>> {
@@ -439,8 +434,11 @@ mod tests {
         let signer = signer()?;
         let snapshot = signed_snapshot()?;
 
-        assert!(verify_snapshot_artifact_integrity(&snapshot, Some(&signer.attest_snapshot(&snapshot)))
-            .is_ok());
+        assert!(verify_snapshot_artifact_integrity(
+            &snapshot,
+            Some(&signer.attest_snapshot(&snapshot))
+        )
+        .is_ok());
         Ok(())
     }
 
@@ -463,10 +461,8 @@ mod tests {
     #[test]
     fn signer_identity_is_trimmed_and_blank_identity_is_rejected(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let signer = ArtifactSigner::from_signing_key_hex(
-            "  control-plane  ",
-            TEST_SIGNING_KEY_ED25519,
-        )?;
+        let signer =
+            ArtifactSigner::from_signing_key_hex("  control-plane  ", TEST_SIGNING_KEY_ED25519)?;
         assert_eq!(signer.signer_identity(), TEST_SIGNER_IDENTITY);
         assert!(matches!(
             ArtifactSigner::from_signing_key_hex("   ", TEST_SIGNING_KEY_ED25519),
@@ -480,9 +476,11 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let signer = signer()?;
         let mut config = WorkspaceConfig::foundation();
-        config.security.artifact_verification.trusted_signers = vec![
-            TrustedArtifactSignerConfig::new("  control-plane  ", signer.trusted_signer().public_key_ed25519),
-        ];
+        config.security.artifact_verification.trusted_signers =
+            vec![TrustedArtifactSignerConfig::new(
+                "  control-plane  ",
+                signer.trusted_signer().public_key_ed25519,
+            )];
         let snapshot = config.compile_snapshot()?;
         let attestation = signer.attest_snapshot(&snapshot);
 

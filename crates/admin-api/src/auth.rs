@@ -451,12 +451,13 @@ fn validate_credentials(credentials: &[AdminCredential]) -> Result<(), InvalidAd
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use lb_test_support::{configure_test_trusted_signers, test_artifact_attestation};
 
     use super::{
-        AdminAuthError, AdminAuthService, AdminCredential, AdminOperationError,
-        AdminPermission, AdminRole, constant_time_eq,
+        constant_time_eq, AdminAuthError, AdminAuthService, AdminCredential, AdminOperationError,
+        AdminPermission, AdminRole,
     };
     use crate::{
         AbuseForensicsExportRequest, AbuseProtectionAdminService, AdminStatus,
@@ -567,16 +568,15 @@ mod tests {
         let versions = auth.list_versions(&control, Some("viewer-secret"));
         let mut abuse_service = AbuseProtectionAdminService::new();
         let mut controller = lb_runtime::EmergencyProtectionController::new();
-        let store = std::sync::Arc::new(lb_runtime::HttpCacheStore::new(lb_runtime::HttpCacheStoreConfig {
-            max_entries: 4,
-            max_bytes: 1024,
-            max_object_bytes: 512,
-        })?);
-        let mut cache_service = HttpCacheAdminService::new(
-            "public-http",
-            true,
-            std::sync::Arc::clone(&store),
-        );
+        let store = std::sync::Arc::new(lb_runtime::HttpCacheStore::new(
+            lb_runtime::HttpCacheStoreConfig {
+                max_entries: 4,
+                max_bytes: 1024,
+                max_object_bytes: 512,
+            },
+        )?);
+        let mut cache_service =
+            HttpCacheAdminService::new("public-http", true, std::sync::Arc::clone(&store));
         let export = auth.export_abuse_forensics(
             &mut abuse_service,
             &mut controller,
@@ -629,16 +629,14 @@ mod tests {
     #[test]
     fn unauthorized_cache_purge_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
         let mut auth = auth_service()?;
-        let store = std::sync::Arc::new(lb_runtime::HttpCacheStore::new(lb_runtime::HttpCacheStoreConfig {
-            max_entries: 4,
-            max_bytes: 1024,
-            max_object_bytes: 512,
-        })?);
-        let mut cache_service = HttpCacheAdminService::new(
-            "public-http",
-            true,
-            store,
-        );
+        let store = std::sync::Arc::new(lb_runtime::HttpCacheStore::new(
+            lb_runtime::HttpCacheStoreConfig {
+                max_entries: 4,
+                max_bytes: 1024,
+                max_object_bytes: 512,
+            },
+        )?);
+        let mut cache_service = HttpCacheAdminService::new("public-http", true, store);
 
         let result = auth.purge_http_cache(
             &mut cache_service,
@@ -688,10 +686,7 @@ mod tests {
             duplicate_token,
             Err(super::InvalidAdminCredential::DuplicateTokenId(token)) if token == "dup"
         ));
-        assert!(matches!(
-            empty_principal,
-            Err(super::InvalidAdminCredential::EmptyPrincipal)
-        ));
+        assert!(matches!(empty_principal, Err(super::InvalidAdminCredential::EmptyPrincipal)));
     }
 
     #[test]

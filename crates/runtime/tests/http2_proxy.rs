@@ -1,3 +1,5 @@
+#![allow(clippy::expect_used, clippy::type_complexity)]
+
 use std::future::poll_fn;
 use std::io;
 use std::net::SocketAddr;
@@ -13,11 +15,11 @@ use lb_net_core::{
     UpstreamEndpointId, UpstreamTarget,
 };
 use lb_runtime::{
-    proxy_http2_connection, AnonymousSourceFilterPolicy, EndpointHealthPolicy,
-    Http2ConnectionReport, Http2ProxyConfig, Http2ProxyError, Http2RouteUpstream,
-    LoadBalancingAlgorithm, LocalityRoutingPolicy, NoHealthyFallback,
-    ProtocolAnomalyCategory, RouteBackendPool, RouteEnumerationProtectionPolicy,
-    SourceAggregation, TrustedClientIpPolicy, UpstreamSelectionPolicy,
+    proxy_http2_connection, AffinityFallbackPolicy, AffinityPolicy, AnonymousSourceFilterPolicy,
+    EndpointHealthPolicy, Http2ConnectionReport, Http2ProxyConfig, Http2ProxyError,
+    Http2RouteUpstream, LoadBalancingAlgorithm, LocalityRoutingPolicy, NoHealthyFallback,
+    ProtocolAnomalyCategory, RouteBackendPool, RouteEnumerationProtectionPolicy, SourceAggregation,
+    TrustedClientIpPolicy, UpstreamSelectionPolicy,
 };
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
@@ -84,14 +86,16 @@ async fn streams_large_http2_request_body() -> Result<(), Box<dyn std::error::Er
     let upstream_addr = spawn_body_counting_h2_upstream().await?;
     let mut config = proxy_config(upstream_addr);
     config.limits.max_body_bytes = 256 * 1024;
+    config.timeouts.idle_timeout = Duration::from_secs(90);
     let (proxy_addr, report_rx) = spawn_one_shot_http2_proxy_listener(config).await?;
 
     let mut client = connect_h2_client(proxy_addr).await?;
-    let body = Bytes::from(vec![b'b'; 32 * 1024]);
+    let body_len = (16 * 1024) + 1;
+    let body = Bytes::from(vec![b'b'; body_len]);
     let response = send_h2_request(&mut client, "/upload", Some(body)).await?;
     let received = receive_h2_response(response).await?;
     assert_eq!(received.0, StatusCode::OK);
-    assert_eq!(received.1, "received=32768");
+    assert_eq!(received.1, format!("received={body_len}"));
     drop(client);
 
     let report = receive_proxy_result(report_rx).await?;
@@ -102,8 +106,8 @@ async fn streams_large_http2_request_body() -> Result<(), Box<dyn std::error::Er
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn evicts_idle_http2_upstream_clients_before_reuse(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn evicts_idle_http2_upstream_clients_before_reuse() -> Result<(), Box<dyn std::error::Error>>
+{
     let upstream_addr = spawn_connection_indexed_h2_upstream(false).await?;
     let mut config = proxy_config(upstream_addr);
     config.timeouts.idle_timeout = Duration::from_millis(40);
@@ -369,8 +373,8 @@ async fn unmatched_http2_host_filtered_routes_return_forbidden(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn progressive_ban_blocks_query_shape_enumeration(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn progressive_ban_blocks_query_shape_enumeration() -> Result<(), Box<dyn std::error::Error>>
+{
     let upstream_addr = spawn_tagged_h2_upstream("search-route").await?;
     let mut config = proxy_config(upstream_addr)
         .with_route_upstreams([Http2RouteUpstream {
@@ -392,7 +396,8 @@ async fn progressive_ban_blocks_query_shape_enumeration(
     let (proxy_addr, report_rx) = spawn_one_shot_http2_proxy_listener(config).await?;
 
     let mut client = connect_h2_client(proxy_addr).await?;
-    let first_response = send_h2_request(&mut client, "http://example.com/search?q=one", None).await?;
+    let first_response =
+        send_h2_request(&mut client, "http://example.com/search?q=one", None).await?;
     let first_received = receive_h2_response(first_response).await?;
     assert_eq!(first_received.0, StatusCode::OK);
     assert_eq!(first_received.1, "search-route");
@@ -403,7 +408,8 @@ async fn progressive_ban_blocks_query_shape_enumeration(
     assert_eq!(second_received.0, StatusCode::FORBIDDEN);
     assert_eq!(second_received.1, "");
 
-    let third_response = send_h2_request(&mut client, "http://example.com/search?q=three", None).await?;
+    let third_response =
+        send_h2_request(&mut client, "http://example.com/search?q=three", None).await?;
     let third_received = receive_h2_response(third_response).await?;
     assert_eq!(third_received.0, StatusCode::FORBIDDEN);
     assert_eq!(third_received.1, "");
@@ -420,8 +426,8 @@ async fn progressive_ban_blocks_query_shape_enumeration(
 async fn blocks_http2_requests_from_configured_anonymous_sources(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let upstream_addr = spawn_tagged_h2_upstream("blocked").await?;
-    let config = proxy_config(upstream_addr).with_anonymous_source_filter(
-        AnonymousSourceFilterPolicy {
+    let config =
+        proxy_config(upstream_addr).with_anonymous_source_filter(AnonymousSourceFilterPolicy {
             enabled: true,
             deny_cidrs: Vec::new(),
             deny_vpn: false,
@@ -432,8 +438,7 @@ async fn blocks_http2_requests_from_configured_anonymous_sources(
             proxy_cidrs: Vec::new(),
             socks_cidrs: Vec::new(),
             tor_exit_cidrs: vec!["127.0.0.0/8".parse::<IpNet>().expect("tor cidr")],
-        },
-    );
+        });
     let (proxy_addr, report_rx) = spawn_one_shot_http2_proxy_listener(config).await?;
 
     let mut client = connect_h2_client(proxy_addr).await?;
@@ -500,13 +505,9 @@ async fn untrusted_http2_forwarding_headers_return_bad_request(
     let (proxy_addr, report_rx) = spawn_one_shot_http2_proxy_listener(config).await?;
 
     let mut client = connect_h2_client(proxy_addr).await?;
-    let response = send_h2_request_with_headers(
-        &mut client,
-        "/",
-        None,
-        &[("forwarded", "for=198.51.100.7")],
-    )
-    .await?;
+    let response =
+        send_h2_request_with_headers(&mut client, "/", None, &[("forwarded", "for=198.51.100.7")])
+            .await?;
     let received = receive_h2_response(response).await?;
     assert_eq!(received.0, StatusCode::BAD_REQUEST);
     drop(client);
@@ -523,10 +524,7 @@ async fn route_backend_pool_passive_failures_keep_failed_http2_endpoint_out_of_r
     let healthy_upstream = spawn_multi_tagged_h2_upstream("healthy-h2-route", 2).await?;
     let pool = route_backend_pool(
         "api",
-        vec![
-            ("a", failed_upstream, 1, None, None),
-            ("b", healthy_upstream, 1, None, None),
-        ],
+        vec![("a", failed_upstream, 1, None, None), ("b", healthy_upstream, 1, None, None)],
         EndpointHealthPolicy {
             degraded_failure_threshold: 1,
             unhealthy_failure_threshold: 1,
@@ -539,15 +537,15 @@ async fn route_backend_pool_passive_failures_keep_failed_http2_endpoint_out_of_r
             algorithm: LoadBalancingAlgorithm::RoundRobin,
             locality: LocalityRoutingPolicy::Disabled,
             no_healthy_fallback: NoHealthyFallback::Fail,
+            affinity: None,
         },
     )?;
-    let mut config = proxy_config(healthy_upstream).with_route_backend_pools([(
-        String::from("api"),
-        pool,
-    )]);
+    let mut config =
+        proxy_config(healthy_upstream).with_route_backend_pools([(String::from("api"), pool)]);
     config.routes = vec![lb_proto_http::RoutePrefixRule::new("api", "/api")];
 
-    let (first_proxy_addr, first_report_rx) = spawn_one_shot_http2_proxy_listener(config.clone()).await?;
+    let (first_proxy_addr, first_report_rx) =
+        spawn_one_shot_http2_proxy_listener(config.clone()).await?;
     let mut first_client = connect_h2_client(first_proxy_addr).await?;
     let first_response = send_h2_request(&mut first_client, "/api", None).await?;
     let first_received = receive_h2_response(first_response).await?;
@@ -556,7 +554,8 @@ async fn route_backend_pool_passive_failures_keep_failed_http2_endpoint_out_of_r
     let first_report = receive_proxy_result(first_report_rx).await?;
     assert_eq!(first_report.metrics.response_status_counts.get(&502), Some(&1));
 
-    let (second_proxy_addr, second_report_rx) = spawn_one_shot_http2_proxy_listener(config.clone()).await?;
+    let (second_proxy_addr, second_report_rx) =
+        spawn_one_shot_http2_proxy_listener(config.clone()).await?;
     let mut second_client = connect_h2_client(second_proxy_addr).await?;
     let second_response = send_h2_request(&mut second_client, "/api", None).await?;
     let second_received = receive_h2_response(second_response).await?;
@@ -597,15 +596,15 @@ async fn graceful_http2_drain_does_not_mark_route_backend_unhealthy(
             algorithm: LoadBalancingAlgorithm::RoundRobin,
             locality: LocalityRoutingPolicy::Disabled,
             no_healthy_fallback: NoHealthyFallback::Fail,
+            affinity: None,
         },
     )?;
-    let mut config = proxy_config(draining_upstream).with_route_backend_pools([(
-        String::from("api"),
-        pool,
-    )]);
+    let mut config =
+        proxy_config(draining_upstream).with_route_backend_pools([(String::from("api"), pool)]);
     config.routes = vec![lb_proto_http::RoutePrefixRule::new("api", "/api")];
 
-    let (first_proxy_addr, first_report_rx) = spawn_one_shot_http2_proxy_listener(config.clone()).await?;
+    let (first_proxy_addr, first_report_rx) =
+        spawn_one_shot_http2_proxy_listener(config.clone()).await?;
     let mut first_client = connect_h2_client(first_proxy_addr).await?;
     let first_response = send_h2_request(&mut first_client, "/api", None).await?;
     let first_received = receive_h2_response(first_response).await?;
@@ -655,12 +654,11 @@ async fn repeated_graceful_http2_drains_do_not_accumulate_route_backend_failures
             algorithm: LoadBalancingAlgorithm::RoundRobin,
             locality: LocalityRoutingPolicy::Disabled,
             no_healthy_fallback: NoHealthyFallback::Fail,
+            affinity: None,
         },
     )?;
-    let mut config = proxy_config(draining_upstream).with_route_backend_pools([(
-        String::from("api"),
-        pool,
-    )]);
+    let mut config =
+        proxy_config(draining_upstream).with_route_backend_pools([(String::from("api"), pool)]);
     config.routes = vec![lb_proto_http::RoutePrefixRule::new("api", "/api")];
 
     for cycle in 1..=3 {
@@ -714,29 +712,84 @@ async fn route_backend_pool_honors_http2_locality_hint_headers(
             algorithm: LoadBalancingAlgorithm::RoundRobin,
             locality: LocalityRoutingPolicy::PreferLocalityThenZone,
             no_healthy_fallback: NoHealthyFallback::Fail,
+            affinity: None,
         },
     )?;
-    let mut config = proxy_config(west_upstream).with_route_backend_pools([(
-        String::from("api"),
-        pool,
-    )]);
+    let mut config =
+        proxy_config(west_upstream).with_route_backend_pools([(String::from("api"), pool)]);
     config.routes = vec![lb_proto_http::RoutePrefixRule::new("api", "/api")];
     let (proxy_addr, report_rx) = spawn_one_shot_http2_proxy_listener(config).await?;
 
     let mut client = connect_h2_client(proxy_addr).await?;
-    let response = send_h2_request_with_headers(
-        &mut client,
-        "/api",
-        None,
-        &[("x-lb-locality", "edge-west")],
-    )
-    .await?;
+    let response =
+        send_h2_request_with_headers(&mut client, "/api", None, &[("x-lb-locality", "edge-west")])
+            .await?;
     let received = receive_h2_response(response).await?;
     assert_eq!(received.0, StatusCode::OK);
     assert_eq!(received.1, "west-h2-route");
     drop(client);
     let report = receive_proxy_result(report_rx).await?;
     assert_eq!(report.metrics.response_status_counts.get(&200), Some(&1));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn route_backend_pool_honors_http2_header_affinity() -> Result<(), Box<dyn std::error::Error>>
+{
+    let first_upstream = spawn_multi_tagged_h2_upstream("sticky-a", 2).await?;
+    let second_upstream = spawn_multi_tagged_h2_upstream("sticky-b", 2).await?;
+    let pool = route_backend_pool(
+        "api",
+        vec![("a", first_upstream, 1, None, None), ("b", second_upstream, 1, None, None)],
+        EndpointHealthPolicy::default(),
+        UpstreamSelectionPolicy {
+            algorithm: LoadBalancingAlgorithm::RoundRobin,
+            locality: LocalityRoutingPolicy::Disabled,
+            no_healthy_fallback: NoHealthyFallback::Fail,
+            affinity: Some(AffinityPolicy::HeaderHash {
+                header_name: String::from("x-session-id"),
+                fallback: AffinityFallbackPolicy::BalanceHealthy,
+            }),
+        },
+    )?;
+    let mut config = proxy_config(first_upstream)
+        .with_route_backend_pools([(String::from("api"), pool.clone())]);
+    config.routes = vec![lb_proto_http::RoutePrefixRule::new("api", "/api")];
+
+    let (first_proxy_addr, first_report_rx) =
+        spawn_one_shot_http2_proxy_listener(config.clone()).await?;
+    let mut first_client = connect_h2_client(first_proxy_addr).await?;
+    let first_response = send_h2_request_with_headers(
+        &mut first_client,
+        "/api",
+        None,
+        &[("x-session-id", "sticky-user")],
+    )
+    .await?;
+    let first_received = receive_h2_response(first_response).await?;
+    drop(first_client);
+    let first_report = receive_proxy_result(first_report_rx).await?;
+    assert_eq!(first_report.metrics.response_status_counts.get(&200), Some(&1));
+
+    let (second_proxy_addr, second_report_rx) = spawn_one_shot_http2_proxy_listener(config).await?;
+    let mut second_client = connect_h2_client(second_proxy_addr).await?;
+    let second_response = send_h2_request_with_headers(
+        &mut second_client,
+        "/api",
+        None,
+        &[("x-session-id", "sticky-user")],
+    )
+    .await?;
+    let second_received = receive_h2_response(second_response).await?;
+    drop(second_client);
+    let second_report = receive_proxy_result(second_report_rx).await?;
+    assert_eq!(second_report.metrics.response_status_counts.get(&200), Some(&1));
+
+    assert_eq!(first_received, second_received);
+    assert!(matches!(first_received.1.as_str(), "sticky-a" | "sticky-b"));
+    let metrics = pool.selection_metrics();
+    assert_eq!(metrics.affinity_hit_count, 2);
+    assert_eq!(metrics.affinity_fallback_count, 0);
     Ok(())
 }
 
@@ -759,6 +812,7 @@ async fn route_backend_pool_include_unhealthy_fallback_keeps_http2_backend_reach
             algorithm: LoadBalancingAlgorithm::RoundRobin,
             locality: LocalityRoutingPolicy::Disabled,
             no_healthy_fallback: NoHealthyFallback::IncludeUnhealthy,
+            affinity: None,
         },
     )?;
     let endpoint_id = pool.active_probe_targets()?[0].endpoint_id.clone();
@@ -780,16 +834,15 @@ async fn route_backend_pool_include_unhealthy_fallback_keeps_http2_backend_reach
             algorithm: LoadBalancingAlgorithm::RoundRobin,
             locality: LocalityRoutingPolicy::Disabled,
             no_healthy_fallback: NoHealthyFallback::Fail,
+            affinity: None,
         },
     )?;
     let fail_closed_endpoint_id = fail_closed_pool.active_probe_targets()?[0].endpoint_id.clone();
     fail_closed_pool.note_active_failure(&fail_closed_endpoint_id)?;
     fail_closed_pool.note_active_failure(&fail_closed_endpoint_id)?;
 
-    let mut fail_closed_config = proxy_config(upstream_addr).with_route_backend_pools([(
-        String::from("api"),
-        fail_closed_pool,
-    )]);
+    let mut fail_closed_config = proxy_config(upstream_addr)
+        .with_route_backend_pools([(String::from("api"), fail_closed_pool)]);
     fail_closed_config.routes = vec![lb_proto_http::RoutePrefixRule::new("api", "/api")];
     let (fail_closed_addr, fail_closed_report_rx) =
         spawn_one_shot_http2_proxy_listener(fail_closed_config).await?;
@@ -801,12 +854,11 @@ async fn route_backend_pool_include_unhealthy_fallback_keeps_http2_backend_reach
     let fail_closed_report = receive_proxy_result(fail_closed_report_rx).await?;
     assert_eq!(fail_closed_report.metrics.response_status_counts.get(&502), Some(&1));
 
-    let mut include_unhealthy_config = proxy_config(upstream_addr).with_route_backend_pools([(
-        String::from("api"),
-        pool,
-    )]);
+    let mut include_unhealthy_config =
+        proxy_config(upstream_addr).with_route_backend_pools([(String::from("api"), pool)]);
     include_unhealthy_config.routes = vec![lb_proto_http::RoutePrefixRule::new("api", "/api")];
-    let (proxy_addr, report_rx) = spawn_one_shot_http2_proxy_listener(include_unhealthy_config).await?;
+    let (proxy_addr, report_rx) =
+        spawn_one_shot_http2_proxy_listener(include_unhealthy_config).await?;
 
     let mut client = connect_h2_client(proxy_addr).await?;
     let response = send_h2_request(&mut client, "/api", None).await?;
@@ -979,8 +1031,8 @@ async fn spawn_connection_indexed_h2_upstream(
                     let response = Response::builder().status(StatusCode::OK).body(());
                     if let Ok(response) = response {
                         if let Ok(mut send) = respond.send_response(response, false) {
-                            let _ = send
-                                .send_data(Bytes::from(format!("conn-{connection_id}")), true);
+                            let _ =
+                                send.send_data(Bytes::from(format!("conn-{connection_id}")), true);
                         }
                     }
 
@@ -995,7 +1047,10 @@ async fn spawn_connection_indexed_h2_upstream(
     Ok(address)
 }
 
-async fn spawn_multi_tagged_h2_upstream(body: &'static str, max_connections: usize) -> io::Result<SocketAddr> {
+async fn spawn_multi_tagged_h2_upstream(
+    body: &'static str,
+    max_connections: usize,
+) -> io::Result<SocketAddr> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
 

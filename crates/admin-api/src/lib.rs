@@ -3,6 +3,7 @@
 mod abuse_control;
 mod auth;
 mod cache;
+mod cache_transport;
 mod control;
 mod mtls;
 mod rollout;
@@ -18,10 +19,14 @@ pub use auth::{
     InvalidAdminCredential,
 };
 pub use cache::{
-    HttpCacheAdminMetrics, HttpCacheAdminService, HttpCachePurgeActionKind,
-    HttpCachePurgeError, HttpCachePurgeHistoryEntry, HttpCachePurgeRequest,
-    HttpCachePurgeResponse, HttpCachePurgeResultKind, HttpCachePurgeTarget,
-    InvalidHttpCachePurgeRequest,
+    HttpCacheAdminMetrics, HttpCacheAdminService, HttpCachePurgeActionKind, HttpCachePurgeError,
+    HttpCachePurgeHistoryEntry, HttpCachePurgeRequest, HttpCachePurgeResponse,
+    HttpCachePurgeResultKind, HttpCachePurgeTarget, InvalidHttpCachePurgeRequest,
+};
+pub use cache_transport::{
+    sign_http_cache_peer_request, HttpCacheInvalidationDeliveryMode, HttpCachePeerConfig,
+    HttpCachePeerInvalidationResponse, HttpCachePeerInvalidationResult, HttpCachePeerTransport,
+    InvalidHttpCachePeerConfig,
 };
 pub use control::{
     InvalidPublishRequest, PublishConflict, PublishEvent, PublishEventKind, PublishResponse,

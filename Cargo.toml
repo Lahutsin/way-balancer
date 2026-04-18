@@ -11,6 +11,7 @@ members = [
   "crates/test-support",
   "binaries/lb-dataplane",
   "binaries/lb-ctl",
+  "binaries/lb-k8s-controller",
 ]
 exclude = ["fuzz"]
 resolver = "2"

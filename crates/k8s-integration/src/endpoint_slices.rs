@@ -198,6 +198,11 @@ impl EndpointSliceController {
     pub const fn stats(&self) -> EndpointSliceStats {
         self.stats
     }
+
+    #[must_use]
+    pub fn slice_refs(&self) -> Vec<(String, String)> {
+        self.slices.keys().map(|(namespace, name)| (namespace.clone(), name.clone())).collect()
+    }
 }
 
 fn validate_slice(slice: &EndpointSliceResource) -> Result<(), EndpointSliceApplyError> {

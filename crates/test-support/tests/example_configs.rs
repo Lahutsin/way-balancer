@@ -11,16 +11,18 @@ fn example_path(file_name: &str) -> PathBuf {
 }
 
 #[test]
-fn documented_example_configs_parse_and_compile(
-) -> Result<(), Box<dyn std::error::Error>> {
+fn documented_example_configs_parse_and_compile() -> Result<(), Box<dyn std::error::Error>> {
     for file_name in [
         "basic-http.json",
+        "cache-peer-node-a.json",
+        "cache-peer-node-b.json",
         "http-cache-public.json",
         "docker-compose-public-admin.json",
         "grpc-retries.json",
         "https-termination.json",
         "public-admin.json",
         "local-dev-insecure.json",
+        "sticky-sessions-cookie.json",
         "virtual-hosts.json",
         "example-com-api.json",
     ] {

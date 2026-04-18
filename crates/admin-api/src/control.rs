@@ -583,7 +583,8 @@ mod tests {
         SnapshotPublishRequest, SnapshotRestoreError,
     };
 
-    fn foundation_snapshot() -> Result<lb_config_model::WorkspaceSnapshot, Box<dyn std::error::Error>> {
+    fn foundation_snapshot(
+    ) -> Result<lb_config_model::WorkspaceSnapshot, Box<dyn std::error::Error>> {
         let mut config = WorkspaceConfig::foundation();
         configure_test_trusted_signers(&mut config)?;
         Ok(config.compile_snapshot()?)

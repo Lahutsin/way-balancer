@@ -1,3 +1,5 @@
+#![allow(clippy::expect_used, clippy::type_complexity)]
+
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -12,10 +14,10 @@ use lb_net_core::{
     UpstreamEndpointId, UpstreamTarget,
 };
 use lb_runtime::{
-    build_http_cache_key_material, proxy_http1_connection, Http1ConnectionReport,
-    Http1ProxyConfig, Http1ProxyError, Http1ResponseCacheConfig, Http1RouteUpstream,
-    HttpCacheRequest, HttpCacheStore, HttpCacheStoreConfig, HttpCacheStoreError,
-    AnonymousSourceFilterPolicy, EndpointHealthPolicy, LoadBalancingAlgorithm,
+    build_http_cache_key_material, proxy_http1_connection, AffinityFallbackPolicy, AffinityPolicy,
+    AnonymousSourceFilterPolicy, EndpointHealthPolicy, Http1ConnectionReport, Http1ProxyConfig,
+    Http1ProxyError, Http1ResponseCacheConfig, Http1RouteUpstream, HttpCacheRequest,
+    HttpCacheStore, HttpCacheStoreConfig, HttpCacheStoreError, LoadBalancingAlgorithm,
     LocalityRoutingPolicy, NoHealthyFallback, ProtocolAnomalyCategory, RouteBackendPool,
     RouteEnumerationProtectionPolicy, SourceAggregation, TrustedClientIpPolicy,
     UpstreamSelectionPolicy,
@@ -174,7 +176,8 @@ async fn rotates_http1_upstream_connection_after_reuse_age_limit(
     Ok(())
 }
 
-async fn spawn_not_modified_revalidation_upstream() -> io::Result<(SocketAddr, oneshot::Receiver<Vec<RequestCapture>>)> {
+async fn spawn_not_modified_revalidation_upstream(
+) -> io::Result<(SocketAddr, oneshot::Receiver<Vec<RequestCapture>>)> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let (captures_tx, captures_rx) = oneshot::channel();
@@ -221,7 +224,8 @@ async fn spawn_short_ttl_not_modified_revalidation_upstream(
     Ok((address, captures_rx))
 }
 
-async fn spawn_revalidation_replacement_upstream() -> io::Result<(SocketAddr, oneshot::Receiver<Vec<RequestCapture>>)> {
+async fn spawn_revalidation_replacement_upstream(
+) -> io::Result<(SocketAddr, oneshot::Receiver<Vec<RequestCapture>>)> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let (captures_tx, captures_rx) = oneshot::channel();
@@ -322,7 +326,8 @@ async fn rejects_unsupported_transfer_encoding_smuggling_shape(
 async fn routes_requests_by_host_and_preserves_query_string(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (api_upstream_addr, api_capture_rx) = spawn_tagged_upstream("api-route").await?;
-    let (fallback_upstream_addr, _fallback_capture_rx) = spawn_tagged_upstream("fallback-route").await?;
+    let (fallback_upstream_addr, _fallback_capture_rx) =
+        spawn_tagged_upstream("fallback-route").await?;
     let mut config = proxy_config(fallback_upstream_addr)
         .with_route_upstreams([
             Http1RouteUpstream {
@@ -344,9 +349,7 @@ async fn routes_requests_by_host_and_preserves_query_string(
 
     let mut client = TcpStream::connect(proxy_addr).await?;
     client
-        .write_all(
-            b"GET /api?auth=user HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
-        )
+        .write_all(b"GET /api?auth=user HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n")
         .await?;
     let response = read_http_response(&mut client).await?;
     assert!(response.ends_with("api-route"));
@@ -418,9 +421,7 @@ async fn progressive_ban_blocks_repeated_route_enumeration(
         spawn_one_shot_http1_proxy_listener(config.clone()).await?;
     let mut first_client = TcpStream::connect(first_proxy_addr).await?;
     first_client
-        .write_all(
-            b"GET /missing HTTP/1.1\r\nHost: other.example\r\nConnection: close\r\n\r\n",
-        )
+        .write_all(b"GET /missing HTTP/1.1\r\nHost: other.example\r\nConnection: close\r\n\r\n")
         .await?;
     let first_response = read_http_response(&mut first_client).await?;
     assert!(first_response.ends_with("route not allowed\n"));
@@ -445,9 +446,7 @@ async fn progressive_ban_blocks_repeated_route_enumeration(
     let (third_proxy_addr, third_report_rx) = spawn_one_shot_http1_proxy_listener(config).await?;
     let mut third_client = TcpStream::connect(third_proxy_addr).await?;
     third_client
-        .write_all(
-            b"GET /api HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
-        )
+        .write_all(b"GET /api HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n")
         .await?;
     let third_response = read_http_response(&mut third_client).await?;
     assert!(third_response.ends_with("source temporarily blocked\n"));
@@ -466,10 +465,7 @@ async fn route_backend_pool_passive_failures_keep_failed_http1_endpoint_out_of_r
         spawn_multi_tagged_upstream("healthy-route", 2).await?;
     let pool = route_backend_pool(
         "api",
-        vec![
-            ("a", failed_upstream, 1, None, None),
-            ("b", healthy_upstream, 1, None, None),
-        ],
+        vec![("a", failed_upstream, 1, None, None), ("b", healthy_upstream, 1, None, None)],
         EndpointHealthPolicy {
             degraded_failure_threshold: 1,
             unhealthy_failure_threshold: 1,
@@ -482,15 +478,15 @@ async fn route_backend_pool_passive_failures_keep_failed_http1_endpoint_out_of_r
             algorithm: LoadBalancingAlgorithm::RoundRobin,
             locality: LocalityRoutingPolicy::Disabled,
             no_healthy_fallback: NoHealthyFallback::Fail,
+            affinity: None,
         },
     )?;
-    let mut config = proxy_config(healthy_upstream).with_route_backend_pools([(
-        String::from("api"),
-        pool,
-    )]);
+    let mut config =
+        proxy_config(healthy_upstream).with_route_backend_pools([(String::from("api"), pool)]);
     config.routes = vec![lb_proto_http::RoutePrefixRule::new("api", "/api")];
 
-    let (first_proxy_addr, first_report_rx) = spawn_one_shot_http1_proxy_listener(config.clone()).await?;
+    let (first_proxy_addr, first_report_rx) =
+        spawn_one_shot_http1_proxy_listener(config.clone()).await?;
     let mut first_client = TcpStream::connect(first_proxy_addr).await?;
     first_client
         .write_all(b"GET /api HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n")
@@ -499,7 +495,8 @@ async fn route_backend_pool_passive_failures_keep_failed_http1_endpoint_out_of_r
     let first_result = receive_proxy_result(first_report_rx).await;
     assert!(first_result.is_err());
 
-    let (second_proxy_addr, second_report_rx) = spawn_one_shot_http1_proxy_listener(config.clone()).await?;
+    let (second_proxy_addr, second_report_rx) =
+        spawn_one_shot_http1_proxy_listener(config.clone()).await?;
     let mut second_client = TcpStream::connect(second_proxy_addr).await?;
     second_client
         .write_all(b"GET /api HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n")
@@ -541,12 +538,11 @@ async fn route_backend_pool_honors_http1_locality_hint_headers(
             algorithm: LoadBalancingAlgorithm::RoundRobin,
             locality: LocalityRoutingPolicy::PreferLocalityThenZone,
             no_healthy_fallback: NoHealthyFallback::Fail,
+            affinity: None,
         },
     )?;
-    let mut config = proxy_config(west_upstream).with_route_backend_pools([(
-        String::from("api"),
-        pool,
-    )]);
+    let mut config =
+        proxy_config(west_upstream).with_route_backend_pools([(String::from("api"), pool)]);
     config.routes = vec![lb_proto_http::RoutePrefixRule::new("api", "/api")];
     let (proxy_addr, report_rx) = spawn_one_shot_http1_proxy_listener(config).await?;
 
@@ -563,6 +559,60 @@ async fn route_backend_pool_honors_http1_locality_hint_headers(
 
     let capture = receive_capture(west_capture_rx).await?;
     assert!(capture.head.contains("GET /api HTTP/1.1\r\n"));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn route_backend_pool_honors_http1_cookie_affinity() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (first_upstream, _first_capture_rx) = spawn_multi_tagged_upstream("sticky-a", 2).await?;
+    let (second_upstream, _second_capture_rx) = spawn_multi_tagged_upstream("sticky-b", 2).await?;
+    let pool = route_backend_pool(
+        "api",
+        vec![("a", first_upstream, 1, None, None), ("b", second_upstream, 1, None, None)],
+        EndpointHealthPolicy::default(),
+        UpstreamSelectionPolicy {
+            algorithm: LoadBalancingAlgorithm::RoundRobin,
+            locality: LocalityRoutingPolicy::Disabled,
+            no_healthy_fallback: NoHealthyFallback::Fail,
+            affinity: Some(AffinityPolicy::CookieHash {
+                cookie_name: String::from("session_id"),
+                fallback: AffinityFallbackPolicy::BalanceHealthy,
+            }),
+        },
+    )?;
+    let mut config = proxy_config(first_upstream)
+        .with_route_backend_pools([(String::from("api"), pool.clone())]);
+    config.routes = vec![lb_proto_http::RoutePrefixRule::new("api", "/api")];
+
+    let (first_proxy_addr, first_report_rx) =
+        spawn_one_shot_http1_proxy_listener(config.clone()).await?;
+    let mut first_client = TcpStream::connect(first_proxy_addr).await?;
+    first_client
+        .write_all(
+            b"GET /api HTTP/1.1\r\nHost: example.test\r\nCookie: session_id=sticky-user\r\nConnection: close\r\n\r\n",
+        )
+        .await?;
+    let first_response = read_http_response(&mut first_client).await?;
+    let first_report = receive_proxy_result(first_report_rx).await?;
+    assert_eq!(first_report.metrics.response_status_counts.get(&200), Some(&1));
+
+    let (second_proxy_addr, second_report_rx) = spawn_one_shot_http1_proxy_listener(config).await?;
+    let mut second_client = TcpStream::connect(second_proxy_addr).await?;
+    second_client
+        .write_all(
+            b"GET /api HTTP/1.1\r\nHost: example.test\r\nCookie: session_id=sticky-user\r\nConnection: close\r\n\r\n",
+        )
+        .await?;
+    let second_response = read_http_response(&mut second_client).await?;
+    let second_report = receive_proxy_result(second_report_rx).await?;
+    assert_eq!(second_report.metrics.response_status_counts.get(&200), Some(&1));
+
+    assert_eq!(first_response, second_response);
+    assert!(first_response.ends_with("sticky-a") || first_response.ends_with("sticky-b"));
+    let metrics = pool.selection_metrics();
+    assert_eq!(metrics.affinity_hit_count, 2);
+    assert_eq!(metrics.affinity_fallback_count, 0);
     Ok(())
 }
 
@@ -585,6 +635,7 @@ async fn route_backend_pool_include_unhealthy_fallback_keeps_http1_backend_reach
             algorithm: LoadBalancingAlgorithm::RoundRobin,
             locality: LocalityRoutingPolicy::Disabled,
             no_healthy_fallback: NoHealthyFallback::IncludeUnhealthy,
+            affinity: None,
         },
     )?;
     let endpoint_id = pool.active_probe_targets()?[0].endpoint_id.clone();
@@ -615,11 +666,16 @@ async fn route_backend_pool_include_unhealthy_fallback_keeps_http1_backend_reach
                 algorithm: LoadBalancingAlgorithm::RoundRobin,
                 locality: LocalityRoutingPolicy::Disabled,
                 no_healthy_fallback: NoHealthyFallback::Fail,
+                affinity: None,
             },
         )?,
     )]);
     fail_closed_config.routes = vec![lb_proto_http::RoutePrefixRule::new("api", "/api")];
-    let fail_closed_pool = fail_closed_config.route_backend_pools.get("api").ok_or("missing fail-closed pool")?.clone();
+    let fail_closed_pool = fail_closed_config
+        .route_backend_pools
+        .get("api")
+        .ok_or("missing fail-closed pool")?
+        .clone();
     let fail_closed_endpoint_id = fail_closed_pool.active_probe_targets()?[0].endpoint_id.clone();
     fail_closed_pool.note_active_failure(&fail_closed_endpoint_id)?;
     fail_closed_pool.note_active_failure(&fail_closed_endpoint_id)?;
@@ -635,12 +691,11 @@ async fn route_backend_pool_include_unhealthy_fallback_keeps_http1_backend_reach
     let fail_closed_report = receive_proxy_result(fail_closed_report_rx).await?;
     assert_eq!(fail_closed_report.metrics.response_status_counts.get(&502), Some(&1));
 
-    let mut include_unhealthy_config = proxy_config(upstream_addr).with_route_backend_pools([(
-        String::from("api"),
-        pool,
-    )]);
+    let mut include_unhealthy_config =
+        proxy_config(upstream_addr).with_route_backend_pools([(String::from("api"), pool)]);
     include_unhealthy_config.routes = vec![lb_proto_http::RoutePrefixRule::new("api", "/api")];
-    let (proxy_addr, report_rx) = spawn_one_shot_http1_proxy_listener(include_unhealthy_config).await?;
+    let (proxy_addr, report_rx) =
+        spawn_one_shot_http1_proxy_listener(include_unhealthy_config).await?;
 
     let mut client = TcpStream::connect(proxy_addr).await?;
     client
@@ -659,8 +714,8 @@ async fn route_backend_pool_include_unhealthy_fallback_keeps_http1_backend_reach
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn blocks_configured_anonymous_source_ranges() -> Result<(), Box<dyn std::error::Error>> {
     let upstream_addr = reserve_unused_addr().await?;
-    let config = proxy_config(upstream_addr).with_anonymous_source_filter(
-        AnonymousSourceFilterPolicy {
+    let config =
+        proxy_config(upstream_addr).with_anonymous_source_filter(AnonymousSourceFilterPolicy {
             enabled: true,
             deny_cidrs: Vec::new(),
             deny_vpn: false,
@@ -671,14 +726,11 @@ async fn blocks_configured_anonymous_source_ranges() -> Result<(), Box<dyn std::
             proxy_cidrs: vec!["127.0.0.0/8".parse::<IpNet>().expect("proxy cidr")],
             socks_cidrs: Vec::new(),
             tor_exit_cidrs: Vec::new(),
-        },
-    );
+        });
     let (proxy_addr, report_rx) = spawn_one_shot_http1_proxy_listener(config).await?;
 
     let mut client = TcpStream::connect(proxy_addr).await?;
-    client
-        .write_all(b"GET / HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n")
-        .await?;
+    client.write_all(b"GET / HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n").await?;
     let response = read_http_response(&mut client).await?;
     assert!(response.starts_with("HTTP/1.1 403 Forbidden\r\n"));
     assert!(response.ends_with("anonymous source blocked\n"));
@@ -821,9 +873,11 @@ async fn fresh_cache_hits_avoid_upstream_requests() -> Result<(), Box<dyn std::e
     };
 
     let (upstream_addr, capture_rx) = spawn_single_cacheable_upstream().await?;
-    let first_config = proxy_config(upstream_addr)
-        .with_response_cache(Http1ResponseCacheConfig::new(policy.clone(), Arc::clone(&shared_store)));
-    let (first_proxy_addr, first_report_rx) = spawn_one_shot_http1_proxy_listener(first_config).await?;
+    let first_config = proxy_config(upstream_addr).with_response_cache(
+        Http1ResponseCacheConfig::new(policy.clone(), Arc::clone(&shared_store)),
+    );
+    let (first_proxy_addr, first_report_rx) =
+        spawn_one_shot_http1_proxy_listener(first_config).await?;
 
     let mut first_client = TcpStream::connect(first_proxy_addr).await?;
     first_client
@@ -843,7 +897,8 @@ async fn fresh_cache_hits_avoid_upstream_requests() -> Result<(), Box<dyn std::e
     let unused_upstream = reserve_unused_addr().await?;
     let second_config = proxy_config(unused_upstream)
         .with_response_cache(Http1ResponseCacheConfig::new(policy, Arc::clone(&shared_store)));
-    let (second_proxy_addr, second_report_rx) = spawn_one_shot_http1_proxy_listener(second_config).await?;
+    let (second_proxy_addr, second_report_rx) =
+        spawn_one_shot_http1_proxy_listener(second_config).await?;
 
     let mut second_client = TcpStream::connect(second_proxy_addr).await?;
     second_client
@@ -879,7 +934,10 @@ async fn non_cacheable_responses_bypass_storage_without_breaking_proxying(
         .write_all(b"GET /private HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n")
         .await?;
     let response = read_http_response(&mut client).await?;
-    assert!(response.contains("Cache-Control: no-store") || response.contains("cache-control: no-store"));
+    assert!(
+        response.contains("Cache-Control: no-store")
+            || response.contains("cache-control: no-store")
+    );
     assert!(response.ends_with("private"));
     drop(client);
 
@@ -900,11 +958,11 @@ async fn cookie_bearing_requests_bypass_shared_cache_storage(
         max_object_bytes: 16 * 1024,
     })?);
     let (first_upstream_addr, first_capture_rx) = spawn_single_cacheable_upstream().await?;
-    let first_config = proxy_config(first_upstream_addr).with_response_cache(Http1ResponseCacheConfig::new(
-        HttpCachePolicyConfig::default(),
-        Arc::clone(&shared_store),
-    ));
-    let (first_proxy_addr, first_report_rx) = spawn_one_shot_http1_proxy_listener(first_config).await?;
+    let first_config = proxy_config(first_upstream_addr).with_response_cache(
+        Http1ResponseCacheConfig::new(HttpCachePolicyConfig::default(), Arc::clone(&shared_store)),
+    );
+    let (first_proxy_addr, first_report_rx) =
+        spawn_one_shot_http1_proxy_listener(first_config).await?;
 
     let mut first_client = TcpStream::connect(first_proxy_addr).await?;
     first_client
@@ -920,11 +978,11 @@ async fn cookie_bearing_requests_bypass_shared_cache_storage(
     assert_eq!(receive_capture_list(first_capture_rx).await?.len(), 1);
 
     let (second_upstream_addr, second_capture_rx) = spawn_single_cacheable_upstream().await?;
-    let second_config = proxy_config(second_upstream_addr).with_response_cache(Http1ResponseCacheConfig::new(
-        HttpCachePolicyConfig::default(),
-        Arc::clone(&shared_store),
-    ));
-    let (second_proxy_addr, second_report_rx) = spawn_one_shot_http1_proxy_listener(second_config).await?;
+    let second_config = proxy_config(second_upstream_addr).with_response_cache(
+        Http1ResponseCacheConfig::new(HttpCachePolicyConfig::default(), Arc::clone(&shared_store)),
+    );
+    let (second_proxy_addr, second_report_rx) =
+        spawn_one_shot_http1_proxy_listener(second_config).await?;
 
     let mut second_client = TcpStream::connect(second_proxy_addr).await?;
     second_client
@@ -942,8 +1000,8 @@ async fn cookie_bearing_requests_bypass_shared_cache_storage(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn unsafe_vary_headers_fail_closed_without_storage(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn unsafe_vary_headers_fail_closed_without_storage() -> Result<(), Box<dyn std::error::Error>>
+{
     let shared_store = Arc::new(HttpCacheStore::new(HttpCacheStoreConfig {
         max_entries: 16,
         max_bytes: 64 * 1024,
@@ -1021,8 +1079,10 @@ async fn stale_while_revalidate_window_can_serve_stale_entries(
         ..HttpCachePolicyConfig::default()
     };
     let (upstream_addr, capture_rx) = spawn_swr_upstream().await?;
-    let config = proxy_config(upstream_addr)
-        .with_response_cache(Http1ResponseCacheConfig::new(policy.clone(), Arc::clone(&shared_store)));
+    let config = proxy_config(upstream_addr).with_response_cache(Http1ResponseCacheConfig::new(
+        policy.clone(),
+        Arc::clone(&shared_store),
+    ));
     let (proxy_addr, report_rx) = spawn_one_shot_http1_proxy_listener(config).await?;
 
     let mut client = TcpStream::connect(proxy_addr).await?;
@@ -1041,7 +1101,8 @@ async fn stale_while_revalidate_window_can_serve_stale_entries(
     let unused_upstream = reserve_unused_addr().await?;
     let second_config = proxy_config(unused_upstream)
         .with_response_cache(Http1ResponseCacheConfig::new(policy, Arc::clone(&shared_store)));
-    let (second_proxy_addr, second_report_rx) = spawn_one_shot_http1_proxy_listener(second_config).await?;
+    let (second_proxy_addr, second_report_rx) =
+        spawn_one_shot_http1_proxy_listener(second_config).await?;
 
     let mut second_client = TcpStream::connect(second_proxy_addr).await?;
     second_client
@@ -1076,8 +1137,10 @@ async fn stale_if_error_window_can_fallback_on_upstream_failure(
         ..HttpCachePolicyConfig::default()
     };
     let (upstream_addr, capture_rx) = spawn_stale_if_error_upstream().await?;
-    let config = proxy_config(upstream_addr)
-        .with_response_cache(Http1ResponseCacheConfig::new(policy.clone(), Arc::clone(&shared_store)));
+    let config = proxy_config(upstream_addr).with_response_cache(Http1ResponseCacheConfig::new(
+        policy.clone(),
+        Arc::clone(&shared_store),
+    ));
     let (proxy_addr, report_rx) = spawn_one_shot_http1_proxy_listener(config).await?;
 
     let mut client = TcpStream::connect(proxy_addr).await?;
@@ -1096,7 +1159,8 @@ async fn stale_if_error_window_can_fallback_on_upstream_failure(
     let unused_upstream = reserve_unused_addr().await?;
     let second_config = proxy_config(unused_upstream)
         .with_response_cache(Http1ResponseCacheConfig::new(policy, Arc::clone(&shared_store)));
-    let (second_proxy_addr, second_report_rx) = spawn_one_shot_http1_proxy_listener(second_config).await?;
+    let (second_proxy_addr, second_report_rx) =
+        spawn_one_shot_http1_proxy_listener(second_config).await?;
 
     let mut second_client = TcpStream::connect(second_proxy_addr).await?;
     second_client
@@ -1134,9 +1198,11 @@ async fn conditional_revalidation_uses_validators_and_304_refreshes_metadata(
     };
 
     let (seed_upstream_addr, seed_capture_rx) = spawn_revalidation_seed_upstream().await?;
-    let seed_config = proxy_config(seed_upstream_addr)
-        .with_response_cache(Http1ResponseCacheConfig::new(policy.clone(), Arc::clone(&shared_store)));
-    let (seed_proxy_addr, seed_report_rx) = spawn_one_shot_http1_proxy_listener(seed_config).await?;
+    let seed_config = proxy_config(seed_upstream_addr).with_response_cache(
+        Http1ResponseCacheConfig::new(policy.clone(), Arc::clone(&shared_store)),
+    );
+    let (seed_proxy_addr, seed_report_rx) =
+        spawn_one_shot_http1_proxy_listener(seed_config).await?;
 
     let mut seed_client = TcpStream::connect(seed_proxy_addr).await?;
     seed_client
@@ -1154,8 +1220,9 @@ async fn conditional_revalidation_uses_validators_and_304_refreshes_metadata(
 
     let (revalidate_upstream_addr, revalidate_capture_rx) =
         spawn_not_modified_revalidation_upstream().await?;
-    let revalidate_config = proxy_config(revalidate_upstream_addr)
-        .with_response_cache(Http1ResponseCacheConfig::new(policy.clone(), Arc::clone(&shared_store)));
+    let revalidate_config = proxy_config(revalidate_upstream_addr).with_response_cache(
+        Http1ResponseCacheConfig::new(policy.clone(), Arc::clone(&shared_store)),
+    );
     let (revalidate_proxy_addr, revalidate_report_rx) =
         spawn_one_shot_http1_proxy_listener(revalidate_config).await?;
 
@@ -1220,9 +1287,11 @@ async fn conditional_revalidation_200_replaces_cached_object(
     };
 
     let (seed_upstream_addr, seed_capture_rx) = spawn_revalidation_seed_upstream().await?;
-    let seed_config = proxy_config(seed_upstream_addr)
-        .with_response_cache(Http1ResponseCacheConfig::new(policy.clone(), Arc::clone(&shared_store)));
-    let (seed_proxy_addr, seed_report_rx) = spawn_one_shot_http1_proxy_listener(seed_config).await?;
+    let seed_config = proxy_config(seed_upstream_addr).with_response_cache(
+        Http1ResponseCacheConfig::new(policy.clone(), Arc::clone(&shared_store)),
+    );
+    let (seed_proxy_addr, seed_report_rx) =
+        spawn_one_shot_http1_proxy_listener(seed_config).await?;
 
     let mut seed_client = TcpStream::connect(seed_proxy_addr).await?;
     seed_client
@@ -1240,8 +1309,9 @@ async fn conditional_revalidation_200_replaces_cached_object(
 
     let (replacement_upstream_addr, replacement_capture_rx) =
         spawn_revalidation_replacement_upstream().await?;
-    let replacement_config = proxy_config(replacement_upstream_addr)
-        .with_response_cache(Http1ResponseCacheConfig::new(policy.clone(), Arc::clone(&shared_store)));
+    let replacement_config = proxy_config(replacement_upstream_addr).with_response_cache(
+        Http1ResponseCacheConfig::new(policy.clone(), Arc::clone(&shared_store)),
+    );
     let (replacement_proxy_addr, replacement_report_rx) =
         spawn_one_shot_http1_proxy_listener(replacement_config).await?;
 
@@ -1306,9 +1376,11 @@ async fn repeated_revalidation_cycles_stay_bounded_under_soak(
     };
 
     let (seed_upstream_addr, seed_capture_rx) = spawn_revalidation_seed_upstream().await?;
-    let seed_config = proxy_config(seed_upstream_addr)
-        .with_response_cache(Http1ResponseCacheConfig::new(policy.clone(), Arc::clone(&shared_store)));
-    let (seed_proxy_addr, seed_report_rx) = spawn_one_shot_http1_proxy_listener(seed_config).await?;
+    let seed_config = proxy_config(seed_upstream_addr).with_response_cache(
+        Http1ResponseCacheConfig::new(policy.clone(), Arc::clone(&shared_store)),
+    );
+    let (seed_proxy_addr, seed_report_rx) =
+        spawn_one_shot_http1_proxy_listener(seed_config).await?;
 
     let mut seed_client = TcpStream::connect(seed_proxy_addr).await?;
     seed_client
@@ -1350,10 +1422,7 @@ async fn repeated_revalidation_cycles_stay_bounded_under_soak(
 
         let metrics = shared_store.metrics();
         assert_eq!(metrics.entry_count, 1, "cycle {cycle} should keep one cached object");
-        assert!(
-            metrics.total_bytes <= 64 * 1024,
-            "cycle {cycle} exceeded cache byte budget"
-        );
+        assert!(metrics.total_bytes <= 64 * 1024, "cycle {cycle} exceeded cache byte budget");
     }
 
     Ok(())
@@ -1390,8 +1459,7 @@ async fn malformed_cache_directives_fail_closed_without_storing(
 }
 
 #[test]
-fn equivalent_requests_produce_identical_cache_keys(
-) -> Result<(), Box<dyn std::error::Error>> {
+fn equivalent_requests_produce_identical_cache_keys() -> Result<(), Box<dyn std::error::Error>> {
     let policy = HttpCachePolicyConfig {
         authorization: AuthorizationCacheBehaviorConfig::Partition,
         cache_key: CacheKeyPolicyConfig {
@@ -1431,12 +1499,8 @@ fn equivalent_requests_produce_identical_cache_keys(
         ],
     };
 
-    let first_key = build_http_cache_key_material(&policy, &first, &[])?
-        .expect("key")
-        .primary;
-    let second_key = build_http_cache_key_material(&policy, &second, &[])?
-        .expect("key")
-        .primary;
+    let first_key = build_http_cache_key_material(&policy, &first, &[])?.expect("key").primary;
+    let second_key = build_http_cache_key_material(&policy, &second, &[])?.expect("key").primary;
     assert_eq!(first_key, second_key);
     Ok(())
 }
@@ -1476,11 +1540,11 @@ fn malformed_request_shapes_do_not_produce_ambiguous_cache_keys() {
         }],
     };
 
-    let error = build_http_cache_key_material(&policy, &request, &[])
-        .expect_err("must fail");
+    let error = build_http_cache_key_material(&policy, &request, &[]).expect_err("must fail");
     assert!(matches!(
         error,
-        HttpCacheStoreError::InvalidRequestTarget(_) | HttpCacheStoreError::HostAuthorityMismatch { .. }
+        HttpCacheStoreError::InvalidRequestTarget(_)
+            | HttpCacheStoreError::HostAuthorityMismatch { .. }
     ));
 }
 
@@ -1534,10 +1598,8 @@ async fn spawn_keep_alive_connection_indexed_http1_upstream(
                 captures.push(capture);
 
                 let body = format!("conn-{connection_index}");
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
-                    body.len()
-                );
+                let response =
+                    format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len());
                 if stream.write_all(response.as_bytes()).await.is_err() {
                     break;
                 }
@@ -1601,7 +1663,9 @@ async fn spawn_reused_connection_close_then_retry_upstream(
             if let Ok(capture) = read_http_request_capture(&mut second_stream).await {
                 captures.push(capture);
                 let _ = second_stream
-                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nsecond")
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nsecond",
+                    )
                     .await;
             }
         }
@@ -1611,7 +1675,6 @@ async fn spawn_reused_connection_close_then_retry_upstream(
 
     Ok((address, captures_rx))
 }
-
 
 async fn spawn_body_echo_upstream() -> io::Result<(SocketAddr, oneshot::Receiver<RequestCapture>)> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -1759,8 +1822,7 @@ async fn spawn_no_store_upstream(
     Ok((address, captures_rx))
 }
 
-async fn spawn_swr_upstream(
-) -> io::Result<(SocketAddr, oneshot::Receiver<Vec<RequestCapture>>)> {
+async fn spawn_swr_upstream() -> io::Result<(SocketAddr, oneshot::Receiver<Vec<RequestCapture>>)> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let (captures_tx, captures_rx) = oneshot::channel();

@@ -103,7 +103,7 @@ impl ListenerResourceConfig {
 }
 
 /// Declarative admin-plane hardening policy.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AdminListenerPolicyConfig {
     /// Authentication and authorization model for admin requests.
@@ -114,17 +114,6 @@ pub struct AdminListenerPolicyConfig {
     pub rate_limit: AdminRateLimitConfig,
     /// Audit retention controls for recent admin actions.
     pub audit: AdminAuditConfig,
-}
-
-impl Default for AdminListenerPolicyConfig {
-    fn default() -> Self {
-        Self {
-            auth: AdminAuthPolicyConfig::default(),
-            allowed_source_cidrs: Vec::new(),
-            rate_limit: AdminRateLimitConfig::default(),
-            audit: AdminAuditConfig::default(),
-        }
-    }
 }
 
 impl AdminListenerPolicyConfig {
@@ -198,10 +187,7 @@ pub struct AdminRateLimitConfig {
 
 impl Default for AdminRateLimitConfig {
     fn default() -> Self {
-        Self {
-            requests_per_minute: 120,
-            burst: 10,
-        }
+        Self { requests_per_minute: 120, burst: 10 }
     }
 }
 
@@ -215,9 +201,7 @@ pub struct AdminAuditConfig {
 
 impl Default for AdminAuditConfig {
     fn default() -> Self {
-        Self {
-            max_retained_events: 64,
-        }
+        Self { max_retained_events: 64 }
     }
 }
 
@@ -266,10 +250,7 @@ fn default_tls_minimum_version() -> ListenerTlsMinimumVersionConfig {
 }
 
 fn default_tls_alpn_protocols() -> Vec<ListenerAlpnProtocolConfig> {
-    vec![
-        ListenerAlpnProtocolConfig::Http2,
-        ListenerAlpnProtocolConfig::Http11,
-    ]
+    vec![ListenerAlpnProtocolConfig::Http2, ListenerAlpnProtocolConfig::Http11]
 }
 
 fn default_tls_session_resumption() -> ListenerTlsSessionResumptionConfig {
@@ -446,7 +427,7 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     use super::{
-        AdminListenerPolicyConfig, compile_listeners, ListenerAlpnProtocolConfig,
+        compile_listeners, AdminListenerPolicyConfig, ListenerAlpnProtocolConfig,
         ListenerCertificateSourceConfig, ListenerClassConfig, ListenerResourceConfig,
         ListenerTlsMinimumVersionConfig, ListenerTlsSessionResumptionConfig,
         ListenerTlsSessionResumptionModeConfig, ListenerTlsSniCertificateConfig,
@@ -566,14 +547,8 @@ mod tests {
         assert_eq!(config.minimum_version, ListenerTlsMinimumVersionConfig::Tls12);
         assert_eq!(
             config.alpn_protocols,
-            vec![
-                ListenerAlpnProtocolConfig::Http2,
-                ListenerAlpnProtocolConfig::Http11,
-            ]
+            vec![ListenerAlpnProtocolConfig::Http2, ListenerAlpnProtocolConfig::Http11,]
         );
-        assert_eq!(
-            config.session_resumption,
-            ListenerTlsSessionResumptionConfig::default()
-        );
+        assert_eq!(config.session_resumption, ListenerTlsSessionResumptionConfig::default());
     }
 }
