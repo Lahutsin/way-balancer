@@ -10,7 +10,8 @@ way-balancer is a production-oriented Rust load balancer with a pre-GA but alrea
 
 - how to build, verify, and run the project locally
 - how the dataplane and control-plane pieces fit together
-- how configuration, examples, cache policy, and affinity are modeled
+- how configuration, admin endpoints, cache policy, and affinity are modeled
+- how to diagnose auth, reload, cache, affinity, and overload issues in production-like environments
 - where to find runbooks for security, TLS, cache, DR, upgrade, and release evidence
 
 ## Start Here
@@ -28,6 +29,22 @@ way-balancer is a production-oriented Rust load balancer with a pre-GA but alrea
 - `Configuration`
 
   Learn the core `WorkspaceConfig` shape, example topologies, admin auth, caching, and sticky-session affinity.
+
+- `Admin API`
+
+  See the concrete admin endpoints, permissions, auth modes, request and response shapes, and operational sequencing.
+
+- `HTTP Cache`
+
+  Understand cache eligibility, revalidation, stale serving, purge, and distributed invalidation behavior.
+
+- `Affinity`
+
+  Learn when cookie or header hashing is appropriate, how fallback behaves, and how to avoid hot-spot mistakes.
+
+- `Troubleshooting`
+
+  Work through auth failures, reload problems, cache misses, affinity surprises, and overload symptoms.
 
 - `Runbooks`
 
@@ -51,4 +68,6 @@ The current repository includes:
 
 - For a local bring-up path, open [Getting Started](getting-started.md).
 - For config structure and example files, open [Configuration](configuration.md).
+- For live admin endpoints and operator workflows, open [Admin API](admin-api.md).
+- For runtime behavior details, open [HTTP Cache](cache.md), [Affinity](affinity.md), and [Troubleshooting](troubleshooting.md).
 - For operator workflows, open the `Runbooks` section in the left navigation.

@@ -53,6 +53,10 @@ nav:
   - Getting Started: getting-started.md
   - Architecture: architecture.md
   - Configuration: configuration.md
+  - Admin API: admin-api.md
+  - HTTP Cache: cache.md
+  - Affinity: affinity.md
+  - Troubleshooting: troubleshooting.md
   - Publishing: publishing.md
   - Runbooks:
       - Admin Plane Hardening: runbooks/admin-plane-hardening.md

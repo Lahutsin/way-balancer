@@ -19,9 +19,9 @@ The workspace is still pre-GA, but it already includes runnable dataplane/contro
 
 ## Implemented Subsystems
 
-- `crates/runtime`: dataplane runtime, proxying, overload, probe, source guard, and snapshot-apply logic
-- `crates/admin-api`: snapshot publication, rollout/rollback, admin auth, abuse control, mTLS, backup/restore hooks
-- `crates/config-model`: typed config schema, validation, security posture, snapshot compiler, digest, and diff model
+- `crates/runtime`: dataplane runtime, HTTP/TCP proxying, cache, affinity-aware upstream selection, overload, probe, source guard, and snapshot-apply logic
+- `crates/admin-api`: snapshot publication, rollout/rollback, admin auth, cache admin services, abuse control, mTLS, backup/restore hooks
+- `crates/config-model`: typed config schema, validation, security posture, snapshot compiler, digest, diff, and traffic-policy model
 - `crates/k8s-integration`: Gateway API translation, reconciliation, and EndpointSlice foundations
 - `crates/proto-http` and `crates/proto-tls`: protocol hardening and certificate-validation foundations
 - `crates/observability`: metrics, tracing, diagnostics, support-bundle, and forensic export foundations
@@ -33,8 +33,8 @@ The diagram below shows how the main control-plane and dataplane pieces fit toge
 
 ```mermaid
 flowchart LR
-	user[Clients] --> public[Public listeners\nHTTP HTTPS gRPC]
-	operator[Operators and CI] --> admin[Admin listeners\nhealthz status validate audit reload]
+	user[Clients] --> public[Public listeners\nHTTP HTTPS gRPC TCP]
+	operator[Operators and CI] --> admin[Admin listeners\nhealthz status validate audit reload\ncache purge cache invalidate]
 	operator --> ctl[lb-ctl]
 	k8s[Kubernetes Gateway API] --> k8s_integration[crates/k8s-integration]
 
@@ -50,11 +50,14 @@ flowchart LR
 		dataplane[lb-dataplane] --> runtime[crates/runtime]
 		public --> dataplane
 		admin --> dataplane
-		runtime --> edge_protection[Anonymous source filter\nroute/query probe protection]
-		runtime --> admin_hardening[Admin auth rate-limit\naudit replay protection]
-		runtime --> upstreams[Upstream clusters and services]
 		snapshot --> runtime
 		safety --> runtime
+		runtime --> routing[Route matching and\nlistener lifecycle]
+		runtime --> selection[Upstream selection\nhealth locality affinity]
+		runtime --> cache[HTTP cache\nrevalidate purge invalidate]
+		runtime --> protection[Overload limits breakers\nsource and protocol protection]
+		selection --> upstreams[Upstream clusters and services]
+		cache --> peers[Peer invalidation\nfan-out delivery]
 	end
 
 	proto_http[crates/proto-http]

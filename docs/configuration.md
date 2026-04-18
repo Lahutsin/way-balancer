@@ -56,6 +56,8 @@ The default bootstrap path is bearer auth through `LB_CTL_ADMIN_SECRET`, but the
 
 For production exposure, prefer the stronger signed-header model documented in the admin-plane hardening runbook.
 
+See [Admin API](admin-api.md) for the concrete runtime endpoints and response shapes exposed by `lb-dataplane serve --config ...`.
+
 ## Hostname And Route Matching
 
 Routes may now include `match.hostnames` together with `match.prefix`.
@@ -81,6 +83,8 @@ Safe defaults in this repository are:
 
 Detailed operational guidance lives in the cache runbooks.
 
+See [HTTP Cache](cache.md) for a more product-level walkthrough of eligibility, revalidation, purge, and distributed invalidation.
+
 ## Affinity And Sticky Sessions
 
 Upstream clusters may opt into deterministic affinity with `upstream_clusters[].traffic_policy.affinity`.
@@ -97,6 +101,8 @@ Current behavior:
 - if the preferred backend is unhealthy or ejected, `fallback: balance_healthy` re-enters healthy selection
 - affinity is intended for stateful workloads and should be used sparingly because it can amplify hot spots
 
+See [Affinity](affinity.md) for deployment guidance, example patterns, and failure interpretation.
+
 ## Security Posture
 
 Artifact verification and secure-default posture live under `security`.
@@ -107,4 +113,4 @@ The checked-in examples leave `trusted_signers` empty on purpose. Production env
 
 ## Next Step
 
-Open [Publishing](publishing.md) for local docs preview and GitHub Pages deployment, or jump into the runbooks for operator-specific procedures.
+Open [Admin API](admin-api.md), [HTTP Cache](cache.md), or [Affinity](affinity.md) for focused feature guides, then use [Troubleshooting](troubleshooting.md) for operator diagnostics.
