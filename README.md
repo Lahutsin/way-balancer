@@ -84,7 +84,6 @@ flowchart LR
 - `scripts/`: local developer and CI helper scripts
 - `docs/`: contributor guides plus compatibility, DR, and release runbooks
 - `artifacts/`: release-evidence inventory and SBOM/provenance artifact locations
-- `plan/`: implementation and documentation roadmaps
 
 ## Documentation Site
 
