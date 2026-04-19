@@ -1,15 +1,15 @@
 # lb-k8s-controller Kubernetes Example
 
-This directory contains a checked-in deployment example for the current `lb-k8s-controller` runtime.
+This directory contains a checked-in HA deployment example for `lb-k8s-controller`.
 
 If you prefer Helm packaging instead of applying the raw manifest directly, use the chart at `charts/lb-k8s-controller`.
 
 ## Current Assumptions
 
-- single replica only
-- no leader election
-- cluster-scoped RBAC for watched resources
+- two warm replicas with Kubernetes lease-based leader election
+- cluster-scoped RBAC for watched resources plus namespaced lease access in `way-balancer-system`
 - namespace-scoped reconcile target set through `LB_K8S_CONTROLLER_NAMESPACE`
+- pod name is used as the explicit lease identity
 
 ## Build The Image
 
@@ -46,13 +46,17 @@ kubectl logs deployment/lb-k8s-controller -n way-balancer-system
 - `ServiceAccount`
 - `ClusterRole`
 - `ClusterRoleBinding`
-- single-replica `Deployment`
+- namespaced `Role` and `RoleBinding` for `coordination.k8s.io` leases
+- two-replica `Deployment`
 
 The example watches `GatewayClass`, `Gateway`, `HTTPRoute`, `Service`, and `EndpointSlice` resources.
 
+Lease defaults target approximately 15 seconds to declare a leader dead, with renewal attempts every 2 seconds and a 10 second self-fencing renew deadline.
+
 ## Operational Notes
 
-- keep the deployment at one replica because leader election is not implemented yet
+- check lease ownership with `kubectl get lease lb-k8s-controller -n way-balancer-system -o yaml`
+- keep at least two replicas if you want warm failover coverage
 - use immutable image tags for upgrades
 - use `kubectl rollout undo` or pin the previous image tag to roll back controller packaging changes
 - dataplane snapshot rollback remains separate from controller deployment rollback

@@ -2,27 +2,6 @@
 
 ## Required Evidence
 
-- `EVID-001`: compatibility and supported-version review
-- `EVID-002`: upgrade and rollback rehearsal
-- `EVID-003`: disaster-recovery restore rehearsal
-- `EVID-004`: coverage and workspace test pass
-- `EVID-005`: cache performance and soak validation summary
-- `EVID-006`: provenance and SBOM artifact refresh
-- `EVID-007`: security and secret-scanning review
-- `EVID-008`: final GA readiness sign-off
-- `EVID-009`: stability-contract review
-
-## Release Candidate Sign-Off Checklist
-
-- required evidence links are present and current
-- cache runbooks match shipped config fields and runtime behavior
-- release artifacts were regenerated for the candidate build
-- GA sign-off references `EVID-008`
-
-# Release Evidence Checklist
-
-## Required Evidence
-
 | Evidence ID | Gate | Required artifact | Verification hook |
 | --- | --- | --- | --- |
 | `EVID-001` | Compatibility policy | `docs/runbooks/compatibility-matrix.md` | `./scripts/check-release-artifacts.sh` |
@@ -34,6 +13,7 @@
 | `EVID-007` | Provenance placeholder or generated artifact location | `artifacts/provenance/README.md` | `./scripts/check-release-artifacts.sh` |
 | `EVID-008` | Final GA review record | `docs/runbooks/ga-readiness-review-template.md` | `./scripts/check-release-artifacts.sh` |
 | `EVID-009` | Stability contract and breaking-change policy | `docs/runbooks/stability-contract.md` | `./scripts/check-release-artifacts.sh` |
+| `EVID-010` | Supported performance envelope artifact | `artifacts/performance-envelope/README.md` | `./scripts/measure-performance-envelope.sh smoke` |
 
 ## Release Candidate Sign-Off Checklist
 
@@ -46,6 +26,8 @@
 - [ ] `EVID-007` provenance location recorded, even if still populated by placeholder automation.
 - [ ] `EVID-008` GA review template completed with approver names or explicit exceptions.
 - [ ] `EVID-009` stability contract reviewed for stable versus experimental scope and breaking-change expectations.
+- [ ] `EVID-010` supported non-loopback performance artifact attached with profile assumptions and timing evidence.
+- [ ] `docs/runbooks/support-boundaries.md` reviewed against the actual candidate deployment shape and customer guidance.
 
 ## Security Exceptions
 

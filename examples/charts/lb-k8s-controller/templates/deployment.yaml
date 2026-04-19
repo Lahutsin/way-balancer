@@ -28,6 +28,7 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       serviceAccountName: {{ include "lb-k8s-controller.serviceAccountName" . }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
       {{- if .Values.priorityClassName }}
       priorityClassName: {{ .Values.priorityClassName }}
       {{- end }}
@@ -56,6 +57,22 @@ spec:
               value: {{ .Values.controller.reconcileDebounceMs | quote }}
             - name: LB_K8S_CONTROLLER_MAX_REQUEUE_MS
               value: {{ .Values.controller.maxRequeueMs | quote }}
+            - name: LB_K8S_CONTROLLER_LEADER_ELECTION
+              value: {{ ternary "true" "false" .Values.controller.leaderElection.enabled | quote }}
+            - name: LB_K8S_CONTROLLER_LEASE_NAME
+              value: {{ .Values.controller.leaderElection.leaseName | quote }}
+            - name: LB_K8S_CONTROLLER_LEASE_NAMESPACE
+              value: {{ default (include "lb-k8s-controller.namespace" .) .Values.controller.leaderElection.leaseNamespace | quote }}
+            - name: LB_K8S_CONTROLLER_IDENTITY
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: LB_K8S_CONTROLLER_LEASE_DURATION_MS
+              value: {{ .Values.controller.leaderElection.leaseDurationMs | quote }}
+            - name: LB_K8S_CONTROLLER_RENEW_DEADLINE_MS
+              value: {{ .Values.controller.leaderElection.renewDeadlineMs | quote }}
+            - name: LB_K8S_CONTROLLER_RETRY_PERIOD_MS
+              value: {{ .Values.controller.leaderElection.retryPeriodMs | quote }}
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

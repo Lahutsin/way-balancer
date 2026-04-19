@@ -13,6 +13,7 @@ use std::fs;
 use std::future::Future;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -43,6 +44,10 @@ const ACTIVE_HEALTH_PROBE_INTERVAL: Duration = Duration::from_millis(500);
 const ACTIVE_HEALTH_PROBE_TIMEOUT: Duration = Duration::from_millis(150);
 const ROUTE_BACKEND_WARMUP_DURATION: Duration = Duration::from_secs(1);
 const ADMIN_AUDIT_DEFAULT_CAPACITY: usize = 64;
+const CONTROL_PLANE_JOURNAL_VERSION: u32 = 1;
+const RECOVERY_UNFINISHED_RELOAD_CODE: &str = "reload_recovered_unfinished";
+const TLS_STATUS_EXPIRY_WARNING_WINDOW: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+static NEXT_CONTROL_PLANE_JOURNAL_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 fn to_dyn_error(error: impl std::fmt::Display) -> DynError {
     Box::new(io::Error::other(error.to_string()))
@@ -99,6 +104,7 @@ struct ManagedHttpsProxyConfig {
     http1: lb_runtime::Http1ProxyConfig,
     http2: lb_runtime::Http2ProxyConfig,
     tls_server_config: Arc<rustls::ServerConfig>,
+    tls_status: ListenerTlsStatus,
 }
 
 #[derive(Debug, Clone)]
@@ -108,6 +114,25 @@ struct CompiledListenerOverloadPolicy {
     shedding_signal_threshold: u64,
     brownout_signal_threshold: u64,
     brownout_features: Vec<CompiledBrownoutFeature>,
+}
+
+#[derive(Debug, Clone)]
+struct CompiledListenerAbuseProtectionPolicy {
+    source_quota: Option<CompiledSourceQuotaPolicy>,
+    handshake_guard: Option<CompiledHandshakeGuardPolicy>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CompiledSourceQuotaPolicy {
+    aggregation: lb_runtime::SourceAggregation,
+    max_active_per_source: usize,
+    max_tracked_sources: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CompiledHandshakeGuardPolicy {
+    max_inflight: usize,
+    timeout: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -272,7 +297,7 @@ struct AdminReplayState {
     nonces: BTreeMap<String, Instant>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct AdminAuditEvent {
     observed_at_unix_ms: u64,
     request_id: String,
@@ -280,9 +305,508 @@ struct AdminAuditEvent {
     actor: String,
     auth_mode: String,
     action: String,
+    code: String,
     source: String,
     outcome: String,
     detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct DurableSnapshotIdentity {
+    source_label: String,
+    digest_sha256: String,
+    api_version: String,
+    snapshot_format_version: String,
+}
+
+impl DurableSnapshotIdentity {
+    fn from_snapshot(source_label: &str, snapshot: &lb_config_model::WorkspaceSnapshot) -> Self {
+        Self {
+            source_label: source_label.to_string(),
+            digest_sha256: snapshot.metadata().digest_sha256().to_owned(),
+            api_version: serde_json::to_value(snapshot.metadata().api_version())
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_owned))
+                .unwrap_or_else(|| String::from("unknown")),
+            snapshot_format_version: snapshot.metadata().format_version().to_string(),
+        }
+    }
+
+    fn to_json(&self) -> String {
+        format!(
+            concat!(
+                "{{",
+                "\"source_label\":\"{}\",",
+                "\"digest_sha256\":\"{}\",",
+                "\"api_version\":\"{}\",",
+                "\"snapshot_format_version\":\"{}\"",
+                "}}"
+            ),
+            crate::escape_json_string(&self.source_label),
+            crate::escape_json_string(&self.digest_sha256),
+            crate::escape_json_string(&self.api_version),
+            crate::escape_json_string(&self.snapshot_format_version),
+        )
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct JournalInFlightOperation {
+    kind: String,
+    started_at_unix_ms: u64,
+    desired_snapshot: DurableSnapshotIdentity,
+    lifecycle_code: String,
+    detail: String,
+    expected_completion_within_ms: Option<u64>,
+    affected_listeners: Vec<String>,
+}
+
+impl JournalInFlightOperation {
+    fn from_reload_plan(
+        desired_snapshot: DurableSnapshotIdentity,
+        plan: &ReloadAuditPlan,
+    ) -> Self {
+        let affected_listeners = if !plan.supported_replacements.is_empty() {
+            plan.supported_replacements.clone()
+        } else {
+            plan.blocked_replacements.clone()
+        };
+        Self {
+            kind: String::from(if !plan.supported_replacements.is_empty() {
+                "reload_overlap_drain"
+            } else {
+                "reload"
+            }),
+            started_at_unix_ms: unix_time_ms(),
+            desired_snapshot,
+            lifecycle_code: String::from(plan.start_code()),
+            detail: plan.start_detail(),
+            expected_completion_within_ms: plan.expected_completion_within_ms,
+            affected_listeners,
+        }
+    }
+
+    fn to_json(&self) -> String {
+        format!(
+            concat!(
+                "{{",
+                "\"kind\":\"{}\",",
+                "\"started_at_unix_ms\":{},",
+                "\"desired_snapshot\":{},",
+                "\"lifecycle_code\":\"{}\",",
+                "\"detail\":\"{}\",",
+                "\"expected_completion_within_ms\":{},",
+                "\"affected_listeners\":[{}]",
+                "}}"
+            ),
+            crate::escape_json_string(&self.kind),
+            self.started_at_unix_ms,
+            self.desired_snapshot.to_json(),
+            crate::escape_json_string(&self.lifecycle_code),
+            crate::escape_json_string(&self.detail),
+            optional_u64_json(self.expected_completion_within_ms),
+            self.affected_listeners
+                .iter()
+                .map(|listener| format!("\"{}\"", crate::escape_json_string(listener)))
+                .collect::<Vec<_>>()
+                .join(","),
+        )
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ControlPlaneJournalPayload {
+    persisted_at_unix_ms: u64,
+    desired_snapshot: Option<DurableSnapshotIdentity>,
+    applied_snapshot: Option<DurableSnapshotIdentity>,
+    reload_health: String,
+    last_reload_outcome_code: String,
+    last_reload_result: String,
+    recent_admin_audit: Vec<AdminAuditEvent>,
+    in_flight_operation: Option<JournalInFlightOperation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ControlPlaneJournalEnvelope {
+    version: u32,
+    payload_json: String,
+    payload_sha256: String,
+}
+
+#[derive(Debug, Clone)]
+struct ControlPlaneRecoveryInfo {
+    state: String,
+    detail: String,
+    last_persisted_at_unix_ms: Option<u64>,
+    restored_reload_health: Option<String>,
+    restored_last_reload_outcome_code: Option<String>,
+    in_flight_operation: Option<JournalInFlightOperation>,
+    reconciled_listeners: Vec<RecoveredListenerStatus>,
+}
+
+#[derive(Debug, Clone)]
+struct RecoveryOperatorGuidance {
+    recommended_action: String,
+    urgency: String,
+    operation_age_ms: Option<u64>,
+    expected_completion_within_ms: Option<u64>,
+    exceeded_expected_completion: bool,
+}
+
+impl RecoveryOperatorGuidance {
+    fn to_json(&self) -> String {
+        format!(
+            concat!(
+                "{{",
+                "\"recommended_action\":\"{}\",",
+                "\"urgency\":\"{}\",",
+                "\"operation_age_ms\":{},",
+                "\"expected_completion_within_ms\":{},",
+                "\"exceeded_expected_completion\":{}",
+                "}}"
+            ),
+            crate::escape_json_string(&self.recommended_action),
+            crate::escape_json_string(&self.urgency),
+            optional_u64_json(self.operation_age_ms),
+            optional_u64_json(self.expected_completion_within_ms),
+            self.exceeded_expected_completion,
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RecoveryReconciliationSummary {
+    overall_verdict: String,
+    recommended_action: String,
+    settled_count: usize,
+    draining_count: usize,
+    failed_preserved_count: usize,
+    drain_timeout_count: usize,
+    missing_count: usize,
+    needs_review_count: usize,
+}
+
+impl RecoveryReconciliationSummary {
+    fn from_reconciled_listeners(listeners: &[RecoveredListenerStatus]) -> Self {
+        let mut summary = Self {
+            overall_verdict: String::from("none"),
+            recommended_action: String::from("none"),
+            settled_count: 0,
+            draining_count: 0,
+            failed_preserved_count: 0,
+            drain_timeout_count: 0,
+            missing_count: 0,
+            needs_review_count: 0,
+        };
+        for listener in listeners {
+            match listener.reconciliation_verdict.as_str() {
+                "settled" => summary.settled_count += 1,
+                "replacement_still_draining" => summary.draining_count += 1,
+                "replacement_failed_preserved" => summary.failed_preserved_count += 1,
+                "replacement_drain_timeout" => summary.drain_timeout_count += 1,
+                "missing" => summary.missing_count += 1,
+                _ => summary.needs_review_count += 1,
+            }
+        }
+        summary.overall_verdict = if listeners.is_empty() {
+            String::from("none")
+        } else if summary.missing_count > 0 || summary.needs_review_count > 0 {
+            String::from("needs_review")
+        } else if summary.failed_preserved_count > 0 {
+            String::from("replacement_failed_preserved")
+        } else if summary.drain_timeout_count > 0 {
+            String::from("replacement_drain_timeout")
+        } else if summary.draining_count > 0 {
+            String::from("replacement_still_draining")
+        } else {
+            String::from("settled")
+        };
+        summary.recommended_action = match summary.overall_verdict.as_str() {
+            "none" => String::from("none"),
+            "settled" => String::from("observe_only"),
+            "replacement_still_draining" => String::from("wait_for_drain_completion"),
+            "replacement_failed_preserved" => String::from("validate_and_retry_reload"),
+            "replacement_drain_timeout" => String::from("investigate_drain_timeout"),
+            _ => String::from("investigate_and_validate_reload"),
+        };
+        summary
+    }
+
+    fn urgency(&self) -> &'static str {
+        match self.overall_verdict.as_str() {
+            "none" | "settled" => "none",
+            "replacement_still_draining" => "watch",
+            "replacement_failed_preserved" => "action_required",
+            "replacement_drain_timeout" | "needs_review" => "urgent",
+            _ => "urgent",
+        }
+    }
+
+    fn to_json(&self) -> String {
+        format!(
+            concat!(
+                "{{",
+                "\"overall_verdict\":\"{}\",",
+                "\"recommended_action\":\"{}\",",
+                "\"settled_count\":{},",
+                "\"draining_count\":{},",
+                "\"failed_preserved_count\":{},",
+                "\"drain_timeout_count\":{},",
+                "\"missing_count\":{},",
+                "\"needs_review_count\":{}",
+                "}}"
+            ),
+            crate::escape_json_string(&self.overall_verdict),
+            crate::escape_json_string(&self.recommended_action),
+            self.settled_count,
+            self.draining_count,
+            self.failed_preserved_count,
+            self.drain_timeout_count,
+            self.missing_count,
+            self.needs_review_count,
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RecoveredListenerStatus {
+    name: String,
+    listener_state: String,
+    replacement_state: String,
+    reconciliation_verdict: String,
+}
+
+impl RecoveredListenerStatus {
+    fn new(name: String, listener_state: String, replacement_state: String) -> Self {
+        let reconciliation_verdict = match (listener_state.as_str(), replacement_state.as_str()) {
+            ("running", "stable") => String::from("settled"),
+            ("running", "replacement_draining") => String::from("replacement_still_draining"),
+            ("missing", "missing") => String::from("missing"),
+            (_, "failed_start_preserved") => String::from("replacement_failed_preserved"),
+            (_, "drain_timeout_expired") => String::from("replacement_drain_timeout"),
+            _ => String::from("needs_review"),
+        };
+        Self { name, listener_state, replacement_state, reconciliation_verdict }
+    }
+
+    fn to_json(&self) -> String {
+        format!(
+            concat!(
+                "{{",
+                "\"name\":\"{}\",",
+                "\"listener_state\":\"{}\",",
+                "\"replacement_state\":\"{}\",",
+                "\"reconciliation_verdict\":\"{}\"",
+                "}}"
+            ),
+            crate::escape_json_string(&self.name),
+            crate::escape_json_string(&self.listener_state),
+            crate::escape_json_string(&self.replacement_state),
+            crate::escape_json_string(&self.reconciliation_verdict),
+        )
+    }
+}
+
+impl Default for ControlPlaneRecoveryInfo {
+    fn default() -> Self {
+        Self {
+            state: String::from("none"),
+            detail: String::from("no durable control-plane state recovered"),
+            last_persisted_at_unix_ms: None,
+            restored_reload_health: None,
+            restored_last_reload_outcome_code: None,
+            in_flight_operation: None,
+            reconciled_listeners: Vec::new(),
+        }
+    }
+}
+
+impl ControlPlaneRecoveryInfo {
+    fn restored(payload: &ControlPlaneJournalPayload) -> Self {
+        let (state, detail) = match &payload.in_flight_operation {
+            Some(operation) => (
+                String::from("needs_operator_action"),
+                format!(
+                    "recovered unfinished {} for desired snapshot {}",
+                    operation.kind, operation.desired_snapshot.digest_sha256
+                ),
+            ),
+            None => (
+                String::from("restored"),
+                String::from("restored durable control-plane state from local journal"),
+            ),
+        };
+        Self {
+            state,
+            detail,
+            last_persisted_at_unix_ms: Some(payload.persisted_at_unix_ms),
+            restored_reload_health: Some(payload.reload_health.clone()),
+            restored_last_reload_outcome_code: Some(payload.last_reload_outcome_code.clone()),
+            in_flight_operation: payload.in_flight_operation.clone(),
+            reconciled_listeners: Vec::new(),
+        }
+    }
+
+    fn reconcile_with_listener_statuses(&mut self, listener_statuses: &[ListenerStatus]) {
+        let Some(operation) = self.in_flight_operation.as_ref() else {
+            self.reconciled_listeners.clear();
+            return;
+        };
+        self.reconciled_listeners = operation
+            .affected_listeners
+            .iter()
+            .map(|listener_name| {
+                listener_statuses
+                    .iter()
+                    .find(|status| &status.name == listener_name)
+                    .map(|status| {
+                        RecoveredListenerStatus::new(
+                            listener_name.clone(),
+                            status.state.clone(),
+                            status.replacement.state.clone(),
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        RecoveredListenerStatus::new(
+                            listener_name.clone(),
+                            String::from("missing"),
+                            String::from("missing"),
+                        )
+                    })
+            })
+            .collect();
+    }
+
+    fn operator_guidance_at(&self, now_ms: u64) -> RecoveryOperatorGuidance {
+        let reconciliation_summary =
+            RecoveryReconciliationSummary::from_reconciled_listeners(&self.reconciled_listeners);
+        let operation_age_ms = self
+            .in_flight_operation
+            .as_ref()
+            .map(|operation| now_ms.saturating_sub(operation.started_at_unix_ms));
+        let expected_completion_within_ms = self
+            .in_flight_operation
+            .as_ref()
+            .and_then(|operation| operation.expected_completion_within_ms);
+        let exceeded_expected_completion =
+            match (operation_age_ms, expected_completion_within_ms) {
+                (Some(age_ms), Some(expected_ms)) => age_ms > expected_ms,
+                _ => false,
+            };
+        if self.state == "needs_operator_action" {
+            let (recommended_action, urgency) = match reconciliation_summary.overall_verdict.as_str()
+            {
+                "replacement_still_draining" if exceeded_expected_completion => {
+                    ("investigate_stalled_drain", "action_required")
+                }
+                "replacement_still_draining" => ("wait_for_drain_completion", "watch"),
+                "replacement_failed_preserved" => {
+                    ("validate_and_retry_reload", "action_required")
+                }
+                "replacement_drain_timeout" => ("investigate_drain_timeout", "urgent"),
+                "needs_review" => ("investigate_and_validate_reload", "urgent"),
+                _ => ("validate_and_retry_reload", "action_required"),
+            };
+            return RecoveryOperatorGuidance {
+                recommended_action: String::from(recommended_action),
+                urgency: String::from(urgency),
+                operation_age_ms,
+                expected_completion_within_ms,
+                exceeded_expected_completion,
+            };
+        }
+
+        let urgency = reconciliation_summary.urgency();
+        RecoveryOperatorGuidance {
+            recommended_action: reconciliation_summary.recommended_action,
+            urgency: String::from(urgency),
+            operation_age_ms,
+            expected_completion_within_ms,
+            exceeded_expected_completion,
+        }
+    }
+
+    fn operator_guidance(&self) -> RecoveryOperatorGuidance {
+        self.operator_guidance_at(unix_time_ms())
+    }
+
+    fn to_json(&self) -> String {
+        let reconciliation_summary =
+            RecoveryReconciliationSummary::from_reconciled_listeners(&self.reconciled_listeners);
+        let operator_guidance = self.operator_guidance();
+        format!(
+            concat!(
+                "{{",
+                "\"state\":\"{}\",",
+                "\"detail\":\"{}\",",
+                "\"last_persisted_at_unix_ms\":{},",
+                "\"restored_reload_health\":{},",
+                "\"restored_last_reload_outcome_code\":{},",
+                "\"in_flight_operation\":{},",
+                "\"operator_guidance\":{},",
+                "\"reconciled_listeners\":[{}],",
+                "\"reconciliation_summary\":{}",
+                "}}"
+            ),
+            crate::escape_json_string(&self.state),
+            crate::escape_json_string(&self.detail),
+            optional_u64_json(self.last_persisted_at_unix_ms),
+            optional_string_json(self.restored_reload_health.as_deref()),
+            optional_string_json(self.restored_last_reload_outcome_code.as_deref()),
+            self.in_flight_operation
+                .as_ref()
+                .map_or_else(|| String::from("null"), JournalInFlightOperation::to_json),
+            operator_guidance.to_json(),
+            self.reconciled_listeners
+                .iter()
+                .map(RecoveredListenerStatus::to_json)
+                .collect::<Vec<_>>()
+                .join(","),
+            reconciliation_summary.to_json(),
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ControlPlaneJournalRuntime {
+    journal_path: String,
+    desired_snapshot: Option<DurableSnapshotIdentity>,
+    applied_snapshot: Option<DurableSnapshotIdentity>,
+    in_flight_operation: Option<JournalInFlightOperation>,
+    recovery: ControlPlaneRecoveryInfo,
+}
+
+impl ControlPlaneJournalRuntime {
+    fn new(config_path: &str) -> Self {
+        Self {
+            journal_path: control_plane_journal_path(config_path),
+            desired_snapshot: None,
+            applied_snapshot: None,
+            in_flight_operation: None,
+            recovery: ControlPlaneRecoveryInfo::default(),
+        }
+    }
+
+    fn to_status_json(&self) -> String {
+        format!(
+            concat!(
+                "{{",
+                "\"path\":\"{}\",",
+                "\"desired_snapshot\":{},",
+                "\"applied_snapshot\":{},",
+                "\"recovery\":{}",
+                "}}"
+            ),
+            crate::escape_json_string(&self.journal_path),
+            self.desired_snapshot
+                .as_ref()
+                .map_or_else(|| String::from("null"), DurableSnapshotIdentity::to_json),
+            self.applied_snapshot
+                .as_ref()
+                .map_or_else(|| String::from("null"), DurableSnapshotIdentity::to_json),
+            self.recovery.to_json(),
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -293,9 +817,31 @@ struct AdminRequestContext {
     source: IpAddr,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AdminApiRequestMode {
+    Legacy { canonical_target: String },
+    V1 { canonical_target: String },
+    UnsupportedVersion { canonical_target: String, requested_version: String, detail: String },
+}
+
+impl AdminApiRequestMode {
+    fn canonical_target(&self) -> &str {
+        match self {
+            Self::Legacy { canonical_target }
+            | Self::V1 { canonical_target }
+            | Self::UnsupportedVersion { canonical_target, .. } => canonical_target,
+        }
+    }
+
+    const fn uses_versioned_contract(&self) -> bool {
+        !matches!(self, Self::Legacy { .. })
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum AdminRequestAction {
     Healthz,
+    Readyz,
     Status,
     Validate,
     Audit,
@@ -310,13 +856,16 @@ impl AdminRequestAction {
         match self {
             Self::Audit => AdminPermission::Audit,
             Self::Reload | Self::CachePurge | Self::CacheInvalidate => AdminPermission::Write,
-            Self::Healthz | Self::Status | Self::Validate | Self::Unknown => AdminPermission::Read,
+            Self::Healthz | Self::Readyz | Self::Status | Self::Validate | Self::Unknown => {
+                AdminPermission::Read
+            }
         }
     }
 
     fn as_str(self) -> &'static str {
         match self {
             Self::Healthz => "healthz",
+            Self::Readyz => "readyz",
             Self::Status => "status",
             Self::Validate => "validate",
             Self::Audit => "audit",
@@ -325,6 +874,146 @@ impl AdminRequestAction {
             Self::CacheInvalidate => "cache_invalidate",
             Self::Unknown => "unknown",
         }
+    }
+}
+
+fn negotiate_admin_api_request(request: &crate::DemoRequestHead) -> AdminApiRequestMode {
+    let path_version = versioned_admin_target_parts(request.target.as_str())
+        .map(|(version, canonical_target)| (version, canonical_target));
+    let header_version = request
+        .header_value("x-lb-admin-api-version")
+        .and_then(normalize_admin_api_version)
+        .map(|version| (version, request.target.clone()));
+
+    match (path_version, header_version) {
+        (None, None) => AdminApiRequestMode::Legacy { canonical_target: request.target.clone() },
+        (Some((path_version, canonical_target)), None) => {
+            admin_api_request_mode_for_version(path_version, canonical_target)
+        }
+        (None, Some((header_version, canonical_target))) => {
+            admin_api_request_mode_for_version(header_version, canonical_target)
+        }
+        (Some((path_version, canonical_target)), Some((header_version, _))) => {
+            if path_version == header_version {
+                admin_api_request_mode_for_version(path_version, canonical_target)
+            } else {
+                AdminApiRequestMode::UnsupportedVersion {
+                    canonical_target,
+                    requested_version: header_version.clone(),
+                    detail: format!(
+                        "conflicting admin api versions requested in path ({path_version}) and header ({header_version})"
+                    ),
+                }
+            }
+        }
+    }
+}
+
+fn admin_api_request_mode_for_version(
+    version: String,
+    canonical_target: String,
+) -> AdminApiRequestMode {
+    if version == lb_admin_api::STABLE_ADMIN_API_VERSION {
+        AdminApiRequestMode::V1 { canonical_target }
+    } else {
+        AdminApiRequestMode::UnsupportedVersion {
+            canonical_target,
+            requested_version: version.clone(),
+            detail: format!("unsupported admin api version {version}"),
+        }
+    }
+}
+
+fn versioned_admin_target_parts(target: &str) -> Option<(String, String)> {
+    let trimmed = target.strip_prefix('/')?;
+    let (segment, remainder) = match trimmed.split_once('/') {
+        Some((segment, remainder)) => (segment, format!("/{remainder}")),
+        None => (trimmed, String::from("/")),
+    };
+    if segment.len() < 2 || !segment.starts_with('v') || !segment[1..].chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some((segment.to_ascii_lowercase(), remainder))
+}
+
+fn normalize_admin_api_version(value: &str) -> Option<String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return None;
+    }
+    if normalized.starts_with('v') {
+        return Some(normalized);
+    }
+    Some(format!("v{normalized}"))
+}
+
+fn versioned_admin_response_headers(extra_headers: &[&'static str]) -> Vec<&'static str> {
+    let mut headers = Vec::with_capacity(extra_headers.len().saturating_add(1));
+    headers.push("X-LB-Admin-Api-Version: v1");
+    headers.extend_from_slice(extra_headers);
+    headers
+}
+
+async fn write_versioned_admin_success<T: Serialize>(
+    stream: &mut TcpStream,
+    status: &'static str,
+    extra_headers: &[&'static str],
+    request_id: &str,
+    data: T,
+) -> io::Result<()> {
+    let body = serde_json::to_string(&lb_admin_api::VersionedAdminApiSuccessEnvelope::new(
+        request_id.to_string(),
+        data,
+    ))
+    .map_err(|error| io::Error::other(error.to_string()))?;
+    let headers = versioned_admin_response_headers(extra_headers);
+    crate::write_http_response_with_headers(
+        stream,
+        status,
+        "application/json",
+        headers.as_slice(),
+        body.as_bytes(),
+    )
+    .await
+}
+
+async fn write_versioned_admin_error(
+    stream: &mut TcpStream,
+    status: &'static str,
+    extra_headers: &[&'static str],
+    request_id: &str,
+    code: lb_admin_api::AdminApiErrorCode,
+    message: impl Into<String>,
+    retryable: bool,
+) -> io::Result<()> {
+    let body = serde_json::to_string(&lb_admin_api::VersionedAdminApiErrorEnvelope::new(
+        request_id.to_string(),
+        lb_admin_api::VersionedAdminApiError::new(code, message, retryable),
+    ))
+    .map_err(|error| io::Error::other(error.to_string()))?;
+    let headers = versioned_admin_response_headers(extra_headers);
+    crate::write_http_response_with_headers(
+        stream,
+        status,
+        "application/json",
+        headers.as_slice(),
+        body.as_bytes(),
+    )
+    .await
+}
+
+fn json_body_to_value(body: &str) -> io::Result<serde_json::Value> {
+    serde_json::from_str(body).map_err(|error| io::Error::other(error.to_string()))
+}
+
+fn admin_auth_error_contract(
+    error: &AdminAuthFailure,
+) -> (lb_admin_api::AdminApiErrorCode, bool) {
+    match (error.status, error.outcome) {
+        ("503 Service Unavailable", _) => (lb_admin_api::AdminApiErrorCode::Misconfigured, false),
+        ("409 Conflict", _) => (lb_admin_api::AdminApiErrorCode::ReplayRejected, false),
+        ("403 Forbidden", _) => (lb_admin_api::AdminApiErrorCode::Forbidden, false),
+        _ => (lb_admin_api::AdminApiErrorCode::Unauthorized, false),
     }
 }
 
@@ -383,11 +1072,19 @@ struct ManagedServeListener {
     drain_timeout: Duration,
     admission_limit: Arc<AtomicUsize>,
     overload_runtime: Arc<StdMutex<Option<ListenerOverloadRuntime>>>,
+    abuse_policy: Arc<RwLock<Option<CompiledListenerAbuseProtectionPolicy>>>,
+    abuse_protection: Arc<RwLock<lb_runtime::ListenerAbuseProtectionState>>,
     counters: Arc<ListenerRuntimeCounters>,
     kind: ManagedListenerKind,
     shutdown_tx: watch::Sender<bool>,
-    task: tokio::task::JoinHandle<io::Result<()>>,
+    task: tokio::task::JoinHandle<io::Result<ListenerDrainOutcome>>,
     probe_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListenerDrainOutcome {
+    Completed,
+    TimedOut,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -443,6 +1140,7 @@ struct ListenerLifecycleModel {
     active_identity: Option<ListenerIdentity>,
     draining_identities: Vec<ListenerIdentity>,
     retired_identities: Vec<ListenerIdentity>,
+    drain_timed_out_identities: Vec<ListenerIdentity>,
     failed_start: Option<FailedListenerStart>,
 }
 
@@ -453,6 +1151,7 @@ impl ListenerLifecycleModel {
             active_identity: Some(identity),
             draining_identities: Vec::new(),
             retired_identities: Vec::new(),
+            drain_timed_out_identities: Vec::new(),
             failed_start: None,
         }
     }
@@ -478,12 +1177,15 @@ impl ListenerLifecycleModel {
         previous
     }
 
-    fn finish_draining(&mut self, identity: ListenerIdentity) {
+    fn finish_draining(&mut self, identity: ListenerIdentity, outcome: ListenerDrainOutcome) {
         if let Some(index) =
             self.draining_identities.iter().position(|candidate| *candidate == identity)
         {
             let retired = self.draining_identities.remove(index);
             self.push_retired(retired);
+            if matches!(outcome, ListenerDrainOutcome::TimedOut) {
+                self.push_drain_timed_out(retired);
+            }
         }
     }
 
@@ -527,6 +1229,15 @@ impl ListenerLifecycleModel {
             let _ = self.retired_identities.remove(0);
         }
         self.retired_identities.push(identity);
+    }
+
+    fn push_drain_timed_out(&mut self, identity: ListenerIdentity) {
+        const MAX_DRAIN_TIMEOUT_IDENTITIES: usize = 4;
+
+        if self.drain_timed_out_identities.len() == MAX_DRAIN_TIMEOUT_IDENTITIES {
+            let _ = self.drain_timed_out_identities.remove(0);
+        }
+        self.drain_timed_out_identities.push(identity);
     }
 }
 
@@ -618,8 +1329,12 @@ impl ManagedListenerSlot {
         self.lifecycle.record_failed_start(ListenerIdentity::from_spec(spec), detail);
     }
 
-    fn finish_draining(&mut self, identity: ListenerIdentity) {
-        self.lifecycle.finish_draining(identity);
+    fn finish_draining_with_outcome(
+        &mut self,
+        identity: ListenerIdentity,
+        outcome: ListenerDrainOutcome,
+    ) {
+        self.lifecycle.finish_draining(identity, outcome);
     }
 }
 
@@ -632,6 +1347,7 @@ enum CompiledServeListener {
         max_connections: usize,
         drain_timeout: Duration,
         overload_policy: Option<CompiledListenerOverloadPolicy>,
+        abuse_protection_policy: Option<CompiledListenerAbuseProtectionPolicy>,
         proxy: ManagedProxyConfig,
     },
     Admin {
@@ -639,6 +1355,7 @@ enum CompiledServeListener {
         max_connections: usize,
         drain_timeout: Duration,
         overload_policy: Option<CompiledListenerOverloadPolicy>,
+        abuse_protection_policy: Option<CompiledListenerAbuseProtectionPolicy>,
         admin_policy: CompiledAdminPolicy,
     },
 }
@@ -687,6 +1404,13 @@ impl CompiledServeListener {
             }
         }
     }
+
+    fn abuse_protection_policy(&self) -> Option<&CompiledListenerAbuseProtectionPolicy> {
+        match self {
+            Self::Public { abuse_protection_policy, .. }
+            | Self::Admin { abuse_protection_policy, .. } => abuse_protection_policy.as_ref(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -708,18 +1432,26 @@ struct WorkspaceServeState {
     reload_requests: AtomicU64,
     reload_success_count: AtomicU64,
     reload_failure_count: AtomicU64,
+    reload_total_duration_ms: AtomicU64,
+    reload_max_duration_ms: AtomicU64,
+    last_reload_duration_ms: AtomicU64,
+    last_successful_reload_duration_ms: AtomicU64,
+    last_failed_reload_duration_ms: AtomicU64,
+    reload_health: AtomicUsize,
     admin_audit_sequence: AtomicU64,
     admin_audit_capacity: AtomicUsize,
+    last_reload_outcome_code: Mutex<String>,
     last_reload_result: Mutex<String>,
     recent_admin_audit: Mutex<VecDeque<AdminAuditEvent>>,
     http_cache_scopes: RwLock<BTreeMap<String, HttpCacheScopeRuntime>>,
+    control_plane_journal: Mutex<ControlPlaneJournalRuntime>,
 }
 
 impl WorkspaceServeState {
     fn new(config_path: String) -> Result<Self, DynError> {
         Ok(Self {
             started_at: Instant::now(),
-            config_path,
+            config_path: config_path.clone(),
             telemetry: lb_runtime::RuntimeTelemetry::new().map_err(to_dyn_error)?,
             proxied_connections: AtomicU64::new(0),
             proxied_requests: AtomicU64::new(0),
@@ -727,11 +1459,19 @@ impl WorkspaceServeState {
             reload_requests: AtomicU64::new(0),
             reload_success_count: AtomicU64::new(0),
             reload_failure_count: AtomicU64::new(0),
+            reload_total_duration_ms: AtomicU64::new(0),
+            reload_max_duration_ms: AtomicU64::new(0),
+            last_reload_duration_ms: AtomicU64::new(0),
+            last_successful_reload_duration_ms: AtomicU64::new(0),
+            last_failed_reload_duration_ms: AtomicU64::new(0),
+            reload_health: AtomicUsize::new(reload_health_index(ReloadHealthState::NotRequested)),
             admin_audit_sequence: AtomicU64::new(1),
             admin_audit_capacity: AtomicUsize::new(ADMIN_AUDIT_DEFAULT_CAPACITY),
+            last_reload_outcome_code: Mutex::new(String::from("not_requested")),
             last_reload_result: Mutex::new(String::from("not requested")),
             recent_admin_audit: Mutex::new(VecDeque::new()),
             http_cache_scopes: RwLock::new(BTreeMap::new()),
+            control_plane_journal: Mutex::new(ControlPlaneJournalRuntime::new(&config_path)),
         })
     }
 
@@ -745,7 +1485,11 @@ impl WorkspaceServeState {
 
     async fn status_body(&self, supervisor: &ServeSupervisor) -> String {
         let listener_statuses = supervisor.listener_statuses().await;
+        let admin_auth_json = supervisor.admin_auth_status().await.to_json();
+        let last_reload_outcome_code = self.last_reload_outcome_code.lock().await.clone();
         let last_reload_result = self.last_reload_result.lock().await.clone();
+        let reload_health = self.reload_health();
+        let readiness = evaluate_workspace_readiness(&listener_statuses, reload_health);
         let listeners_json =
             listener_statuses.iter().map(ListenerStatus::to_json).collect::<Vec<_>>().join(",\n");
         let overload_events_json = self
@@ -757,6 +1501,7 @@ impl WorkspaceServeState {
             .map(|event| OverloadEventStatus::from_telemetry(event).to_json())
             .collect::<Vec<_>>()
             .join(",\n");
+        let control_plane_journal_json = self.control_plane_journal.lock().await.to_status_json();
 
         format!(
             concat!(
@@ -771,8 +1516,18 @@ impl WorkspaceServeState {
                 "  \"reload_requests\": {},\n",
                 "  \"reload_success_count\": {},\n",
                 "  \"reload_failure_count\": {},\n",
+                "  \"reload_total_duration_ms\": {},\n",
+                "  \"reload_max_duration_ms\": {},\n",
+                "  \"reload_last_duration_ms\": {},\n",
+                "  \"reload_last_success_duration_ms\": {},\n",
+                "  \"reload_last_failure_duration_ms\": {},\n",
+                "  \"reload_health\": \"{}\",\n",
+                "  \"last_reload_outcome_code\": \"{}\",\n",
                 "  \"admin_audit_events\": {},\n",
                 "  \"last_reload_result\": \"{}\",\n",
+                "  \"admin_auth\": {},\n",
+                "  \"control_plane_journal\": {},\n",
+                "  \"readiness\": {},\n",
                 "  \"listeners\": [\n{}\n  ],\n",
                 "  \"recent_overload_events\": [\n{}\n  ]\n",
                 "}}\n"
@@ -785,8 +1540,18 @@ impl WorkspaceServeState {
             self.reload_requests.load(Ordering::SeqCst),
             self.reload_success_count.load(Ordering::SeqCst),
             self.reload_failure_count.load(Ordering::SeqCst),
+            self.reload_total_duration_ms.load(Ordering::SeqCst),
+            self.reload_max_duration_ms.load(Ordering::SeqCst),
+            self.last_reload_duration_ms.load(Ordering::SeqCst),
+            self.last_successful_reload_duration_ms.load(Ordering::SeqCst),
+            self.last_failed_reload_duration_ms.load(Ordering::SeqCst),
+            reload_health_name(reload_health),
+            crate::escape_json_string(&last_reload_outcome_code),
             self.recent_admin_audit.lock().await.len(),
             crate::escape_json_string(&last_reload_result),
+            admin_auth_json,
+            control_plane_journal_json,
+            readiness.to_json(),
             if listeners_json.is_empty() { String::new() } else { format!("    {listeners_json}") },
             if overload_events_json.is_empty() {
                 String::new()
@@ -794,6 +1559,25 @@ impl WorkspaceServeState {
                 format!("    {overload_events_json}")
             },
         )
+    }
+
+    fn reload_health(&self) -> ReloadHealthState {
+        match self.reload_health.load(Ordering::SeqCst) {
+            1 => ReloadHealthState::Healthy,
+            2 => ReloadHealthState::Failed,
+            _ => ReloadHealthState::NotRequested,
+        }
+    }
+
+    fn record_reload_duration(&self, duration_ms: u64, succeeded: bool) {
+        self.reload_total_duration_ms.fetch_add(duration_ms, Ordering::SeqCst);
+        self.reload_max_duration_ms.fetch_max(duration_ms, Ordering::SeqCst);
+        self.last_reload_duration_ms.store(duration_ms, Ordering::SeqCst);
+        if succeeded {
+            self.last_successful_reload_duration_ms.store(duration_ms, Ordering::SeqCst);
+        } else {
+            self.last_failed_reload_duration_ms.store(duration_ms, Ordering::SeqCst);
+        }
     }
 
     fn record_overload_event(
@@ -813,6 +1597,37 @@ impl WorkspaceServeState {
         }
     }
 
+    fn record_listener_abuse_rejection(
+        &self,
+        listener_name: &str,
+        reason: lb_runtime::AbuseRejectionReason,
+    ) {
+        let detail = format!(
+            "listener rejected hostile-edge connection: {} ({})",
+            reason.code(),
+            reason.detail(),
+        );
+        if let Err(error) =
+            self.telemetry.record_listener_abuse_rejection(listener_name, reason, &detail)
+        {
+            eprintln!("listener abuse telemetry emission failed: {error}");
+        }
+    }
+
+    async fn sync_listener_abuse_snapshot(
+        &self,
+        listener_name: &str,
+        abuse_protection: &RwLock<lb_runtime::ListenerAbuseProtectionState>,
+    ) {
+        let snapshot = abuse_protection.read().await.snapshot();
+        if let Err(error) = self
+            .telemetry
+            .record_listener_abuse_snapshot(listener_name, &snapshot)
+        {
+            eprintln!("listener abuse snapshot emission failed: {error}");
+        }
+    }
+
     fn set_admin_audit_capacity(&self, capacity: usize) {
         self.admin_audit_capacity.store(capacity.max(1), Ordering::SeqCst);
     }
@@ -824,6 +1639,10 @@ impl WorkspaceServeState {
         while recent.len() > max_events {
             recent.pop_front();
         }
+        drop(recent);
+        if let Err(error) = self.persist_control_plane_journal().await {
+            eprintln!("control-plane journal persistence failed after audit update: {error}");
+        }
     }
 
     async fn audit_body(&self) -> Result<String, DynError> {
@@ -834,6 +1653,162 @@ impl WorkspaceServeState {
 
     fn next_admin_request_id(&self) -> String {
         format!("admin-{:016x}", self.admin_audit_sequence.fetch_add(1, Ordering::SeqCst))
+    }
+
+    async fn prepare_reload_persistence(
+        &self,
+        operation: JournalInFlightOperation,
+    ) -> Result<(), DynError> {
+        let mut journal = self.control_plane_journal.lock().await;
+        journal.desired_snapshot = Some(operation.desired_snapshot.clone());
+        journal.in_flight_operation = Some(operation);
+        drop(journal);
+        self.persist_control_plane_journal().await
+    }
+
+    async fn finish_reload_persistence(
+        &self,
+        applied_snapshot: Option<DurableSnapshotIdentity>,
+        resolve_recovery: bool,
+    ) -> Result<(), DynError> {
+        let current_reload_health = String::from(reload_health_name(self.reload_health()));
+        let current_reload_outcome_code = self.last_reload_outcome_code.lock().await.clone();
+        let mut journal = self.control_plane_journal.lock().await;
+        if let Some(applied_snapshot) = applied_snapshot {
+            journal.applied_snapshot = Some(applied_snapshot);
+        }
+        journal.in_flight_operation = None;
+        if resolve_recovery && journal.recovery.state == "needs_operator_action" {
+            journal.recovery.state = String::from("resolved");
+            journal.recovery.detail =
+                String::from("operator completed a subsequent reload after startup recovery");
+            journal.recovery.last_persisted_at_unix_ms = Some(unix_time_ms());
+            journal.recovery.restored_reload_health = Some(current_reload_health);
+            journal.recovery.restored_last_reload_outcome_code = Some(current_reload_outcome_code);
+            journal.recovery.in_flight_operation = None;
+        }
+        drop(journal);
+        self.persist_control_plane_journal().await
+    }
+
+    async fn restore_control_plane_journal(&self) -> Result<(), DynError> {
+        let journal_path = self.control_plane_journal.lock().await.journal_path.clone();
+        if !Path::new(&journal_path).exists() {
+            return Ok(());
+        }
+
+        let raw = fs::read_to_string(&journal_path).map_err(to_dyn_error)?;
+        let envelope: ControlPlaneJournalEnvelope = serde_json::from_str(&raw).map_err(|error| {
+            to_dyn_error(format!(
+                "control-plane journal at {journal_path} is unreadable: {error}"
+            ))
+        })?;
+        if envelope.version != CONTROL_PLANE_JOURNAL_VERSION {
+            return Err(to_dyn_error(format!(
+                "control-plane journal at {journal_path} uses unsupported version {}",
+                envelope.version
+            )));
+        }
+        let expected_sha256 = sha256_hex(envelope.payload_json.as_bytes());
+        if envelope.payload_sha256 != expected_sha256 {
+            return Err(to_dyn_error(format!(
+                "control-plane journal at {journal_path} failed checksum validation"
+            )));
+        }
+        let payload: ControlPlaneJournalPayload =
+            serde_json::from_str(&envelope.payload_json).map_err(|error| {
+                to_dyn_error(format!(
+                    "control-plane journal payload at {journal_path} is invalid: {error}"
+                ))
+            })?;
+
+        let mut restored_reload_health = reload_health_from_name(&payload.reload_health);
+        let mut restored_last_reload_outcome_code = payload.last_reload_outcome_code.clone();
+        let mut restored_last_reload_result = payload.last_reload_result.clone();
+        let mut restored_recent_admin_audit = payload.recent_admin_audit.clone();
+        if let Some(operation) = payload.in_flight_operation.as_ref() {
+            restored_reload_health = ReloadHealthState::Failed;
+            restored_last_reload_outcome_code = String::from(RECOVERY_UNFINISHED_RELOAD_CODE);
+            restored_last_reload_result = format!(
+                "startup recovery detected unfinished reload for desired snapshot {}; operator must validate and reload again",
+                operation.desired_snapshot.digest_sha256
+            );
+            restored_recent_admin_audit.push(AdminAuditEvent {
+                observed_at_unix_ms: unix_time_ms(),
+                request_id: format!("recovery-{:016x}", unix_time_ms()),
+                listener: String::from("system"),
+                actor: String::from("system"),
+                auth_mode: String::from("recovery"),
+                action: String::from("reload_recovery"),
+                code: String::from(RECOVERY_UNFINISHED_RELOAD_CODE),
+                source: String::from("local"),
+                outcome: String::from("needs_operator_action"),
+                detail: restored_last_reload_result.clone(),
+            });
+        }
+        let audit_capacity = self.admin_audit_capacity.load(Ordering::SeqCst).max(1);
+        while restored_recent_admin_audit.len() > audit_capacity {
+            restored_recent_admin_audit.remove(0);
+        }
+
+        self.reload_health
+            .store(reload_health_index(restored_reload_health), Ordering::SeqCst);
+        *self.last_reload_outcome_code.lock().await = restored_last_reload_outcome_code;
+        *self.last_reload_result.lock().await = restored_last_reload_result;
+        *self.recent_admin_audit.lock().await = restored_recent_admin_audit.iter().cloned().collect();
+        self.admin_audit_sequence.store(
+            next_admin_sequence_from_events(&restored_recent_admin_audit),
+            Ordering::SeqCst,
+        );
+
+        let mut journal = self.control_plane_journal.lock().await;
+        journal.desired_snapshot = payload.desired_snapshot.clone();
+        journal.applied_snapshot = payload.applied_snapshot.clone();
+        journal.in_flight_operation = payload.in_flight_operation.clone();
+        journal.recovery = ControlPlaneRecoveryInfo::restored(&payload);
+        drop(journal);
+        if payload.in_flight_operation.is_some() {
+            self.persist_control_plane_journal().await?;
+        }
+        Ok(())
+    }
+
+    async fn persist_control_plane_journal(&self) -> Result<(), DynError> {
+        let (journal_path, desired_snapshot, applied_snapshot, in_flight_operation) = {
+            let journal = self.control_plane_journal.lock().await;
+            (
+                journal.journal_path.clone(),
+                journal.desired_snapshot.clone(),
+                journal.applied_snapshot.clone(),
+                journal.in_flight_operation.clone(),
+            )
+        };
+        let last_reload_outcome_code = self.last_reload_outcome_code.lock().await.clone();
+        let last_reload_result = self.last_reload_result.lock().await.clone();
+        let recent_admin_audit = self.recent_admin_audit.lock().await.iter().cloned().collect();
+        let payload = ControlPlaneJournalPayload {
+            persisted_at_unix_ms: unix_time_ms(),
+            desired_snapshot,
+            applied_snapshot,
+            reload_health: String::from(reload_health_name(self.reload_health())),
+            last_reload_outcome_code,
+            last_reload_result,
+            recent_admin_audit,
+            in_flight_operation,
+        };
+        write_control_plane_journal_atomic(&journal_path, &payload)
+    }
+
+    async fn reconcile_control_plane_recovery(
+        &self,
+        listener_statuses: &[ListenerStatus],
+    ) -> Result<(), DynError> {
+        let mut journal = self.control_plane_journal.lock().await;
+        journal
+            .recovery
+            .reconcile_with_listener_statuses(listener_statuses);
+        drop(journal);
+        self.persist_control_plane_journal().await
     }
 
     fn sync_listener_overload_snapshot(
@@ -961,6 +1936,37 @@ struct ConfigValidationPreview {
 struct ReloadAuditPlan {
     supported_replacements: Vec<String>,
     blocked_replacements: Vec<String>,
+    expected_completion_within_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ReloadApplyOutcome {
+    drain_timed_out_replacements: Vec<String>,
+}
+
+impl ReloadApplyOutcome {
+    fn timed_out_during_drain(&self) -> bool {
+        !self.drain_timed_out_replacements.is_empty()
+    }
+
+    fn generic_success_code(&self) -> &'static str {
+        if self.timed_out_during_drain() {
+            "reload_applied_with_drain_timeout"
+        } else {
+            "reload_applied"
+        }
+    }
+
+    fn generic_success_detail(&self) -> String {
+        if self.timed_out_during_drain() {
+            format!(
+                "configuration applied; drain timeout expired for: {}",
+                self.drain_timed_out_replacements.join(", ")
+            )
+        } else {
+            String::from("configuration applied")
+        }
+    }
 }
 
 impl ReloadAuditPlan {
@@ -968,11 +1974,15 @@ impl ReloadAuditPlan {
         current_identities: &BTreeMap<String, CurrentListenerIdentity>,
         candidate_listeners: &BTreeMap<String, CompiledServeListener>,
     ) -> Self {
+        let supported_replacements =
+            collect_supported_listener_replacements(current_identities, candidate_listeners);
         Self {
-            supported_replacements: collect_supported_listener_replacements(
-                current_identities,
-                candidate_listeners,
-            ),
+            expected_completion_within_ms: supported_replacements
+                .iter()
+                .filter_map(|listener_name| candidate_listeners.get(listener_name))
+                .map(|listener| listener.drain_timeout().as_millis().try_into().unwrap_or(u64::MAX))
+                .max(),
+            supported_replacements,
             blocked_replacements: collect_blocked_listener_replacements(
                 current_identities,
                 candidate_listeners,
@@ -996,14 +2006,39 @@ impl ReloadAuditPlan {
         }
     }
 
-    fn success_detail(&self) -> String {
-        if !self.supported_replacements.is_empty() {
+    fn start_code(&self) -> &'static str {
+        if !self.blocked_replacements.is_empty() {
+            "reload_started_blocked_candidate"
+        } else if !self.supported_replacements.is_empty() {
+            "reload_started_overlap_drain"
+        } else {
+            "reload_started_in_place"
+        }
+    }
+
+    fn success_detail(&self, outcome: &ReloadApplyOutcome) -> String {
+        if outcome.timed_out_during_drain() {
+            format!(
+                "configuration applied; replacement stayed active but drain timeout expired for: {}",
+                outcome.drain_timed_out_replacements.join(", ")
+            )
+        } else if !self.supported_replacements.is_empty() {
             format!(
                 "configuration applied; overlap-and-drain replacement completed for: {}",
                 self.supported_replacements.join(", ")
             )
         } else {
             String::from("configuration applied")
+        }
+    }
+
+    fn success_code(&self, outcome: &ReloadApplyOutcome) -> &'static str {
+        if outcome.timed_out_during_drain() {
+            "reload_applied_overlap_drain_timeout"
+        } else if !self.supported_replacements.is_empty() {
+            "reload_applied_overlap_drain"
+        } else {
+            "reload_applied_in_place"
         }
     }
 
@@ -1022,6 +2057,83 @@ impl ReloadAuditPlan {
             format!("reload failed: {error}")
         }
     }
+
+    fn failure_code(&self) -> &'static str {
+        if !self.blocked_replacements.is_empty() {
+            "reload_failed_blocked_change"
+        } else if !self.supported_replacements.is_empty() {
+            "reload_failed_rollback_preserved"
+        } else {
+            "reload_failed_apply"
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AdminAuthStatus {
+    secret_sources: Vec<AdminSecretHealthStatus>,
+}
+
+impl AdminAuthStatus {
+    fn to_json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_else(|_| String::from("{\"secret_sources\":[]}"))
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AdminSecretHealthStatus {
+    listener: String,
+    actor: String,
+    auth_mode: String,
+    secret_env: String,
+    source_kind: String,
+    source_reference: String,
+    supports_rotation_without_reload: bool,
+    healthy: bool,
+    state: String,
+    detail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ListenerTlsStatus {
+    state: String,
+    warning_window_secs: u64,
+    minimum_version: String,
+    alpn_protocols: Vec<String>,
+    session_resumption: ListenerTlsSessionResumptionStatus,
+    default_certificate: ListenerTlsCertificateStatus,
+    sni_certificates: Vec<ListenerTlsCertificateStatus>,
+    reason_codes: Vec<String>,
+}
+
+impl ListenerTlsStatus {
+    fn to_json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_else(|_| String::from("null"))
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ListenerTlsSessionResumptionStatus {
+    mode: String,
+    session_cache_size: usize,
+    tls13_ticket_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ListenerTlsCertificateStatus {
+    label: String,
+    server_names: Vec<String>,
+    cert_path: String,
+    key_path: String,
+    ocsp_path: Option<String>,
+    common_name: Option<String>,
+    san_dns_names: Vec<String>,
+    fingerprint_sha256: String,
+    not_before_unix_secs: i64,
+    not_after_unix_secs: i64,
+    not_yet_valid: bool,
+    expired: bool,
+    expires_within_warning_window: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1037,9 +2149,65 @@ struct ListenerStatus {
     active_connections: usize,
     completed_connections: u64,
     shed_connections: u64,
+    abuse_protection: ListenerAbuseProtectionStatus,
     brownout_features: Vec<String>,
     recent_overload_events: Vec<OverloadEventStatus>,
     replacement: ListenerReplacementStatus,
+    tls: Option<ListenerTlsStatus>,
+}
+
+#[derive(Debug, Clone)]
+struct ListenerAbuseProtectionStatus {
+    state: String,
+    source_quota: Option<SourceQuotaStatus>,
+    handshake_guard: Option<HandshakeGuardStatus>,
+    source_quota_rejections: u64,
+    tracked_source_limit_rejections: u64,
+    handshake_guard_rejections: u64,
+    tracked_sources: usize,
+    active_handshakes: usize,
+    reason_codes: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct SourceQuotaStatus {
+    aggregation: String,
+    max_active_per_source: usize,
+    max_tracked_sources: usize,
+}
+
+#[derive(Debug, Clone)]
+struct HandshakeGuardStatus {
+    max_inflight: usize,
+    timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReloadHealthState {
+    NotRequested,
+    Healthy,
+    Failed,
+}
+
+#[derive(Debug, Clone)]
+struct ListenerReadinessStatus {
+    name: String,
+    class: lb_config_model::ListenerClassConfig,
+    protocol: lb_config_model::ListenerProtocolConfig,
+    configured_bind: SocketAddr,
+    ready: bool,
+    status: String,
+    reason_codes: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct WorkspaceReadinessStatus {
+    ready: bool,
+    status: String,
+    evaluated_listener_scope: String,
+    reload_status: String,
+    reason_codes: Vec<String>,
+    listeners: Vec<ListenerReadinessStatus>,
 }
 
 #[derive(Debug, Clone)]
@@ -1076,6 +2244,66 @@ impl ListenerIdentityStatus {
     }
 }
 
+impl ListenerReadinessStatus {
+    fn to_json(&self) -> String {
+        format!(
+            concat!(
+                "{{",
+                "\"name\":\"{}\",",
+                "\"class\":\"{}\",",
+                "\"protocol\":\"{}\",",
+                "\"configured_bind\":\"{}\",",
+                "\"ready\":{},",
+                "\"status\":\"{}\",",
+                "\"reason_codes\":[{}]",
+                "}}"
+            ),
+            crate::escape_json_string(&self.name),
+            listener_class_name(self.class),
+            listener_protocol_name(self.protocol),
+            self.configured_bind,
+            self.ready,
+            crate::escape_json_string(&self.status),
+            self.reason_codes
+                .iter()
+                .map(|code| format!("\"{}\"", crate::escape_json_string(code)))
+                .collect::<Vec<_>>()
+                .join(","),
+        )
+    }
+}
+
+impl WorkspaceReadinessStatus {
+    fn to_json(&self) -> String {
+        format!(
+            concat!(
+                "{{",
+                "\"ready\":{},",
+                "\"status\":\"{}\",",
+                "\"evaluated_listener_scope\":\"{}\",",
+                "\"reload_status\":\"{}\",",
+                "\"reason_codes\":[{}],",
+                "\"listeners\":[{}]",
+                "}}"
+            ),
+            self.ready,
+            crate::escape_json_string(&self.status),
+            crate::escape_json_string(&self.evaluated_listener_scope),
+            crate::escape_json_string(&self.reload_status),
+            self.reason_codes
+                .iter()
+                .map(|code| format!("\"{}\"", crate::escape_json_string(code)))
+                .collect::<Vec<_>>()
+                .join(","),
+            self.listeners
+                .iter()
+                .map(ListenerReadinessStatus::to_json)
+                .collect::<Vec<_>>()
+                .join(","),
+        )
+    }
+}
+
 #[derive(Debug, Clone)]
 struct FailedListenerStartStatus {
     identity: ListenerIdentityStatus,
@@ -1098,6 +2326,7 @@ struct ListenerReplacementStatus {
     desired: ListenerIdentityStatus,
     draining: Vec<ListenerIdentityStatus>,
     retired_recent: Vec<ListenerIdentityStatus>,
+    drain_timeout_recent: Vec<ListenerIdentityStatus>,
     failed_start: Option<FailedListenerStartStatus>,
 }
 
@@ -1107,6 +2336,8 @@ impl ListenerReplacementStatus {
             "replacement_draining"
         } else if lifecycle.failed_start.is_some() {
             "failed_start_preserved"
+        } else if !lifecycle.drain_timed_out_identities.is_empty() {
+            "drain_timeout_expired"
         } else {
             "stable"
         };
@@ -1122,6 +2353,12 @@ impl ListenerReplacementStatus {
                 .collect(),
             retired_recent: lifecycle
                 .retired_identities
+                .iter()
+                .copied()
+                .map(ListenerIdentityStatus::from)
+                .collect(),
+            drain_timeout_recent: lifecycle
+                .drain_timed_out_identities
                 .iter()
                 .copied()
                 .map(ListenerIdentityStatus::from)
@@ -1144,6 +2381,12 @@ impl ListenerReplacementStatus {
             .map(ListenerIdentityStatus::to_json)
             .collect::<Vec<_>>()
             .join(",");
+        let drain_timeout_recent = self
+            .drain_timeout_recent
+            .iter()
+            .map(ListenerIdentityStatus::to_json)
+            .collect::<Vec<_>>()
+            .join(",");
         let failed_start = self
             .failed_start
             .as_ref()
@@ -1156,6 +2399,7 @@ impl ListenerReplacementStatus {
                 "\"desired\":{},",
                 "\"draining\":[{}],",
                 "\"retired_recent\":[{}],",
+                "\"drain_timeout_recent\":[{}],",
                 "\"failed_start\":{}",
                 "}}"
             ),
@@ -1163,6 +2407,7 @@ impl ListenerReplacementStatus {
             self.desired.to_json(),
             draining,
             retired_recent,
+            drain_timeout_recent,
             failed_start,
         )
     }
@@ -1184,9 +2429,11 @@ impl ListenerStatus {
                 "\"active_connections\":{},",
                 "\"shed_connections\":{},",
                 "\"completed_connections\":{},",
+                "\"abuse_protection\":{},",
                 "\"brownout_features\":[{}],",
                 "\"recent_overload_events\":[{}],",
-                "\"replacement\":{}",
+                "\"replacement\":{},",
+                "\"tls\":{}",
                 "}}"
             ),
             crate::escape_json_string(&self.name),
@@ -1200,6 +2447,7 @@ impl ListenerStatus {
             self.active_connections,
             self.shed_connections,
             self.completed_connections,
+            self.abuse_protection.to_json(),
             self.brownout_features
                 .iter()
                 .map(|feature| format!("\"{}\"", crate::escape_json_string(feature)))
@@ -1211,7 +2459,234 @@ impl ListenerStatus {
                 .collect::<Vec<_>>()
                 .join(","),
             self.replacement.to_json(),
+            self.tls.as_ref().map_or_else(|| String::from("null"), ListenerTlsStatus::to_json),
         )
+    }
+}
+
+impl ListenerAbuseProtectionStatus {
+    fn from_runtime(
+        policy: Option<&CompiledListenerAbuseProtectionPolicy>,
+        snapshot: lb_runtime::ListenerAbuseProtectionSnapshot,
+    ) -> Self {
+        let mut reason_codes = Vec::new();
+        if snapshot.source_quota_rejections > 0 {
+            push_unique_reason(&mut reason_codes, lb_runtime::AbuseRejectionReason::SourceQuotaExceeded.code());
+        }
+        if snapshot.tracked_source_limit_rejections > 0 {
+            push_unique_reason(
+                &mut reason_codes,
+                lb_runtime::AbuseRejectionReason::TrackedSourceLimitReached.code(),
+            );
+        }
+        if snapshot.handshake_guard_rejections > 0 {
+            push_unique_reason(
+                &mut reason_codes,
+                lb_runtime::AbuseRejectionReason::HandshakeLimitReached.code(),
+            );
+        }
+
+        let source_quota = policy.and_then(|policy| {
+            policy.source_quota.map(|source_quota| SourceQuotaStatus {
+                aggregation: String::from(source_aggregation_name(source_quota.aggregation)),
+                max_active_per_source: source_quota.max_active_per_source,
+                max_tracked_sources: source_quota.max_tracked_sources,
+            })
+        });
+        if source_quota
+            .as_ref()
+            .is_some_and(|source_quota| snapshot.tracked_sources >= source_quota.max_tracked_sources)
+        {
+            push_unique_reason(&mut reason_codes, "tracked_source_capacity_saturated");
+        }
+
+        let handshake_guard = policy.and_then(|policy| {
+            policy.handshake_guard.map(|handshake_guard| HandshakeGuardStatus {
+                max_inflight: handshake_guard.max_inflight,
+                timeout_ms: handshake_guard.timeout.as_millis() as u64,
+            })
+        });
+        if handshake_guard
+            .as_ref()
+            .is_some_and(|handshake_guard| snapshot.active_handshakes >= handshake_guard.max_inflight)
+        {
+            push_unique_reason(&mut reason_codes, "handshake_guard_saturated");
+        }
+
+        let state = if policy.is_none() {
+            "disabled"
+        } else if reason_codes.iter().any(|reason| {
+            reason == "tracked_source_capacity_saturated" || reason == "handshake_guard_saturated"
+        }) {
+            "constrained"
+        } else {
+            "enforcing"
+        };
+
+        Self {
+            state: String::from(state),
+            source_quota,
+            handshake_guard,
+            source_quota_rejections: snapshot.source_quota_rejections,
+            tracked_source_limit_rejections: snapshot.tracked_source_limit_rejections,
+            handshake_guard_rejections: snapshot.handshake_guard_rejections,
+            tracked_sources: snapshot.tracked_sources,
+            active_handshakes: snapshot.active_handshakes,
+            reason_codes,
+        }
+    }
+
+    fn to_json(&self) -> String {
+        let source_quota = self.source_quota.as_ref().map_or_else(
+            || String::from("null"),
+            |source_quota| {
+                format!(
+                    concat!(
+                        "{{",
+                        "\"aggregation\":\"{}\",",
+                        "\"max_active_per_source\":{},",
+                        "\"max_tracked_sources\":{}",
+                        "}}"
+                    ),
+                    crate::escape_json_string(&source_quota.aggregation),
+                    source_quota.max_active_per_source,
+                    source_quota.max_tracked_sources,
+                )
+            },
+        );
+        let handshake_guard = self.handshake_guard.as_ref().map_or_else(
+            || String::from("null"),
+            |handshake_guard| {
+                format!(
+                    concat!(
+                        "{{",
+                        "\"max_inflight\":{},",
+                        "\"timeout_ms\":{}",
+                        "}}"
+                    ),
+                    handshake_guard.max_inflight,
+                    handshake_guard.timeout_ms,
+                )
+            },
+        );
+
+        format!(
+            concat!(
+                "{{",
+                "\"state\":\"{}\",",
+                "\"source_quota\":{},",
+                "\"handshake_guard\":{},",
+                "\"source_quota_rejections\":{},",
+                "\"tracked_source_limit_rejections\":{},",
+                "\"handshake_guard_rejections\":{},",
+                "\"tracked_sources\":{},",
+                "\"active_handshakes\":{},",
+                "\"reason_codes\":[{}]",
+                "}}"
+            ),
+            crate::escape_json_string(&self.state),
+            source_quota,
+            handshake_guard,
+            self.source_quota_rejections,
+            self.tracked_source_limit_rejections,
+            self.handshake_guard_rejections,
+            self.tracked_sources,
+            self.active_handshakes,
+            self.reason_codes
+                .iter()
+                .map(|code| format!("\"{}\"", crate::escape_json_string(code)))
+                .collect::<Vec<_>>()
+                .join(","),
+        )
+    }
+}
+
+fn evaluate_workspace_readiness(
+    listener_statuses: &[ListenerStatus],
+    reload_health: ReloadHealthState,
+) -> WorkspaceReadinessStatus {
+    let evaluate_public_only = listener_statuses
+        .iter()
+        .any(|listener| listener.class == lb_config_model::ListenerClassConfig::Public);
+    let evaluated_listener_scope = if evaluate_public_only { "public" } else { "all" };
+    let listeners = listener_statuses
+        .iter()
+        .filter(|listener| {
+            !evaluate_public_only || listener.class == lb_config_model::ListenerClassConfig::Public
+        })
+        .map(reduce_listener_readiness)
+        .collect::<Vec<_>>();
+    let mut reason_codes = Vec::new();
+
+    if matches!(reload_health, ReloadHealthState::Failed) {
+        push_unique_reason(&mut reason_codes, "reload_failed");
+    }
+    if listeners.is_empty() {
+        push_unique_reason(&mut reason_codes, "no_serving_listeners");
+    }
+    for listener in &listeners {
+        for reason in &listener.reason_codes {
+            push_unique_reason(&mut reason_codes, reason);
+        }
+    }
+
+    WorkspaceReadinessStatus {
+        ready: reason_codes.is_empty(),
+        status: String::from(if reason_codes.is_empty() { "ready" } else { "not_ready" }),
+        evaluated_listener_scope: String::from(evaluated_listener_scope),
+        reload_status: String::from(reload_health_name(reload_health)),
+        reason_codes,
+        listeners,
+    }
+}
+
+fn reduce_listener_readiness(listener: &ListenerStatus) -> ListenerReadinessStatus {
+    let mut reason_codes = Vec::new();
+
+    match listener.state.as_str() {
+        "running" => {}
+        "draining" => push_unique_reason(&mut reason_codes, "listener_draining"),
+        _ => push_unique_reason(&mut reason_codes, "listener_not_running"),
+    }
+
+    match listener.overload_state.as_str() {
+        "shedding" => push_unique_reason(&mut reason_codes, "listener_overload_shedding"),
+        "brownout" => push_unique_reason(&mut reason_codes, "listener_overload_brownout"),
+        _ => {}
+    }
+
+    if listener.replacement.failed_start.is_some()
+        || listener.replacement.state == "failed_start_preserved"
+    {
+        push_unique_reason(&mut reason_codes, "listener_replacement_failed");
+    }
+
+    for reason in &listener.abuse_protection.reason_codes {
+        match reason.as_str() {
+            "tracked_source_capacity_saturated" => {
+                push_unique_reason(&mut reason_codes, "listener_abuse_source_tracking_saturated");
+            }
+            "handshake_guard_saturated" => {
+                push_unique_reason(&mut reason_codes, "listener_abuse_handshake_saturated");
+            }
+            _ => {}
+        }
+    }
+
+    ListenerReadinessStatus {
+        name: listener.name.clone(),
+        class: listener.class,
+        protocol: listener.protocol,
+        configured_bind: listener.configured_bind,
+        ready: reason_codes.is_empty(),
+        status: String::from(if reason_codes.is_empty() { "ready" } else { "not_ready" }),
+        reason_codes,
+    }
+}
+
+fn push_unique_reason(reasons: &mut Vec<String>, reason: &str) {
+    if !reasons.iter().any(|existing| existing == reason) {
+        reasons.push(String::from(reason));
     }
 }
 
@@ -1276,6 +2751,7 @@ pub(crate) async fn serve_workspace_main(serve_args: &ServeArgs) -> Result<(), D
 impl ServeSupervisor {
     async fn start(config_path: String, admin_secret: Arc<String>) -> Result<Self, DynError> {
         let state = Arc::new(WorkspaceServeState::new(config_path.clone())?);
+        state.restore_control_plane_journal().await?;
         let supervisor = Self {
             shared: Arc::new(ServeSupervisorShared {
                 config_path,
@@ -1285,26 +2761,80 @@ impl ServeSupervisor {
                 inner: Mutex::new(ServeSupervisorInner::default()),
             }),
         };
-        supervisor.reload().await?;
+        let _ = supervisor.reload_with_recovery_resolution(false).await?;
+        let listener_statuses = supervisor.listener_statuses().await;
+        supervisor
+            .shared
+            .state
+            .reconcile_control_plane_recovery(&listener_statuses)
+            .await?;
         Ok(supervisor)
     }
 
-    fn reload(&self) -> Pin<Box<dyn Future<Output = Result<(), DynError>> + Send + '_>> {
+    fn reload(&self) -> Pin<Box<dyn Future<Output = Result<ReloadApplyOutcome, DynError>> + Send + '_>> {
+        self.reload_with_recovery_resolution(true)
+    }
+
+    fn reload_with_recovery_resolution(
+        &self,
+        resolve_recovery: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<ReloadApplyOutcome, DynError>> + Send + '_>> {
         Box::pin(async move {
             let _guard = self.shared.reload_guard.lock().await;
             self.shared.state.reload_requests.fetch_add(1, Ordering::SeqCst);
+            let started_at = Instant::now();
 
             let compiled = compile_workspace_runtime(&self.shared.config_path)?;
+            let desired_snapshot =
+                DurableSnapshotIdentity::from_snapshot(&compiled.source_label, &compiled.snapshot);
+            let current_identities = {
+                let inner = self.shared.inner.lock().await;
+                inner
+                    .listeners
+                    .iter()
+                    .map(|(name, listener)| (name.clone(), listener.current_identity()))
+                    .collect::<BTreeMap<_, _>>()
+            };
+            let reload_plan = ReloadAuditPlan::from_candidate(&current_identities, &compiled.listeners);
+            self.shared
+                .state
+                .prepare_reload_persistence(JournalInFlightOperation::from_reload_plan(
+                    desired_snapshot.clone(),
+                    &reload_plan,
+                ))
+                .await?;
             let result = self.apply_compiled_runtime(compiled).await;
+            let duration_ms = elapsed_millis_at_least_one(started_at.elapsed());
+            self.shared.state.record_reload_duration(duration_ms, result.is_ok());
             match &result {
-                Ok(()) => {
+                Ok(outcome) => {
                     self.shared.state.reload_success_count.fetch_add(1, Ordering::SeqCst);
+                    self.shared
+                        .state
+                        .reload_health
+                        .store(reload_health_index(ReloadHealthState::Healthy), Ordering::SeqCst);
+                    *self.shared.state.last_reload_outcome_code.lock().await =
+                        String::from(outcome.generic_success_code());
                     *self.shared.state.last_reload_result.lock().await =
-                        String::from("configuration applied");
+                        outcome.generic_success_detail();
+                    self.shared
+                        .state
+                        .finish_reload_persistence(Some(desired_snapshot.clone()), resolve_recovery)
+                        .await?;
                 }
                 Err(error) => {
                     self.shared.state.reload_failure_count.fetch_add(1, Ordering::SeqCst);
+                    self.shared
+                        .state
+                        .reload_health
+                        .store(reload_health_index(ReloadHealthState::Failed), Ordering::SeqCst);
+                    *self.shared.state.last_reload_outcome_code.lock().await =
+                        String::from("reload_failed_apply");
                     *self.shared.state.last_reload_result.lock().await = error.to_string();
+                    self.shared
+                        .state
+                        .finish_reload_persistence(None, resolve_recovery)
+                        .await?;
                 }
             }
             result
@@ -1331,6 +2861,52 @@ impl ServeSupervisor {
         ))
     }
 
+    async fn admin_auth_status(&self) -> AdminAuthStatus {
+        let admin_policies = {
+            let inner = self.shared.inner.lock().await;
+            inner
+                .listeners
+                .iter()
+                .filter_map(|(listener_name, slot)| match &slot.active.kind {
+                    ManagedListenerKind::Admin { runtime } => Some((
+                        listener_name.clone(),
+                        Arc::clone(&runtime.shared_policy),
+                    )),
+                    ManagedListenerKind::Public { .. } => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let mut secret_sources = Vec::new();
+        for (listener_name, shared_policy) in admin_policies {
+            let policy = shared_policy.read().await.clone();
+            match policy.auth {
+                CompiledAdminAuthPolicy::Bearer { secret_env, .. } => {
+                    let mut status =
+                        inspect_secret_material(&secret_env, self.shared.admin_secret.as_ref());
+                    status.listener = listener_name.clone();
+                    status.actor = String::from("shared-bearer");
+                    status.auth_mode = String::from("bearer");
+                    secret_sources.push(status);
+                }
+                CompiledAdminAuthPolicy::SignedHeaders { operators, .. } => {
+                    for (actor, operator) in operators {
+                        let mut status = inspect_secret_material(
+                            &operator.secret_env,
+                            self.shared.admin_secret.as_ref(),
+                        );
+                        status.listener = listener_name.clone();
+                        status.actor = actor;
+                        status.auth_mode = String::from("signed_headers");
+                        secret_sources.push(status);
+                    }
+                }
+            }
+        }
+
+        AdminAuthStatus { secret_sources }
+    }
+
     async fn describe_reload_audit_plan(&self) -> Result<ReloadAuditPlan, DynError> {
         let current_identities = {
             let inner = self.shared.inner.lock().await;
@@ -1347,7 +2923,7 @@ impl ServeSupervisor {
     async fn apply_compiled_runtime(
         &self,
         compiled: CompiledWorkspaceRuntime,
-    ) -> Result<(), DynError> {
+    ) -> Result<ReloadApplyOutcome, DynError> {
         let CompiledWorkspaceRuntime { source_label, snapshot, listeners, http_cache_scopes } =
             compiled;
         self.shared.state.set_admin_audit_capacity(
@@ -1451,17 +3027,23 @@ impl ServeSupervisor {
 
         self.shared.state.replace_http_cache_scopes(http_cache_scopes).await;
 
+        let mut outcome = ReloadApplyOutcome::default();
         for retired_listener in retired {
-            retired_listener.listener.shutdown().await?;
+            let drain_outcome = retired_listener.listener.shutdown().await?;
             if let Some(slot_name) = retired_listener.slot_name {
                 let mut inner = self.shared.inner.lock().await;
                 if let Some(slot) = inner.listeners.get_mut(&slot_name) {
-                    slot.finish_draining(retired_listener.identity);
+                    slot.finish_draining_with_outcome(retired_listener.identity, drain_outcome);
+                }
+                if matches!(drain_outcome, ListenerDrainOutcome::TimedOut)
+                    && !outcome.drain_timed_out_replacements.iter().any(|name| name == &slot_name)
+                {
+                    outcome.drain_timed_out_replacements.push(slot_name);
                 }
             }
         }
 
-        Ok(())
+        Ok(outcome)
     }
 
     async fn shutdown(&self) -> Result<(), DynError> {
@@ -1493,6 +3075,14 @@ impl ServeSupervisor {
                         slot.active.local_addr,
                         Arc::clone(&slot.active.counters),
                         Arc::clone(&slot.active.overload_runtime),
+                        Arc::clone(&slot.active.abuse_policy),
+                        Arc::clone(&slot.active.abuse_protection),
+                        match &slot.active.kind {
+                            ManagedListenerKind::Public { shared_proxy } => {
+                                Some(Arc::clone(shared_proxy))
+                            }
+                            ManagedListenerKind::Admin { .. } => None,
+                        },
                         slot.lifecycle.clone(),
                     )
                 })
@@ -1508,6 +3098,9 @@ impl ServeSupervisor {
             local_addr,
             counters,
             overload_runtime,
+            abuse_policy,
+            abuse_protection,
+            shared_proxy,
             lifecycle,
         ) in listeners
         {
@@ -1517,6 +3110,16 @@ impl ServeSupervisor {
                     &counters,
                     &overload_runtime,
                 );
+            let abuse_snapshot = abuse_protection.read().await.snapshot();
+            let abuse_policy = abuse_policy.read().await.clone();
+            let tls = if let Some(shared_proxy) = shared_proxy {
+                match shared_proxy.read().await.clone() {
+                    ManagedProxyConfig::Https(proxy) => Some(proxy.tls_status),
+                    ManagedProxyConfig::Http1(_) | ManagedProxyConfig::Http2(_) => None,
+                }
+            } else {
+                None
+            };
             statuses.push(ListenerStatus {
                 name,
                 class,
@@ -1529,9 +3132,14 @@ impl ServeSupervisor {
                 active_connections: counters.active_connections.load(Ordering::SeqCst),
                 shed_connections: counters.shed_connections.load(Ordering::SeqCst),
                 completed_connections: counters.completed_connections.load(Ordering::SeqCst),
+                abuse_protection: ListenerAbuseProtectionStatus::from_runtime(
+                    abuse_policy.as_ref(),
+                    abuse_snapshot,
+                ),
                 brownout_features,
                 recent_overload_events,
                 replacement: ListenerReplacementStatus::from_lifecycle(&lifecycle),
+                tls,
             });
         }
         statuses
@@ -1544,6 +3152,9 @@ impl ManagedServeListener {
         self.admission_limit.store(spec.max_connections(), Ordering::SeqCst);
         *self.overload_runtime.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
             build_listener_overload_runtime(spec.overload_policy())?;
+        *self.abuse_policy.write().await = spec.abuse_protection_policy().cloned();
+        *self.abuse_protection.write().await =
+            build_listener_abuse_protection_state(spec.abuse_protection_policy());
         if let (
             ManagedListenerKind::Public { shared_proxy },
             CompiledServeListener::Public { proxy, .. },
@@ -1560,20 +3171,20 @@ impl ManagedServeListener {
         Ok(())
     }
 
-    async fn shutdown(self) -> io::Result<()> {
+    async fn shutdown(self) -> io::Result<ListenerDrainOutcome> {
         let _ = self.shutdown_tx.send(true);
         self.join().await
     }
 
-    async fn join(self) -> io::Result<()> {
-        match self.task.await {
+    async fn join(self) -> io::Result<ListenerDrainOutcome> {
+        let outcome = match self.task.await {
             Ok(result) => result?,
             Err(error) => return Err(io::Error::other(error.to_string())),
-        }
+        };
         if let Some(probe_task) = self.probe_task {
             probe_task.await.map_err(|error| io::Error::other(error.to_string()))?;
         }
-        Ok(())
+        Ok(outcome)
     }
 }
 
@@ -1589,6 +3200,9 @@ async fn start_managed_listener(
     let admission_limit = Arc::new(AtomicUsize::new(spec.max_connections()));
     let overload_runtime =
         Arc::new(StdMutex::new(build_listener_overload_runtime(spec.overload_policy())?));
+    let abuse_policy = Arc::new(RwLock::new(spec.abuse_protection_policy().cloned()));
+    let abuse_protection =
+        Arc::new(RwLock::new(build_listener_abuse_protection_state(spec.abuse_protection_policy())));
     let counters = Arc::new(ListenerRuntimeCounters::new());
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -1602,6 +3216,7 @@ async fn start_managed_listener(
                 Arc::clone(&shared_proxy),
                 Arc::clone(&admission_limit),
                 Arc::clone(&overload_runtime),
+                Arc::clone(&abuse_protection),
                 Arc::clone(&counters),
                 Arc::clone(&state),
                 shutdown_rx,
@@ -1622,6 +3237,8 @@ async fn start_managed_listener(
                     drain_timeout,
                     admission_limit,
                     overload_runtime,
+                    abuse_policy,
+                    abuse_protection,
                     counters,
                     kind: ManagedListenerKind::Public { shared_proxy },
                     shutdown_tx,
@@ -1644,6 +3261,7 @@ async fn start_managed_listener(
                 name.clone(),
                 Arc::clone(&admission_limit),
                 Arc::clone(&overload_runtime),
+                Arc::clone(&abuse_protection),
                 Arc::clone(&counters),
                 Arc::clone(&state),
                 shutdown_rx,
@@ -1663,6 +3281,8 @@ async fn start_managed_listener(
                     drain_timeout,
                     admission_limit,
                     overload_runtime,
+                    abuse_policy,
+                    abuse_protection,
                     counters,
                     kind: ManagedListenerKind::Admin { runtime: admin_runtime },
                     shutdown_tx,
@@ -1685,7 +3305,7 @@ async fn await_managed_listener_ready(
         Err(_) => {
             let _ = listener.shutdown_tx.send(true);
             match listener.join().await {
-                Ok(()) => Err(to_dyn_error("listener exited before becoming ready")),
+                Ok(_) => Err(to_dyn_error("listener exited before becoming ready")),
                 Err(error) => Err(to_dyn_error(error)),
             }
         }
@@ -1781,12 +3401,13 @@ async fn run_public_listener_loop(
     shared_proxy: Arc<RwLock<ManagedProxyConfig>>,
     admission_limit: Arc<AtomicUsize>,
     overload_runtime: Arc<StdMutex<Option<ListenerOverloadRuntime>>>,
+    abuse_protection: Arc<RwLock<lb_runtime::ListenerAbuseProtectionState>>,
     counters: Arc<ListenerRuntimeCounters>,
     state: Arc<WorkspaceServeState>,
     mut shutdown_rx: watch::Receiver<bool>,
     drain_timeout: Duration,
     ready_tx: oneshot::Sender<()>,
-) -> io::Result<()> {
+) -> io::Result<ListenerDrainOutcome> {
     *counters.state.write().await = String::from("running");
     let _ = ready_tx.send(());
     let mut tasks = JoinSet::new();
@@ -1800,8 +3421,47 @@ async fn run_public_listener_loop(
             }
             accepted = listener.accept() => {
                 let (mut stream, peer_addr) = accepted?;
+                let source_lease = {
+                    let protection = abuse_protection.read().await;
+                    match protection.try_acquire_source(peer_addr) {
+                        Ok(source_lease) => source_lease,
+                        Err(reason) => {
+                            state.record_listener_abuse_rejection(&listener_name, reason);
+                            state.sync_listener_abuse_snapshot(&listener_name, &abuse_protection).await;
+                            let proxy = shared_proxy.read().await.clone();
+                            if matches!(&proxy, ManagedProxyConfig::Http1(_)) {
+                                let _ = write_abuse_rejection_response(&mut stream, reason).await;
+                            }
+                            continue;
+                        }
+                    }
+                };
+                let proxy = shared_proxy.read().await.clone();
+                let mut handshake_permit = {
+                    let protection = abuse_protection.read().await;
+                    match protection.try_acquire_handshake() {
+                        Ok(handshake_permit) => handshake_permit,
+                        Err(reason) => {
+                            drop(source_lease);
+                            state.record_listener_abuse_rejection(&listener_name, reason);
+                            state.sync_listener_abuse_snapshot(&listener_name, &abuse_protection).await;
+                            if matches!(&proxy, ManagedProxyConfig::Http1(_)) {
+                                let _ = write_abuse_rejection_response(&mut stream, reason).await;
+                            }
+                            continue;
+                        }
+                    }
+                };
+                if !matches!(&proxy, ManagedProxyConfig::Https(_)) {
+                    if let Some(handshake_permit) = handshake_permit.as_mut() {
+                        handshake_permit.release();
+                    }
+                }
+                state.sync_listener_abuse_snapshot(&listener_name, &abuse_protection).await;
                 counters.accepted_connections.fetch_add(1, Ordering::SeqCst);
                 if !try_acquire_listener_slot(&counters, &admission_limit) {
+                    drop(source_lease);
+                    drop(handshake_permit);
                     counters.shed_connections.fetch_add(1, Ordering::SeqCst);
                     state.record_overload_event(
                         &listener_name,
@@ -1818,8 +3478,7 @@ async fn run_public_listener_loop(
                         &overload_runtime,
                         true,
                     );
-                    let proxy = shared_proxy.read().await.clone();
-                    if matches!(proxy, ManagedProxyConfig::Http1(_)) {
+                    if matches!(&proxy, ManagedProxyConfig::Http1(_)) {
                         let _ = write_overload_response(&mut stream).await;
                     }
                     continue;
@@ -1833,12 +3492,12 @@ async fn run_public_listener_loop(
                 );
                 let counters = Arc::clone(&counters);
                 let state = Arc::clone(&state);
-                let shared_proxy = Arc::clone(&shared_proxy);
                 let listener_name = listener_name.clone();
                 let admission_limit = Arc::clone(&admission_limit);
                 let overload_runtime = Arc::clone(&overload_runtime);
+                let abuse_protection = Arc::clone(&abuse_protection);
                 tasks.spawn(async move {
-                    let proxy = shared_proxy.read().await.clone();
+                    let _source_lease = source_lease;
                     let result: io::Result<u64> = match proxy {
                         ManagedProxyConfig::Http1(config) => lb_runtime::proxy_http1_connection(stream, &config)
                             .await
@@ -1849,7 +3508,7 @@ async fn run_public_listener_loop(
                             .map(|report| report.metrics.request_count)
                             .map_err(|error| io::Error::other(error.to_string())),
                         ManagedProxyConfig::Https(config) => {
-                            proxy_https_connection(stream, peer_addr, config).await
+                            proxy_https_connection(stream, peer_addr, config, handshake_permit).await
                         }
                     };
                     if let Ok(request_count) = result {
@@ -1865,16 +3524,27 @@ async fn run_public_listener_loop(
                         &overload_runtime,
                         false,
                     );
+                    state.sync_listener_abuse_snapshot(&listener_name, &abuse_protection).await;
                 });
             }
         }
     }
 
     *counters.state.write().await = String::from("draining");
-    let _ =
-        time::timeout(drain_timeout, async { while tasks.join_next().await.is_some() {} }).await;
-    *counters.state.write().await = String::from("stopped");
-    Ok(())
+    let drain_outcome = if time::timeout(
+        drain_timeout,
+        async { while tasks.join_next().await.is_some() {} },
+    )
+    .await
+    .is_ok()
+    {
+        *counters.state.write().await = String::from("stopped");
+        ListenerDrainOutcome::Completed
+    } else {
+        *counters.state.write().await = String::from("drain_timeout_expired");
+        ListenerDrainOutcome::TimedOut
+    };
+    Ok(drain_outcome)
 }
 
 async fn run_admin_listener_loop(
@@ -1882,6 +3552,7 @@ async fn run_admin_listener_loop(
     listener_name: String,
     admission_limit: Arc<AtomicUsize>,
     overload_runtime: Arc<StdMutex<Option<ListenerOverloadRuntime>>>,
+    abuse_protection: Arc<RwLock<lb_runtime::ListenerAbuseProtectionState>>,
     counters: Arc<ListenerRuntimeCounters>,
     state: Arc<WorkspaceServeState>,
     mut shutdown_rx: watch::Receiver<bool>,
@@ -1890,7 +3561,7 @@ async fn run_admin_listener_loop(
     admin_secret: Arc<String>,
     supervisor: ServeSupervisor,
     ready_tx: oneshot::Sender<()>,
-) -> io::Result<()> {
+) -> io::Result<ListenerDrainOutcome> {
     *counters.state.write().await = String::from("running");
     let _ = ready_tx.send(());
     let mut tasks = JoinSet::new();
@@ -1904,8 +3575,38 @@ async fn run_admin_listener_loop(
             }
             accepted = listener.accept() => {
                 let (mut stream, peer_addr) = accepted?;
+                let source_lease = {
+                    let protection = abuse_protection.read().await;
+                    match protection.try_acquire_source(peer_addr) {
+                        Ok(source_lease) => source_lease,
+                        Err(reason) => {
+                            state.record_listener_abuse_rejection(&listener_name, reason);
+                            state.sync_listener_abuse_snapshot(&listener_name, &abuse_protection).await;
+                            let _ = write_abuse_rejection_response(&mut stream, reason).await;
+                            continue;
+                        }
+                    }
+                };
+                let mut handshake_permit = {
+                    let protection = abuse_protection.read().await;
+                    match protection.try_acquire_handshake() {
+                        Ok(handshake_permit) => handshake_permit,
+                        Err(reason) => {
+                            drop(source_lease);
+                            state.record_listener_abuse_rejection(&listener_name, reason);
+                            state.sync_listener_abuse_snapshot(&listener_name, &abuse_protection).await;
+                            let _ = write_abuse_rejection_response(&mut stream, reason).await;
+                            continue;
+                        }
+                    }
+                };
+                if let Some(handshake_permit) = handshake_permit.as_mut() {
+                    handshake_permit.release();
+                }
+                state.sync_listener_abuse_snapshot(&listener_name, &abuse_protection).await;
                 counters.accepted_connections.fetch_add(1, Ordering::SeqCst);
                 if !try_acquire_listener_slot(&counters, &admission_limit) {
+                    drop(source_lease);
                     counters.shed_connections.fetch_add(1, Ordering::SeqCst);
                     state.record_overload_event(
                         &listener_name,
@@ -1940,7 +3641,9 @@ async fn run_admin_listener_loop(
                 let listener_name = listener_name.clone();
                 let admission_limit = Arc::clone(&admission_limit);
                 let overload_runtime = Arc::clone(&overload_runtime);
+                let abuse_protection = Arc::clone(&abuse_protection);
                 tasks.spawn(async move {
+                    let _source_lease = source_lease;
                     let state_for_connection = Arc::clone(&state);
                     let _ = handle_workspace_admin_connection(
                         stream,
@@ -1961,16 +3664,27 @@ async fn run_admin_listener_loop(
                         &overload_runtime,
                         false,
                     );
+                    state.sync_listener_abuse_snapshot(&listener_name, &abuse_protection).await;
                 });
             }
         }
     }
 
     *counters.state.write().await = String::from("draining");
-    let _ =
-        time::timeout(drain_timeout, async { while tasks.join_next().await.is_some() {} }).await;
-    *counters.state.write().await = String::from("stopped");
-    Ok(())
+    let drain_outcome = if time::timeout(
+        drain_timeout,
+        async { while tasks.join_next().await.is_some() {} },
+    )
+    .await
+    .is_ok()
+    {
+        *counters.state.write().await = String::from("stopped");
+        ListenerDrainOutcome::Completed
+    } else {
+        *counters.state.write().await = String::from("drain_timeout_expired");
+        ListenerDrainOutcome::TimedOut
+    };
+    Ok(drain_outcome)
 }
 
 async fn handle_workspace_admin_connection(
@@ -1989,7 +3703,9 @@ async fn handle_workspace_admin_connection(
     };
 
     let policy = admin_runtime.shared_policy.read().await.clone();
-    let action = classify_admin_request_action(request.method.as_str(), request.target.as_str());
+    let api_mode = negotiate_admin_api_request(&request);
+    let action =
+        classify_admin_request_action(request.method.as_str(), api_mode.canonical_target());
     let request_id = state.next_admin_request_id();
     let source_ip = peer_addr.ip();
 
@@ -1998,24 +3714,39 @@ async fn handle_workspace_admin_connection(
             &state,
             AdminAuditEvent {
                 observed_at_unix_ms: unix_time_ms(),
-                request_id,
+                request_id: request_id.clone(),
                 listener: listener_name,
                 actor: String::from("anonymous"),
                 auth_mode: String::from("source_policy"),
                 action: String::from(action.as_str()),
+                code: admin_audit_code(action.as_str(), "denied"),
                 source: source_ip.to_string(),
                 outcome: String::from("denied"),
                 detail: String::from("source address is outside the admin allow-list"),
             },
         )
-        .await;
-        return crate::write_http_response(
-            &mut stream,
-            "403 Forbidden",
-            "text/plain; charset=utf-8",
-            b"admin source not allowed\n",
-        )
-        .await;
+        .await
+        .map_err(|error| io::Error::other(error.to_string()))?;
+        return if api_mode.uses_versioned_contract() {
+            write_versioned_admin_error(
+                &mut stream,
+                "403 Forbidden",
+                &[],
+                &request_id,
+                lb_admin_api::AdminApiErrorCode::Forbidden,
+                "admin source not allowed",
+                false,
+            )
+            .await
+        } else {
+            crate::write_http_response(
+                &mut stream,
+                "403 Forbidden",
+                "text/plain; charset=utf-8",
+                b"admin source not allowed\n",
+            )
+            .await
+        };
     }
 
     let request_context = match authenticate_admin_request(
@@ -2033,25 +3764,41 @@ async fn handle_workspace_admin_connection(
                 &state,
                 AdminAuditEvent {
                     observed_at_unix_ms: unix_time_ms(),
-                    request_id,
+                    request_id: request_id.clone(),
                     listener: listener_name,
-                    actor: auth_error.actor,
-                    auth_mode: auth_error.auth_mode,
+                    actor: auth_error.actor.clone(),
+                    auth_mode: auth_error.auth_mode.clone(),
                     action: String::from(action.as_str()),
+                    code: admin_audit_code(action.as_str(), auth_error.outcome),
                     source: source_ip.to_string(),
                     outcome: String::from(auth_error.outcome),
-                    detail: auth_error.detail,
+                    detail: auth_error.detail.clone(),
                 },
             )
-            .await;
-            return crate::write_http_response_with_headers(
-                &mut stream,
-                auth_error.status,
-                "text/plain; charset=utf-8",
-                auth_error.headers.as_slice(),
-                auth_error.body.as_bytes(),
-            )
-            .await;
+            .await
+            .map_err(|error| io::Error::other(error.to_string()))?;
+            let (error_code, retryable) = admin_auth_error_contract(&auth_error);
+            return if api_mode.uses_versioned_contract() {
+                write_versioned_admin_error(
+                    &mut stream,
+                    auth_error.status,
+                    auth_error.headers.as_slice(),
+                    &request_id,
+                    error_code,
+                    auth_error.body.trim(),
+                    retryable,
+                )
+                .await
+            } else {
+                crate::write_http_response_with_headers(
+                    &mut stream,
+                    auth_error.status,
+                    "text/plain; charset=utf-8",
+                    auth_error.headers.as_slice(),
+                    auth_error.body.as_bytes(),
+                )
+                .await
+            };
         }
     };
 
@@ -2073,32 +3820,177 @@ async fn handle_workspace_admin_connection(
                 actor: request_context.actor.clone(),
                 auth_mode: request_context.auth_mode.clone(),
                 action: String::from(action.as_str()),
+                code: admin_audit_code(action.as_str(), "rate_limited"),
                 source: source_ip.to_string(),
                 outcome: String::from("rate_limited"),
                 detail: String::from("admin identity exceeded configured rate limits"),
             },
         )
-        .await;
-        return crate::write_http_response(
-            &mut stream,
-            "429 Too Many Requests",
-            "text/plain; charset=utf-8",
-            b"admin rate limit exceeded\n",
-        )
-        .await;
+        .await
+        .map_err(|error| io::Error::other(error.to_string()))?;
+        return if api_mode.uses_versioned_contract() {
+            write_versioned_admin_error(
+                &mut stream,
+                "429 Too Many Requests",
+                &[],
+                &request_context.request_id,
+                lb_admin_api::AdminApiErrorCode::RateLimited,
+                "admin rate limit exceeded",
+                true,
+            )
+            .await
+        } else {
+            crate::write_http_response(
+                &mut stream,
+                "429 Too Many Requests",
+                "text/plain; charset=utf-8",
+                b"admin rate limit exceeded\n",
+            )
+            .await
+        };
     }
 
     let action_name = String::from(action.as_str());
-    let audit_outcome = match action {
+    let audit_outcome = if let AdminApiRequestMode::UnsupportedVersion { detail, .. } = &api_mode {
+        write_versioned_admin_error(
+            &mut stream,
+            "406 Not Acceptable",
+            &[],
+            &request_context.request_id,
+            lb_admin_api::AdminApiErrorCode::UnsupportedApiVersion,
+            detail.clone(),
+            false,
+        )
+        .await?;
+        (String::from("failed"), detail.clone())
+    } else {
+        match action {
         AdminRequestAction::Healthz => {
-            crate::write_http_response(&mut stream, "200 OK", "text/plain; charset=utf-8", b"ok\n")
+            if api_mode.uses_versioned_contract() {
+                write_versioned_admin_success(
+                    &mut stream,
+                    "200 OK",
+                    &[],
+                    &request_context.request_id,
+                    serde_json::json!({
+                        "status": "ok",
+                        "live": true,
+                    }),
+                )
                 .await?;
+            } else {
+                crate::write_http_response(
+                    &mut stream,
+                    "200 OK",
+                    "text/plain; charset=utf-8",
+                    b"ok\n",
+                )
+                .await?;
+            }
             (String::from("served"), String::from("health check completed"))
+        }
+        AdminRequestAction::Readyz => {
+            let listener_statuses = supervisor.listener_statuses().await;
+            let readiness = evaluate_workspace_readiness(&listener_statuses, state.reload_health());
+            let response_status = if readiness.ready {
+                "200 OK"
+            } else {
+                "503 Service Unavailable"
+            };
+            let detail = if readiness.ready {
+                String::from("readiness check completed: ready")
+            } else {
+                format!(
+                    "readiness check completed: not ready ({})",
+                    readiness.reason_codes.join(", ")
+                )
+            };
+            if api_mode.uses_versioned_contract() {
+                write_versioned_admin_success(
+                    &mut stream,
+                    response_status,
+                    &[],
+                    &request_context.request_id,
+                    json_body_to_value(&readiness.to_json())?,
+                )
+                .await?;
+            } else {
+                let body = format!("{}\n", readiness.to_json());
+                crate::write_http_response(
+                    &mut stream,
+                    response_status,
+                    "application/json",
+                    body.as_bytes(),
+                )
+                .await?;
+            }
+            (
+                String::from(if readiness.ready { "served" } else { "degraded" }),
+                detail,
+            )
         }
         AdminRequestAction::Validate => match supervisor.validate_current_config().await {
             Ok(preview) => {
-                let body =
-                    preview.render_json().map_err(|error| io::Error::other(error.to_string()))?;
+                if api_mode.uses_versioned_contract() {
+                    write_versioned_admin_success(
+                        &mut stream,
+                        "200 OK",
+                        &[],
+                        &request_context.request_id,
+                        preview,
+                    )
+                    .await?;
+                } else {
+                    let body = preview
+                        .render_json()
+                        .map_err(|error| io::Error::other(error.to_string()))?;
+                    crate::write_http_response(
+                        &mut stream,
+                        "200 OK",
+                        "application/json",
+                        body.as_bytes(),
+                    )
+                    .await?;
+                }
+                (String::from("served"), String::from("validation preview generated"))
+            }
+            Err(error) => {
+                let detail = format!("validation preview failed: {error}");
+                if api_mode.uses_versioned_contract() {
+                    write_versioned_admin_error(
+                        &mut stream,
+                        "400 Bad Request",
+                        &[],
+                        &request_context.request_id,
+                        lb_admin_api::AdminApiErrorCode::ValidationFailed,
+                        detail.clone(),
+                        false,
+                    )
+                    .await?;
+                } else {
+                    crate::write_http_response(
+                        &mut stream,
+                        "400 Bad Request",
+                        "text/plain; charset=utf-8",
+                        format!("{detail}\n").as_bytes(),
+                    )
+                    .await?;
+                }
+                (String::from("failed"), detail)
+            }
+        },
+        AdminRequestAction::Status => {
+            let body = state.status_body(&supervisor).await;
+            if api_mode.uses_versioned_contract() {
+                write_versioned_admin_success(
+                    &mut stream,
+                    "200 OK",
+                    &[],
+                    &request_context.request_id,
+                    json_body_to_value(&body)?,
+                )
+                .await?;
+            } else {
                 crate::write_http_response(
                     &mut stream,
                     "200 OK",
@@ -2106,31 +3998,30 @@ async fn handle_workspace_admin_connection(
                     body.as_bytes(),
                 )
                 .await?;
-                (String::from("served"), String::from("validation preview generated"))
             }
-            Err(error) => {
-                let detail = format!("validation preview failed: {error}");
-                crate::write_http_response(
-                    &mut stream,
-                    "400 Bad Request",
-                    "text/plain; charset=utf-8",
-                    format!("{detail}\n").as_bytes(),
-                )
-                .await?;
-                (String::from("failed"), detail)
-            }
-        },
-        AdminRequestAction::Status => {
-            let body = state.status_body(&supervisor).await;
-            crate::write_http_response(&mut stream, "200 OK", "application/json", body.as_bytes())
-                .await?;
             (String::from("served"), String::from("status response generated"))
         }
         AdminRequestAction::Audit => {
             let body =
                 state.audit_body().await.map_err(|error| io::Error::other(error.to_string()))?;
-            crate::write_http_response(&mut stream, "200 OK", "application/json", body.as_bytes())
+            if api_mode.uses_versioned_contract() {
+                write_versioned_admin_success(
+                    &mut stream,
+                    "200 OK",
+                    &[],
+                    &request_context.request_id,
+                    json_body_to_value(&body)?,
+                )
                 .await?;
+            } else {
+                crate::write_http_response(
+                    &mut stream,
+                    "200 OK",
+                    "application/json",
+                    body.as_bytes(),
+                )
+                .await?;
+            }
             (String::from("served"), String::from("audit log response generated"))
         }
         AdminRequestAction::Reload => {
@@ -2139,6 +4030,11 @@ async fn handle_workspace_admin_connection(
                 || String::from("reload started; plan preview unavailable before apply"),
                 ReloadAuditPlan::start_detail,
             );
+            let started_code = reload_plan
+                .as_ref()
+                .map_or_else(|| String::from("reload_started_unknown"), |plan| {
+                    String::from(plan.start_code())
+                });
             record_admin_audit(
                 &state,
                 AdminAuditEvent {
@@ -2148,42 +4044,94 @@ async fn handle_workspace_admin_connection(
                     actor: request_context.actor.clone(),
                     auth_mode: request_context.auth_mode.clone(),
                     action: action_name.clone(),
+                    code: started_code,
                     source: request_context.source.to_string(),
                     outcome: String::from("started"),
                     detail: started_detail,
                 },
             )
-            .await;
+            .await
+            .map_err(|error| io::Error::other(error.to_string()))?;
 
             match supervisor.reload().await {
-                Ok(()) => {
-                    crate::write_http_response(
-                        &mut stream,
-                        "200 OK",
-                        "text/plain; charset=utf-8",
-                        b"configuration applied\n",
-                    )
-                    .await?;
-                    (
-                        String::from("executed"),
-                        reload_plan.as_ref().map_or_else(
-                            || String::from("configuration applied"),
-                            ReloadAuditPlan::success_detail,
-                        ),
-                    )
+                Ok(outcome) => {
+                    let success_code = reload_plan
+                        .as_ref()
+                        .map_or_else(|| String::from(outcome.generic_success_code()), |plan| {
+                            String::from(plan.success_code(&outcome))
+                        });
+                    let success_detail = reload_plan.as_ref().map_or_else(
+                        || outcome.generic_success_detail(),
+                        |plan| plan.success_detail(&outcome),
+                    );
+                    *state.last_reload_outcome_code.lock().await = success_code;
+                    *state.last_reload_result.lock().await = success_detail.clone();
+                    if api_mode.uses_versioned_contract() {
+                        let last_reload_outcome_code = state.last_reload_outcome_code.lock().await.clone();
+                        let last_reload_result = state.last_reload_result.lock().await.clone();
+                        write_versioned_admin_success(
+                            &mut stream,
+                            "200 OK",
+                            &[],
+                            &request_context.request_id,
+                            serde_json::json!({
+                                "result": "configuration_applied",
+                                "outcome_code": last_reload_outcome_code,
+                                "detail": last_reload_result,
+                                "reload_health": reload_health_name(state.reload_health()),
+                                "degraded": outcome.timed_out_during_drain(),
+                            }),
+                        )
+                        .await?;
+                    } else {
+                        crate::write_http_response(
+                            &mut stream,
+                            "200 OK",
+                            "text/plain; charset=utf-8",
+                            b"configuration applied\n",
+                        )
+                        .await?;
+                    }
+                    (String::from("executed"), success_detail)
                 }
                 Err(error) => {
+                    let failure_code = reload_plan
+                        .as_ref()
+                        .map_or_else(|| String::from("reload_failed_apply"), |plan| {
+                            String::from(plan.failure_code())
+                        });
+                    *state.last_reload_outcome_code.lock().await = failure_code;
                     let detail = reload_plan.as_ref().map_or_else(
                         || format!("reload failed: {error}"),
                         |plan| plan.failure_detail(&error),
                     );
-                    crate::write_http_response(
-                        &mut stream,
-                        "500 Internal Server Error",
-                        "text/plain; charset=utf-8",
-                        format!("{detail}\n").as_bytes(),
-                    )
-                    .await?;
+                    if api_mode.uses_versioned_contract() {
+                        let error_code = if state.last_reload_outcome_code.lock().await.as_str()
+                            == "reload_failed_blocked_change"
+                        {
+                            lb_admin_api::AdminApiErrorCode::UnsupportedMutation
+                        } else {
+                            lb_admin_api::AdminApiErrorCode::ReloadFailed
+                        };
+                        write_versioned_admin_error(
+                            &mut stream,
+                            "500 Internal Server Error",
+                            &[],
+                            &request_context.request_id,
+                            error_code,
+                            detail.clone(),
+                            false,
+                        )
+                        .await?;
+                    } else {
+                        crate::write_http_response(
+                            &mut stream,
+                            "500 Internal Server Error",
+                            "text/plain; charset=utf-8",
+                            format!("{detail}\n").as_bytes(),
+                        )
+                        .await?;
+                    }
                     (String::from("failed"), detail)
                 }
             }
@@ -2191,15 +4139,26 @@ async fn handle_workspace_admin_connection(
         AdminRequestAction::CachePurge => {
             match handle_admin_cache_purge(&state, &request_body).await {
                 Ok(response) => {
-                    let body = serde_json::to_string_pretty(&response)
-                        .map_err(|error| io::Error::other(error.to_string()))?;
-                    crate::write_http_response(
-                        &mut stream,
-                        "200 OK",
-                        "application/json",
-                        body.as_bytes(),
-                    )
-                    .await?;
+                    if api_mode.uses_versioned_contract() {
+                        write_versioned_admin_success(
+                            &mut stream,
+                            "200 OK",
+                            &[],
+                            &request_context.request_id,
+                            &response,
+                        )
+                        .await?;
+                    } else {
+                        let body = serde_json::to_string_pretty(&response)
+                            .map_err(|error| io::Error::other(error.to_string()))?;
+                        crate::write_http_response(
+                            &mut stream,
+                            "200 OK",
+                            "application/json",
+                            body.as_bytes(),
+                        )
+                        .await?;
+                    }
                     (
                         String::from(if response.degraded { "degraded" } else { "executed" }),
                         format!(
@@ -2209,13 +4168,26 @@ async fn handle_workspace_admin_connection(
                     )
                 }
                 Err(error) => {
-                    crate::write_http_response(
-                        &mut stream,
-                        "400 Bad Request",
-                        "text/plain; charset=utf-8",
-                        format!("{error}\n").as_bytes(),
-                    )
-                    .await?;
+                    if api_mode.uses_versioned_contract() {
+                        write_versioned_admin_error(
+                            &mut stream,
+                            "400 Bad Request",
+                            &[],
+                            &request_context.request_id,
+                            lb_admin_api::AdminApiErrorCode::ValidationFailed,
+                            error.clone(),
+                            false,
+                        )
+                        .await?;
+                    } else {
+                        crate::write_http_response(
+                            &mut stream,
+                            "400 Bad Request",
+                            "text/plain; charset=utf-8",
+                            format!("{error}\n").as_bytes(),
+                        )
+                        .await?;
+                    }
                     (String::from("failed"), error)
                 }
             }
@@ -2223,15 +4195,26 @@ async fn handle_workspace_admin_connection(
         AdminRequestAction::CacheInvalidate => {
             match handle_admin_cache_invalidate(&state, &request_body).await {
                 Ok(response) => {
-                    let body = serde_json::to_string(&response)
-                        .map_err(|error| io::Error::other(error.to_string()))?;
-                    crate::write_http_response(
-                        &mut stream,
-                        "200 OK",
-                        "application/json",
-                        body.as_bytes(),
-                    )
-                    .await?;
+                    if api_mode.uses_versioned_contract() {
+                        write_versioned_admin_success(
+                            &mut stream,
+                            "200 OK",
+                            &[],
+                            &request_context.request_id,
+                            &response,
+                        )
+                        .await?;
+                    } else {
+                        let body = serde_json::to_string(&response)
+                            .map_err(|error| io::Error::other(error.to_string()))?;
+                        crate::write_http_response(
+                            &mut stream,
+                            "200 OK",
+                            "application/json",
+                            body.as_bytes(),
+                        )
+                        .await?;
+                    }
                     (
                         String::from(match response.result {
                             lb_admin_api::HttpCachePeerInvalidationResult::Applied => "executed",
@@ -2244,27 +4227,60 @@ async fn handle_workspace_admin_connection(
                     )
                 }
                 Err(error) => {
-                    crate::write_http_response(
-                        &mut stream,
-                        "400 Bad Request",
-                        "text/plain; charset=utf-8",
-                        format!("{error}\n").as_bytes(),
-                    )
-                    .await?;
+                    if api_mode.uses_versioned_contract() {
+                        write_versioned_admin_error(
+                            &mut stream,
+                            "400 Bad Request",
+                            &[],
+                            &request_context.request_id,
+                            lb_admin_api::AdminApiErrorCode::ValidationFailed,
+                            error.clone(),
+                            false,
+                        )
+                        .await?;
+                    } else {
+                        crate::write_http_response(
+                            &mut stream,
+                            "400 Bad Request",
+                            "text/plain; charset=utf-8",
+                            format!("{error}\n").as_bytes(),
+                        )
+                        .await?;
+                    }
                     (String::from("failed"), error)
                 }
             }
         }
         AdminRequestAction::Unknown => {
-            crate::write_http_response(
-                &mut stream,
-                "404 Not Found",
-                "text/plain; charset=utf-8",
-                b"not found\n",
-            )
-            .await?;
+            if api_mode.uses_versioned_contract() {
+                write_versioned_admin_error(
+                    &mut stream,
+                    "404 Not Found",
+                    &[],
+                    &request_context.request_id,
+                    lb_admin_api::AdminApiErrorCode::NotFound,
+                    "unknown admin endpoint",
+                    false,
+                )
+                .await?;
+            } else {
+                crate::write_http_response(
+                    &mut stream,
+                    "404 Not Found",
+                    "text/plain; charset=utf-8",
+                    b"not found\n",
+                )
+                .await?;
+            }
             (String::from("not_found"), String::from("unknown admin endpoint"))
         }
+    }
+    };
+
+    let audit_code = if matches!(action, AdminRequestAction::Reload) {
+        state.last_reload_outcome_code.lock().await.clone()
+    } else {
+        admin_audit_code(&action_name, &audit_outcome.0)
     };
 
     record_admin_audit(
@@ -2276,12 +4292,14 @@ async fn handle_workspace_admin_connection(
             actor: request_context.actor,
             auth_mode: request_context.auth_mode,
             action: action_name,
+            code: audit_code,
             source: request_context.source.to_string(),
             outcome: audit_outcome.0,
             detail: audit_outcome.1,
         },
     )
-    .await;
+    .await
+    .map_err(|error| io::Error::other(error.to_string()))?;
 
     Ok(())
 }
@@ -2289,6 +4307,7 @@ async fn handle_workspace_admin_connection(
 fn classify_admin_request_action(method: &str, target: &str) -> AdminRequestAction {
     match (method, target) {
         ("GET", "/healthz") => AdminRequestAction::Healthz,
+        ("GET", "/readyz") => AdminRequestAction::Readyz,
         ("GET", "/status") => AdminRequestAction::Status,
         ("GET", "/validate") => AdminRequestAction::Validate,
         ("GET", "/audit") => AdminRequestAction::Audit,
@@ -2297,6 +4316,10 @@ fn classify_admin_request_action(method: &str, target: &str) -> AdminRequestActi
         ("POST", "/cache/invalidate") => AdminRequestAction::CacheInvalidate,
         _ => AdminRequestAction::Unknown,
     }
+}
+
+fn admin_audit_code(action: &str, outcome: &str) -> String {
+    format!("{}_{}", action, outcome)
 }
 
 fn admin_source_allowed(source_ip: IpAddr, policy: &CompiledAdminPolicy) -> bool {
@@ -2423,6 +4446,20 @@ struct AdminAuthFailure {
     actor: String,
     auth_mode: String,
     outcome: &'static str,
+    detail: String,
+}
+
+struct ResolvedSecretMaterial {
+    value: String,
+    source_kind: &'static str,
+    source_reference: String,
+    supports_rotation_without_reload: bool,
+}
+
+struct SecretMaterialResolutionError {
+    source_kind: &'static str,
+    source_reference: String,
+    state: &'static str,
     detail: String,
 }
 
@@ -2646,6 +4683,59 @@ fn resolve_admin_secret(
     auth_mode: &'static str,
     actor: &str,
 ) -> Result<ResolvedAdminSecret, AdminAuthFailure> {
+    let value = resolve_secret_material(secret_env, legacy_admin_secret).map_err(|error| {
+        AdminAuthFailure {
+            status: "503 Service Unavailable",
+            headers: Vec::new(),
+            body: String::from("admin authorization unavailable\n"),
+            actor: actor.to_string(),
+            auth_mode: String::from(auth_mode),
+            outcome: "misconfigured",
+            detail: error.detail,
+        }
+    })?;
+
+    Ok(ResolvedAdminSecret { value: value.value, actor: actor.to_string(), auth_mode })
+}
+
+fn resolve_secret_material(
+    secret_env: &str,
+    legacy_admin_secret: &str,
+) -> Result<ResolvedSecretMaterial, SecretMaterialResolutionError> {
+    let secret_file_env = format!("{secret_env}_FILE");
+    if let Ok(secret_file_path) = std::env::var(&secret_file_env) {
+        let secret_file_path = secret_file_path.trim().to_string();
+        if !secret_file_path.is_empty() {
+            let value = fs::read_to_string(&secret_file_path).map_err(|error| {
+                SecretMaterialResolutionError {
+                    source_kind: "file",
+                    source_reference: secret_file_path.clone(),
+                    state: "read_failed",
+                    detail: format!(
+                        "admin secret file {secret_file_path} from {secret_file_env} could not be read: {error}"
+                    ),
+                }
+            })?;
+            let value = trim_secret_material(&value);
+            if value.is_empty() {
+                return Err(SecretMaterialResolutionError {
+                    source_kind: "file",
+                    source_reference: secret_file_path,
+                    state: "empty",
+                    detail: format!(
+                        "admin secret file configured via {secret_file_env} was empty"
+                    ),
+                });
+            }
+            return Ok(ResolvedSecretMaterial {
+                value,
+                source_kind: "file",
+                source_reference: secret_file_path,
+                supports_rotation_without_reload: true,
+            });
+        }
+    }
+
     let value = std::env::var(secret_env).unwrap_or_else(|_| {
         if secret_env == "LB_CTL_ADMIN_SECRET" {
             String::from(legacy_admin_secret)
@@ -2655,18 +4745,53 @@ fn resolve_admin_secret(
     });
 
     if value.is_empty() {
-        return Err(AdminAuthFailure {
-            status: "503 Service Unavailable",
-            headers: Vec::new(),
-            body: String::from("admin authorization unavailable\n"),
-            actor: actor.to_string(),
-            auth_mode: String::from(auth_mode),
-            outcome: "misconfigured",
+        return Err(SecretMaterialResolutionError {
+            source_kind: "env",
+            source_reference: String::from(secret_env),
+            state: "missing",
             detail: format!("admin secret env {secret_env} is not configured"),
         });
     }
 
-    Ok(ResolvedAdminSecret { value, actor: actor.to_string(), auth_mode })
+    Ok(ResolvedSecretMaterial {
+        value,
+        source_kind: "env",
+        source_reference: String::from(secret_env),
+        supports_rotation_without_reload: false,
+    })
+}
+
+fn inspect_secret_material(secret_env: &str, legacy_admin_secret: &str) -> AdminSecretHealthStatus {
+    match resolve_secret_material(secret_env, legacy_admin_secret) {
+        Ok(material) => AdminSecretHealthStatus {
+            listener: String::new(),
+            actor: String::new(),
+            auth_mode: String::new(),
+            secret_env: String::from(secret_env),
+            source_kind: String::from(material.source_kind),
+            source_reference: material.source_reference,
+            supports_rotation_without_reload: material.supports_rotation_without_reload,
+            healthy: true,
+            state: String::from("loaded"),
+            detail: String::from("secret material loaded"),
+        },
+        Err(error) => AdminSecretHealthStatus {
+            listener: String::new(),
+            actor: String::new(),
+            auth_mode: String::new(),
+            secret_env: String::from(secret_env),
+            source_kind: String::from(error.source_kind),
+            source_reference: error.source_reference,
+            supports_rotation_without_reload: matches!(error.source_kind, "file"),
+            healthy: false,
+            state: String::from(error.state),
+            detail: error.detail,
+        },
+    }
+}
+
+fn trim_secret_material(value: &str) -> String {
+    value.trim_end_matches(['\r', '\n']).to_string()
 }
 
 fn sign_admin_request(
@@ -2712,8 +4837,73 @@ fn admin_permission_name(permission: AdminPermission) -> &'static str {
     }
 }
 
-async fn record_admin_audit(state: &WorkspaceServeState, event: AdminAuditEvent) {
+async fn record_admin_audit(state: &WorkspaceServeState, event: AdminAuditEvent) -> Result<(), DynError> {
     state.record_admin_audit(event).await;
+    Ok(())
+}
+
+fn optional_string_json(value: Option<&str>) -> String {
+    value
+        .map(|value| format!("\"{}\"", crate::escape_json_string(value)))
+        .unwrap_or_else(|| String::from("null"))
+}
+
+fn optional_u64_json(value: Option<u64>) -> String {
+    value.map_or_else(|| String::from("null"), |value| value.to_string())
+}
+
+fn control_plane_journal_path(config_path: &str) -> String {
+    format!("{config_path}.control-plane.json")
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(bytes);
+    digest.finalize().iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn write_control_plane_journal_atomic(
+    journal_path: &str,
+    payload: &ControlPlaneJournalPayload,
+) -> Result<(), DynError> {
+    let payload_json = serde_json::to_string_pretty(payload).map_err(to_dyn_error)?;
+    let envelope = ControlPlaneJournalEnvelope {
+        version: CONTROL_PLANE_JOURNAL_VERSION,
+        payload_sha256: sha256_hex(payload_json.as_bytes()),
+        payload_json,
+    };
+    let serialized = serde_json::to_vec_pretty(&envelope).map_err(to_dyn_error)?;
+    let write_sequence =
+        NEXT_CONTROL_PLANE_JOURNAL_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temporary_path = format!(
+        "{journal_path}.tmp-{}-{}-{write_sequence}",
+        std::process::id(),
+        unix_time_ms()
+    );
+    fs::write(&temporary_path, serialized).map_err(to_dyn_error)?;
+    fs::rename(&temporary_path, journal_path).map_err(to_dyn_error)?;
+    Ok(())
+}
+
+fn reload_health_from_name(name: &str) -> ReloadHealthState {
+    match name {
+        "healthy" => ReloadHealthState::Healthy,
+        "failed" => ReloadHealthState::Failed,
+        _ => ReloadHealthState::NotRequested,
+    }
+}
+
+fn next_admin_sequence_from_events(events: &[AdminAuditEvent]) -> u64 {
+    events
+        .iter()
+        .filter_map(|event| {
+            event
+                .request_id
+                .strip_prefix("admin-")
+                .and_then(|suffix| u64::from_str_radix(suffix, 16).ok())
+        })
+        .max()
+        .map_or(1, |sequence| sequence.saturating_add(1))
 }
 
 fn unix_time_ms() -> u64 {
@@ -2753,6 +4943,53 @@ async fn write_overload_response(stream: &mut TcpStream) -> io::Result<()> {
     )
     .await?;
     stream.shutdown().await
+}
+
+async fn write_abuse_rejection_response(
+    stream: &mut TcpStream,
+    reason: lb_runtime::AbuseRejectionReason,
+) -> io::Result<()> {
+    let body = format!("listener rejected connection: {}\n", reason.code());
+    let response = format!(
+        concat!(
+            "HTTP/1.1 503 Service Unavailable\r\n",
+            "Content-Type: text/plain; charset=utf-8\r\n",
+            "Content-Length: {}\r\n",
+            "Connection: close\r\n",
+            "X-LB-Abuse-Reason: {}\r\n\r\n",
+            "{}"
+        ),
+        body.len(),
+        reason.code(),
+        body,
+    );
+    stream.write_all(response.as_bytes()).await?;
+    stream.shutdown().await
+}
+
+fn build_listener_abuse_protection_state(
+    policy: Option<&CompiledListenerAbuseProtectionPolicy>,
+) -> lb_runtime::ListenerAbuseProtectionState {
+    lb_runtime::ListenerAbuseProtectionState::new(
+        policy.map_or_else(
+            lb_runtime::ListenerAbuseProtectionPolicy::default,
+            |policy| lb_runtime::ListenerAbuseProtectionPolicy {
+                source_quota: policy.source_quota.map(|source_quota| {
+                    lb_runtime::SourceQuotaPolicy::new(
+                        source_quota.aggregation,
+                        source_quota.max_active_per_source,
+                        source_quota.max_tracked_sources,
+                    )
+                }),
+                handshake_guard: policy.handshake_guard.map(|handshake_guard| {
+                    lb_runtime::HandshakeGuardPolicy::new(
+                        handshake_guard.max_inflight,
+                        handshake_guard.timeout,
+                    )
+                }),
+            },
+        ),
+    )
 }
 
 fn build_listener_overload_runtime(
@@ -2830,6 +5067,30 @@ fn snapshot_listener_overload_status(
             )
         })
         .unwrap_or((fallback_state, Vec::new(), Vec::new()))
+}
+
+fn reload_health_name(state: ReloadHealthState) -> &'static str {
+    match state {
+        ReloadHealthState::NotRequested => "not_requested",
+        ReloadHealthState::Healthy => "healthy",
+        ReloadHealthState::Failed => "failed",
+    }
+}
+
+fn elapsed_millis_at_least_one(duration: Duration) -> u64 {
+    let millis = match u64::try_from(duration.as_millis()) {
+        Ok(millis) => millis,
+        Err(_) => u64::MAX,
+    };
+    millis.max(1)
+}
+
+const fn reload_health_index(state: ReloadHealthState) -> usize {
+    match state {
+        ReloadHealthState::NotRequested => 0,
+        ReloadHealthState::Healthy => 1,
+        ReloadHealthState::Failed => 2,
+    }
 }
 
 fn build_config_validation_preview(
@@ -3059,6 +5320,7 @@ fn compile_workspace_runtime(config_path: &str) -> Result<CompiledWorkspaceRunti
                 max_connections: compiled_listener.max_connections,
                 drain_timeout: compiled_listener.drain_timeout,
                 overload_policy: compile_listener_overload_policy(&config, listener)?,
+                abuse_protection_policy: compile_listener_abuse_protection_policy(&config, listener)?,
                 proxy: ManagedProxyConfig::Http1(compile_http1_proxy_config(
                     &config,
                     listener,
@@ -3078,6 +5340,7 @@ fn compile_workspace_runtime(config_path: &str) -> Result<CompiledWorkspaceRunti
                 max_connections: compiled_listener.max_connections,
                 drain_timeout: compiled_listener.drain_timeout,
                 overload_policy: compile_listener_overload_policy(&config, listener)?,
+                abuse_protection_policy: compile_listener_abuse_protection_policy(&config, listener)?,
                 proxy: ManagedProxyConfig::Http2(compile_http2_proxy_config(
                     &config,
                     listener,
@@ -3094,6 +5357,7 @@ fn compile_workspace_runtime(config_path: &str) -> Result<CompiledWorkspaceRunti
                 max_connections: compiled_listener.max_connections,
                 drain_timeout: compiled_listener.drain_timeout,
                 overload_policy: compile_listener_overload_policy(&config, listener)?,
+                abuse_protection_policy: compile_listener_abuse_protection_policy(&config, listener)?,
                 proxy: ManagedProxyConfig::Https(compile_https_proxy_config(
                     &config,
                     listener,
@@ -3119,6 +5383,7 @@ fn compile_workspace_runtime(config_path: &str) -> Result<CompiledWorkspaceRunti
                 max_connections: compiled_listener.max_connections,
                 drain_timeout: compiled_listener.drain_timeout,
                 overload_policy: compile_listener_overload_policy(&config, listener)?,
+                abuse_protection_policy: compile_listener_abuse_protection_policy(&config, listener)?,
                 admin_policy: compile_admin_policy(listener)?,
             },
             (lb_config_model::ListenerClassConfig::Admin, protocol) => {
@@ -3415,6 +5680,7 @@ fn compile_https_proxy_config(
         http1,
         http2,
         tls_server_config: Arc::new(build_tls_server_config(tls_termination)?),
+        tls_status: build_listener_tls_status(tls_termination)?,
     })
 }
 
@@ -3504,6 +5770,142 @@ fn load_certified_key_from_source(
     Ok(certified_key)
 }
 
+fn build_listener_tls_status(
+    tls_termination: &lb_config_model::ListenerTlsTerminationConfig,
+) -> Result<ListenerTlsStatus, DynError> {
+    let default_certificate = build_tls_certificate_status(
+        "default",
+        Vec::new(),
+        &tls_termination.certificate_source,
+    )?;
+    let mut sni_certificates = Vec::with_capacity(tls_termination.sni_certificates.len());
+    let mut reason_codes = Vec::new();
+
+    merge_tls_reason_codes(&mut reason_codes, &default_certificate);
+    for certificate in &tls_termination.sni_certificates {
+        let status = build_tls_certificate_status(
+            "sni",
+            certificate.server_names.clone(),
+            &certificate.certificate_source,
+        )?;
+        merge_tls_reason_codes(&mut reason_codes, &status);
+        sni_certificates.push(status);
+    }
+
+    let state = if reason_codes.iter().any(|reason| reason == "tls_certificate_expired") {
+        "expired"
+    } else if reason_codes.iter().any(|reason| reason == "tls_certificate_not_yet_valid") {
+        "not_yet_valid"
+    } else if reason_codes.iter().any(|reason| reason == "tls_certificate_expiring_soon") {
+        "expiring_soon"
+    } else {
+        "healthy"
+    };
+
+    Ok(ListenerTlsStatus {
+        state: String::from(state),
+        warning_window_secs: TLS_STATUS_EXPIRY_WARNING_WINDOW.as_secs(),
+        minimum_version: String::from(tls_minimum_version_name(tls_termination.minimum_version)),
+        alpn_protocols: tls_termination
+            .alpn_protocols
+            .iter()
+            .map(|protocol| String::from(tls_alpn_protocol_name(*protocol)))
+            .collect(),
+        session_resumption: ListenerTlsSessionResumptionStatus {
+            mode: String::from(tls_session_resumption_mode_name(
+                tls_termination.session_resumption.mode,
+            )),
+            session_cache_size: tls_termination.session_resumption.session_cache_size,
+            tls13_ticket_count: tls_termination.session_resumption.tls13_ticket_count,
+        },
+        default_certificate,
+        sni_certificates,
+        reason_codes,
+    })
+}
+
+fn build_tls_certificate_status(
+    label: &str,
+    server_names: Vec<String>,
+    certificate_source: &lb_config_model::ListenerCertificateSourceConfig,
+) -> Result<ListenerTlsCertificateStatus, DynError> {
+    match certificate_source {
+        lb_config_model::ListenerCertificateSourceConfig::Files {
+            cert_path,
+            key_path,
+            ocsp_path,
+        } => {
+            let metadata = lb_proto_tls::inspect_tls_identity_from_files(
+                cert_path,
+                key_path,
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|duration| duration.as_secs() as i64)
+                    .unwrap_or_default(),
+                TLS_STATUS_EXPIRY_WARNING_WINDOW,
+            )
+            .map_err(to_dyn_error)?;
+            Ok(ListenerTlsCertificateStatus {
+                label: String::from(label),
+                server_names,
+                cert_path: cert_path.clone(),
+                key_path: key_path.clone(),
+                ocsp_path: ocsp_path.clone(),
+                common_name: metadata.common_name,
+                san_dns_names: metadata.san_dns_names,
+                fingerprint_sha256: metadata.fingerprint_sha256,
+                not_before_unix_secs: metadata.not_before_unix_secs,
+                not_after_unix_secs: metadata.not_after_unix_secs,
+                not_yet_valid: metadata.not_yet_valid,
+                expired: metadata.expired,
+                expires_within_warning_window: metadata.expires_within_warning_window,
+            })
+        }
+    }
+}
+
+fn merge_tls_reason_codes(
+    reason_codes: &mut Vec<String>,
+    certificate: &ListenerTlsCertificateStatus,
+) {
+    if certificate.expired {
+        push_unique_reason(reason_codes, "tls_certificate_expired");
+    }
+    if certificate.not_yet_valid {
+        push_unique_reason(reason_codes, "tls_certificate_not_yet_valid");
+    }
+    if certificate.expires_within_warning_window {
+        push_unique_reason(reason_codes, "tls_certificate_expiring_soon");
+    }
+}
+
+fn tls_minimum_version_name(
+    minimum_version: lb_config_model::ListenerTlsMinimumVersionConfig,
+) -> &'static str {
+    match minimum_version {
+        lb_config_model::ListenerTlsMinimumVersionConfig::Tls12 => "tls12",
+        lb_config_model::ListenerTlsMinimumVersionConfig::Tls13 => "tls13",
+    }
+}
+
+fn tls_session_resumption_mode_name(
+    mode: lb_config_model::ListenerTlsSessionResumptionModeConfig,
+) -> &'static str {
+    match mode {
+        lb_config_model::ListenerTlsSessionResumptionModeConfig::Disabled => "disabled",
+        lb_config_model::ListenerTlsSessionResumptionModeConfig::Stateful => "stateful",
+        lb_config_model::ListenerTlsSessionResumptionModeConfig::Tickets => "tickets",
+        lb_config_model::ListenerTlsSessionResumptionModeConfig::Hybrid => "hybrid",
+    }
+}
+
+fn tls_alpn_protocol_name(protocol: lb_config_model::ListenerAlpnProtocolConfig) -> &'static str {
+    match protocol {
+        lb_config_model::ListenerAlpnProtocolConfig::Http2 => "http2",
+        lb_config_model::ListenerAlpnProtocolConfig::Http11 => "http11",
+    }
+}
+
 fn protocol_versions_for_minimum(
     minimum_version: lb_config_model::ListenerTlsMinimumVersionConfig,
 ) -> &'static [&'static rustls::SupportedProtocolVersion] {
@@ -3517,10 +5919,14 @@ async fn proxy_https_connection(
     stream: TcpStream,
     peer_addr: SocketAddr,
     config: ManagedHttpsProxyConfig,
+    mut handshake_permit: Option<lb_runtime::HandshakePermit>,
 ) -> io::Result<u64> {
     let acceptor = TlsAcceptor::from(Arc::clone(&config.tls_server_config));
     let tls_stream =
         acceptor.accept(stream).await.map_err(|error| io::Error::other(error.to_string()))?;
+    if let Some(handshake_permit) = handshake_permit.as_mut() {
+        handshake_permit.release();
+    }
     let negotiated_h2 =
         tls_stream.get_ref().1.alpn_protocol().is_some_and(|protocol| protocol == b"h2");
 
@@ -3822,6 +6228,14 @@ fn listener_protocol_name(protocol: lb_config_model::ListenerProtocolConfig) -> 
     }
 }
 
+fn source_aggregation_name(aggregation: lb_runtime::SourceAggregation) -> &'static str {
+    match aggregation {
+        lb_runtime::SourceAggregation::ExactIp => "exact_ip",
+        lb_runtime::SourceAggregation::Ipv4Subnet24 => "ipv4_subnet_24",
+        lb_runtime::SourceAggregation::Ipv6Subnet64 => "ipv6_subnet_64",
+    }
+}
+
 fn overload_state_name(state: lb_runtime::OverloadState) -> &'static str {
     match state {
         lb_runtime::OverloadState::Normal => "normal",
@@ -3891,6 +6305,53 @@ fn compile_listener_overload_policy(
     }))
 }
 
+fn compile_listener_abuse_protection_policy(
+    config: &lb_config_model::WorkspaceConfig,
+    listener: &lb_config_model::ListenerResourceConfig,
+) -> Result<Option<CompiledListenerAbuseProtectionPolicy>, DynError> {
+    let Some(policy_name) = listener.policies.hostile_edge_protection.as_deref() else {
+        return Ok(None);
+    };
+
+    let policy = config
+        .policies
+        .hostile_edge_protections
+        .iter()
+        .find(|policy| policy.name == policy_name)
+        .ok_or_else(|| {
+            to_dyn_error(format!(
+                "listener {} references unknown hostile-edge protection policy {policy_name}",
+                listener.name,
+            ))
+        })?;
+
+    Ok(Some(CompiledListenerAbuseProtectionPolicy {
+        source_quota: policy.spec.source_quota.as_ref().map(|source_quota| {
+            CompiledSourceQuotaPolicy {
+                aggregation: match source_quota.aggregation {
+                    lb_config_model::HostileEdgeSourceAggregationConfig::ExactIp => {
+                        lb_runtime::SourceAggregation::ExactIp
+                    }
+                    lb_config_model::HostileEdgeSourceAggregationConfig::Ipv4Subnet24 => {
+                        lb_runtime::SourceAggregation::Ipv4Subnet24
+                    }
+                    lb_config_model::HostileEdgeSourceAggregationConfig::Ipv6Subnet64 => {
+                        lb_runtime::SourceAggregation::Ipv6Subnet64
+                    }
+                },
+                max_active_per_source: source_quota.max_active_per_source,
+                max_tracked_sources: source_quota.max_tracked_sources,
+            }
+        }),
+        handshake_guard: policy.spec.handshake_guard.as_ref().map(|handshake_guard| {
+            CompiledHandshakeGuardPolicy {
+                max_inflight: handshake_guard.max_inflight,
+                timeout: Duration::from_millis(handshake_guard.timeout_ms),
+            }
+        }),
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -3915,9 +6376,18 @@ mod tests {
 
     use super::{
         build_tls_server_config, compile_route_backend_pool, compile_workspace_runtime,
-        sign_admin_request, to_dyn_error, CompiledServeListener, DynError, ListenerIdentity,
-        ListenerLifecycleEntry, ListenerLifecycleModel, ListenerLifecycleState, ManagedProxyConfig,
-        ServeSupervisor, ACTIVE_HEALTH_PROBE_INTERVAL, ROUTE_BACKEND_WARMUP_DURATION,
+        control_plane_journal_path, evaluate_workspace_readiness, reload_health_name,
+        sign_admin_request, to_dyn_error, unix_time_ms, write_control_plane_journal_atomic,
+        AdminAuditEvent, CompiledServeListener, ControlPlaneJournalEnvelope,
+        ControlPlaneJournalPayload, ControlPlaneRecoveryInfo, DurableSnapshotIdentity, DynError,
+        JournalInFlightOperation, ListenerDrainOutcome, ListenerIdentity,
+        ListenerAbuseProtectionStatus, ListenerIdentityStatus, ListenerLifecycleEntry,
+        ListenerLifecycleModel, ListenerLifecycleState, ListenerReplacementStatus,
+        ListenerStatus,
+        ManagedProxyConfig, RecoveredListenerStatus, RecoveryReconciliationSummary,
+        ReloadHealthState, ServeSupervisor,
+        ACTIVE_HEALTH_PROBE_INTERVAL, CONTROL_PLANE_JOURNAL_VERSION,
+        RECOVERY_UNFINISHED_RELOAD_CODE, ROUTE_BACKEND_WARMUP_DURATION,
     };
 
     static NEXT_TEST_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -3966,7 +6436,7 @@ mod tests {
             ]
         );
 
-        lifecycle.finish_draining(active);
+        lifecycle.finish_draining(active, ListenerDrainOutcome::Completed);
         assert_eq!(
             lifecycle.entries(),
             vec![
@@ -3978,6 +6448,225 @@ mod tests {
             ]
         );
         Ok(())
+    }
+
+    #[test]
+    fn recovered_listener_status_assigns_machine_readable_verdicts() {
+        let cases = [
+            ("running", "stable", "settled"),
+            (
+                "running",
+                "replacement_draining",
+                "replacement_still_draining",
+            ),
+            (
+                "running",
+                "failed_start_preserved",
+                "replacement_failed_preserved",
+            ),
+            (
+                "running",
+                "drain_timeout_expired",
+                "replacement_drain_timeout",
+            ),
+            ("missing", "missing", "missing"),
+            ("draining", "stable", "needs_review"),
+        ];
+
+        for (listener_state, replacement_state, expected_verdict) in cases {
+            let recovered = RecoveredListenerStatus::new(
+                String::from("public"),
+                String::from(listener_state),
+                String::from(replacement_state),
+            );
+            assert_eq!(recovered.reconciliation_verdict, expected_verdict);
+        }
+    }
+
+    #[test]
+    fn recovery_reconciliation_summary_aggregates_verdicts() {
+        let listeners = vec![
+            RecoveredListenerStatus::new(
+                String::from("a"),
+                String::from("running"),
+                String::from("stable"),
+            ),
+            RecoveredListenerStatus::new(
+                String::from("b"),
+                String::from("running"),
+                String::from("replacement_draining"),
+            ),
+            RecoveredListenerStatus::new(
+                String::from("c"),
+                String::from("missing"),
+                String::from("missing"),
+            ),
+        ];
+
+        let summary = RecoveryReconciliationSummary::from_reconciled_listeners(&listeners);
+        assert_eq!(summary.overall_verdict, "needs_review");
+        assert_eq!(summary.recommended_action, "investigate_and_validate_reload");
+        assert_eq!(summary.settled_count, 1);
+        assert_eq!(summary.draining_count, 1);
+        assert_eq!(summary.missing_count, 1);
+        assert_eq!(summary.failed_preserved_count, 0);
+        assert_eq!(summary.drain_timeout_count, 0);
+        assert_eq!(summary.needs_review_count, 0);
+    }
+
+    #[test]
+    fn recovery_reconciliation_summary_recommends_next_action() {
+        let cases = [
+            (
+                vec![RecoveredListenerStatus::new(
+                    String::from("a"),
+                    String::from("running"),
+                    String::from("stable"),
+                )],
+                "settled",
+                "observe_only",
+            ),
+            (
+                vec![RecoveredListenerStatus::new(
+                    String::from("a"),
+                    String::from("running"),
+                    String::from("replacement_draining"),
+                )],
+                "replacement_still_draining",
+                "wait_for_drain_completion",
+            ),
+            (
+                vec![RecoveredListenerStatus::new(
+                    String::from("a"),
+                    String::from("running"),
+                    String::from("failed_start_preserved"),
+                )],
+                "replacement_failed_preserved",
+                "validate_and_retry_reload",
+            ),
+            (
+                vec![RecoveredListenerStatus::new(
+                    String::from("a"),
+                    String::from("running"),
+                    String::from("drain_timeout_expired"),
+                )],
+                "replacement_drain_timeout",
+                "investigate_drain_timeout",
+            ),
+        ];
+
+        for (listeners, expected_verdict, expected_action) in cases {
+            let summary = RecoveryReconciliationSummary::from_reconciled_listeners(&listeners);
+            assert_eq!(summary.overall_verdict, expected_verdict);
+            assert_eq!(summary.recommended_action, expected_action);
+        }
+    }
+
+    #[test]
+    fn recovery_operator_guidance_defaults_plain_unfinished_reload_to_retry() {
+        let recovery = ControlPlaneRecoveryInfo {
+            state: String::from("needs_operator_action"),
+            detail: String::from("recovered unfinished reload"),
+            last_persisted_at_unix_ms: None,
+            restored_reload_health: Some(String::from("healthy")),
+            restored_last_reload_outcome_code: Some(String::from("reload_started_in_place")),
+            in_flight_operation: Some(JournalInFlightOperation {
+                kind: String::from("reload"),
+                started_at_unix_ms: 1,
+                desired_snapshot: DurableSnapshotIdentity {
+                    source_label: String::from("test"),
+                    digest_sha256: String::from("abc123"),
+                    api_version: String::from("v1alpha1"),
+                    snapshot_format_version: String::from("1"),
+                },
+                lifecycle_code: String::from("reload_started_in_place"),
+                detail: String::from("reload started"),
+                expected_completion_within_ms: None,
+                affected_listeners: Vec::new(),
+            }),
+            reconciled_listeners: Vec::new(),
+        };
+
+        let guidance = recovery.operator_guidance_at(101);
+        assert_eq!(guidance.recommended_action, "validate_and_retry_reload");
+        assert_eq!(guidance.urgency, "action_required");
+        assert_eq!(guidance.operation_age_ms, Some(100));
+        assert_eq!(guidance.expected_completion_within_ms, None);
+        assert!(!guidance.exceeded_expected_completion);
+    }
+
+    #[test]
+    fn recovery_operator_guidance_escalates_stale_replacement_drain() {
+        let recovery = ControlPlaneRecoveryInfo {
+            state: String::from("needs_operator_action"),
+            detail: String::from("recovered unfinished overlap drain"),
+            last_persisted_at_unix_ms: None,
+            restored_reload_health: Some(String::from("healthy")),
+            restored_last_reload_outcome_code: Some(String::from("reload_started_overlap_drain")),
+            in_flight_operation: Some(JournalInFlightOperation {
+                kind: String::from("reload_overlap_drain"),
+                started_at_unix_ms: 1,
+                desired_snapshot: DurableSnapshotIdentity {
+                    source_label: String::from("test"),
+                    digest_sha256: String::from("abc123"),
+                    api_version: String::from("v1alpha1"),
+                    snapshot_format_version: String::from("1"),
+                },
+                lifecycle_code: String::from("reload_started_overlap_drain"),
+                detail: String::from("reload started"),
+                expected_completion_within_ms: Some(50),
+                affected_listeners: vec![String::from("public")],
+            }),
+            reconciled_listeners: vec![RecoveredListenerStatus::new(
+                String::from("public"),
+                String::from("running"),
+                String::from("replacement_draining"),
+            )],
+        };
+
+        let guidance = recovery.operator_guidance_at(101);
+        assert_eq!(guidance.recommended_action, "investigate_stalled_drain");
+        assert_eq!(guidance.urgency, "action_required");
+        assert_eq!(guidance.operation_age_ms, Some(100));
+        assert_eq!(guidance.expected_completion_within_ms, Some(50));
+        assert!(guidance.exceeded_expected_completion);
+    }
+
+    #[test]
+    fn recovery_operator_guidance_allows_fresh_replacement_drain_to_continue() {
+        let recovery = ControlPlaneRecoveryInfo {
+            state: String::from("needs_operator_action"),
+            detail: String::from("recovered unfinished overlap drain"),
+            last_persisted_at_unix_ms: None,
+            restored_reload_health: Some(String::from("healthy")),
+            restored_last_reload_outcome_code: Some(String::from("reload_started_overlap_drain")),
+            in_flight_operation: Some(JournalInFlightOperation {
+                kind: String::from("reload_overlap_drain"),
+                started_at_unix_ms: 75,
+                desired_snapshot: DurableSnapshotIdentity {
+                    source_label: String::from("test"),
+                    digest_sha256: String::from("abc123"),
+                    api_version: String::from("v1alpha1"),
+                    snapshot_format_version: String::from("1"),
+                },
+                lifecycle_code: String::from("reload_started_overlap_drain"),
+                detail: String::from("reload started"),
+                expected_completion_within_ms: Some(50),
+                affected_listeners: vec![String::from("public")],
+            }),
+            reconciled_listeners: vec![RecoveredListenerStatus::new(
+                String::from("public"),
+                String::from("running"),
+                String::from("replacement_draining"),
+            )],
+        };
+
+        let guidance = recovery.operator_guidance_at(101);
+        assert_eq!(guidance.recommended_action, "wait_for_drain_completion");
+        assert_eq!(guidance.urgency, "watch");
+        assert_eq!(guidance.operation_age_ms, Some(26));
+        assert_eq!(guidance.expected_completion_within_ms, Some(50));
+        assert!(!guidance.exceeded_expected_completion);
     }
 
     #[test]
@@ -4075,6 +6764,134 @@ mod tests {
         );
         Ok(())
     }
+
+                fn test_listener_status(
+                    class: lb_config_model::ListenerClassConfig,
+                    state: &str,
+                    overload_state: &str,
+                ) -> Result<ListenerStatus, DynError> {
+                    let configured_bind: SocketAddr = "127.0.0.1:8080".parse()?;
+                    Ok(ListenerStatus {
+                        name: String::from("listener-under-test"),
+                        class,
+                        protocol: lb_config_model::ListenerProtocolConfig::Http1,
+                        configured_bind,
+                        local_addr: configured_bind,
+                        state: String::from(state),
+                        overload_state: String::from(overload_state),
+                        accepted_connections: 0,
+                        active_connections: 0,
+                        completed_connections: 0,
+                        shed_connections: 0,
+                        abuse_protection: ListenerAbuseProtectionStatus {
+                            state: String::from("disabled"),
+                            source_quota: None,
+                            handshake_guard: None,
+                            source_quota_rejections: 0,
+                            tracked_source_limit_rejections: 0,
+                            handshake_guard_rejections: 0,
+                            tracked_sources: 0,
+                            active_handshakes: 0,
+                            reason_codes: Vec::new(),
+                        },
+                        brownout_features: Vec::new(),
+                        recent_overload_events: Vec::new(),
+                        replacement: ListenerReplacementStatus {
+                            state: String::from("stable"),
+                            desired: ListenerIdentityStatus {
+                                class,
+                                protocol: lb_config_model::ListenerProtocolConfig::Http1,
+                                configured_bind,
+                            },
+                            draining: Vec::new(),
+                            retired_recent: Vec::new(),
+                            drain_timeout_recent: Vec::new(),
+                            failed_start: None,
+                        },
+                        tls: None,
+                    })
+                }
+
+                #[test]
+                fn workspace_readiness_is_ready_for_running_public_listener() -> Result<(), DynError> {
+                    let readiness = evaluate_workspace_readiness(
+                        &[test_listener_status(
+                            lb_config_model::ListenerClassConfig::Public,
+                            "running",
+                            "normal",
+                        )?],
+                        ReloadHealthState::Healthy,
+                    );
+
+                    assert!(readiness.ready);
+                    assert_eq!(readiness.status, "ready");
+                    assert_eq!(readiness.reload_status, reload_health_name(ReloadHealthState::Healthy));
+                    assert!(readiness.reason_codes.is_empty());
+                    Ok(())
+                }
+
+                #[test]
+                fn workspace_readiness_is_not_ready_for_draining_public_listener() -> Result<(), DynError> {
+                    let readiness = evaluate_workspace_readiness(
+                        &[test_listener_status(
+                            lb_config_model::ListenerClassConfig::Public,
+                            "draining",
+                            "normal",
+                        )?],
+                        ReloadHealthState::Healthy,
+                    );
+
+                    assert!(!readiness.ready);
+                    assert_eq!(readiness.reason_codes, vec![String::from("listener_draining")]);
+                    Ok(())
+                }
+
+                #[test]
+                fn workspace_readiness_is_not_ready_for_failed_reload_and_shedding_listener(
+                ) -> Result<(), DynError> {
+                    let readiness = evaluate_workspace_readiness(
+                        &[test_listener_status(
+                            lb_config_model::ListenerClassConfig::Public,
+                            "running",
+                            "shedding",
+                        )?],
+                        ReloadHealthState::Failed,
+                    );
+
+                    assert!(!readiness.ready);
+                    assert_eq!(
+                        readiness.reason_codes,
+                        vec![
+                            String::from("reload_failed"),
+                            String::from("listener_overload_shedding"),
+                        ]
+                    );
+                    Ok(())
+                }
+
+                #[test]
+                fn workspace_readiness_evaluates_public_listeners_only_when_present() -> Result<(), DynError> {
+                    let readiness = evaluate_workspace_readiness(
+                        &[
+                            test_listener_status(
+                                lb_config_model::ListenerClassConfig::Public,
+                                "running",
+                                "normal",
+                            )?,
+                            test_listener_status(
+                                lb_config_model::ListenerClassConfig::Admin,
+                                "draining",
+                                "normal",
+                            )?,
+                        ],
+                        ReloadHealthState::Healthy,
+                    );
+
+                    assert!(readiness.ready);
+                    assert_eq!(readiness.evaluated_listener_scope, "public");
+                    assert_eq!(readiness.listeners.len(), 1);
+                    Ok(())
+                }
 
     #[test]
     fn compile_route_backend_pool_supports_locality_preferences() -> Result<(), DynError> {
@@ -4681,9 +7498,1046 @@ mod tests {
         assert!(reload.starts_with("HTTP/1.1 500 Internal Server Error"));
         assert!(reload.contains("zero-downtime replacement is not available"));
 
+        let status = send_admin_status(admin_addr).await?;
+        assert!(status.contains("\"last_reload_outcome_code\": \"reload_failed_blocked_change\""));
+        let status_json = parse_http_json_body(&status)?;
+        assert!(json_u64_field(&status_json, "reload_last_duration_ms")? >= 1);
+        assert!(json_u64_field(&status_json, "reload_last_failure_duration_ms")? >= 1);
+        assert!(json_u64_field(&status_json, "reload_last_success_duration_ms")? >= 1);
+
+        let audit = send_admin_audit(admin_addr).await?;
+        assert!(audit.contains("\"code\": \"reload_started_blocked_candidate\""));
+        assert!(audit.contains("\"code\": \"reload_failed_blocked_change\""));
+
         let response = send_http1_request(public_addr, "/").await?;
         assert!(response.starts_with("HTTP/1.1 200 OK"));
         assert!(response.contains("upstream-a"));
+
+        supervisor.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn successful_reload_clears_prior_failed_reload_state() -> Result<(), DynError> {
+        std::env::set_var("LB_CTL_ADMIN_SECRET", "admin-secret");
+        let public_bind = reserve_unused_addr().await?;
+        let admin_bind = reserve_unused_addr().await?;
+        let upstream_a = spawn_tagged_http1_upstream("upstream-a").await?;
+        let upstream_b = spawn_tagged_http1_upstream("upstream-b").await?;
+        let path = write_temp_config(
+            "reload-recovery",
+            &workspace_config_json(
+                &public_bind.to_string(),
+                &admin_bind.to_string(),
+                "http1",
+                &upstream_a.to_string(),
+            ),
+        )?;
+        let supervisor = ServeSupervisor::start(
+            path.to_str().ok_or("utf8 path")?.to_string(),
+            Arc::new(String::from("admin-secret")),
+        )
+        .await?;
+
+        let statuses = supervisor.listener_statuses().await;
+        let public_addr = statuses
+            .iter()
+            .find(|status| status.class == lb_config_model::ListenerClassConfig::Public)
+            .ok_or("missing public listener")?
+            .local_addr;
+        let admin_addr = statuses
+            .iter()
+            .find(|status| status.class == lb_config_model::ListenerClassConfig::Admin)
+            .ok_or("missing admin listener")?
+            .local_addr;
+
+        fs::write(
+            &path,
+            workspace_config_json(
+                &public_bind.to_string(),
+                &admin_bind.to_string(),
+                "http2",
+                &upstream_a.to_string(),
+            ),
+        )?;
+
+        let failed_reload = send_admin_reload(admin_addr).await?;
+        assert!(failed_reload.starts_with("HTTP/1.1 500 Internal Server Error"));
+
+        let failed_readyz = send_admin_readyz(admin_addr).await?;
+        assert!(failed_readyz.starts_with("HTTP/1.1 503 Service Unavailable"));
+        assert!(failed_readyz.contains("\"reload_failed\""));
+
+        fs::write(
+            &path,
+            workspace_config_json(
+                &public_bind.to_string(),
+                &admin_bind.to_string(),
+                "http1",
+                &upstream_b.to_string(),
+            ),
+        )?;
+
+        let successful_reload = send_admin_reload(admin_addr).await?;
+        assert!(successful_reload.starts_with("HTTP/1.1 200 OK"));
+
+        let recovered_readyz = send_admin_readyz(admin_addr).await?;
+        assert!(recovered_readyz.starts_with("HTTP/1.1 200 OK"));
+        assert!(recovered_readyz.contains("\"status\":\"ready\""));
+
+        let status = send_admin_status(admin_addr).await?;
+        assert!(status.contains("\"reload_health\": \"healthy\""));
+        assert!(status.contains("\"last_reload_outcome_code\": \"reload_applied_in_place\""));
+        assert!(status.contains("\"last_reload_result\": \"configuration applied\""));
+        assert!(!status.contains("reload_failed_rollback_preserved"));
+
+        let response = send_http1_request(public_addr, "/").await?;
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(response.contains("upstream-b"));
+
+        let audit = send_admin_audit(admin_addr).await?;
+        assert!(audit.contains("\"code\": \"reload_failed_blocked_change\""));
+        assert!(audit.contains("\"code\": \"reload_applied_in_place\""));
+
+        supervisor.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reload_metrics_accumulate_across_failed_then_successful_sequence(
+    ) -> Result<(), DynError> {
+        std::env::set_var("LB_CTL_ADMIN_SECRET", "admin-secret");
+        let public_bind = reserve_unused_addr().await?;
+        let admin_bind = reserve_unused_addr().await?;
+        let upstream_a = spawn_tagged_http1_upstream("upstream-a").await?;
+        let upstream_b = spawn_tagged_http1_upstream("upstream-b").await?;
+        let path = write_temp_config(
+            "reload-metric-sequence",
+            &workspace_config_json(
+                &public_bind.to_string(),
+                &admin_bind.to_string(),
+                "http1",
+                &upstream_a.to_string(),
+            ),
+        )?;
+        let supervisor = ServeSupervisor::start(
+            path.to_str().ok_or("utf8 path")?.to_string(),
+            Arc::new(String::from("admin-secret")),
+        )
+        .await?;
+
+        let admin_addr = supervisor
+            .listener_statuses()
+            .await
+            .into_iter()
+            .find(|status| status.class == lb_config_model::ListenerClassConfig::Admin)
+            .ok_or("missing admin listener")?
+            .local_addr;
+
+        let baseline_status = send_admin_status(admin_addr).await?;
+        let baseline_json = parse_http_json_body(&baseline_status)?;
+        let baseline_requests = json_u64_field(&baseline_json, "reload_requests")?;
+        let baseline_success = json_u64_field(&baseline_json, "reload_success_count")?;
+        let baseline_failure = json_u64_field(&baseline_json, "reload_failure_count")?;
+        let baseline_total_duration = json_u64_field(&baseline_json, "reload_total_duration_ms")?;
+
+        fs::write(
+            &path,
+            workspace_config_json(
+                &public_bind.to_string(),
+                &admin_bind.to_string(),
+                "http2",
+                &upstream_a.to_string(),
+            ),
+        )?;
+        let failed_reload = send_admin_reload(admin_addr).await?;
+        assert!(failed_reload.starts_with("HTTP/1.1 500 Internal Server Error"));
+
+        fs::write(
+            &path,
+            workspace_config_json(
+                &public_bind.to_string(),
+                &admin_bind.to_string(),
+                "http1",
+                &upstream_b.to_string(),
+            ),
+        )?;
+        let successful_reload = send_admin_reload(admin_addr).await?;
+        assert!(successful_reload.starts_with("HTTP/1.1 200 OK"));
+
+        let final_status = send_admin_status(admin_addr).await?;
+        let final_json = parse_http_json_body(&final_status)?;
+        assert_eq!(json_u64_field(&final_json, "reload_requests")?, baseline_requests + 2);
+        assert_eq!(json_u64_field(&final_json, "reload_success_count")?, baseline_success + 1);
+        assert_eq!(json_u64_field(&final_json, "reload_failure_count")?, baseline_failure + 1);
+        assert!(
+            json_u64_field(&final_json, "reload_total_duration_ms")?
+                >= baseline_total_duration
+                    + json_u64_field(&final_json, "reload_last_success_duration_ms")?
+        );
+        assert!(json_u64_field(&final_json, "reload_last_success_duration_ms")? >= 1);
+        assert!(json_u64_field(&final_json, "reload_last_failure_duration_ms")? >= 1);
+        assert!(json_u64_field(&final_json, "reload_max_duration_ms")? >= 1);
+
+        supervisor.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reload_counters_and_health_remain_monotonic_across_mixed_sequence(
+    ) -> Result<(), DynError> {
+        std::env::set_var("LB_CTL_ADMIN_SECRET", "admin-secret");
+        let public_bind = reserve_unused_addr().await?;
+        let admin_bind = reserve_unused_addr().await?;
+        let upstream_a = spawn_tagged_http1_upstream("upstream-a").await?;
+        let upstream_b = spawn_tagged_http1_upstream("upstream-b").await?;
+        let upstream_c = spawn_tagged_http1_upstream("upstream-c").await?;
+        let path = write_temp_config(
+            "reload-mixed-sequence",
+            &workspace_config_json(
+                &public_bind.to_string(),
+                &admin_bind.to_string(),
+                "http1",
+                &upstream_a.to_string(),
+            ),
+        )?;
+        let supervisor = ServeSupervisor::start(
+            path.to_str().ok_or("utf8 path")?.to_string(),
+            Arc::new(String::from("admin-secret")),
+        )
+        .await?;
+
+        let admin_addr = supervisor
+            .listener_statuses()
+            .await
+            .into_iter()
+            .find(|status| status.class == lb_config_model::ListenerClassConfig::Admin)
+            .ok_or("missing admin listener")?
+            .local_addr;
+
+        let baseline_status = send_admin_status(admin_addr).await?;
+        let baseline_json = parse_http_json_body(&baseline_status)?;
+        let baseline_requests = json_u64_field(&baseline_json, "reload_requests")?;
+        let baseline_success = json_u64_field(&baseline_json, "reload_success_count")?;
+        let baseline_failure = json_u64_field(&baseline_json, "reload_failure_count")?;
+        let baseline_total_duration = json_u64_field(&baseline_json, "reload_total_duration_ms")?;
+
+        struct SequenceStep<'a> {
+            protocol: &'a str,
+            upstream: &'a str,
+            expected_prefix: &'a str,
+            expected_health: &'a str,
+            expected_code: &'a str,
+            success_delta: u64,
+            failure_delta: u64,
+        }
+
+        let upstream_b_value = upstream_b.to_string();
+        let upstream_c_value = upstream_c.to_string();
+        let steps = [
+            SequenceStep {
+                protocol: "http1",
+                upstream: &upstream_b_value,
+                expected_prefix: "HTTP/1.1 200 OK",
+                expected_health: "healthy",
+                expected_code: "reload_applied_in_place",
+                success_delta: 1,
+                failure_delta: 0,
+            },
+            SequenceStep {
+                protocol: "http2",
+                upstream: &upstream_b_value,
+                expected_prefix: "HTTP/1.1 500 Internal Server Error",
+                expected_health: "failed",
+                expected_code: "reload_failed_blocked_change",
+                success_delta: 1,
+                failure_delta: 1,
+            },
+            SequenceStep {
+                protocol: "http1",
+                upstream: &upstream_c_value,
+                expected_prefix: "HTTP/1.1 200 OK",
+                expected_health: "healthy",
+                expected_code: "reload_applied_in_place",
+                success_delta: 2,
+                failure_delta: 1,
+            },
+        ];
+
+        let mut last_total_duration = baseline_total_duration;
+        for (index, step) in steps.iter().enumerate() {
+            fs::write(
+                &path,
+                workspace_config_json(
+                    &public_bind.to_string(),
+                    &admin_bind.to_string(),
+                    step.protocol,
+                    step.upstream,
+                ),
+            )?;
+
+            let reload_response = send_admin_reload(admin_addr).await?;
+            assert!(reload_response.starts_with(step.expected_prefix));
+
+            let status = send_admin_status(admin_addr).await?;
+            let status_json = parse_http_json_body(&status)?;
+            assert_eq!(
+                json_u64_field(&status_json, "reload_requests")?,
+                baseline_requests + index as u64 + 1
+            );
+            assert_eq!(
+                json_u64_field(&status_json, "reload_success_count")?,
+                baseline_success + step.success_delta
+            );
+            assert_eq!(
+                json_u64_field(&status_json, "reload_failure_count")?,
+                baseline_failure + step.failure_delta
+            );
+            assert!(status.contains(&format!("\"reload_health\": \"{}\"", step.expected_health)));
+            assert!(status.contains(&format!("\"last_reload_outcome_code\": \"{}\"", step.expected_code)));
+
+            let total_duration = json_u64_field(&status_json, "reload_total_duration_ms")?;
+            assert!(total_duration >= last_total_duration);
+            assert!(json_u64_field(&status_json, "reload_max_duration_ms")? >= 1);
+            last_total_duration = total_duration;
+        }
+
+        supervisor.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn restart_restores_control_plane_journal_state() -> Result<(), DynError> {
+        std::env::set_var("LB_CTL_ADMIN_SECRET", "admin-secret");
+        let public_bind = reserve_unused_addr().await?;
+        let admin_bind = reserve_unused_addr().await?;
+        let upstream_a = spawn_tagged_http1_upstream("upstream-a").await?;
+        let upstream_b = spawn_tagged_http1_upstream("upstream-b").await?;
+        let path = write_temp_config(
+            "control-plane-journal-restore",
+            &workspace_config_json(
+                &public_bind.to_string(),
+                &admin_bind.to_string(),
+                "http1",
+                &upstream_a.to_string(),
+            ),
+        )?;
+        let journal_path = control_plane_journal_path(path.to_str().ok_or("utf8 path")?);
+
+        let supervisor = ServeSupervisor::start(
+            path.to_str().ok_or("utf8 path")?.to_string(),
+            Arc::new(String::from("admin-secret")),
+        )
+        .await?;
+        let admin_addr = supervisor
+            .listener_statuses()
+            .await
+            .into_iter()
+            .find(|status| status.class == lb_config_model::ListenerClassConfig::Admin)
+            .ok_or("missing admin listener")?
+            .local_addr;
+
+        fs::write(
+            &path,
+            workspace_config_json(
+                &public_bind.to_string(),
+                &admin_bind.to_string(),
+                "http1",
+                &upstream_b.to_string(),
+            ),
+        )?;
+        let reload = send_admin_reload(admin_addr).await?;
+        assert!(reload.starts_with("HTTP/1.1 200 OK"));
+        assert!(std::path::Path::new(&journal_path).exists());
+
+        supervisor.shutdown().await?;
+
+        let restarted = ServeSupervisor::start(
+            path.to_str().ok_or("utf8 path")?.to_string(),
+            Arc::new(String::from("admin-secret")),
+        )
+        .await?;
+        let restarted_admin_addr = restarted
+            .listener_statuses()
+            .await
+            .into_iter()
+            .find(|status| status.class == lb_config_model::ListenerClassConfig::Admin)
+            .ok_or("missing admin listener after restart")?
+            .local_addr;
+
+        let status = send_admin_status(restarted_admin_addr).await?;
+        let status_json = parse_http_json_body(&status)?;
+        let journal = status_json
+            .get("control_plane_journal")
+            .ok_or_else(|| to_dyn_error("missing control_plane_journal"))?;
+        assert_eq!(
+            journal
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| to_dyn_error("missing journal path"))?,
+            journal_path
+        );
+        let recovery = journal
+            .get("recovery")
+            .ok_or_else(|| to_dyn_error("missing recovery block"))?;
+        assert_eq!(
+            recovery
+                .get("state")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| to_dyn_error("missing recovery state"))?,
+            "restored"
+        );
+        assert_eq!(
+            recovery
+                .get("restored_last_reload_outcome_code")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| to_dyn_error("missing restored reload outcome code"))?,
+            "reload_applied_in_place"
+        );
+        let desired_digest = journal
+            .get("desired_snapshot")
+            .and_then(|snapshot| snapshot.get("digest_sha256"))
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| to_dyn_error("missing desired snapshot digest"))?;
+        let applied_digest = journal
+            .get("applied_snapshot")
+            .and_then(|snapshot| snapshot.get("digest_sha256"))
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| to_dyn_error("missing applied snapshot digest"))?;
+        assert_eq!(desired_digest, applied_digest);
+
+        let audit = send_admin_audit(restarted_admin_addr).await?;
+        assert!(audit.contains("\"code\": \"reload_started_in_place\""));
+        assert!(audit.contains("\"code\": \"reload_applied_in_place\""));
+
+        restarted.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn corrupted_control_plane_journal_blocks_startup() -> Result<(), DynError> {
+        std::env::set_var("LB_CTL_ADMIN_SECRET", "admin-secret");
+        let path = write_temp_config(
+            "control-plane-journal-corrupt",
+            &workspace_config_json("127.0.0.1:0", "127.0.0.1:0", "http1", "127.0.0.1:1"),
+        )?;
+        let journal_path = control_plane_journal_path(path.to_str().ok_or("utf8 path")?);
+        fs::write(&journal_path, b"{not-valid-json")?;
+
+        let error = ServeSupervisor::start(
+            path.to_str().ok_or("utf8 path")?.to_string(),
+            Arc::new(String::from("admin-secret")),
+        )
+        .await
+        .expect_err("corrupted durable state must block startup");
+        let error_text = error.to_string();
+        assert!(error_text.contains("control-plane journal"));
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn unfinished_reload_recovery_surfaces_needs_operator_action_after_startup(
+    ) -> Result<(), DynError> {
+        std::env::set_var("LB_CTL_ADMIN_SECRET", "admin-secret");
+        let public_bind = reserve_unused_addr().await?;
+        let admin_bind = reserve_unused_addr().await?;
+        let upstream_a = spawn_tagged_http1_upstream("upstream-a").await?;
+        let path = write_temp_config(
+            "control-plane-unfinished-reload",
+            &workspace_config_json(
+                &public_bind.to_string(),
+                &admin_bind.to_string(),
+                "http1",
+                &upstream_a.to_string(),
+            ),
+        )?;
+        let compiled = compile_workspace_runtime(path.to_str().ok_or("utf8 path")?)?;
+        let desired_snapshot =
+            DurableSnapshotIdentity::from_snapshot(&compiled.source_label, &compiled.snapshot);
+        let journal_path = control_plane_journal_path(path.to_str().ok_or("utf8 path")?);
+        write_control_plane_journal_atomic(
+            &journal_path,
+            &ControlPlaneJournalPayload {
+                persisted_at_unix_ms: unix_time_ms(),
+                desired_snapshot: Some(desired_snapshot.clone()),
+                applied_snapshot: Some(desired_snapshot.clone()),
+                reload_health: String::from("healthy"),
+                last_reload_outcome_code: String::from("reload_started_in_place"),
+                last_reload_result: String::from("reload started before prior process exited"),
+                recent_admin_audit: vec![AdminAuditEvent {
+                    observed_at_unix_ms: unix_time_ms(),
+                    request_id: String::from("admin-0000000000000001"),
+                    listener: String::from("admin"),
+                    actor: String::from("writer"),
+                    auth_mode: String::from("signed_header"),
+                    action: String::from("reload"),
+                    code: String::from("reload_started_in_place"),
+                    source: String::from("127.0.0.1"),
+                    outcome: String::from("started"),
+                    detail: String::from("reload started"),
+                }],
+                in_flight_operation: Some(JournalInFlightOperation {
+                    kind: String::from("reload"),
+                    started_at_unix_ms: unix_time_ms(),
+                    desired_snapshot,
+                    lifecycle_code: String::from("reload_started_in_place"),
+                    detail: String::from("reload started"),
+                    expected_completion_within_ms: None,
+                    affected_listeners: Vec::new(),
+                }),
+            },
+        )?;
+
+        let supervisor = ServeSupervisor::start(
+            path.to_str().ok_or("utf8 path")?.to_string(),
+            Arc::new(String::from("admin-secret")),
+        )
+        .await?;
+        let admin_addr = supervisor
+            .listener_statuses()
+            .await
+            .into_iter()
+            .find(|status| status.class == lb_config_model::ListenerClassConfig::Admin)
+            .ok_or("missing admin listener")?
+            .local_addr;
+
+        let status = send_admin_status(admin_addr).await?;
+        let status_json = parse_http_json_body(&status)?;
+        let recovery = status_json
+            .get("control_plane_journal")
+            .and_then(|value| value.get("recovery"))
+            .ok_or_else(|| to_dyn_error("missing recovery block"))?;
+        assert_eq!(
+            recovery
+                .get("state")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| to_dyn_error("missing recovery state"))?,
+            "needs_operator_action"
+        );
+        assert_eq!(
+            recovery
+                .get("in_flight_operation")
+                .and_then(|value| value.get("kind"))
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| to_dyn_error("missing in-flight operation kind"))?,
+            "reload"
+        );
+        assert_eq!(
+            recovery
+                .get("restored_last_reload_outcome_code")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| to_dyn_error("missing restored reload outcome code"))?,
+            "reload_started_in_place"
+        );
+        assert_eq!(
+            recovery
+                .get("operator_guidance")
+                .and_then(|value| value.get("recommended_action"))
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| to_dyn_error("missing operator guidance action"))?,
+            "validate_and_retry_reload"
+        );
+        assert_eq!(
+            recovery
+                .get("operator_guidance")
+                .and_then(|value| value.get("urgency"))
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| to_dyn_error("missing operator guidance urgency"))?,
+            "action_required"
+        );
+        recovery
+            .get("operator_guidance")
+            .and_then(|value| value.get("operation_age_ms"))
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| to_dyn_error("missing operator guidance operation age"))?;
+        assert!(
+            recovery
+                .get("operator_guidance")
+                .and_then(|value| value.get("expected_completion_within_ms"))
+                .map_or(true, serde_json::Value::is_null)
+        );
+        assert!(!recovery
+            .get("operator_guidance")
+            .and_then(|value| value.get("exceeded_expected_completion"))
+            .and_then(serde_json::Value::as_bool)
+            .ok_or_else(|| to_dyn_error("missing operator guidance exceeded flag"))?);
+
+        let audit = send_admin_audit(admin_addr).await?;
+        assert!(audit.contains("\"code\": \"reload_started_in_place\""));
+        assert!(audit.contains(&format!("\"code\": \"{}\"", RECOVERY_UNFINISHED_RELOAD_CODE)));
+        assert!(audit.contains("needs_operator_action"));
+
+        supervisor.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn checksum_mismatch_control_plane_journal_blocks_startup() -> Result<(), DynError> {
+        std::env::set_var("LB_CTL_ADMIN_SECRET", "admin-secret");
+        let path = write_temp_config(
+            "control-plane-journal-checksum",
+            &workspace_config_json("127.0.0.1:0", "127.0.0.1:0", "http1", "127.0.0.1:1"),
+        )?;
+        let journal_path = control_plane_journal_path(path.to_str().ok_or("utf8 path")?);
+        let payload_json = serde_json::to_string_pretty(&ControlPlaneJournalPayload {
+            persisted_at_unix_ms: unix_time_ms(),
+            desired_snapshot: None,
+            applied_snapshot: None,
+            reload_health: String::from("not_requested"),
+            last_reload_outcome_code: String::from("not_requested"),
+            last_reload_result: String::from("not requested"),
+            recent_admin_audit: Vec::new(),
+            in_flight_operation: None,
+        })?;
+        let envelope = ControlPlaneJournalEnvelope {
+            version: CONTROL_PLANE_JOURNAL_VERSION,
+            payload_json,
+            payload_sha256: String::from("deadbeef"),
+        };
+        fs::write(&journal_path, serde_json::to_vec_pretty(&envelope)?)?;
+
+        let error = ServeSupervisor::start(
+            path.to_str().ok_or("utf8 path")?.to_string(),
+            Arc::new(String::from("admin-secret")),
+        )
+        .await
+        .expect_err("checksum mismatch must block startup");
+        assert!(error.to_string().contains("checksum validation"));
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn successful_operator_reload_resolves_prior_recovery_state() -> Result<(), DynError> {
+        std::env::set_var("LB_CTL_ADMIN_SECRET", "admin-secret");
+        let public_bind = reserve_unused_addr().await?;
+        let admin_bind = reserve_unused_addr().await?;
+        let upstream_a = spawn_tagged_http1_upstream("upstream-a").await?;
+        let upstream_b = spawn_tagged_http1_upstream("upstream-b").await?;
+        let path = write_temp_config(
+            "control-plane-recovery-resolve",
+            &workspace_config_json(
+                &public_bind.to_string(),
+                &admin_bind.to_string(),
+                "http1",
+                &upstream_a.to_string(),
+            ),
+        )?;
+        let compiled = compile_workspace_runtime(path.to_str().ok_or("utf8 path")?)?;
+        let desired_snapshot =
+            DurableSnapshotIdentity::from_snapshot(&compiled.source_label, &compiled.snapshot);
+        let journal_path = control_plane_journal_path(path.to_str().ok_or("utf8 path")?);
+        write_control_plane_journal_atomic(
+            &journal_path,
+            &ControlPlaneJournalPayload {
+                persisted_at_unix_ms: unix_time_ms(),
+                desired_snapshot: Some(desired_snapshot.clone()),
+                applied_snapshot: Some(desired_snapshot.clone()),
+                reload_health: String::from("healthy"),
+                last_reload_outcome_code: String::from("reload_started_in_place"),
+                last_reload_result: String::from("reload started before prior process exited"),
+                recent_admin_audit: Vec::new(),
+                in_flight_operation: Some(JournalInFlightOperation {
+                    kind: String::from("reload"),
+                    started_at_unix_ms: unix_time_ms(),
+                    desired_snapshot,
+                    lifecycle_code: String::from("reload_started_in_place"),
+                    detail: String::from("reload started before prior process exited"),
+                    expected_completion_within_ms: None,
+                    affected_listeners: Vec::new(),
+                }),
+            },
+        )?;
+
+        let supervisor = ServeSupervisor::start(
+            path.to_str().ok_or("utf8 path")?.to_string(),
+            Arc::new(String::from("admin-secret")),
+        )
+        .await?;
+        let admin_addr = supervisor
+            .listener_statuses()
+            .await
+            .into_iter()
+            .find(|status| status.class == lb_config_model::ListenerClassConfig::Admin)
+            .ok_or("missing admin listener")?
+            .local_addr;
+
+        fs::write(
+            &path,
+            workspace_config_json(
+                &public_bind.to_string(),
+                &admin_bind.to_string(),
+                "http1",
+                &upstream_b.to_string(),
+            ),
+        )?;
+        let reload = send_admin_reload(admin_addr).await?;
+        assert!(reload.starts_with("HTTP/1.1 200 OK"));
+
+        let status = send_admin_status(admin_addr).await?;
+        let status_json = parse_http_json_body(&status)?;
+        let recovery = status_json
+            .get("control_plane_journal")
+            .and_then(|value| value.get("recovery"))
+            .ok_or_else(|| to_dyn_error("missing recovery block"))?;
+        assert_eq!(
+            recovery
+                .get("state")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| to_dyn_error("missing recovery state"))?,
+            "resolved"
+        );
+        assert_eq!(
+            recovery
+                .get("in_flight_operation")
+                .and_then(serde_json::Value::as_null),
+            Some(())
+        );
+
+        let audit = send_admin_audit(admin_addr).await?;
+        assert!(audit.contains(&format!("\"code\": \"{}\"", RECOVERY_UNFINISHED_RELOAD_CODE)));
+        assert!(audit.contains("\"code\": \"reload_applied_in_place\""));
+
+        supervisor.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn unfinished_overlap_drain_recovery_surfaces_affected_listeners(
+    ) -> Result<(), DynError> {
+        std::env::set_var("LB_CTL_ADMIN_SECRET", "admin-secret");
+        let public_bind = reserve_unused_addr().await?;
+        let admin_bind = reserve_unused_addr().await?;
+        let upstream_a = spawn_tagged_http1_upstream("upstream-a").await?;
+        let path = write_temp_config(
+            "control-plane-overlap-recovery",
+            &workspace_config_json(
+                &public_bind.to_string(),
+                &admin_bind.to_string(),
+                "http1",
+                &upstream_a.to_string(),
+            ),
+        )?;
+        let compiled = compile_workspace_runtime(path.to_str().ok_or("utf8 path")?)?;
+        let desired_snapshot =
+            DurableSnapshotIdentity::from_snapshot(&compiled.source_label, &compiled.snapshot);
+        let journal_path = control_plane_journal_path(path.to_str().ok_or("utf8 path")?);
+        write_control_plane_journal_atomic(
+            &journal_path,
+            &ControlPlaneJournalPayload {
+                persisted_at_unix_ms: unix_time_ms(),
+                desired_snapshot: Some(desired_snapshot.clone()),
+                applied_snapshot: Some(desired_snapshot.clone()),
+                reload_health: String::from("healthy"),
+                last_reload_outcome_code: String::from("reload_started_overlap_drain"),
+                last_reload_result: String::from("replacement reload started before prior process exited"),
+                recent_admin_audit: Vec::new(),
+                in_flight_operation: Some(JournalInFlightOperation {
+                    kind: String::from("reload_overlap_drain"),
+                    started_at_unix_ms: unix_time_ms().saturating_sub(200),
+                    desired_snapshot,
+                    lifecycle_code: String::from("reload_started_overlap_drain"),
+                    detail: String::from(
+                        "reload started; overlap-and-drain replacement planned for: public; inspect GET /status for live drain progress",
+                    ),
+                    expected_completion_within_ms: Some(50),
+                    affected_listeners: vec![String::from("public")],
+                }),
+            },
+        )?;
+
+        let supervisor = ServeSupervisor::start(
+            path.to_str().ok_or("utf8 path")?.to_string(),
+            Arc::new(String::from("admin-secret")),
+        )
+        .await?;
+        let admin_addr = supervisor
+            .listener_statuses()
+            .await
+            .into_iter()
+            .find(|status| status.class == lb_config_model::ListenerClassConfig::Admin)
+            .ok_or("missing admin listener")?
+            .local_addr;
+
+        let status = send_admin_status(admin_addr).await?;
+        let status_json = parse_http_json_body(&status)?;
+        let recovery_operation = status_json
+            .get("control_plane_journal")
+            .and_then(|value| value.get("recovery"))
+            .and_then(|value| value.get("in_flight_operation"))
+            .ok_or_else(|| to_dyn_error("missing recovery in-flight operation"))?;
+        assert_eq!(
+            recovery_operation
+                .get("kind")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| to_dyn_error("missing in-flight operation kind"))?,
+            "reload_overlap_drain"
+        );
+        assert_eq!(
+            recovery_operation
+                .get("expected_completion_within_ms")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| to_dyn_error("missing recovery expected completion window"))?,
+            50
+        );
+        assert_eq!(
+            recovery_operation
+                .get("lifecycle_code")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| to_dyn_error("missing recovery lifecycle code"))?,
+            "reload_started_overlap_drain"
+        );
+        let affected_listeners = recovery_operation
+            .get("affected_listeners")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| to_dyn_error("missing affected listeners"))?;
+        assert_eq!(affected_listeners.len(), 1);
+        assert_eq!(
+            affected_listeners[0]
+                .as_str()
+                .ok_or_else(|| to_dyn_error("missing affected listener value"))?,
+            "public"
+        );
+        let reconciled_listeners = status_json
+            .get("control_plane_journal")
+            .and_then(|value| value.get("recovery"))
+            .and_then(|value| value.get("reconciled_listeners"))
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| to_dyn_error("missing reconciled listeners"))?;
+        assert_eq!(reconciled_listeners.len(), 1);
+        assert_eq!(
+            reconciled_listeners[0]
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| to_dyn_error("missing reconciled listener name"))?,
+            "public"
+        );
+        assert_eq!(
+            reconciled_listeners[0]
+                .get("listener_state")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| to_dyn_error("missing reconciled listener state"))?,
+            "running"
+        );
+        assert_eq!(
+            reconciled_listeners[0]
+                .get("replacement_state")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| to_dyn_error("missing reconciled replacement state"))?,
+            "stable"
+        );
+        assert_eq!(
+            reconciled_listeners[0]
+                .get("reconciliation_verdict")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| to_dyn_error("missing reconciliation verdict"))?,
+            "settled"
+        );
+        let reconciliation_summary = status_json
+            .get("control_plane_journal")
+            .and_then(|value| value.get("recovery"))
+            .and_then(|value| value.get("reconciliation_summary"))
+            .ok_or_else(|| to_dyn_error("missing reconciliation summary"))?;
+        assert_eq!(
+            reconciliation_summary
+                .get("overall_verdict")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| to_dyn_error("missing overall verdict"))?,
+            "settled"
+        );
+        assert_eq!(
+            reconciliation_summary
+                .get("recommended_action")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| to_dyn_error("missing recommended_action"))?,
+            "observe_only"
+        );
+        let operator_guidance = status_json
+            .get("control_plane_journal")
+            .and_then(|value| value.get("recovery"))
+            .and_then(|value| value.get("operator_guidance"))
+            .ok_or_else(|| to_dyn_error("missing operator guidance"))?;
+        assert_eq!(
+            operator_guidance
+                .get("recommended_action")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| to_dyn_error("missing operator guidance action"))?,
+            "validate_and_retry_reload"
+        );
+        assert_eq!(
+            operator_guidance
+                .get("urgency")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| to_dyn_error("missing operator guidance urgency"))?,
+            "action_required"
+        );
+        assert!(
+            operator_guidance
+                .get("operation_age_ms")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| to_dyn_error("missing operator guidance operation age"))?
+                > 0
+        );
+        assert_eq!(
+            operator_guidance
+                .get("expected_completion_within_ms")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| to_dyn_error("missing operator guidance expected completion window"))?,
+            50
+        );
+        assert!(operator_guidance
+            .get("exceeded_expected_completion")
+            .and_then(serde_json::Value::as_bool)
+            .ok_or_else(|| to_dyn_error("missing operator guidance exceeded flag"))?);
+        assert_eq!(
+            reconciliation_summary
+                .get("settled_count")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| to_dyn_error("missing settled_count"))?,
+            1
+        );
+
+        supervisor.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn recovery_reconciliation_marks_missing_affected_listener() -> Result<(), DynError> {
+        std::env::set_var("LB_CTL_ADMIN_SECRET", "admin-secret");
+        let public_bind = reserve_unused_addr().await?;
+        let admin_bind = reserve_unused_addr().await?;
+        let upstream_a = spawn_tagged_http1_upstream("upstream-a").await?;
+        let path = write_temp_config(
+            "control-plane-missing-recovery-listener",
+            &workspace_config_json(
+                &public_bind.to_string(),
+                &admin_bind.to_string(),
+                "http1",
+                &upstream_a.to_string(),
+            ),
+        )?;
+        let compiled = compile_workspace_runtime(path.to_str().ok_or("utf8 path")?)?;
+        let desired_snapshot =
+            DurableSnapshotIdentity::from_snapshot(&compiled.source_label, &compiled.snapshot);
+        let journal_path = control_plane_journal_path(path.to_str().ok_or("utf8 path")?);
+        write_control_plane_journal_atomic(
+            &journal_path,
+            &ControlPlaneJournalPayload {
+                persisted_at_unix_ms: unix_time_ms(),
+                desired_snapshot: Some(desired_snapshot.clone()),
+                applied_snapshot: Some(desired_snapshot),
+                reload_health: String::from("healthy"),
+                last_reload_outcome_code: String::from("reload_started_overlap_drain"),
+                last_reload_result: String::from("replacement reload started before prior process exited"),
+                recent_admin_audit: Vec::new(),
+                in_flight_operation: Some(JournalInFlightOperation {
+                    kind: String::from("reload_overlap_drain"),
+                    started_at_unix_ms: unix_time_ms(),
+                    desired_snapshot: DurableSnapshotIdentity::from_snapshot(
+                        &compiled.source_label,
+                        &compiled.snapshot,
+                    ),
+                    lifecycle_code: String::from("reload_started_overlap_drain"),
+                    detail: String::from("reload started; overlap-and-drain replacement planned for: ghost-listener"),
+                    expected_completion_within_ms: Some(50),
+                    affected_listeners: vec![String::from("ghost-listener")],
+                }),
+            },
+        )?;
+
+        let supervisor = ServeSupervisor::start(
+            path.to_str().ok_or("utf8 path")?.to_string(),
+            Arc::new(String::from("admin-secret")),
+        )
+        .await?;
+        let admin_addr = supervisor
+            .listener_statuses()
+            .await
+            .into_iter()
+            .find(|status| status.class == lb_config_model::ListenerClassConfig::Admin)
+            .ok_or("missing admin listener")?
+            .local_addr;
+
+        let status = send_admin_status(admin_addr).await?;
+        let status_json = parse_http_json_body(&status)?;
+        let reconciled_listeners = status_json
+            .get("control_plane_journal")
+            .and_then(|value| value.get("recovery"))
+            .and_then(|value| value.get("reconciled_listeners"))
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| to_dyn_error("missing reconciled listeners"))?;
+        assert_eq!(reconciled_listeners.len(), 1);
+        assert_eq!(
+            reconciled_listeners[0]
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| to_dyn_error("missing reconciled listener name"))?,
+            "ghost-listener"
+        );
+        assert_eq!(
+            reconciled_listeners[0]
+                .get("reconciliation_verdict")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| to_dyn_error("missing reconciliation verdict"))?,
+            "missing"
+        );
+        let reconciliation_summary = status_json
+            .get("control_plane_journal")
+            .and_then(|value| value.get("recovery"))
+            .and_then(|value| value.get("reconciliation_summary"))
+            .ok_or_else(|| to_dyn_error("missing reconciliation summary"))?;
+        assert_eq!(
+            reconciliation_summary
+                .get("overall_verdict")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| to_dyn_error("missing overall verdict"))?,
+            "needs_review"
+        );
+        assert_eq!(
+            reconciliation_summary
+                .get("recommended_action")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| to_dyn_error("missing recommended_action"))?,
+            "investigate_and_validate_reload"
+        );
+        let operator_guidance = status_json
+            .get("control_plane_journal")
+            .and_then(|value| value.get("recovery"))
+            .and_then(|value| value.get("operator_guidance"))
+            .ok_or_else(|| to_dyn_error("missing operator guidance"))?;
+        assert_eq!(
+            operator_guidance
+                .get("recommended_action")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| to_dyn_error("missing operator guidance action"))?,
+            "investigate_and_validate_reload"
+        );
+        assert_eq!(
+            operator_guidance
+                .get("urgency")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| to_dyn_error("missing operator guidance urgency"))?,
+            "urgent"
+        );
+        assert!(
+            operator_guidance
+                .get("operation_age_ms")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| to_dyn_error("missing operator guidance operation age"))?
+                > 0
+        );
+        assert_eq!(
+            operator_guidance
+                .get("expected_completion_within_ms")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| to_dyn_error("missing operator guidance expected completion window"))?,
+            50
+        );
+        assert!(!operator_guidance
+            .get("exceeded_expected_completion")
+            .and_then(serde_json::Value::as_bool)
+            .ok_or_else(|| to_dyn_error("missing operator guidance exceeded flag"))?);
 
         supervisor.shutdown().await?;
         Ok(())
@@ -4771,6 +8625,85 @@ mod tests {
         assert!(first_response.starts_with("HTTP/1.1 200 OK"));
         assert!(first_response.contains("upstream-a"));
 
+        supervisor.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn replacement_drain_timeout_is_reported_in_status() -> Result<(), DynError> {
+        std::env::set_var("LB_CTL_ADMIN_SECRET", "admin-secret");
+        let initial_public_bind = reserve_unused_addr().await?;
+        let replacement_public_bind = reserve_unused_addr().await?;
+        let (upstream_a, accepted_rx, release_tx) =
+            spawn_blocked_http1_upstream("upstream-a").await?;
+        let upstream_b = spawn_tagged_http1_upstream("upstream-b").await?;
+        let path = write_temp_config(
+            "drain-timeout-replacement",
+            &workspace_config_json_with_drain_timeout(
+                &initial_public_bind.to_string(),
+                "127.0.0.1:0",
+                "http1",
+                &upstream_a.to_string(),
+                50,
+            ),
+        )?;
+        let supervisor = ServeSupervisor::start(
+            path.to_str().ok_or("utf8 path")?.to_string(),
+            Arc::new(String::from("admin-secret")),
+        )
+        .await?;
+
+        let statuses = supervisor.listener_statuses().await;
+        let public_addr = statuses
+            .iter()
+            .find(|status| status.class == lb_config_model::ListenerClassConfig::Public)
+            .ok_or("missing public listener")?
+            .local_addr;
+        let admin_addr = statuses
+            .iter()
+            .find(|status| status.class == lb_config_model::ListenerClassConfig::Admin)
+            .ok_or("missing admin listener")?
+            .local_addr;
+
+        let first = start_http1_request(public_addr, "/").await?;
+        accepted_rx.await.map_err(to_dyn_error)?;
+
+        fs::write(
+            &path,
+            workspace_config_json_with_drain_timeout(
+                &replacement_public_bind.to_string(),
+                "127.0.0.1:0",
+                "http1",
+                &upstream_b.to_string(),
+                50,
+            ),
+        )?;
+
+        let reload = send_admin_reload(admin_addr).await?;
+        assert!(reload.starts_with("HTTP/1.1 200 OK"));
+
+        let status = send_admin_status(admin_addr).await?;
+        assert!(
+            status.contains("\"last_reload_outcome_code\": \"reload_applied_overlap_drain_timeout\"")
+        );
+        assert!(status.contains("drain timeout expired for: public"));
+        assert!(status.contains("\"replacement\":{\"state\":\"drain_timeout_expired\""));
+        assert!(status.contains("\"drain_timeout_recent\":[{"));
+        assert!(status.contains(&format!(
+            "\"configured_bind\":\"{}\"",
+            initial_public_bind
+        )));
+
+        let audit = send_admin_audit(admin_addr).await?;
+        assert!(audit.contains("\"code\": \"reload_applied_overlap_drain_timeout\""));
+        assert!(audit.contains("replacement stayed active but drain timeout expired for: public"));
+
+        let replacement_response = send_http1_request(replacement_public_bind, "/").await?;
+        assert!(replacement_response.starts_with("HTTP/1.1 200 OK"));
+        assert!(replacement_response.contains("upstream-b"));
+
+        drop(first);
+        let _ = release_tx.send(());
         supervisor.shutdown().await?;
         Ok(())
     }
@@ -4905,9 +8838,28 @@ mod tests {
         let reload = send_admin_reload(admin_addr).await?;
         assert!(reload.starts_with("HTTP/1.1 500 Internal Server Error"));
 
+        let readyz = send_admin_readyz(admin_addr).await?;
+        assert!(readyz.starts_with("HTTP/1.1 503 Service Unavailable"));
+        assert!(readyz.contains("\"status\":\"not_ready\""));
+        assert!(readyz.contains("\"reload_failed\""));
+
         let response = send_http1_request(public_addr, "/").await?;
         assert!(response.starts_with("HTTP/1.1 200 OK"));
         assert!(response.contains("upstream-a"));
+
+        let status = send_admin_status(admin_addr).await?;
+        assert!(status.contains("\"reload_health\": \"failed\""));
+        assert!(status.contains("\"last_reload_outcome_code\": \"reload_failed_rollback_preserved\""));
+        assert!(status.contains("\"last_reload_result\":"));
+        assert!(status.contains("\"reload_failed\""));
+        let status_json = parse_http_json_body(&status)?;
+        assert!(json_u64_field(&status_json, "reload_last_duration_ms")? >= 1);
+        assert!(json_u64_field(&status_json, "reload_last_failure_duration_ms")? >= 1);
+        assert!(json_u64_field(&status_json, "reload_total_duration_ms")? >= 1);
+
+        let audit = send_admin_audit(admin_addr).await?;
+        assert!(audit.contains("\"code\": \"reload_started_overlap_drain\""));
+        assert!(audit.contains("\"code\": \"reload_failed_rollback_preserved\""));
 
         let post_reload_statuses = supervisor.listener_statuses().await;
         let current_public_addr = post_reload_statuses
@@ -4993,6 +8945,7 @@ mod tests {
         assert!(audit_during_reload.starts_with("HTTP/1.1 200 OK"));
         assert!(audit_during_reload.contains("\"action\": \"reload\""));
         assert!(audit_during_reload.contains("\"outcome\": \"started\""));
+        assert!(audit_during_reload.contains("\"code\": \"reload_started_overlap_drain\""));
         assert!(audit_during_reload.contains("overlap-and-drain replacement planned for: public"));
 
         let second = send_http1_request(replacement_public_bind, "/").await?;
@@ -5006,14 +8959,164 @@ mod tests {
 
         let audit_after_reload = send_admin_audit(admin_addr).await?;
         assert!(audit_after_reload.contains("\"outcome\": \"executed\""));
+        assert!(audit_after_reload.contains("\"code\": \"reload_applied_overlap_drain\""));
         assert!(audit_after_reload.contains("replacement completed for: public"));
 
         let final_status = send_admin_status(admin_addr).await?;
         assert!(final_status.contains("\"replacement\":{\"state\":\"stable\""));
+        assert!(
+            final_status.contains("\"last_reload_outcome_code\": \"reload_applied_overlap_drain\"")
+        );
+        let final_status_json = parse_http_json_body(&final_status)?;
+        assert!(json_u64_field(&final_status_json, "reload_last_duration_ms")? >= 1);
+        assert!(json_u64_field(&final_status_json, "reload_last_success_duration_ms")? >= 1);
+        assert!(json_u64_field(&final_status_json, "reload_total_duration_ms")? >= 1);
+        assert!(
+            json_u64_field(&final_status_json, "reload_max_duration_ms")?
+                >= json_u64_field(&final_status_json, "reload_last_duration_ms")?
+        );
         assert!(final_status.contains(&format!(
             "\"retired_recent\":[{{\"class\":\"public\",\"protocol\":\"http1\",\"configured_bind\":\"{}\"}}]",
             initial_public_bind
         )));
+
+        let mut first_response = Vec::new();
+        first.read_to_end(&mut first_response).await?;
+        let first_response = String::from_utf8(first_response).map_err(to_dyn_error)?;
+        assert!(first_response.starts_with("HTTP/1.1 200 OK"));
+        assert!(first_response.contains("upstream-a"));
+
+        supervisor.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_reload_requests_are_serialized_without_state_loss(
+    ) -> Result<(), DynError> {
+        std::env::set_var("LB_CTL_ADMIN_SECRET", "admin-secret");
+        let initial_public_bind = reserve_unused_addr().await?;
+        let replacement_public_bind_one = reserve_unused_addr().await?;
+        let replacement_public_bind_two = reserve_unused_addr().await?;
+        let (upstream_a, accepted_rx, release_tx) =
+            spawn_blocked_http1_upstream("upstream-a").await?;
+        let upstream_b = spawn_tagged_http1_upstream("upstream-b").await?;
+        let upstream_c = spawn_tagged_http1_upstream("upstream-c").await?;
+        let path = write_temp_config(
+            "serialized-reloads",
+            &workspace_config_json(
+                &initial_public_bind.to_string(),
+                "127.0.0.1:0",
+                "http1",
+                &upstream_a.to_string(),
+            ),
+        )?;
+        let supervisor = ServeSupervisor::start(
+            path.to_str().ok_or("utf8 path")?.to_string(),
+            Arc::new(String::from("admin-secret")),
+        )
+        .await?;
+
+        let statuses = supervisor.listener_statuses().await;
+        let public_addr = statuses
+            .iter()
+            .find(|status| status.class == lb_config_model::ListenerClassConfig::Public)
+            .ok_or("missing public listener")?
+            .local_addr;
+        let admin_addr = statuses
+            .iter()
+            .find(|status| status.class == lb_config_model::ListenerClassConfig::Admin)
+            .ok_or("missing admin listener")?
+            .local_addr;
+        assert_eq!(public_addr, initial_public_bind);
+
+        let mut first = start_http1_request(public_addr, "/").await?;
+        accepted_rx.await.map_err(to_dyn_error)?;
+
+        fs::write(
+            &path,
+            workspace_config_json(
+                &replacement_public_bind_one.to_string(),
+                "127.0.0.1:0",
+                "http1",
+                &upstream_b.to_string(),
+            ),
+        )?;
+
+        let reload_one = tokio::spawn(send_admin_reload(admin_addr));
+        let live_status = loop {
+            let status = send_admin_status(admin_addr).await?;
+            if status.contains("\"replacement\":{\"state\":\"replacement_draining\"") {
+                break status;
+            }
+            time::sleep(Duration::from_millis(25)).await;
+        };
+        assert!(live_status.contains(&format!(
+            "\"desired\":{{\"class\":\"public\",\"protocol\":\"http1\",\"configured_bind\":\"{}\"}}",
+            replacement_public_bind_one
+        )));
+
+        fs::write(
+            &path,
+            workspace_config_json(
+                &replacement_public_bind_two.to_string(),
+                "127.0.0.1:0",
+                "http1",
+                &upstream_c.to_string(),
+            ),
+        )?;
+
+        let reload_two = tokio::spawn(send_admin_reload(admin_addr));
+        time::sleep(Duration::from_millis(75)).await;
+        assert!(!reload_two.is_finished());
+
+        let queued_status = send_admin_status(admin_addr).await?;
+        assert!(queued_status.contains(&format!(
+            "\"desired\":{{\"class\":\"public\",\"protocol\":\"http1\",\"configured_bind\":\"{}\"}}",
+            replacement_public_bind_one
+        )));
+
+        let _ = release_tx.send(());
+        let reload_one_response = reload_one.await.map_err(to_dyn_error)??;
+        assert!(
+            reload_one_response.starts_with("HTTP/1.1 200 OK"),
+            "unexpected first reload response: {reload_one_response}"
+        );
+        let reload_two_response = reload_two.await.map_err(to_dyn_error)??;
+        assert!(reload_two_response.starts_with("HTTP/1.1 200 OK"));
+
+        let final_public_status = loop {
+            let statuses = supervisor.listener_statuses().await;
+            if let Some(status) = statuses
+                .iter()
+                .find(|status| status.class == lb_config_model::ListenerClassConfig::Public)
+            {
+                if status.local_addr == replacement_public_bind_two
+                    && status.replacement.state == "stable"
+                {
+                    break status.clone();
+                }
+            }
+            time::sleep(Duration::from_millis(25)).await;
+        };
+        assert_eq!(final_public_status.local_addr, replacement_public_bind_two);
+
+        let final_response = send_http1_request(replacement_public_bind_two, "/").await?;
+        assert!(final_response.starts_with("HTTP/1.1 200 OK"));
+        assert!(final_response.contains("upstream-c"));
+
+        let final_status = send_admin_status(admin_addr).await?;
+        let final_status_json = parse_http_json_body(&final_status)?;
+        assert!(json_u64_field(&final_status_json, "reload_requests")? >= 3);
+        assert!(json_u64_field(&final_status_json, "reload_success_count")? >= 3);
+        assert_eq!(json_u64_field(&final_status_json, "reload_failure_count")?, 0);
+        assert!(
+            json_u64_field(&final_status_json, "reload_total_duration_ms")?
+                >= json_u64_field(&final_status_json, "reload_last_duration_ms")?
+        );
+
+        let audit = send_admin_audit(admin_addr).await?;
+        assert!(audit.matches("\"code\": \"reload_started_overlap_drain\"").count() >= 2);
+        assert!(audit.matches("\"code\": \"reload_applied_overlap_drain\"").count() >= 2);
 
         let mut first_response = Vec::new();
         first.read_to_end(&mut first_response).await?;
@@ -5457,6 +9560,7 @@ mod tests {
         std::env::set_var("LB_CTL_ADMIN_SECRET", "admin-secret");
         let (upstream_addr, accepted_rx, release_tx) =
             spawn_blocked_http1_upstream("delayed-upstream").await?;
+
         let path = write_temp_config(
             "http1-overload",
             &workspace_config_json_with_limits(
@@ -5495,11 +9599,19 @@ mod tests {
 
         let status = send_admin_status(admin_addr).await?;
         assert!(status.starts_with("HTTP/1.1 200 OK"));
+        assert!(status.contains("\"readiness\": {"));
+        assert!(status.contains("\"ready\":false"));
+        assert!(status.contains("\"reason_codes\":[\"listener_overload_shedding\"]"));
         assert!(status.contains("\"name\":\"public\""));
         assert!(status.contains("\"shed_connections\":1"));
         assert!(status.contains("\"recent_overload_events\""));
         assert!(status.contains("overload.request.shed"));
         assert!(status.contains("workspace_listener_public"));
+
+        let readyz = send_admin_readyz(admin_addr).await?;
+        assert!(readyz.starts_with("HTTP/1.1 503 Service Unavailable"));
+        assert!(readyz.contains("\"status\":\"not_ready\""));
+        assert!(readyz.contains("\"listener_overload_shedding\""));
 
         let _ = release_tx.send(());
         let mut first_response = Vec::new();
@@ -5507,6 +9619,10 @@ mod tests {
         let first_response = String::from_utf8(first_response).map_err(to_dyn_error)?;
         assert!(first_response.starts_with("HTTP/1.1 200 OK"));
         assert!(first_response.contains("delayed-upstream"));
+
+        let readyz_after = send_admin_readyz(admin_addr).await?;
+        assert!(readyz_after.starts_with("HTTP/1.1 200 OK"));
+        assert!(readyz_after.contains("\"status\":\"ready\""));
 
         supervisor.shutdown().await?;
         Ok(())
@@ -5642,6 +9758,135 @@ mod tests {
         let _ = release_tx.send(());
         let mut first_response = Vec::new();
         first.read_to_end(&mut first_response).await?;
+
+        supervisor.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn supervisor_enforces_hostile_edge_source_quota_and_reports_reason_codes(
+    ) -> Result<(), DynError> {
+        std::env::set_var("LB_CTL_ADMIN_SECRET", "admin-secret");
+        let (upstream_addr, accepted_rx, release_tx) =
+            spawn_blocked_http1_upstream("hostile-edge-upstream").await?;
+        let path = write_temp_config(
+            "hostile-edge-source-quota",
+            &workspace_config_json_with_hostile_edge_policy(
+                "127.0.0.1:0",
+                "127.0.0.1:0",
+                "http1",
+                &upstream_addr.to_string(),
+                "edge-default",
+                1,
+                64,
+                16,
+            ),
+        )?;
+        let supervisor = ServeSupervisor::start(
+            path.to_str().ok_or("utf8 path")?.to_string(),
+            Arc::new(String::from("admin-secret")),
+        )
+        .await?;
+
+        let statuses = supervisor.listener_statuses().await;
+        let public_addr = statuses
+            .iter()
+            .find(|status| status.class == lb_config_model::ListenerClassConfig::Public)
+            .ok_or("missing public listener")?
+            .local_addr;
+        let admin_addr = statuses
+            .iter()
+            .find(|status| status.class == lb_config_model::ListenerClassConfig::Admin)
+            .ok_or("missing admin listener")?
+            .local_addr;
+
+        let mut first = start_http1_request(public_addr, "/").await?;
+        accepted_rx.await.map_err(to_dyn_error)?;
+
+        let second = send_http1_request(public_addr, "/").await?;
+        assert!(second.starts_with("HTTP/1.1 503 Service Unavailable"));
+        assert!(second.contains("X-LB-Abuse-Reason: source_quota_exceeded"));
+        assert!(second.contains("listener rejected connection: source_quota_exceeded"));
+
+        let status = send_admin_status(admin_addr).await?;
+        assert!(status.contains("\"abuse_protection\":{\"state\":\"enforcing\""));
+        assert!(status.contains("\"source_quota\":{\"aggregation\":\"exact_ip\",\"max_active_per_source\":1,\"max_tracked_sources\":64}"));
+        assert!(status.contains("\"handshake_guard\":{\"max_inflight\":16,\"timeout_ms\":5000}"));
+        assert!(status.contains("\"source_quota_rejections\":1"));
+        assert!(status.contains("\"reason_codes\":[\"source_quota_exceeded\"]"));
+
+        let _ = release_tx.send(());
+        let mut first_response = Vec::new();
+        first.read_to_end(&mut first_response).await?;
+
+        supervisor.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn admin_reload_updates_hostile_edge_policy_in_place() -> Result<(), DynError> {
+        std::env::set_var("LB_CTL_ADMIN_SECRET", "admin-secret");
+        let upstream_addr = spawn_tagged_http1_upstream("reload-edge-upstream").await?;
+        let path = write_temp_config(
+            "reload-hostile-edge-policy",
+            &workspace_config_json_with_hostile_edge_policy(
+                "127.0.0.1:0",
+                "127.0.0.1:0",
+                "http1",
+                &upstream_addr.to_string(),
+                "edge-default-a",
+                1,
+                64,
+                16,
+            ),
+        )?;
+        let supervisor = ServeSupervisor::start(
+            path.to_str().ok_or("utf8 path")?.to_string(),
+            Arc::new(String::from("admin-secret")),
+        )
+        .await?;
+
+        let statuses = supervisor.listener_statuses().await;
+        let public_addr = statuses
+            .iter()
+            .find(|status| status.class == lb_config_model::ListenerClassConfig::Public)
+            .ok_or("missing public listener")?
+            .local_addr;
+        let admin_addr = statuses
+            .iter()
+            .find(|status| status.class == lb_config_model::ListenerClassConfig::Admin)
+            .ok_or("missing admin listener")?
+            .local_addr;
+
+        fs::write(
+            &path,
+            workspace_config_json_with_hostile_edge_policy(
+                "127.0.0.1:0",
+                "127.0.0.1:0",
+                "http1",
+                &upstream_addr.to_string(),
+                "edge-default-b",
+                2,
+                128,
+                32,
+            ),
+        )?;
+        let reload = send_admin_reload(admin_addr).await?;
+        assert!(reload.starts_with("HTTP/1.1 200 OK"));
+
+        let post_reload_statuses = supervisor.listener_statuses().await;
+        let reloaded_public_addr = post_reload_statuses
+            .iter()
+            .find(|status| status.class == lb_config_model::ListenerClassConfig::Public)
+            .ok_or("missing public listener after reload")?
+            .local_addr;
+        assert_eq!(reloaded_public_addr, public_addr);
+
+        let status = send_admin_status(admin_addr).await?;
+        assert!(status.contains("\"max_active_per_source\":2"));
+        assert!(status.contains("\"max_tracked_sources\":128"));
+        assert!(status.contains("\"max_inflight\":32"));
+        assert!(!status.contains("\"max_active_per_source\":1"));
 
         supervisor.shutdown().await?;
         Ok(())
@@ -6033,6 +10278,324 @@ mod tests {
         Ok(path)
     }
 
+    fn write_temp_secret_file(prefix: &str, contents: &str) -> Result<PathBuf, DynError> {
+        let unique = unique_test_file_suffix()?;
+        let path = std::env::temp_dir().join(format!("way-balancer-{prefix}-{unique}.secret"));
+        fs::write(&path, contents)?;
+        Ok(path)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn versioned_status_endpoint_wraps_legacy_payload_in_stable_envelope(
+    ) -> Result<(), DynError> {
+        std::env::set_var("LB_CTL_ADMIN_SECRET", "admin-secret");
+        let upstream_addr = spawn_tagged_http1_upstream("upstream-a").await?;
+        let path = write_temp_config(
+            "versioned-status-envelope",
+            &workspace_config_json("127.0.0.1:0", "127.0.0.1:0", "http1", &upstream_addr.to_string()),
+        )?;
+        let supervisor = ServeSupervisor::start(
+            path.to_str().ok_or("utf8 path")?.to_string(),
+            Arc::new(String::from("admin-secret")),
+        )
+        .await?;
+
+        let admin_addr = supervisor
+            .listener_statuses()
+            .await
+            .into_iter()
+            .find(|status| status.class == lb_config_model::ListenerClassConfig::Admin)
+            .ok_or("missing admin listener")?
+            .local_addr;
+
+        let response = send_bearer_admin_request(admin_addr, "GET", "/v1/status", &[], b"").await?;
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(response.contains("X-LB-Admin-Api-Version: v1"));
+        let envelope = parse_http_json_body(&response)?;
+        assert_eq!(envelope.get("api_version").and_then(serde_json::Value::as_str), Some("v1"));
+        assert_eq!(envelope.get("status").and_then(serde_json::Value::as_str), Some("ok"));
+        assert_eq!(envelope.get("data").and_then(|value| value.get("service")).and_then(serde_json::Value::as_str), Some("lb-dataplane"));
+        assert_eq!(envelope.get("data").and_then(|value| value.get("mode")).and_then(serde_json::Value::as_str), Some("workspace"));
+
+        supervisor.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn versioned_status_reports_tls_listener_metadata() -> Result<(), DynError> {
+        std::env::set_var("LB_CTL_ADMIN_SECRET", "admin-secret");
+        let upstream_addr = spawn_tagged_http1_upstream("https-status").await?;
+        let (cert_path, key_path, _cert_der) = write_temp_tls_identity()?;
+        let path = write_temp_config(
+            "versioned-status-tls-metadata",
+            &workspace_config_json_with_tls(
+                "127.0.0.1:0",
+                "127.0.0.1:0",
+                &upstream_addr.to_string(),
+                &cert_path,
+                &key_path,
+                "tls12",
+                &["http11"],
+            ),
+        )?;
+        let supervisor = ServeSupervisor::start(
+            path.to_str().ok_or("utf8 path")?.to_string(),
+            Arc::new(String::from("admin-secret")),
+        )
+        .await?;
+
+        let admin_addr = supervisor
+            .listener_statuses()
+            .await
+            .into_iter()
+            .find(|status| status.class == lb_config_model::ListenerClassConfig::Admin)
+            .ok_or("missing admin listener")?
+            .local_addr;
+
+        let response = send_bearer_admin_request(admin_addr, "GET", "/v1/status", &[], b"").await?;
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        let envelope = parse_http_json_body(&response)?;
+        let listeners = envelope
+            .get("data")
+            .and_then(|value| value.get("listeners"))
+            .and_then(serde_json::Value::as_array)
+            .ok_or("missing listeners array")?;
+        let public_listener = listeners
+            .iter()
+            .find(|listener| {
+                listener.get("class").and_then(serde_json::Value::as_str) == Some("public")
+            })
+            .ok_or("missing public listener")?;
+        let tls = public_listener.get("tls").ok_or("missing tls status")?;
+
+        assert_eq!(tls.get("state").and_then(serde_json::Value::as_str), Some("healthy"));
+        assert_eq!(
+            tls.get("minimum_version").and_then(serde_json::Value::as_str),
+            Some("tls12")
+        );
+        assert_eq!(
+            tls.get("default_certificate")
+                .and_then(|value| value.get("cert_path"))
+                .and_then(serde_json::Value::as_str),
+            Some(cert_path.as_str())
+        );
+        assert!(
+            tls.get("default_certificate")
+                .and_then(|value| value.get("fingerprint_sha256"))
+                .and_then(serde_json::Value::as_str)
+                .is_some()
+        );
+
+        supervisor.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn bearer_admin_secret_file_rotation_updates_status_and_auth_without_reload(
+    ) -> Result<(), DynError> {
+        let upstream_addr = spawn_tagged_http1_upstream("admin-secret-rotation").await?;
+        let secret_path = write_temp_secret_file("rotating-admin-secret", "initial-secret\n")?;
+        let secret_file_path = secret_path.to_string_lossy().into_owned();
+        std::env::remove_var("LB_CTL_ROTATING_ADMIN_SECRET");
+        std::env::set_var("LB_CTL_ROTATING_ADMIN_SECRET_FILE", &secret_file_path);
+
+        let path = write_temp_config(
+            "admin-secret-file-rotation",
+            &workspace_config_json_with_admin_policy(
+                "127.0.0.1:0",
+                "127.0.0.1:0",
+                "http1",
+                &upstream_addr.to_string(),
+                &bearer_admin_policy_json("LB_CTL_ROTATING_ADMIN_SECRET"),
+            ),
+        )?;
+        let supervisor = ServeSupervisor::start(
+            path.to_str().ok_or("utf8 path")?.to_string(),
+            Arc::new(String::from("legacy-secret")),
+        )
+        .await?;
+
+        let admin_addr = supervisor
+            .listener_statuses()
+            .await
+            .into_iter()
+            .find(|status| status.class == lb_config_model::ListenerClassConfig::Admin)
+            .ok_or("missing admin listener")?
+            .local_addr;
+
+        let initial = send_bearer_admin_request_with_token(
+            admin_addr,
+            "GET",
+            "/v1/status",
+            &[],
+            b"",
+            "initial-secret",
+        )
+        .await?;
+        assert!(initial.starts_with("HTTP/1.1 200 OK"));
+        let initial_envelope = parse_http_json_body(&initial)?;
+        let secret_sources = initial_envelope
+            .get("data")
+            .and_then(|value| value.get("admin_auth"))
+            .and_then(|value| value.get("secret_sources"))
+            .and_then(serde_json::Value::as_array)
+            .ok_or("missing secret sources")?;
+        assert_eq!(secret_sources.len(), 1);
+        assert_eq!(
+            secret_sources[0]
+                .get("source_kind")
+                .and_then(serde_json::Value::as_str),
+            Some("file")
+        );
+        assert_eq!(
+            secret_sources[0]
+                .get("source_reference")
+                .and_then(serde_json::Value::as_str),
+            Some(secret_file_path.as_str())
+        );
+        assert_eq!(
+            secret_sources[0]
+                .get("supports_rotation_without_reload")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            secret_sources[0].get("healthy").and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+
+        fs::write(&secret_path, b"rotated-secret\n")?;
+
+        let stale = send_bearer_admin_request_with_token(
+            admin_addr,
+            "GET",
+            "/v1/status",
+            &[],
+            b"",
+            "initial-secret",
+        )
+        .await?;
+        assert!(stale.starts_with("HTTP/1.1 401 Unauthorized"));
+
+        let rotated = send_bearer_admin_request_with_token(
+            admin_addr,
+            "GET",
+            "/v1/status",
+            &[],
+            b"",
+            "rotated-secret",
+        )
+        .await?;
+        assert!(rotated.starts_with("HTTP/1.1 200 OK"));
+
+        supervisor.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn unsupported_admin_api_version_returns_machine_readable_error(
+    ) -> Result<(), DynError> {
+        std::env::set_var("LB_CTL_ADMIN_SECRET", "admin-secret");
+        let upstream_addr = spawn_tagged_http1_upstream("upstream-a").await?;
+        let path = write_temp_config(
+            "unsupported-admin-api-version",
+            &workspace_config_json("127.0.0.1:0", "127.0.0.1:0", "http1", &upstream_addr.to_string()),
+        )?;
+        let supervisor = ServeSupervisor::start(
+            path.to_str().ok_or("utf8 path")?.to_string(),
+            Arc::new(String::from("admin-secret")),
+        )
+        .await?;
+
+        let admin_addr = supervisor
+            .listener_statuses()
+            .await
+            .into_iter()
+            .find(|status| status.class == lb_config_model::ListenerClassConfig::Admin)
+            .ok_or("missing admin listener")?
+            .local_addr;
+
+        let response = send_bearer_admin_request(admin_addr, "GET", "/v2/status", &[], b"").await?;
+        assert!(response.starts_with("HTTP/1.1 406 Not Acceptable"));
+        let envelope = parse_http_json_body(&response)?;
+        assert_eq!(envelope.get("api_version").and_then(serde_json::Value::as_str), Some("v1"));
+        assert_eq!(envelope.get("status").and_then(serde_json::Value::as_str), Some("error"));
+        assert_eq!(
+            envelope
+                .get("error")
+                .and_then(|value| value.get("code"))
+                .and_then(serde_json::Value::as_str),
+            Some("unsupported_api_version")
+        );
+
+        supervisor.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn versioned_reload_failure_uses_typed_unsupported_mutation_error(
+    ) -> Result<(), DynError> {
+        std::env::set_var("LB_CTL_ADMIN_SECRET", "admin-secret");
+        let public_bind = reserve_unused_addr().await?;
+        let upstream_addr = spawn_tagged_http1_upstream("upstream-a").await?;
+        let path = write_temp_config(
+            "versioned-reload-unsupported-mutation",
+            &workspace_config_json(
+                &public_bind.to_string(),
+                "127.0.0.1:0",
+                "http1",
+                &upstream_addr.to_string(),
+            ),
+        )?;
+        let supervisor = ServeSupervisor::start(
+            path.to_str().ok_or("utf8 path")?.to_string(),
+            Arc::new(String::from("admin-secret")),
+        )
+        .await?;
+
+        let admin_addr = supervisor
+            .listener_statuses()
+            .await
+            .into_iter()
+            .find(|status| status.class == lb_config_model::ListenerClassConfig::Admin)
+            .ok_or("missing admin listener")?
+            .local_addr;
+
+        fs::write(
+            &path,
+            workspace_config_json(
+                &public_bind.to_string(),
+                "127.0.0.1:0",
+                "http2",
+                &upstream_addr.to_string(),
+            ),
+        )?;
+
+        let reload = send_bearer_admin_request(admin_addr, "POST", "/v1/reload", &[], b"").await?;
+        assert!(reload.starts_with("HTTP/1.1 500 Internal Server Error"));
+        let reload_envelope = parse_http_json_body(&reload)?;
+        assert_eq!(
+            reload_envelope
+                .get("error")
+                .and_then(|value| value.get("code"))
+                .and_then(serde_json::Value::as_str),
+            Some("unsupported_mutation")
+        );
+
+        let status = send_bearer_admin_request(admin_addr, "GET", "/v1/status", &[], b"").await?;
+        let status_envelope = parse_http_json_body(&status)?;
+        assert_eq!(
+            status_envelope
+                .get("data")
+                .and_then(|value| value.get("last_reload_outcome_code"))
+                .and_then(serde_json::Value::as_str),
+            Some("reload_failed_blocked_change")
+        );
+
+        supervisor.shutdown().await?;
+        Ok(())
+    }
+
     fn workspace_config_json(
         public_addr: &str,
         admin_addr: &str,
@@ -6047,6 +10610,62 @@ mod tests {
             128,
             128,
         )
+    }
+
+    fn workspace_config_json_with_drain_timeout(
+        public_addr: &str,
+        admin_addr: &str,
+        public_protocol: &str,
+        upstream_addr: &str,
+        drain_timeout_ms: u64,
+    ) -> String {
+                format!(
+                        r#"{{
+    "api_version": "v1_alpha1",
+    "name": "workspace-runtime",
+    "listeners": [
+        {{
+            "name": "public",
+            "class": "public",
+            "bind_address": "{public_addr}",
+            "protocol": "{public_protocol}",
+            "max_connections": 128,
+            "drain_timeout_ms": {drain_timeout_ms},
+            "routes": ["web"]
+        }},
+        {{
+            "name": "admin",
+            "class": "admin",
+            "bind_address": "{admin_addr}",
+            "max_connections": 128,
+            "protocol": "http1",
+            "drain_timeout_ms": {drain_timeout_ms}
+        }}
+    ],
+    "routes": [
+        {{
+            "name": "web",
+            "match": {{ "type": "path_prefix", "prefix": "/" }},
+            "upstream_cluster": "frontend"
+        }}
+    ],
+    "upstream_clusters": [
+        {{
+            "name": "frontend",
+            "endpoints": [
+                {{
+                    "id": "frontend-a",
+                    "address": "{upstream_addr}",
+                    "state": "ready",
+                    "zone": null,
+                    "locality": null,
+                    "weight": 1
+                }}
+            ]
+        }}
+    ]
+}}"#
+                )
     }
 
     fn workspace_config_json_with_admin_policy(
@@ -6216,6 +10835,22 @@ mod tests {
                     "max_retained_events": 16
                 }
             }"#
+    }
+
+    fn bearer_admin_policy_json(secret_env: &str) -> String {
+        format!(
+            r#", 
+            "admin": {{
+                "auth": {{
+                    "mode": "bearer",
+                    "secret_env": "{secret_env}",
+                    "permissions": ["read", "audit", "write"]
+                }},
+                "audit": {{
+                    "max_retained_events": 16
+                }}
+            }}"#
+        )
     }
 
     fn workspace_config_json_with_limits(
@@ -6407,6 +11042,82 @@ mod tests {
                     "shedding_signal_threshold": 1,
                     "brownout_signal_threshold": 1,
                     "brownout_features": [{brownout_features_json}]
+                }}
+            }}
+        ]
+    }}
+}}"#,
+        )
+    }
+
+    fn workspace_config_json_with_hostile_edge_policy(
+        public_addr: &str,
+        admin_addr: &str,
+        public_protocol: &str,
+        upstream_addr: &str,
+        policy_name: &str,
+        max_active_per_source: usize,
+        max_tracked_sources: usize,
+        max_inflight_handshakes: usize,
+    ) -> String {
+        format!(
+            r#"{{
+    "api_version": "v1_alpha1",
+    "name": "workspace-runtime",
+    "listeners": [
+        {{
+            "name": "public",
+            "class": "public",
+            "bind_address": "{public_addr}",
+            "protocol": "{public_protocol}",
+            "routes": ["web"],
+            "policies": {{
+                "hostile_edge_protection": "{policy_name}"
+            }}
+        }},
+        {{
+            "name": "admin",
+            "class": "admin",
+            "bind_address": "{admin_addr}",
+            "protocol": "http1"
+        }}
+    ],
+    "routes": [
+        {{
+            "name": "web",
+            "match": {{ "type": "path_prefix", "prefix": "/" }},
+            "upstream_cluster": "frontend"
+        }}
+    ],
+    "upstream_clusters": [
+        {{
+            "name": "frontend",
+            "endpoints": [
+                {{
+                    "id": "frontend-a",
+                    "address": "{upstream_addr}",
+                    "state": "ready",
+                    "zone": null,
+                    "locality": null,
+                    "weight": 1
+                }}
+            ]
+        }}
+    ],
+    "policies": {{
+        "hostile_edge_protections": [
+            {{
+                "name": "{policy_name}",
+                "spec": {{
+                    "source_quota": {{
+                        "aggregation": "exact_ip",
+                        "max_active_per_source": {max_active_per_source},
+                        "max_tracked_sources": {max_tracked_sources}
+                    }},
+                    "handshake_guard": {{
+                        "max_inflight": {max_inflight_handshakes},
+                        "timeout_ms": 5000
+                    }}
                 }}
             }}
         ]
@@ -6744,6 +11455,18 @@ mod tests {
         String::from_utf8(response).map_err(to_dyn_error)
     }
 
+    async fn send_admin_readyz(address: SocketAddr) -> Result<String, DynError> {
+        let mut stream = TcpStream::connect(address).await?;
+        stream
+            .write_all(
+                b"GET /readyz HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer admin-secret\r\nConnection: close\r\n\r\n",
+            )
+            .await?;
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await?;
+        String::from_utf8(response).map_err(to_dyn_error)
+    }
+
     async fn send_admin_audit(address: SocketAddr) -> Result<String, DynError> {
         let mut stream = TcpStream::connect(address).await?;
         stream
@@ -6766,6 +11489,59 @@ mod tests {
         let mut response = Vec::new();
         stream.read_to_end(&mut response).await?;
         String::from_utf8(response).map_err(to_dyn_error)
+    }
+
+    async fn send_bearer_admin_request(
+        address: SocketAddr,
+        method: &str,
+        target: &str,
+        extra_headers: &[(&str, &str)],
+        body: &[u8],
+    ) -> Result<String, DynError> {
+        send_bearer_admin_request_with_token(
+            address,
+            method,
+            target,
+            extra_headers,
+            body,
+            "admin-secret",
+        )
+        .await
+    }
+
+    async fn send_bearer_admin_request_with_token(
+        address: SocketAddr,
+        method: &str,
+        target: &str,
+        extra_headers: &[(&str, &str)],
+        body: &[u8],
+        bearer_token: &str,
+    ) -> Result<String, DynError> {
+        let mut request = format!(
+            "{method} {target} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {bearer_token}\r\nConnection: close\r\n"
+        );
+        for (name, value) in extra_headers {
+            request.push_str(&format!("{name}: {value}\r\n"));
+        }
+        request.push_str(&format!("Content-Length: {}\r\n\r\n", body.len()));
+
+        let mut bytes = request.into_bytes();
+        bytes.extend_from_slice(body);
+        send_admin_request_bytes(address, &bytes).await
+    }
+
+    fn parse_http_json_body(response: &str) -> Result<serde_json::Value, DynError> {
+        let (_, body) = response.split_once("\r\n\r\n").ok_or_else(|| {
+            to_dyn_error("http response did not contain a header/body separator")
+        })?;
+        serde_json::from_str(body).map_err(to_dyn_error)
+    }
+
+    fn json_u64_field(value: &serde_json::Value, key: &str) -> Result<u64, DynError> {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| to_dyn_error(format!("missing u64 field: {key}")))
     }
 
     async fn send_signed_admin_request(

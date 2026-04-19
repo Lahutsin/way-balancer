@@ -5,8 +5,11 @@ mod auth;
 mod cache;
 mod cache_transport;
 mod control;
+mod fleet;
 mod mtls;
 mod rollout;
+
+use serde::{Deserialize, Serialize};
 
 pub use abuse_control::{
     AbuseControlActionKind, AbuseControlError, AbuseControlHistoryEntry, AbuseControlMetrics,
@@ -25,14 +28,25 @@ pub use cache::{
 };
 pub use cache_transport::{
     sign_http_cache_peer_request, HttpCacheInvalidationDeliveryMode, HttpCachePeerConfig,
-    HttpCachePeerInvalidationResponse, HttpCachePeerInvalidationResult, HttpCachePeerTransport,
-    InvalidHttpCachePeerConfig,
+    HttpCachePeerDeliveryRecord, HttpCachePeerDeliveryResult, HttpCachePeerFanoutReport,
+    HttpCachePeerInvalidationResponse, HttpCachePeerInvalidationResult,
+    HttpCachePeerRetryPolicy, HttpCachePeerTransport, InvalidHttpCachePeerConfig,
 };
 pub use control::{
     InvalidPublishRequest, PublishConflict, PublishEvent, PublishEventKind, PublishResponse,
     PublishResponseKind, PublishedSnapshotRecord, PublishedSnapshotSummary, SnapshotBackupBundle,
     SnapshotBackupError, SnapshotControlService, SnapshotLookupError, SnapshotPublicationError,
-    SnapshotPublishRequest, SnapshotRegistryMetrics, SnapshotRestoreError,
+    SnapshotPublishRequest, SnapshotRegistryDurableEnvelope, SnapshotRegistryDurableState,
+    SnapshotRegistryMetrics, SnapshotRegistryRetentionPolicy, SnapshotRegistryStateError,
+    SnapshotRestoreError,
+};
+pub use fleet::{
+    FleetConsistencyMode, FleetConvergenceReport, FleetConvergenceState,
+    FleetNodeActionOutcome, FleetNodeActionResult, FleetNodeBackend, FleetNodeBackendError,
+    FleetNodeConvergenceState, FleetNodeRuntimeStatus, FleetNodeStatus,
+    FleetRecommendedAction, FleetRollbackRequest, FleetRolloutCoordinator,
+    FleetRolloutError, FleetRolloutHistoryEntry, FleetRolloutMetrics, FleetRolloutRequest,
+    FleetRolloutResponse, FleetRolloutStrategy, InvalidFleetRequest,
 };
 pub use mtls::{
     PrivilegedChannelAuthenticator, PrivilegedChannelIdentity, PrivilegedChannelMtlsConfig,
@@ -45,6 +59,98 @@ pub use rollout::{
 
 /// Returns the crate identifier for admin API surfaces.
 pub const CRATE_ID: &str = "lb-admin-api";
+
+/// Stable machine-readable HTTP admin API version.
+pub const STABLE_ADMIN_API_VERSION: &str = "v1";
+
+/// Stable machine-readable error codes for the versioned admin API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdminApiErrorCode {
+    Unauthorized,
+    Forbidden,
+    ReplayRejected,
+    RateLimited,
+    ValidationFailed,
+    ReloadFailed,
+    UnsupportedMutation,
+    Internal,
+    NotFound,
+    UnsupportedApiVersion,
+    Misconfigured,
+}
+
+/// Versioned admin API success envelope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VersionedAdminApiSuccessEnvelope<T> {
+    pub api_version: String,
+    pub request_id: String,
+    pub status: String,
+    pub data: T,
+}
+
+impl<T> VersionedAdminApiSuccessEnvelope<T> {
+    #[must_use]
+    pub fn new(request_id: impl Into<String>, data: T) -> Self {
+        Self {
+            api_version: String::from(STABLE_ADMIN_API_VERSION),
+            request_id: request_id.into(),
+            status: String::from("ok"),
+            data,
+        }
+    }
+}
+
+/// Stable machine-readable admin API error payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VersionedAdminApiError {
+    pub code: AdminApiErrorCode,
+    pub message: String,
+    pub retryable: bool,
+}
+
+impl VersionedAdminApiError {
+    #[must_use]
+    pub fn new(code: AdminApiErrorCode, message: impl Into<String>, retryable: bool) -> Self {
+        Self { code, message: message.into(), retryable }
+    }
+}
+
+/// Versioned admin API error envelope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VersionedAdminApiErrorEnvelope {
+    pub api_version: String,
+    pub request_id: String,
+    pub status: String,
+    pub error: VersionedAdminApiError,
+}
+
+impl VersionedAdminApiErrorEnvelope {
+    #[must_use]
+    pub fn new(request_id: impl Into<String>, error: VersionedAdminApiError) -> Self {
+        Self {
+            api_version: String::from(STABLE_ADMIN_API_VERSION),
+            request_id: request_id.into(),
+            status: String::from("error"),
+            error,
+        }
+    }
+}
+
+/// Returns the canonical versioned target path for a stable admin endpoint.
+#[must_use]
+pub fn versioned_admin_target(target: &str) -> String {
+    if target.is_empty() {
+        return String::from("/v1");
+    }
+    if target == "/" {
+        return String::from("/v1/");
+    }
+    if target.starts_with('/') {
+        return format!("/v1{target}");
+    }
+    format!("/v1/{target}")
+}
 
 /// Minimal admin API status view placeholder.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,7 +207,11 @@ pub struct AdminSupportBundle {
 
 #[cfg(test)]
 mod tests {
-    use super::{AdminStatus, SupportBundleService};
+    use super::{
+        versioned_admin_target, AdminApiErrorCode, AdminStatus, SupportBundleService,
+        VersionedAdminApiError, VersionedAdminApiErrorEnvelope,
+        VersionedAdminApiSuccessEnvelope,
+    };
 
     #[test]
     fn support_bundle_generation_is_bounded_and_partial_failure_tolerant(
@@ -133,6 +243,46 @@ mod tests {
             .iter()
             .any(|warning| warning.detail.contains("logs section unavailable")));
         assert_eq!(service.metrics().success_count, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn versioned_admin_target_normalizes_paths() {
+        assert_eq!(versioned_admin_target("/status"), "/v1/status");
+        assert_eq!(versioned_admin_target("reload"), "/v1/reload");
+        assert_eq!(versioned_admin_target(""), "/v1");
+    }
+
+    #[test]
+    fn versioned_success_envelope_serializes_stably() -> Result<(), Box<dyn std::error::Error>> {
+        let body = serde_json::to_value(VersionedAdminApiSuccessEnvelope::new(
+            "req-1",
+            serde_json::json!({"ready": true}),
+        ))?;
+
+        assert_eq!(body["api_version"], "v1");
+        assert_eq!(body["request_id"], "req-1");
+        assert_eq!(body["status"], "ok");
+        assert_eq!(body["data"]["ready"], true);
+        Ok(())
+    }
+
+    #[test]
+    fn versioned_error_envelope_serializes_stably() -> Result<(), Box<dyn std::error::Error>> {
+        let body = serde_json::to_value(VersionedAdminApiErrorEnvelope::new(
+            "req-2",
+            VersionedAdminApiError::new(
+                AdminApiErrorCode::UnsupportedApiVersion,
+                "unsupported admin api version",
+                false,
+            ),
+        ))?;
+
+        assert_eq!(body["api_version"], "v1");
+        assert_eq!(body["request_id"], "req-2");
+        assert_eq!(body["status"], "error");
+        assert_eq!(body["error"]["code"], "unsupported_api_version");
+        assert_eq!(body["error"]["retryable"], false);
         Ok(())
     }
 }

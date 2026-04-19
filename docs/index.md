@@ -1,10 +1,10 @@
 # way-balancer
 
-way-balancer is a production-oriented Rust load balancer with a pre-GA but already operational scope: typed config validation, runtime reload mechanics, admin-plane controls, HTTP caching, Kubernetes translation foundations, and security-focused runbooks.
+way-balancer is a production-oriented Rust load balancer with explicit `0.1.x` release discipline: typed config validation, runtime reload mechanics, admin-plane controls, HTTP caching, Kubernetes translation, secure-default posture, and evidence-backed operator runbooks.
 
-!!! warning "Pre-GA status"
+!!! info "GA release discipline"
 
-    The repository already supports real build, test, and operational workflows, but it should still be treated as pre-GA software with explicit release and operational review before broad production rollout.
+  A candidate is considered release-ready only when the evidence set in the release checklist is complete, the support boundaries match the intended deployment, and the final GA review record is signed off.
 
 ## What This Site Covers
 
@@ -13,6 +13,7 @@ way-balancer is a production-oriented Rust load balancer with a pre-GA but alrea
 - how configuration, admin endpoints, cache policy, and affinity are modeled
 - how to diagnose auth, reload, cache, affinity, and overload issues in production-like environments
 - where to find runbooks for security, TLS, cache, DR, upgrade, and release evidence
+- where to find the explicit support-boundary guidance for supported and unsupported deployment shapes
 
 ## Start Here
 
@@ -48,7 +49,7 @@ way-balancer is a production-oriented Rust load balancer with a pre-GA but alrea
 
 - `Runbooks`
 
-  Jump straight to hardening, cache operations, compatibility, DR, TLS, observability, and release guidance.
+  Jump straight to hardening, cache operations, compatibility, support boundaries, DR, TLS, observability, and release guidance.
 
 </div>
 

@@ -85,9 +85,9 @@ pub use route_enumeration::{
     RouteEnumerationProtectionState,
 };
 pub use source_guards::{
-    AbuseRejectionReason, HandshakeGuardPolicy, ListenerAbuseProtectionPolicy,
-    ListenerAbuseProtectionSnapshot, ListenerAbuseProtectionState, SourceAggregation,
-    SourceQuotaPolicy,
+    AbuseRejectionReason, HandshakeGuardPolicy, HandshakePermit,
+    ListenerAbuseProtectionPolicy, ListenerAbuseProtectionSnapshot,
+    ListenerAbuseProtectionState, SourceAggregation, SourceQuotaPolicy,
 };
 pub use tcp_proxy::{
     proxy_tcp_stream, ConnectionContext, ConnectionEventKind, ConnectionMetadata,

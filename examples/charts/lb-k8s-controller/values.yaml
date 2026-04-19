@@ -1,9 +1,10 @@
-replicaCount: 1
+replicaCount: 2
 
 nameOverride: ""
 fullnameOverride: ""
 namespaceOverride: ""
 revisionHistoryLimit: 3
+terminationGracePeriodSeconds: 20
 
 image:
   repository: ghcr.io/your-org/way-balancer-k8s-controller
@@ -32,6 +33,13 @@ controller:
   listenerProtocol: http1
   reconcileDebounceMs: 250
   maxRequeueMs: 30000
+  leaderElection:
+    enabled: true
+    leaseName: lb-k8s-controller
+    leaseNamespace: ""
+    leaseDurationMs: 15000
+    renewDeadlineMs: 10000
+    retryPeriodMs: 2000
 
 podAnnotations: {}
 podLabels: {}

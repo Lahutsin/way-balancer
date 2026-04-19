@@ -53,6 +53,7 @@ pub struct ListenerAbuseProtectionPolicy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ListenerAbuseProtectionSnapshot {
     pub source_quota_rejections: u64,
+    pub tracked_source_limit_rejections: u64,
     pub handshake_guard_rejections: u64,
     pub tracked_sources: usize,
     pub active_handshakes: usize,
@@ -66,6 +67,15 @@ pub enum AbuseRejectionReason {
 }
 
 impl AbuseRejectionReason {
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::SourceQuotaExceeded => "source_quota_exceeded",
+            Self::TrackedSourceLimitReached => "tracked_source_limit_reached",
+            Self::HandshakeLimitReached => "handshake_limit_reached",
+        }
+    }
+
     #[must_use]
     pub const fn detail(self) -> &'static str {
         match self {
@@ -81,6 +91,7 @@ pub struct ListenerAbuseProtectionState {
     source_quota: Option<Arc<SourceQuotaTracker>>,
     handshake_guard: Option<Arc<HandshakeGuard>>,
     source_quota_rejections: AtomicU64,
+    tracked_source_limit_rejections: AtomicU64,
     handshake_guard_rejections: AtomicU64,
 }
 
@@ -91,6 +102,7 @@ impl ListenerAbuseProtectionState {
             source_quota: policy.source_quota.map(SourceQuotaTracker::new).map(Arc::new),
             handshake_guard: policy.handshake_guard.map(HandshakeGuard::new).map(Arc::new),
             source_quota_rejections: AtomicU64::new(0),
+            tracked_source_limit_rejections: AtomicU64::new(0),
             handshake_guard_rejections: AtomicU64::new(0),
         }
     }
@@ -103,8 +115,16 @@ impl ListenerAbuseProtectionState {
             return Ok(None);
         };
 
-        tracker.try_acquire(peer_addr).map(Some).inspect_err(|_error| {
-            self.source_quota_rejections.fetch_add(1, Ordering::SeqCst);
+        tracker.try_acquire(peer_addr).map(Some).inspect_err(|error| {
+            match error {
+                AbuseRejectionReason::SourceQuotaExceeded => {
+                    self.source_quota_rejections.fetch_add(1, Ordering::SeqCst);
+                }
+                AbuseRejectionReason::TrackedSourceLimitReached => {
+                    self.tracked_source_limit_rejections.fetch_add(1, Ordering::SeqCst);
+                }
+                AbuseRejectionReason::HandshakeLimitReached => {}
+            }
         })
     }
 
@@ -122,6 +142,9 @@ impl ListenerAbuseProtectionState {
     pub fn snapshot(&self) -> ListenerAbuseProtectionSnapshot {
         ListenerAbuseProtectionSnapshot {
             source_quota_rejections: self.source_quota_rejections.load(Ordering::SeqCst),
+            tracked_source_limit_rejections: self
+                .tracked_source_limit_rejections
+                .load(Ordering::SeqCst),
             handshake_guard_rejections: self.handshake_guard_rejections.load(Ordering::SeqCst),
             tracked_sources: self
                 .source_quota

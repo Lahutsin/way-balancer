@@ -144,6 +144,8 @@ Look for:
 
 That means the initiating node purged locally but remote convergence is incomplete.
 
+In the current multi-node model, peer invalidation remains best-effort on final outcome, but delivery attempts are no longer fire-and-forget. `HttpCachePeerTransport` applies a bounded retry policy and records a per-peer fan-out report so operators can distinguish a temporary retryable miss from a sustained partition or dead peer.
+
 ## Safe Rollout Pattern
 
 1. Start with one named cache policy for one traffic class.
@@ -156,3 +158,4 @@ That means the initiating node purged locally but remote convergence is incomple
 - [Admin API](admin-api.md) for the live cache-control endpoints
 - [Troubleshooting](troubleshooting.md) for cache miss and invalidation failure workflows
 - [Cache Operations](runbooks/cache-operations.md) and [Cache Invalidation](runbooks/cache-invalidation.md) for deeper operator runbooks
+- [Multi-Node Topology](runbooks/multi-node-topology.md) for the supported active-active contract

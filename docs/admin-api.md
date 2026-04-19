@@ -4,38 +4,90 @@
 
 The admin surface is exposed by `lb-dataplane serve --config ...` and is intended for privileged operational control, not public application traffic.
 
-In the current workspace mode, the admin listener exposes health, status, validation, audit, reload, and cache-control endpoints over HTTP/1.
+In the current workspace mode, the admin listener exposes liveness, serving-readiness, status, validation, audit, reload, and cache-control endpoints over HTTP/1.
+
+The legacy unversioned endpoints remain available for backward compatibility. The stable machine-readable contract is exposed additively under `/v1/...` and returns `X-LB-Admin-Api-Version: v1` on every response.
 
 ## Endpoint Matrix
 
 | Endpoint | Method | Permission | Typical result | Purpose |
 | --- | --- | --- | --- | --- |
-| `/healthz` | `GET` | `read` | `200 OK` | Cheap readiness probe for the admin surface. |
+| `/healthz` | `GET` | `read` | `200 OK` | Liveness probe for the admin surface. |
+| `/readyz` | `GET` | `read` | `200 OK` or `503 Service Unavailable` | Serving-readiness probe for the dataplane instance. |
 | `/status` | `GET` | `read` | `200 OK` | Runtime counters, listener state, replacement lifecycle, and recent overload events. |
 | `/validate` | `GET` | `read` | `200 OK` or `400 Bad Request` | Dry-run current config file and preview active vs candidate snapshots, warnings, and apply strategy. |
-| `/audit` | `GET` | `audit` | `200 OK` | Recent admin-plane activity with actor, outcome, and detail. |
+| `/audit` | `GET` | `audit` | `200 OK` | Recent admin-plane activity with actor, code, outcome, and detail. |
 | `/reload` | `POST` | `write` | `200 OK` or `500 Internal Server Error` | Apply the current config file using rollback-safe reload logic. |
 | `/cache/purge` | `POST` | `write` | `200 OK` or `400 Bad Request` | Purge cache entries by exact key or path prefix. |
 | `/cache/invalidate` | `POST` | `write` | `200 OK` or `400 Bad Request` | Apply a replay-safe invalidation event, usually for multi-node convergence. |
+
+Each listed endpoint also has a stable versioned form under `/v1`, such as `/v1/status`, `/v1/readyz`, and `/v1/reload`.
+
+## Versioned Contract
+
+`/v1/*` responses use a stable envelope:
+
+```json
+{
+  "api_version": "v1",
+  "status": "ok",
+  "data": { ... }
+}
+```
+
+Errors use:
+
+```json
+{
+  "api_version": "v1",
+  "status": "error",
+  "error": {
+    "code": "unsupported_api_version",
+    "message": "requested admin API version is not supported"
+  }
+}
+```
+
+Current stable error codes include:
+
+- `unauthorized`
+- `forbidden`
+- `replay_rejected`
+- `rate_limited`
+- `validation_failed`
+- `reload_failed`
+- `unsupported_mutation`
+- `not_found`
+- `unsupported_api_version`
+- `misconfigured`
+- `internal`
 
 ## Auth Modes
 
 The admin listener supports two explicit auth models:
 
-- `bearer`: shared bearer secret, typically from `LB_CTL_ADMIN_SECRET`
+- `bearer`: shared bearer secret, typically from `LB_CTL_ADMIN_SECRET` or `LB_CTL_ADMIN_SECRET_FILE`
 - `signed_headers`: per-operator signing with permissions, replay protection, and clock-skew checks
 
 For production exposure, prefer `signed_headers`. The bearer mode is practical for localhost-only or isolated bootstrap flows.
+
+When `<SECRET_ENV>_FILE` is set, the runtime reads the secret material directly from that file on each admin request. That is the supported zero-downtime rotation path for file-projected Kubernetes secrets and similar external secret delivery mechanisms.
 
 ## Bearer Example
 
 ```sh
 export LB_CTL_ADMIN_SECRET=<admin-bearer-token>
 curl -H "Authorization: Bearer $LB_CTL_ADMIN_SECRET" http://127.0.0.1:9900/status
+curl -H "Authorization: Bearer $LB_CTL_ADMIN_SECRET" http://127.0.0.1:9900/readyz
 curl -H "Authorization: Bearer $LB_CTL_ADMIN_SECRET" http://127.0.0.1:9900/validate
 curl -H "Authorization: Bearer $LB_CTL_ADMIN_SECRET" http://127.0.0.1:9900/audit
 curl -X POST -H "Authorization: Bearer $LB_CTL_ADMIN_SECRET" http://127.0.0.1:9900/reload
 ```
+
+Use probe endpoints with this split:
+
+- `GET /healthz`: confirms the process is alive and the admin listener can answer.
+- `GET /readyz`: confirms whether the instance should receive new traffic.
 
 ## Signed Header Contract
 
@@ -73,7 +125,12 @@ The detailed security posture and rollout guidance live in [Admin Plane Hardenin
 - service mode and config path
 - uptime and proxied request or connection counters
 - admin request and reload counters
+- `reload_health`
+- `last_reload_outcome_code`
+- reload duration metrics: `reload_total_duration_ms`, `reload_max_duration_ms`, `reload_last_duration_ms`, `reload_last_success_duration_ms`, `reload_last_failure_duration_ms`
 - `last_reload_result`
+- `control_plane_journal`
+- rolled-up `readiness`
 - per-listener status records
 - `recent_overload_events`
 
@@ -84,7 +141,50 @@ Each listener record includes:
 - `brownout_features`
 - replacement lifecycle state under `replacement`
 
-The replacement object is especially important during reloads. It shows whether the listener is stable, draining, or preserving a failed replacement start.
+For HTTPS listeners, `listener.tls` also exposes:
+
+- TLS health state and stable reason codes
+- minimum TLS version and ALPN policy
+- session resumption mode
+- certificate metadata for the default certificate and any SNI certificates, including fingerprint, SANs, validity bounds, and expiry-warning status
+
+The replacement object is especially important during reloads. It shows whether the listener is stable, draining, preserving a failed replacement start, or reporting that an old listener exceeded its configured drain timeout while the replacement stayed active.
+
+The status surface also publishes `last_reload_outcome_code` so automation can distinguish `reload_applied_in_place`, `reload_applied_overlap_drain`, `reload_failed_rollback_preserved`, and `reload_failed_blocked_change` without parsing free-form text. It also includes bounded reload duration metrics so operators can reason about recent, worst-case, and cumulative apply latency without scraping free-form audit text.
+
+At the top level, `admin_auth.secret_sources` reports the configured admin secret sources without leaking secret values. Each entry includes the listener name, auth mode, actor, source kind (`env` or `file`), source reference, current health, and whether that source supports rotation without a process reload.
+
+The `control_plane_journal` object exposes the local durable journal path plus the currently restored desired and applied snapshot identity. Its nested `recovery` object tells operators whether the process restored prior durable state cleanly or detected an unfinished in-flight reload that now needs operator attention.
+
+When unfinished recovery is present, `control_plane_journal.recovery.in_flight_operation` also carries the persisted lifecycle code, human-readable detail, and any affected listener names. For overlap-and-drain recovery, that lets automation distinguish a plain in-place reload from a replacement-aware reload that was interrupted mid-flight.
+
+After startup reconciliation, `control_plane_journal.recovery.reconciled_listeners` reports the current live `listener_state` and `replacement_state` for each affected listener name plus a machine-readable `reconciliation_verdict`. Current verdicts distinguish at least `settled`, `replacement_still_draining`, `replacement_failed_preserved`, `replacement_drain_timeout`, `missing`, and fallback `needs_review`.
+
+The same recovery block also publishes `reconciliation_summary`, which rolls those listener-level verdicts into an `overall_verdict` plus per-bucket counts. That is the fastest surface for automation to decide whether recovered replacement work is settled, still draining, or still needs review.
+
+`reconciliation_summary` also includes `recommended_action`, a machine-readable next-step hint. Current values distinguish at least `observe_only`, `wait_for_drain_completion`, `validate_and_retry_reload`, `investigate_drain_timeout`, and `investigate_and_validate_reload`.
+
+At the top level, `control_plane_journal.recovery.operator_guidance` turns the full recovery state into an operator-facing recommendation even when there are no affected listeners to reconcile. It currently exposes a machine-readable `recommended_action`, `urgency`, `operation_age_ms`, `expected_completion_within_ms`, and `exceeded_expected_completion`, so plain unfinished reload recovery can still report `validate_and_retry_reload` with `action_required`, while interrupted overlap-and-drain recovery can escalate to `investigate_stalled_drain` once the persisted operation age exceeds the expected drain window.
+
+When startup successfully bootstraps the current config after crash recovery, `reload_health` and `last_reload_outcome_code` may move forward to the new startup apply result. In that case, use `control_plane_journal.recovery` and the recovery audit event code `reload_recovered_unfinished` to decide whether prior unfinished work still needs operator review.
+
+After an operator performs a subsequent successful `POST /reload`, the recovery block should move from `needs_operator_action` to `resolved`. That transition is the machine-readable signal that the unfinished recovered reload has been reviewed and superseded by a new completed apply.
+
+The journal currently retains a bounded recent admin audit slice rather than unbounded history. In serve mode, that bounded slice follows the active admin audit capacity so restart recovery preserves the most recent operator-relevant events without turning the local journal into an unbounded log.
+
+## What `GET /readyz` Returns
+
+`GET /readyz` is the serving-readiness endpoint. It returns machine-readable JSON plus:
+
+- `200 OK` when the instance should receive new traffic
+- `503 Service Unavailable` when the instance should be removed from new traffic
+
+The current readiness contract rolls up public listeners when public listeners exist. It becomes not ready when:
+
+- there are no serving listeners in the evaluated scope
+- a relevant listener is `draining` or otherwise not `running`
+- a relevant listener enters unsafe overload states such as `shedding` or `brownout`
+- the last reload attempt is still marked failed
 
 ## What `GET /validate` Returns
 
@@ -108,11 +208,29 @@ The audit endpoint returns a bounded in-memory list of recent admin actions, inc
 - actor
 - auth mode
 - action
+- code
 - source
 - outcome
 - detail
 
 This is the fastest way to understand whether a denied or failed admin action was caused by auth, permissions, rate limits, replay rejection, or a runtime apply failure.
+
+Reload audit entries publish machine-readable lifecycle codes such as `reload_started_in_place`, `reload_started_overlap_drain`, `reload_started_blocked_candidate`, `reload_applied_in_place`, `reload_applied_overlap_drain`, `reload_applied_overlap_drain_timeout`, `reload_failed_apply`, `reload_failed_rollback_preserved`, and `reload_failed_blocked_change`.
+
+## Fleet Rollout Coordination
+
+The current multi-node contract is exposed through the `lb-admin-api` library surface rather than a built-in `/fleet/*` HTTP endpoint in `lb-dataplane`.
+
+Use `FleetRolloutCoordinator` when one control-plane workflow needs to coordinate rollout or rollback across multiple dataplane nodes while preserving explicit consistency tradeoffs.
+
+Key fleet surfaces:
+
+- `FleetRolloutRequest` and `FleetRollbackRequest`
+- `FleetRolloutStrategy`: `immediate`, `sequential`, or `canary`
+- `FleetConvergenceReport` with `converged`, `progressing`, `degraded`, and `diverged` states
+- per-node `desired_version`, `active_version`, and convergence detail
+
+The contract is `bounded_eventual`: the fleet is only considered converged when every targeted node reports the desired version and digest within the configured divergence budget.
 
 ## Reload Semantics
 
@@ -123,7 +241,9 @@ Important behavior:
 - successful reloads return `configuration applied`
 - failed reloads preserve the active runtime and return `500 Internal Server Error`
 - overlap-and-drain listener replacement is used when a safe staged swap is possible
+- if a replacement becomes active but an old listener exceeds its configured drain timeout, the reload still succeeds but surfaces a distinct drain-timeout outcome code and detail
 - started reloads are recorded in audit before the apply finishes
+- only one reload apply path executes at a time; later reload requests wait behind the active apply instead of interleaving listener mutation
 
 Operational rule: run `GET /validate` first, then `POST /reload`, then confirm with `GET /status` and `GET /audit`.
 
@@ -159,6 +279,8 @@ The response reports local purge effect and fan-out status, including:
 - `degraded`
 - `invalidation_event_id`
 
+When the HTTP peer transport is used, the transport also keeps a machine-readable last fan-out report with per-peer attempts, duplicate outcomes, and partition detection. That is the recommended control-plane surface for retry policy tuning and follow-up automation.
+
 ### `POST /cache/invalidate`
 
 This endpoint applies a replay-safe invalidation event directly. It is most useful for internal or peer-delivery workflows, not for a human operator’s first-line purge path.
@@ -191,13 +313,16 @@ The response indicates whether the event was newly applied or detected as a dupl
 | `500 Internal Server Error` | Reload attempted but the apply failed. |
 | `503 Service Unavailable` | Required admin signing secret was missing or another fail-closed prerequisite was not met. |
 
+For the stable `/v1/*` contract, prefer the machine-readable `error.code` field over raw HTTP status text for automation.
+
 ## Recommended Operator Sequence
 
 1. Call `/healthz` to confirm the admin plane is reachable.
-2. Call `/validate` before mutating config.
-3. Call `/reload` only after a clean preview.
-4. Call `/status` to inspect listener replacement or overload state.
-5. Call `/audit` after denied or failed actions to capture the exact reason.
+2. Call `/readyz` to confirm the instance should receive new traffic.
+3. Call `/validate` before mutating config.
+4. Call `/reload` only after a clean preview.
+5. Call `/status` to inspect listener replacement, reload, or overload state.
+6. Call `/audit` after denied or failed actions to capture the exact reason.
 
 ## Next Step
 

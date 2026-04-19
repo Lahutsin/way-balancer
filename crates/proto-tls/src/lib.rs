@@ -38,6 +38,29 @@ pub struct LoadedTlsIdentity {
     pub private_key_der: Vec<u8>,
 }
 
+/// Operator-visible metadata about loaded TLS identity material.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadedTlsIdentityMetadata {
+    /// Number of certificates present in the chain PEM.
+    pub certificate_chain_len: usize,
+    /// Parsed leaf common name, if present.
+    pub common_name: Option<String>,
+    /// Parsed leaf SAN DNS names.
+    pub san_dns_names: Vec<String>,
+    /// SHA-256 fingerprint of the leaf certificate DER.
+    pub fingerprint_sha256: String,
+    /// Leaf validity lower bound.
+    pub not_before_unix_secs: i64,
+    /// Leaf validity upper bound.
+    pub not_after_unix_secs: i64,
+    /// Whether the leaf certificate is not yet valid for the provided inspection time.
+    pub not_yet_valid: bool,
+    /// Whether the leaf certificate is already expired for the provided inspection time.
+    pub expired: bool,
+    /// Whether the leaf certificate will expire within the provided warning window.
+    pub expires_within_warning_window: bool,
+}
+
 /// Certificate material source abstraction for future TLS termination.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CertificateSource {
@@ -124,6 +147,32 @@ impl fmt::Display for CertificateLoadError {
 }
 
 impl std::error::Error for CertificateLoadError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TlsIdentityInspectError {
+    Load(CertificateLoadError),
+    InvalidCertificate,
+}
+
+impl fmt::Display for TlsIdentityInspectError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Load(error) => write!(formatter, "failed loading TLS identity: {error}"),
+            Self::InvalidCertificate => {
+                formatter.write_str("certificate material is malformed or unsupported")
+            }
+        }
+    }
+}
+
+impl std::error::Error for TlsIdentityInspectError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Load(error) => Some(error),
+            Self::InvalidCertificate => None,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CertificateValidationError {
@@ -304,6 +353,49 @@ pub fn load_tls_identity_from_files(
     Ok(LoadedTlsIdentity {
         certificate_chain_der: load_certificates_from_pem(&cert_pem)?,
         private_key_der: load_private_key_from_pem(&key_pem)?,
+    })
+}
+
+pub fn inspect_tls_identity_from_files(
+    cert_path: impl AsRef<Path>,
+    key_path: impl AsRef<Path>,
+    now_unix_secs: i64,
+    warning_window: Duration,
+) -> Result<LoadedTlsIdentityMetadata, TlsIdentityInspectError> {
+    let cert_path = cert_path.as_ref();
+    let key_path = key_path.as_ref();
+    let cert_pem = std::fs::read_to_string(cert_path)
+        .map_err(|_| TlsIdentityInspectError::Load(CertificateLoadError::ReadFile(
+            cert_path.display().to_string(),
+        )))?;
+    let key_pem = std::fs::read_to_string(key_path)
+        .map_err(|_| TlsIdentityInspectError::Load(CertificateLoadError::ReadFile(
+            key_path.display().to_string(),
+        )))?;
+    let certificate_chain_der =
+        load_certificates_from_pem(&cert_pem).map_err(TlsIdentityInspectError::Load)?;
+    let _private_key = load_private_key_from_pem(&key_pem).map_err(TlsIdentityInspectError::Load)?;
+    let chain = parse_certificates(&certificate_chain_der)
+        .map_err(|_| TlsIdentityInspectError::InvalidCertificate)?;
+    let leaf = chain.first().ok_or(TlsIdentityInspectError::InvalidCertificate)?;
+    let not_before_unix_secs = leaf.validity().not_before.timestamp();
+    let not_after_unix_secs = leaf.validity().not_after.timestamp();
+    let not_yet_valid = not_before_unix_secs > now_unix_secs;
+    let expired = not_after_unix_secs < now_unix_secs;
+    let expires_within_warning_window = !expired
+        && not_after_unix_secs.saturating_sub(now_unix_secs)
+            <= i64::try_from(warning_window.as_secs()).unwrap_or(i64::MAX);
+
+    Ok(LoadedTlsIdentityMetadata {
+        certificate_chain_len: certificate_chain_der.len(),
+        common_name: collect_common_name(leaf),
+        san_dns_names: collect_san_dns_names(leaf),
+        fingerprint_sha256: hex_sha256(&certificate_chain_der[0]),
+        not_before_unix_secs,
+        not_after_unix_secs,
+        not_yet_valid,
+        expired,
+        expires_within_warning_window,
     })
 }
 
@@ -634,10 +726,10 @@ mod tests {
     use rcgen::{BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair};
 
     use super::{
-        inspect_client_hello, load_certificates_from_pem, load_private_key_from_pem,
-        load_tls_identity_from_files, CertificateSource, CertificateValidationError,
-        CertificateValidationPolicy, CertificateValidator, TlsClientHelloClassification,
-        TlsInspectError, TlsTerminationConfig,
+        inspect_client_hello, inspect_tls_identity_from_files, load_certificates_from_pem,
+        load_private_key_from_pem, load_tls_identity_from_files, CertificateSource,
+        CertificateValidationError, CertificateValidationPolicy, CertificateValidator,
+        TlsClientHelloClassification, TlsInspectError, TlsTerminationConfig,
     };
 
     #[test]
@@ -836,6 +928,41 @@ mod tests {
 
         assert_eq!(loaded.certificate_chain_der.len(), 1);
         assert!(!loaded.private_key_der.is_empty());
+
+        let _ = fs::remove_file(&cert_path);
+        let _ = fs::remove_file(&key_path);
+        let _ = fs::remove_dir(&temp_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn tls_identity_inspection_surfaces_leaf_expiry_metadata(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let fixtures = certificate_fixtures(false)?;
+        let temp_dir = env::temp_dir().join(format!(
+            "way-balancer-proto-tls-inspect-{}",
+            SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_nanos()
+        ));
+        fs::create_dir_all(&temp_dir)?;
+        let cert_path = temp_dir.join("server.pem");
+        let key_path = temp_dir.join("server.key");
+        fs::write(&cert_path, &fixtures.leaf_pem)?;
+        fs::write(&key_path, &fixtures.leaf_key_pem)?;
+
+        let metadata = inspect_tls_identity_from_files(
+            &cert_path,
+            &key_path,
+            fixtures.now_unix_secs,
+            Duration::from_secs(30 * 24 * 60 * 60),
+        )?;
+
+        assert_eq!(metadata.certificate_chain_len, 1);
+        assert_eq!(metadata.common_name.as_deref(), Some("operator.internal"));
+        assert!(metadata.san_dns_names.iter().any(|name| name == "operator.internal"));
+        assert!(!metadata.fingerprint_sha256.is_empty());
+        assert!(!metadata.not_yet_valid);
+        assert!(!metadata.expired);
+        assert!(metadata.expires_within_warning_window);
 
         let _ = fs::remove_file(&cert_path);
         let _ = fs::remove_file(&key_path);

@@ -10,12 +10,21 @@ When something feels wrong, start with these in order:
 
 ```sh
 curl -H "Authorization: Bearer $LB_CTL_ADMIN_SECRET" http://127.0.0.1:9900/healthz
+curl -H "Authorization: Bearer $LB_CTL_ADMIN_SECRET" http://127.0.0.1:9900/readyz
 curl -H "Authorization: Bearer $LB_CTL_ADMIN_SECRET" http://127.0.0.1:9900/status
 curl -H "Authorization: Bearer $LB_CTL_ADMIN_SECRET" http://127.0.0.1:9900/validate
 curl -H "Authorization: Bearer $LB_CTL_ADMIN_SECRET" http://127.0.0.1:9900/audit
 ```
 
-Those four endpoints usually tell you whether the issue is auth, config, listener lifecycle, or runtime pressure.
+Those endpoints usually tell you whether the issue is liveness, serving readiness, auth, config, listener lifecycle, or runtime pressure.
+
+Use them with this split:
+
+- `GET /healthz`: the process is alive and serving the admin socket.
+- `GET /readyz`: this instance should receive new traffic right now.
+- `GET /status`: detailed listener, reload, and overload state.
+- `GET /validate`: config preview before reload.
+- `GET /audit`: recent admin-plane activity.
 
 ## Admin API Failures
 
@@ -42,6 +51,42 @@ The most useful `replacement.state` values are:
 - `stable`: no staged replacement in progress
 - `replacement_draining`: the desired listener is active while an old one drains
 - `failed_start_preserved`: the replacement start failed and the prior listener stayed active
+- `drain_timeout_expired`: the replacement became active, but an old listener exceeded its configured drain timeout before finishing cleanly
+
+If crash recovery is in play, also inspect `control_plane_journal.recovery.reconciled_listeners[*].reconciliation_verdict` in `GET /status`:
+
+- `settled`: the affected listener is back to `running` plus `stable`
+- `replacement_still_draining`: the listener is serving but replacement drain work is still visible
+- `replacement_failed_preserved`: the active listener was preserved after replacement start failure
+- `replacement_drain_timeout`: replacement stayed active but prior drain exceeded timeout
+- `missing`: the recovered affected listener name is not present after restart and needs review
+- `needs_review`: the post-restart state does not match any safer known bucket yet
+
+If you need the fast aggregate answer first, check `control_plane_journal.recovery.reconciliation_summary.overall_verdict`:
+
+- `settled`: every affected listener reconciled cleanly
+- `replacement_still_draining`: only transitional drain work remains visible
+- `replacement_failed_preserved` or `replacement_drain_timeout`: recovery found a bounded but non-clean replacement outcome
+- `needs_review`: at least one affected listener is missing or otherwise outside the safer known buckets
+
+Then use `control_plane_journal.recovery.reconciliation_summary.recommended_action` as the default next step:
+
+- `observe_only`: no immediate remediation is suggested
+- `wait_for_drain_completion`: keep watching until replacement drain work clears
+- `validate_and_retry_reload`: re-run validation and a clean follow-up reload
+- `investigate_drain_timeout`: inspect why the old listener failed to drain in time
+- `investigate_stalled_drain`: the recovered overlap-and-drain operation is still draining after its expected completion window and should be investigated
+- `investigate_and_validate_reload`: investigate the mismatch first, then validate and reload once the intent is clear
+
+If you want the single operator-facing answer that also works for plain interrupted reloads, use `control_plane_journal.recovery.operator_guidance`:
+
+- `recommended_action`: the current default next step across the whole recovery block
+- `urgency`: `none`, `watch`, `action_required`, or `urgent`
+- `operation_age_ms`: how long the recovered in-flight operation has been open according to the persisted start timestamp
+- `expected_completion_within_ms`: the persisted expected completion window for overlap-and-drain recovery when one is known
+- `exceeded_expected_completion`: `true` when the recovered operation age is already beyond that expected completion window
+
+This is the safer field for automation that should not special-case whether `affected_listeners` existed in the recovered in-flight operation.
 
 This is a rollback-safe behavior, not silent partial mutation.
 
@@ -65,6 +110,22 @@ Check the purge response for:
 - non-empty `fanout_failed_targets`
 
 That means the local node purged, but distributed convergence did not complete.
+
+If the control plane keeps a `HttpCachePeerTransport` handle, inspect its last fan-out report as well:
+
+- peers with `attempts > 1` indicate retry pressure
+- peers with `result = failed` after retries indicate real degraded convergence
+- `partition_detected = true` means you should treat the event as a partial-cluster issue, not a single local miss
+
+## Fleet Rollout Is Mixed Across Nodes
+
+Check whether the control plane fleet report says:
+
+- `state = progressing`: the rollout is still within the bounded divergence budget
+- `state = degraded`: at least one node failed or became unreachable
+- `state = diverged`: the fleet stayed mixed beyond the configured divergence budget
+
+Then inspect per-node `desired_version`, `active_version`, and convergence detail. The safe remediation path is usually to retry failed nodes or roll back the whole fleet to a shared known-good version.
 
 ### Cache Growth Or Churn Looks Wrong
 
@@ -119,6 +180,7 @@ This is one of the strongest signals that you should inspect telemetry and the o
 | config preview and reload safety | [Config Safety Workflow](runbooks/config-safety-workflow.md) |
 | cache policy and purge behavior | [Cache Operations](runbooks/cache-operations.md) |
 | distributed invalidation | [Cache Invalidation](runbooks/cache-invalidation.md) |
+| active-active fleet rollout | [Multi-Node Topology](runbooks/multi-node-topology.md) |
 | listener replacement and rollback | [Upgrade And Rollback Policy](runbooks/upgrade-rollback-policy.md) |
 | soak, chaos, and failure visibility | [Soak And Chaos Failure Injection](runbooks/soak-chaos-failure-injection.md) |
 | observability stack and diagnostics | [Observability Stack](runbooks/observability-stack.md) |

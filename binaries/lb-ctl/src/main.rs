@@ -111,9 +111,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     )?;
     let visible_versions = auth.list_versions(&control, operator_token)?;
+    let status_target = lb_admin_api::versioned_admin_target("/status");
 
     println!(
-        "lb-ctl rollout ready: config={} published_versions={} visible_versions={} stable={:?} canary={:?} rollback={:?} active={} last_good={} history={} auth_audit_events={}",
+        "lb-ctl rollout ready: api_version={} status_target={} config={} published_versions={} visible_versions={} stable={:?} canary={:?} rollback={:?} active={} last_good={} history={} auth_audit_events={}",
+        lb_admin_api::STABLE_ADMIN_API_VERSION,
+        status_target,
         status.config_name,
         control.list_versions().len(),
         visible_versions.len(),

@@ -42,11 +42,14 @@ pub use overload_policy::{
 };
 pub use policy::{
     AuthorizationCacheBehaviorConfig, CacheKeyPolicyConfig, CacheQueryKeyBehaviorConfig,
-    HttpCacheMethodConfig, HttpCachePolicyConfig, HttpCacheStorageConfig,
-    NamedBrownoutFeatureConfig, NamedCircuitBreakerPolicyConfig, NamedHttpCachePolicyConfig,
-    NamedLocalConcurrencyLimitPolicyConfig, NamedLocalRateLimitPolicyConfig,
-    NamedOverloadResponsePolicyConfig, NamedRetryBudgetPolicyConfig,
-    NamedTimeoutHierarchyPolicyConfig, PolicyBindingConfig, PolicyResourcesConfig,
+    HostileEdgeHandshakeGuardConfig, HostileEdgeProtectionPolicyConfig,
+    HostileEdgeSourceAggregationConfig, HostileEdgeSourceQuotaConfig, HttpCacheMethodConfig,
+    HttpCachePolicyConfig, HttpCacheStorageConfig, NamedBrownoutFeatureConfig,
+    NamedCircuitBreakerPolicyConfig, NamedHostileEdgeProtectionPolicyConfig,
+    NamedHttpCachePolicyConfig, NamedLocalConcurrencyLimitPolicyConfig,
+    NamedLocalRateLimitPolicyConfig, NamedOverloadResponsePolicyConfig,
+    NamedRetryBudgetPolicyConfig, NamedTimeoutHierarchyPolicyConfig, PolicyBindingConfig,
+    PolicyResourcesConfig,
 };
 pub use route::{RouteConfig, RouteMatchConfig};
 pub use security::{

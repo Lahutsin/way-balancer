@@ -1,29 +1,5 @@
 # GA Readiness Review Template
 
-## Evidence Inventory
-
-- `EVID-001`
-- `EVID-002`
-- `EVID-003`
-- `EVID-004`
-- `EVID-005`
-- `EVID-006`
-- `EVID-007`
-- `EVID-008`
-- `EVID-009`
-
-## Decision
-
-- `go`
-- `go_with_exceptions`
-- `no_go`
-
-## Notes
-
-- summarize release blockers, exceptions, and cache-specific operational guidance for the candidate
-
-# GA Readiness Review Template
-
 ## Release Summary
 
 - Release line:
@@ -42,6 +18,24 @@
 - `EVID-007` Provenance artifact location attached:
 - `EVID-008` Final review record completed:
 - `EVID-009` Stability contract reviewed and aligned with the candidate:
+- `EVID-010` Supported performance-envelope artifact attached when the candidate makes absolute capacity claims:
+
+## GA Exit Criteria
+
+- [ ] All required evidence artifacts are present, reproducible, and linked.
+- [ ] The intended deployment matches a supported topology in `docs/runbooks/support-boundaries.md`.
+- [ ] No unsupported override such as `security.insecure_dev_mode` is part of the candidate posture.
+- [ ] Stable versus experimental surfaces are aligned with `docs/runbooks/stability-contract.md`.
+- [ ] Capacity or failover claims are backed by the documented supported performance artifact when such claims appear in the release narrative.
+
+## Support-Boundary Review
+
+- Intended deployment topology:
+- Supported topology reference:
+- Protocol surfaces in scope:
+- Explicitly unsupported or deferred surfaces:
+- Failure-mode exceptions accepted for this candidate:
+- Performance artifact path, if required:
 
 ## Readiness Questions
 
@@ -50,6 +44,7 @@
 3. Can the product be restored after failure or compromise using the documented DR path?
 4. Are unresolved security exceptions documented with explicit acceptance?
 5. Is release metadata visible and aligned with the candidate under review?
+6. Does the intended deployment stay within the documented support boundaries?
 
 ## Decision
 

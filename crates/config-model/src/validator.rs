@@ -5,11 +5,11 @@ use serde::{Deserialize, Serialize};
 use crate::{
     AdminAuthPolicyConfig, AdminAuthorizationScopeConfig, AffinityPolicyConfig,
     AnonymousSourceFilterConfig, ArtifactVerificationMode, CacheKeyPolicyConfig,
-    HttpCachePolicyConfig, HttpCacheStorageConfig, ListenerAlpnProtocolConfig, ListenerClassConfig,
-    ListenerProtocolConfig, LocalConcurrencyLimitPolicyConfig, LocalLimitScopeConfig,
-    LocalRateLimitPolicyConfig, NamedOverloadResponsePolicyConfig, OverloadResponsePolicyConfig,
-    PolicyBindingConfig, PolicyResourcesConfig, RouteConfig, RouteMatchConfig,
-    TrustedClientIpConfig, WorkspaceConfig,
+    HostileEdgeProtectionPolicyConfig, HttpCachePolicyConfig, HttpCacheStorageConfig,
+    ListenerAlpnProtocolConfig, ListenerClassConfig, ListenerProtocolConfig,
+    LocalConcurrencyLimitPolicyConfig, LocalLimitScopeConfig, LocalRateLimitPolicyConfig,
+    NamedOverloadResponsePolicyConfig, OverloadResponsePolicyConfig, PolicyBindingConfig,
+    PolicyResourcesConfig, RouteConfig, RouteMatchConfig, TrustedClientIpConfig, WorkspaceConfig,
 };
 
 /// Stable validation error category.
@@ -984,6 +984,20 @@ fn validate_policy_binding(
         report,
     );
     validate_single_policy_ref(
+        binding.hostile_edge_protection.as_deref(),
+        &format!("{base_path}.hostile_edge_protection"),
+        "hostile-edge protection policy",
+        &registry.hostile_edge_protections,
+        report,
+    );
+    if binding.hostile_edge_protection.is_some() && !matches!(target, PolicyBindingTarget::Listener(_)) {
+        report.errors.push(ValidationError::semantic(
+            ValidationCode::InvalidPolicyScope,
+            format!("{base_path}.hostile_edge_protection"),
+            "hostile-edge protection policies may only be bound to listeners",
+        ));
+    }
+    validate_single_policy_ref(
         binding.cache_policy.as_deref(),
         &format!("{base_path}.cache_policy"),
         "http cache policy",
@@ -1151,6 +1165,7 @@ where
 struct PolicyRegistry {
     local_rate_limits: BTreeSet<String>,
     local_concurrency_limits: BTreeSet<String>,
+    hostile_edge_protections: BTreeSet<String>,
     retry_budgets: BTreeSet<String>,
     timeout_hierarchies: BTreeSet<String>,
     circuit_breakers: BTreeSet<String>,
@@ -1165,6 +1180,7 @@ impl PolicyRegistry {
         let mut registry = Self {
             local_rate_limits: BTreeSet::new(),
             local_concurrency_limits: BTreeSet::new(),
+            hostile_edge_protections: BTreeSet::new(),
             retry_budgets: BTreeSet::new(),
             timeout_hierarchies: BTreeSet::new(),
             circuit_breakers: BTreeSet::new(),
@@ -1176,6 +1192,7 @@ impl PolicyRegistry {
 
         validate_named_local_rate_limits(resources, &mut registry, report);
         validate_named_local_concurrency_limits(resources, &mut registry, report);
+        validate_named_hostile_edge_protections(resources, &mut registry, report);
         validate_named_retry_budgets(resources, &mut registry, report);
         validate_named_timeout_hierarchies(resources, &mut registry, report);
         validate_named_circuit_breakers(resources, &mut registry, report);
@@ -1371,6 +1388,24 @@ fn validate_named_local_concurrency_limits(
         );
         validate_concurrency_limit_policy(&policy.spec, &base_path, report);
         registry.concurrency_limit_scopes.insert(policy.name.clone(), policy.spec.scope.clone());
+    }
+}
+
+fn validate_named_hostile_edge_protections(
+    resources: &PolicyResourcesConfig,
+    registry: &mut PolicyRegistry,
+    report: &mut ValidationReport,
+) {
+    for (index, policy) in resources.hostile_edge_protections.iter().enumerate() {
+        let base_path = format!("policies.hostile_edge_protections[{index}]");
+        register_policy_name(
+            &policy.name,
+            &format!("{base_path}.name"),
+            "hostile-edge protection policy",
+            &mut registry.hostile_edge_protections,
+            report,
+        );
+        validate_hostile_edge_policy(&policy.spec, &base_path, report);
     }
 }
 
@@ -1582,6 +1617,40 @@ fn validate_overload_policy(
     }
 }
 
+fn validate_hostile_edge_policy(
+    policy: &HostileEdgeProtectionPolicyConfig,
+    base_path: &str,
+    report: &mut ValidationReport,
+) {
+    if policy.source_quota.is_none() && policy.handshake_guard.is_none() {
+        report.errors.push(ValidationError::schema(
+            ValidationCode::InvalidPolicyField,
+            format!("{base_path}.spec"),
+            "hostile-edge protection policy must enable at least one guard",
+        ));
+    }
+
+    if let Some(source_quota) = &policy.source_quota {
+        if source_quota.max_active_per_source == 0 || source_quota.max_tracked_sources == 0 {
+            report.errors.push(ValidationError::schema(
+                ValidationCode::InvalidPolicyField,
+                format!("{base_path}.spec.source_quota"),
+                "hostile-edge source quota must use non-zero max_active_per_source and max_tracked_sources",
+            ));
+        }
+    }
+
+    if let Some(handshake_guard) = &policy.handshake_guard {
+        if handshake_guard.max_inflight == 0 || handshake_guard.timeout_ms == 0 {
+            report.errors.push(ValidationError::schema(
+                ValidationCode::InvalidPolicyField,
+                format!("{base_path}.spec.handshake_guard"),
+                "hostile-edge handshake guard must use non-zero max_inflight and timeout_ms",
+            ));
+        }
+    }
+}
+
 fn register_policy_name(
     name: &str,
     path: &str,
@@ -1648,15 +1717,17 @@ mod tests {
     use crate::{
         AdminListenerPolicyConfig, AffinityFallbackConfig, AffinityPolicyConfig,
         AuthorizationCacheBehaviorConfig, CacheKeyPolicyConfig, CacheQueryKeyBehaviorConfig,
-        HttpCacheMethodConfig, HttpCachePolicyConfig, HttpCacheStorageConfig,
-        ListenerCertificateSourceConfig, ListenerClassConfig, ListenerResourceConfig,
-        ListenerTlsTerminationConfig, LocalConcurrencyLimitPolicyConfig, LocalLimitKeyKindConfig,
-        LocalLimitScopeConfig, LocalRateLimitPolicyConfig, NamedHttpCachePolicyConfig,
-        NamedLocalConcurrencyLimitPolicyConfig, NamedLocalRateLimitPolicyConfig,
-        NamedOverloadResponsePolicyConfig, NamedRetryBudgetPolicyConfig,
-        OverloadResponsePolicyConfig, PolicyBindingConfig, PolicyResourcesConfig, RouteConfig,
-        UpstreamClusterConfig, UpstreamEndpointConfig, UpstreamTrafficPolicyConfig,
-        WorkspaceConfig,
+        HostileEdgeHandshakeGuardConfig, HostileEdgeProtectionPolicyConfig,
+        HostileEdgeSourceQuotaConfig, HttpCacheMethodConfig, HttpCachePolicyConfig,
+        HttpCacheStorageConfig, ListenerCertificateSourceConfig, ListenerClassConfig,
+        ListenerResourceConfig, ListenerTlsTerminationConfig,
+        LocalConcurrencyLimitPolicyConfig, LocalLimitKeyKindConfig, LocalLimitScopeConfig,
+        LocalRateLimitPolicyConfig, NamedHostileEdgeProtectionPolicyConfig,
+        NamedHttpCachePolicyConfig, NamedLocalConcurrencyLimitPolicyConfig,
+        NamedLocalRateLimitPolicyConfig, NamedOverloadResponsePolicyConfig,
+        NamedRetryBudgetPolicyConfig, OverloadResponsePolicyConfig, PolicyBindingConfig,
+        PolicyResourcesConfig, RouteConfig, UpstreamClusterConfig, UpstreamEndpointConfig,
+        UpstreamTrafficPolicyConfig, WorkspaceConfig,
     };
 
     fn valid_workspace() -> Result<WorkspaceConfig, Box<dyn std::error::Error>> {
@@ -1729,6 +1800,7 @@ mod tests {
                         max_tracked_keys: 256,
                     },
                 }],
+                hostile_edge_protections: Vec::new(),
                 retry_budgets: vec![NamedRetryBudgetPolicyConfig {
                     name: String::from("standard-retry"),
                     spec: crate::RetryBudgetPolicyConfig {
@@ -1996,6 +2068,46 @@ mod tests {
         assert!(report.errors.iter().any(|error| {
             error.path == "policies.http_caches[0].spec.cache_key.headers[0]"
                 && error.code == ValidationCode::InvalidPolicyField
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn validator_rejects_empty_hostile_edge_policy() -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = valid_workspace()?;
+        config.listeners[0].policies.hostile_edge_protection = Some(String::from("edge-default"));
+        config.policies.hostile_edge_protections.push(NamedHostileEdgeProtectionPolicyConfig {
+            name: String::from("edge-default"),
+            spec: HostileEdgeProtectionPolicyConfig::default(),
+        });
+
+        let report = validate_workspace_config(&config);
+
+        assert!(report.errors.iter().any(|error| {
+            error.code == ValidationCode::InvalidPolicyField
+                && error.path == "policies.hostile_edge_protections[0].spec"
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn validator_rejects_hostile_edge_policy_bound_outside_listener(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = valid_workspace()?;
+        config.routes[0].policies.hostile_edge_protection = Some(String::from("edge-default"));
+        config.policies.hostile_edge_protections.push(NamedHostileEdgeProtectionPolicyConfig {
+            name: String::from("edge-default"),
+            spec: HostileEdgeProtectionPolicyConfig {
+                source_quota: Some(HostileEdgeSourceQuotaConfig::default()),
+                handshake_guard: Some(HostileEdgeHandshakeGuardConfig::default()),
+            },
+        });
+
+        let report = validate_workspace_config(&config);
+
+        assert!(report.errors.iter().any(|error| {
+            error.code == ValidationCode::InvalidPolicyScope
+                && error.path == "routes[0].policies.hostile_edge_protection"
         }));
         Ok(())
     }

@@ -42,14 +42,44 @@ subjects:
     name: lb-k8s-controller
     namespace: way-balancer-system
 ---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: lb-k8s-controller-leases
+  namespace: way-balancer-system
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources:
+      - leases
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: lb-k8s-controller-leases
+  namespace: way-balancer-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: lb-k8s-controller-leases
+subjects:
+  - kind: ServiceAccount
+    name: lb-k8s-controller
+    namespace: way-balancer-system
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: lb-k8s-controller
   namespace: way-balancer-system
 spec:
-  replicas: 1
+  replicas: 2
   revisionHistoryLimit: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
   selector:
     matchLabels:
       app.kubernetes.io/name: lb-k8s-controller
@@ -59,6 +89,7 @@ spec:
         app.kubernetes.io/name: lb-k8s-controller
     spec:
       serviceAccountName: lb-k8s-controller
+      terminationGracePeriodSeconds: 20
       containers:
         - name: controller
           image: ghcr.io/your-org/way-balancer-k8s-controller:0.1.0
@@ -78,6 +109,24 @@ spec:
               value: "250"
             - name: LB_K8S_CONTROLLER_MAX_REQUEUE_MS
               value: "30000"
+            - name: LB_K8S_CONTROLLER_LEADER_ELECTION
+              value: "true"
+            - name: LB_K8S_CONTROLLER_LEASE_NAME
+              value: lb-k8s-controller
+            - name: LB_K8S_CONTROLLER_LEASE_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: LB_K8S_CONTROLLER_IDENTITY
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: LB_K8S_CONTROLLER_LEASE_DURATION_MS
+              value: "15000"
+            - name: LB_K8S_CONTROLLER_RENEW_DEADLINE_MS
+              value: "10000"
+            - name: LB_K8S_CONTROLLER_RETRY_PERIOD_MS
+              value: "2000"
           resources:
             requests:
               cpu: 100m

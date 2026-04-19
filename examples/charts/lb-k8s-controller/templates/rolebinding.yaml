@@ -1,0 +1,17 @@
+{{- if .Values.rbac.create }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "lb-k8s-controller.fullname" . }}-leases
+  namespace: {{ default (include "lb-k8s-controller.namespace" .) .Values.controller.leaderElection.leaseNamespace }}
+  labels:
+    {{- include "lb-k8s-controller.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "lb-k8s-controller.fullname" . }}-leases
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "lb-k8s-controller.serviceAccountName" . }}
+    namespace: {{ include "lb-k8s-controller.namespace" . }}
+{{- end }}

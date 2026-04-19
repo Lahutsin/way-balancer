@@ -3,13 +3,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use lb_config_model::{
     verify_snapshot_artifact_integrity, ArtifactAttestation, ArtifactIntegrityError,
-    WorkspaceSnapshot,
+    SnapshotCompileError, WorkspaceSnapshot, WorkspaceSnapshotView,
 };
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 const SHA256_HEX_LEN: usize = 64;
 const MAX_VERSION_LEN: usize = 128;
 const MAX_ACTOR_LEN: usize = 128;
 const MAX_REASON_LEN: usize = 256;
+const SNAPSHOT_REGISTRY_STATE_VERSION: u32 = 1;
+const DEFAULT_MAX_PERSISTED_AUDIT_EVENTS: usize = 128;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotPublishRequest {
@@ -33,6 +37,50 @@ pub struct PublishedSnapshotRecord {
     pub snapshot: WorkspaceSnapshot,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublishedSnapshotRecordDurable {
+    pub version: String,
+    pub workspace_name: String,
+    pub digest_sha256: String,
+    pub artifact_attestation: Option<ArtifactAttestation>,
+    pub published_at_unix_ms: u64,
+    pub published_by: Option<String>,
+    pub reason: Option<String>,
+    pub snapshot: WorkspaceSnapshotView,
+}
+
+impl From<&PublishedSnapshotRecord> for PublishedSnapshotRecordDurable {
+    fn from(value: &PublishedSnapshotRecord) -> Self {
+        Self {
+            version: value.version.clone(),
+            workspace_name: value.workspace_name.clone(),
+            digest_sha256: value.digest_sha256.clone(),
+            artifact_attestation: value.artifact_attestation.clone(),
+            published_at_unix_ms: value.published_at_unix_ms,
+            published_by: value.published_by.clone(),
+            reason: value.reason.clone(),
+            snapshot: value.snapshot.view(),
+        }
+    }
+}
+
+impl PublishedSnapshotRecordDurable {
+    fn try_into_record(self) -> Result<PublishedSnapshotRecord, SnapshotRegistryStateError> {
+        let snapshot = WorkspaceSnapshot::from_view(self.snapshot)
+            .map_err(SnapshotRegistryStateError::SnapshotCompile)?;
+        Ok(PublishedSnapshotRecord {
+            version: self.version,
+            workspace_name: self.workspace_name,
+            digest_sha256: self.digest_sha256,
+            artifact_attestation: self.artifact_attestation,
+            published_at_unix_ms: self.published_at_unix_ms,
+            published_by: self.published_by,
+            reason: self.reason,
+            snapshot,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublishedSnapshotSummary {
     pub version: String,
@@ -54,7 +102,7 @@ impl From<&PublishedSnapshotRecord> for PublishedSnapshotSummary {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PublishResponseKind {
     Published,
     Unchanged,
@@ -66,14 +114,14 @@ pub struct PublishResponse {
     pub record: PublishedSnapshotRecord,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PublishEventKind {
     Published,
     Unchanged,
     Rejected,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PublishEvent {
     pub kind: PublishEventKind,
     pub version: String,
@@ -99,6 +147,76 @@ pub struct SnapshotRegistryMetrics {
 pub struct SnapshotBackupBundle {
     pub exported_at_unix_ms: u64,
     pub records: Vec<PublishedSnapshotRecord>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotRegistryRetentionPolicy {
+    pub max_audit_events: usize,
+}
+
+impl Default for SnapshotRegistryRetentionPolicy {
+    fn default() -> Self {
+        Self { max_audit_events: DEFAULT_MAX_PERSISTED_AUDIT_EVENTS }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotRegistryDurableState {
+    pub records: Vec<PublishedSnapshotRecordDurable>,
+    pub audit_events: Vec<PublishEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotRegistryDurableEnvelope {
+    pub version: u32,
+    pub payload_json: String,
+    pub payload_sha256: String,
+}
+
+#[derive(Debug)]
+pub enum SnapshotRegistryStateError {
+    Serialize(serde_json::Error),
+    Deserialize(serde_json::Error),
+    UnsupportedVersion(u32),
+    ChecksumMismatch,
+    SnapshotCompile(SnapshotCompileError),
+    Publication(SnapshotPublicationError),
+}
+
+impl std::fmt::Display for SnapshotRegistryStateError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Serialize(error) => {
+                write!(formatter, "failed to serialize snapshot registry state: {error}")
+            }
+            Self::Deserialize(error) => {
+                write!(formatter, "failed to deserialize snapshot registry state: {error}")
+            }
+            Self::UnsupportedVersion(version) => {
+                write!(formatter, "unsupported snapshot registry state version: {version}")
+            }
+            Self::ChecksumMismatch => {
+                write!(formatter, "snapshot registry state checksum validation failed")
+            }
+            Self::SnapshotCompile(error) => {
+                write!(formatter, "failed to rehydrate snapshot registry state: {error}")
+            }
+            Self::Publication(error) => {
+                write!(formatter, "snapshot registry state restore failed: {error}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SnapshotRegistryStateError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Serialize(error) | Self::Deserialize(error) => Some(error),
+            Self::SnapshotCompile(error) => Some(error),
+            Self::Publication(error) => Some(error),
+            Self::UnsupportedVersion(_) | Self::ChecksumMismatch => None,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -447,6 +565,68 @@ impl SnapshotControlService {
         Ok(service)
     }
 
+    pub fn export_durable_state(
+        &self,
+    ) -> Result<SnapshotRegistryDurableEnvelope, SnapshotRegistryStateError> {
+        self.export_durable_state_with_retention(SnapshotRegistryRetentionPolicy::default())
+    }
+
+    pub fn export_durable_state_with_retention(
+        &self,
+        retention: SnapshotRegistryRetentionPolicy,
+    ) -> Result<SnapshotRegistryDurableEnvelope, SnapshotRegistryStateError> {
+        let payload = SnapshotRegistryDurableState {
+            records: self
+                .history
+                .iter()
+                .filter_map(|version| self.records_by_version.get(version))
+                .map(PublishedSnapshotRecordDurable::from)
+                .collect(),
+            audit_events: prune_publish_events(&self.audit_events, retention.max_audit_events),
+        };
+        let payload_json =
+            serde_json::to_string_pretty(&payload).map_err(SnapshotRegistryStateError::Serialize)?;
+        Ok(SnapshotRegistryDurableEnvelope {
+            version: SNAPSHOT_REGISTRY_STATE_VERSION,
+            payload_sha256: sha256_hex(payload_json.as_bytes()),
+            payload_json,
+        })
+    }
+
+    pub fn restore_durable_state(
+        envelope: &SnapshotRegistryDurableEnvelope,
+    ) -> Result<Self, SnapshotRegistryStateError> {
+        Self::restore_durable_state_with_retention(
+            envelope,
+            SnapshotRegistryRetentionPolicy::default(),
+        )
+    }
+
+    pub fn restore_durable_state_with_retention(
+        envelope: &SnapshotRegistryDurableEnvelope,
+        retention: SnapshotRegistryRetentionPolicy,
+    ) -> Result<Self, SnapshotRegistryStateError> {
+        if envelope.version != SNAPSHOT_REGISTRY_STATE_VERSION {
+            return Err(SnapshotRegistryStateError::UnsupportedVersion(envelope.version));
+        }
+        if sha256_hex(envelope.payload_json.as_bytes()) != envelope.payload_sha256 {
+            return Err(SnapshotRegistryStateError::ChecksumMismatch);
+        }
+
+        let payload: SnapshotRegistryDurableState = serde_json::from_str(&envelope.payload_json)
+            .map_err(SnapshotRegistryStateError::Deserialize)?;
+        let mut service = Self::new();
+        for record in payload.records {
+            service
+                .restore_record(record.try_into_record()?)
+                .map_err(SnapshotRegistryStateError::Publication)?;
+        }
+        service.audit_events = prune_publish_events(&payload.audit_events, retention.max_audit_events);
+        service.metrics.restore_success_count = service.metrics.restore_success_count.saturating_add(1);
+        service.metrics.active_registry_size = service.records_by_version.len();
+        Ok(service)
+    }
+
     #[must_use]
     pub fn list_versions(&self) -> Vec<PublishedSnapshotSummary> {
         self.history
@@ -485,6 +665,42 @@ impl SnapshotControlService {
     #[must_use]
     pub const fn metrics(&self) -> SnapshotRegistryMetrics {
         self.metrics
+    }
+
+    fn restore_record(
+        &mut self,
+        record: PublishedSnapshotRecord,
+    ) -> Result<(), SnapshotPublicationError> {
+        validate_publish_request(&SnapshotPublishRequest {
+            version: record.version.clone(),
+            snapshot: record.snapshot.clone(),
+            artifact_attestation: record.artifact_attestation.clone(),
+            expected_digest_sha256: Some(record.digest_sha256.clone()),
+            published_by: record.published_by.clone(),
+            reason: record.reason.clone(),
+        })
+        .map_err(SnapshotPublicationError::InvalidRequest)?;
+
+        if let Some(existing) = self.records_by_version.get(&record.version) {
+            return Err(SnapshotPublicationError::Conflict(PublishConflict::VersionAlreadyExists {
+                version: existing.version.clone(),
+                existing_digest_sha256: existing.digest_sha256.clone(),
+            }));
+        }
+        if let Some(existing_version) = self.version_by_digest.get(&record.digest_sha256) {
+            return Err(SnapshotPublicationError::Conflict(PublishConflict::DigestAlreadyPublished {
+                digest_sha256: record.digest_sha256.clone(),
+                existing_version: existing_version.clone(),
+            }));
+        }
+
+        self.version_by_digest
+            .insert(record.digest_sha256.clone(), record.version.clone());
+        self.history.push(record.version.clone());
+        self.records_by_version.insert(record.version.clone(), record);
+        self.metrics.published_versions_count = self.records_by_version.len().try_into().unwrap_or(u64::MAX);
+        self.metrics.active_registry_size = self.records_by_version.len();
+        Ok(())
     }
 
     fn push_event(
@@ -572,6 +788,20 @@ fn is_lower_hex_digest(value: &str) -> bool {
         && value.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
+fn prune_publish_events(events: &[PublishEvent], max_audit_events: usize) -> Vec<PublishEvent> {
+    if max_audit_events == 0 {
+        return Vec::new();
+    }
+    let keep_from = events.len().saturating_sub(max_audit_events);
+    events[keep_from..].to_vec()
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
+}
+
 #[cfg(test)]
 mod tests {
     use lb_config_model::WorkspaceConfig;
@@ -580,7 +810,8 @@ mod tests {
     use super::{
         InvalidPublishRequest, PublishEventKind, PublishResponseKind, SnapshotBackupBundle,
         SnapshotControlService, SnapshotLookupError, SnapshotPublicationError,
-        SnapshotPublishRequest, SnapshotRestoreError,
+        SnapshotPublishRequest, SnapshotRegistryDurableEnvelope,
+        SnapshotRegistryRetentionPolicy, SnapshotRegistryStateError, SnapshotRestoreError,
     };
 
     fn foundation_snapshot(
@@ -902,6 +1133,150 @@ mod tests {
                 )
             )))
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn durable_state_round_trip_preserves_registry_and_audit_history(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let stable_snapshot = named_snapshot("stable-durable")?;
+        let canary_snapshot = named_snapshot("canary-durable")?;
+
+        let mut service = SnapshotControlService::new();
+        service.publish_at(
+            SnapshotPublishRequest {
+                version: String::from("stable-durable-v1"),
+                snapshot: stable_snapshot.clone(),
+                artifact_attestation: Some(test_artifact_attestation(&stable_snapshot)?),
+                expected_digest_sha256: Some(stable_snapshot.metadata().digest_sha256().to_owned()),
+                published_by: Some(String::from("ops")),
+                reason: Some(String::from("stable seed")),
+            },
+            100,
+        )?;
+        service.publish_at(
+            SnapshotPublishRequest {
+                version: String::from("canary-durable-v1"),
+                snapshot: canary_snapshot.clone(),
+                artifact_attestation: Some(test_artifact_attestation(&canary_snapshot)?),
+                expected_digest_sha256: Some(canary_snapshot.metadata().digest_sha256().to_owned()),
+                published_by: Some(String::from("ops")),
+                reason: Some(String::from("canary seed")),
+            },
+            200,
+        )?;
+
+        let envelope = service.export_durable_state()?;
+        let restored = SnapshotControlService::restore_durable_state(&envelope)?;
+
+        assert_eq!(restored.list_versions().len(), 2);
+        assert_eq!(restored.audit_events().len(), 2);
+        assert_eq!(restored.audit_events()[0].kind, PublishEventKind::Published);
+        assert_eq!(restored.audit_events()[1].kind, PublishEventKind::Published);
+        assert_eq!(
+            restored.get_version("stable-durable-v1")?.digest_sha256,
+            stable_snapshot.metadata().digest_sha256()
+        );
+        assert_eq!(
+            restored.get_version("canary-durable-v1")?.digest_sha256,
+            canary_snapshot.metadata().digest_sha256()
+        );
+        assert_eq!(restored.metrics().restore_success_count, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn durable_state_restore_rejects_checksum_mismatch(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let snapshot = foundation_snapshot()?;
+        let mut service = SnapshotControlService::new();
+        service.publish_at(
+            SnapshotPublishRequest {
+                version: String::from("checksum-v1"),
+                snapshot: snapshot.clone(),
+                artifact_attestation: Some(test_artifact_attestation(&snapshot)?),
+                expected_digest_sha256: Some(snapshot.metadata().digest_sha256().to_owned()),
+                published_by: Some(String::from("ops")),
+                reason: Some(String::from("checksum seed")),
+            },
+            100,
+        )?;
+
+        let mut envelope = service.export_durable_state()?;
+        envelope.payload_sha256 = String::from("deadbeef");
+
+        let result = SnapshotControlService::restore_durable_state(&envelope);
+        assert!(matches!(result, Err(SnapshotRegistryStateError::ChecksumMismatch)));
+        Ok(())
+    }
+
+    #[test]
+    fn durable_state_export_prunes_audit_history_by_retention(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let stable_snapshot = named_snapshot("stable-prune")?;
+        let canary_snapshot = named_snapshot("canary-prune")?;
+        let mut service = SnapshotControlService::new();
+
+        service.publish_at(
+            SnapshotPublishRequest {
+                version: String::from("stable-prune-v1"),
+                snapshot: stable_snapshot.clone(),
+                artifact_attestation: Some(test_artifact_attestation(&stable_snapshot)?),
+                expected_digest_sha256: Some(stable_snapshot.metadata().digest_sha256().to_owned()),
+                published_by: Some(String::from("ops")),
+                reason: Some(String::from("stable seed")),
+            },
+            100,
+        )?;
+        let duplicate = service.publish_at(
+            SnapshotPublishRequest {
+                version: String::from("stable-prune-v1"),
+                snapshot: stable_snapshot.clone(),
+                artifact_attestation: Some(test_artifact_attestation(&stable_snapshot)?),
+                expected_digest_sha256: Some(stable_snapshot.metadata().digest_sha256().to_owned()),
+                published_by: Some(String::from("ops")),
+                reason: Some(String::from("stable seed")),
+            },
+            150,
+        )?;
+        assert_eq!(duplicate.kind, PublishResponseKind::Unchanged);
+        service.publish_at(
+            SnapshotPublishRequest {
+                version: String::from("canary-prune-v1"),
+                snapshot: canary_snapshot.clone(),
+                artifact_attestation: Some(test_artifact_attestation(&canary_snapshot)?),
+                expected_digest_sha256: Some(canary_snapshot.metadata().digest_sha256().to_owned()),
+                published_by: Some(String::from("ops")),
+                reason: Some(String::from("canary seed")),
+            },
+            200,
+        )?;
+
+        let envelope = service.export_durable_state_with_retention(SnapshotRegistryRetentionPolicy {
+            max_audit_events: 2,
+        })?;
+        let restored = SnapshotControlService::restore_durable_state_with_retention(
+            &envelope,
+            SnapshotRegistryRetentionPolicy { max_audit_events: 2 },
+        )?;
+
+        assert_eq!(restored.list_versions().len(), 2);
+        assert_eq!(restored.audit_events().len(), 2);
+        assert_eq!(restored.audit_events()[0].kind, PublishEventKind::Unchanged);
+        assert_eq!(restored.audit_events()[1].kind, PublishEventKind::Published);
+        Ok(())
+    }
+
+    #[test]
+    fn durable_state_restore_rejects_unsupported_version() -> Result<(), Box<dyn std::error::Error>> {
+        let envelope = SnapshotRegistryDurableEnvelope {
+            version: 999,
+            payload_json: String::from("{}"),
+            payload_sha256: String::from("deadbeef"),
+        };
+
+        let result = SnapshotControlService::restore_durable_state(&envelope);
+        assert!(matches!(result, Err(SnapshotRegistryStateError::UnsupportedVersion(999))));
         Ok(())
     }
 }

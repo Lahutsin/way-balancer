@@ -30,6 +30,38 @@ This runbook summarizes the current edge and control-plane hardening posture for
 - Snapshot publication and application require artifact attestation verification when security posture is enforced.
 - Disabling artifact verification requires explicit insecure-dev acknowledgement.
 - Privileged control-plane channels require peer certificate validation and optional identity pinning.
+- Admin-plane credentials support file-backed secret rotation through `<SECRET_ENV>_FILE` without exposing secret contents in status, logs, or audit payloads.
+- HTTPS listener status now exposes certificate fingerprints, validity bounds, expiry-warning state, minimum TLS version, ALPN policy, and session resumption mode so operators can verify live TLS posture without shelling into the pod.
+
+## Hostile-Edge Listener Protections
+
+- Public and admin listeners can now attach named `policies.hostile_edge_protections` resources through `listeners[].policies.hostile_edge_protection`.
+- `source_quota` applies fail-closed per-source admission fairness before a connection can consume steady-state listener capacity.
+- `handshake_guard` caps in-flight protected handshakes so slow or abusive connection setup cannot starve healthy clients.
+- Protected listeners expose a first-class `abuse_protection` block in `GET /status` with configured limits, current tracked-source and handshake pressure, cumulative rejection counters, and stable reason codes.
+- `GET /readyz` remains ready during normal enforcement, but reports not-ready when hostile-edge state is currently saturated enough to stop admitting new tracked sources or new protected handshakes.
+
+## Stable Hostile-Edge Reason Codes
+
+- `source_quota_exceeded`: a source bucket hit its configured active-connection ceiling.
+- `tracked_source_limit_reached`: the listener exhausted bounded tracking state for distinct sources.
+- `handshake_limit_reached`: the listener exhausted the configured in-flight handshake budget.
+- `tracked_source_capacity_saturated`: status/readiness indicator showing the source-tracking pool is currently full.
+- `handshake_guard_saturated`: status/readiness indicator showing the handshake guard is currently at capacity.
+
+## Metrics And Status Surfaces
+
+- `runtime_listener_abuse_rejections_total{listener,reason}` counts hostile-edge listener rejections by stable reason code.
+- `runtime_listener_abuse_tracked_sources{listener}` reports the current number of tracked hostile-edge source buckets.
+- `runtime_listener_abuse_active_handshakes{listener}` reports the current protected handshake concurrency.
+- HTTP/1 and admin listeners return `503 Service Unavailable` with `X-LB-Abuse-Reason` when hostile-edge admission rejects the connection before proxying.
+
+## Tuning Notes
+
+- Keep `max_tracked_sources` comfortably above expected distinct healthy source cardinality so enforcement remains focused on abuse rather than normal fan-in.
+- Set `max_active_per_source` low enough to preserve fairness, but high enough for legitimate client retry bursts and shared egress NATs.
+- Reserve `handshake_guard.max_inflight` for listeners that terminate TLS or otherwise spend meaningful work in early connection setup.
+- Prefer tightening source aggregation and quotas over raising global `max_connections` when healthy traffic is being crowded out by a small number of sources.
 
 ## Focused Validation
 
@@ -38,7 +70,9 @@ Security-sensitive regression coverage currently includes:
 - `cargo test -p lb-proto-http`
 - `cargo test -p lb-runtime --test http1_proxy`
 - `cargo test -p lb-runtime --test http2_proxy`
+- `cargo test -p lb-runtime --test source_guards`
 - `cargo test -p lb-runtime --test telemetry`
 - `cargo test -p lb-runtime --test tracing`
+- `cargo test -p lb-dataplane workspace_serve -- --nocapture`
 
 These suites cover malformed parser shapes, forwarding-header trust, cache fail-closed behavior, and control-plane trust primitives.

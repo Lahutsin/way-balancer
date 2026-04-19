@@ -49,6 +49,7 @@ Smoke-test the running stack:
 ```sh
 curl http://localhost:8080/
 curl -H "Authorization: Bearer $LB_CTL_ADMIN_SECRET" http://localhost:9900/healthz
+curl -H "Authorization: Bearer $LB_CTL_ADMIN_SECRET" http://localhost:9900/readyz
 curl -H "Authorization: Bearer $LB_CTL_ADMIN_SECRET" http://localhost:9900/status
 curl -H "Authorization: Bearer $LB_CTL_ADMIN_SECRET" http://localhost:9900/validate
 curl -H "Authorization: Bearer $LB_CTL_ADMIN_SECRET" http://localhost:9900/audit

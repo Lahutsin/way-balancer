@@ -3,8 +3,8 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{
-    HttpCacheInvalidationDeliveryMode, HttpCachePeerConfig, HttpCachePeerTransport,
-    InvalidHttpCachePeerConfig,
+    HttpCacheInvalidationDeliveryMode, HttpCachePeerConfig, HttpCachePeerRetryPolicy,
+    HttpCachePeerTransport, InvalidHttpCachePeerConfig,
 };
 
 const MAX_SCOPE_LEN: usize = lb_runtime::HTTP_CACHE_INVALIDATION_MAX_SCOPE_LEN;
@@ -262,8 +262,22 @@ impl HttpCacheAdminService {
         node_id: impl Into<String>,
         peers: impl IntoIterator<Item = HttpCachePeerConfig>,
     ) -> Result<Self, HttpCachePurgeError> {
-        let transport =
-            HttpCachePeerTransport::new(peers).map_err(HttpCachePurgeError::InvalidPeerConfig)?;
+        self.with_http_peer_transport_and_retry_policy(
+            node_id,
+            peers,
+            HttpCachePeerRetryPolicy::default(),
+        )
+    }
+
+    pub fn with_http_peer_transport_and_retry_policy(
+        self,
+        node_id: impl Into<String>,
+        peers: impl IntoIterator<Item = HttpCachePeerConfig>,
+        retry_policy: HttpCachePeerRetryPolicy,
+    ) -> Result<Self, HttpCachePurgeError> {
+        let transport = HttpCachePeerTransport::new(peers)
+            .map_err(HttpCachePurgeError::InvalidPeerConfig)?
+            .with_retry_policy(retry_policy);
         Ok(self.with_invalidation_transport(
             node_id,
             Arc::new(transport),

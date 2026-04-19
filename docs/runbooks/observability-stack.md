@@ -11,6 +11,14 @@ This runbook defines the operator-facing telemetry contract for the runtime obse
 - Log labels are bounded and sanitized through `lb_observability::TelemetryLabel` and `TelemetryLabelKey`.
 - Correlation fields use normalized `correlation_id`, `trace_id`, and `span_id` values.
 
+## Probe Semantics
+
+- `GET /healthz` is a liveness probe only. It confirms the process is alive and the admin listener can answer.
+- `GET /readyz` is the serving-readiness probe. It returns machine-readable JSON and reports whether the instance should receive new traffic.
+- Readiness currently rolls up the public listener set when public listeners exist. It becomes not ready when there are no serving listeners, when a relevant listener is draining or otherwise not running, when a relevant listener is in unsafe overload states such as `shedding` or `brownout`, or when the last reload attempt is still in a failed state.
+- `GET /status` includes the same rolled-up readiness object plus listener-by-listener lifecycle and overload detail.
+- `GET /status` also exposes bounded reload timing metrics: `reload_total_duration_ms`, `reload_max_duration_ms`, `reload_last_duration_ms`, `reload_last_success_duration_ms`, and `reload_last_failure_duration_ms`.
+
 ## Metrics Contract
 
 The runtime exports Prometheus text via `RuntimeTelemetry::export_metrics()`.

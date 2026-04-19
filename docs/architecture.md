@@ -15,6 +15,7 @@ flowchart LR
         ctl --> admin_api[crates/admin-api]
         k8s_integration --> config_model[crates/config-model]
         admin_api --> config_model
+        admin_api --> fleet[Fleet rollout coordination\nbounded eventual convergence]
         config_model --> snapshot[Validated config snapshot\ncompile digest diff]
         config_model --> safety[Config safety preview\nvalidate warnings apply strategy]
     end
@@ -30,7 +31,8 @@ flowchart LR
         runtime --> cache[HTTP cache\nrevalidate purge invalidate]
         runtime --> protection[Overload limits breakers\nsource and protocol protection]
         selection --> upstreams[Upstream clusters and services]
-        cache --> peers[Peer invalidation\nfan-out delivery]
+        cache --> peers[Peer invalidation\nretry-aware fan-out delivery]
+        fleet --> dataplane
     end
 
     proto_http[crates/proto-http]
@@ -52,7 +54,7 @@ flowchart LR
 ### Control Plane
 
 - `crates/config-model` defines the typed workspace schema and validation rules
-- `crates/admin-api` provides snapshot publication, rollout, rollback, auth, audit, and cache-admin building blocks
+- `crates/admin-api` provides snapshot publication, single-node and fleet rollout or rollback, auth, audit, cache-admin building blocks, and checksummed durable snapshot-registry export or restore primitives
 - `crates/k8s-integration` translates Kubernetes Gateway API inputs into runtime config shapes
 
 ### Dataplane
@@ -72,6 +74,7 @@ flowchart LR
 - admin listeners expose privileged control endpoints such as `healthz`, `status`, `validate`, `audit`, `reload`, `cache/purge`, and `cache/invalidate`
 - snapshots compile and validate before activation, allowing preview and rollback workflows
 - cache invalidation and sticky-session affinity are runtime features, but both are driven by typed configuration and bounded operator controls
+- active-active fleets are supported through explicit bounded-eventual coordination and visibility rather than hidden distributed consensus inside the dataplane
 - security posture is explicit: artifact verification, source filtering, auth policy, and bounded runtime behavior are all modeled in configuration or runbooks
 
 ## Runtime Concerns

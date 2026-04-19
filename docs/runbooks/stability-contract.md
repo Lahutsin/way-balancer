@@ -21,6 +21,7 @@ The following surfaces are considered stable within `0.1.x` unless this document
 - compiled snapshot publication, attestation, rollout, and rollback flows
 - operator runbooks referenced by release evidence and runtime metadata
 - admin and dataplane behaviors already documented as required production workflows
+- the versioned `/v1/*` admin API envelope, stable error-code taxonomy, and additive machine-readable status fields documented in `docs/admin-api.md`
 
 Stable means:
 
@@ -46,6 +47,7 @@ Stable means:
 - Canonical runbooks referenced by release evidence are part of the supported operator surface.
 - Documented command workflows and release gates must stay reproducible through repository automation.
 - Paths surfaced by `RuntimeMetadata` are release artifacts and must remain accurate for the current line.
+- The unversioned admin endpoints remain compatibility shims for existing tooling, while the documented `/v1/*` admin API is the stable automation contract for the current release line.
 
 ## Experimental Surfaces
 
@@ -53,9 +55,16 @@ Experimental means the surface may change without backward-compatibility guarant
 
 Current experimental categories in `0.1.x`:
 
-- local performance-envelope numbers produced by loopback harnesses: stable as regression tools, experimental as absolute capacity claims across environments
+- loopback performance-envelope artifacts under `loopback_regression_v1`: stable as regression tools, experimental as absolute capacity claims across environments
 - any insecure-development override such as `security.insecure_dev_mode`: explicitly not a supported production contract
 - future or placeholder schema branches not referenced by `RuntimeMetadata` or release-evidence hooks
+
+Supported performance-envelope claims are promoted out of this experimental set only when all of these are true:
+
+- the artifact uses a named supported deployment profile such as `lab_small_non_loopback_v1`
+- the artifact records the documented host, network, TLS, and hostile-edge assumptions
+- the artifact includes required reload and failover timing evidence
+- the artifact passes the profile threshold checks and is stored in the release-evidence location under `artifacts/performance-envelope/`
 
 When promoting a surface from experimental to stable, update this document, the relevant runbook, and any release checks that enforce the artifact.
 
@@ -67,6 +76,8 @@ Deprecations within a supported release line must follow all of these rules:
 2. The deprecated surface must remain available for the rest of the current release line unless retaining it would create an unacceptable security risk.
 3. Operator-facing docs must state the preferred replacement and expected removal point.
 4. Release evidence and compatibility docs must be updated before removal lands.
+
+For the admin API specifically, additive fields may be introduced within `/v1/*`, but existing documented fields and error codes must not change meaning silently within `0.1.x`.
 
 For security-driven removals, document the risk and treat the change through the breaking-change process below.
 

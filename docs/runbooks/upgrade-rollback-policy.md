@@ -1,23 +1,5 @@
 # Upgrade and Rollback Policy
 
-## Upgrade Flow
-
-- validate config and publish an attested snapshot
-- roll out to one environment slice first
-- confirm cache hit, miss, purge, and revalidation telemetry remains stable
-- continue wider rollout only after observability and support-bundle checks pass
-
-## Rollback Flow
-
-- prefer snapshot rollback to the last known-good version rather than ad hoc config edits
-- use purge only for cache-content correction, not as a substitute for runtime rollback
-- verify post-rollback cache behavior and listener health before resuming rollout
-
-## Validation References
-
-- `upgrade_rollback_smoke`
-- `insecure_dev_mode` remains development-only and must not be used to bypass production artifact verification# Upgrade and Rollback Policy
-
 ## Preconditions
 
 - Use a workspace release from the supported `0.1.x` line.
@@ -33,6 +15,7 @@
 4. Confirm dataplane activation succeeded and the active digest matches the published digest.
 5. For config-driven listener changes, inspect `GET /status` until each affected listener reports `replacement.state = stable` and no unexpected `draining` entries remain.
 6. Record the upgrade outcome in release evidence.
+7. For active-active fleets, use `FleetRolloutCoordinator` and do not declare success until the fleet convergence report is `converged`.
 
 ## Rollback Flow
 
@@ -41,6 +24,21 @@
 3. Confirm the active digest returned to the known-good digest.
 4. Inspect `GET /audit` for the rollback request so the start and completion or failure outcome is preserved alongside the failed candidate.
 5. Keep the failed candidate in audit history for investigation.
+6. For active-active fleets, prefer a whole-fleet rollback to a shared known-good version instead of leaving a mixed-version steady state in place.
+
+For admin-driven config rollback, also confirm `GET /status` reports the expected `last_reload_outcome_code` and that `GET /audit` records matching reload lifecycle `code` values. That keeps rollback verification machine-readable.
+
+If the instance recently recovered from crash and `GET /status` still reports `control_plane_journal.recovery.state = needs_operator_action`, do not treat rollback or rollout as fully closed until a clean follow-up reload moves that recovery state to `resolved`.
+
+If snapshot publication state itself must survive process restart before rollout resumes, export and restore the checksummed registry envelope through `SnapshotControlService::export_durable_state` and `SnapshotControlService::restore_durable_state`. That keeps published versions, digests, and bounded publish audit history stable across crash recovery instead of relying only on live in-memory registry state.
+
+## Multi-Node Rollout Rules
+
+- Treat fleet consistency as `bounded_eventual`, not instantaneous.
+- `immediate` rollout is appropriate only when operators are prepared to handle degraded partial convergence explicitly.
+- `sequential` or `canary` rollout is the safer default for higher-risk config changes.
+- If the fleet report reaches `degraded`, remediate unreachable or failed nodes before continuing wider rollout.
+- If the fleet report reaches `diverged`, prefer a fleet rollback instead of waiting indefinitely.
 
 ## Validation Hooks
 
@@ -59,6 +57,7 @@
 - Digest mismatch or missing attestation blocks rollout before activation.
 - Activation failures keep the previous last-known-good snapshot available for rollback.
 - Supported listener replacements stay rollback-safe because failed replacement startup preserves the prior active listener and surfaces the failure in `GET /status` and `GET /audit`.
+- A reload that ends with `reload_applied_overlap_drain_timeout` should be treated as degraded success: the new listener stayed active, but the old draining listener exceeded its configured drain timeout and requires follow-up.
 - Any accepted dependency advisory or tooling gap must be recorded in the release evidence package.
 
 ## Release Gate Reference

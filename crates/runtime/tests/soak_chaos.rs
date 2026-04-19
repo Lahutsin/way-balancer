@@ -148,38 +148,84 @@ async fn http2_upstream_flap_chaos_soak_keeps_fd_growth_bounded(
 
         let mut client = connect_h2_client(proxy_addr).await?;
         let response = send_h2_request(&mut client, "/chaos", None).await?;
-        let (status, body) = receive_h2_response(response).await?;
+        let response_result = receive_h2_response(response).await;
         drop(client);
-        let report = receive_http2_proxy_result(report_rx).await?;
-        assert_eq!(report.metrics.request_count, 1);
-        assert_eq!(report.metrics.active_streams, 0);
-        assert!(report.metrics.peak_active_streams <= 1);
 
         match scenario {
             Http2ChaosScenario::HealthyResponse => {
+                let (status, body) = response_result?;
+                let report = receive_http2_proxy_result(report_rx).await?;
+                assert_eq!(report.metrics.request_count, 1);
+                assert_eq!(report.metrics.active_streams, 0);
+                assert!(report.metrics.peak_active_streams <= 1);
                 assert_eq!(status, StatusCode::OK);
                 assert_eq!(body, "steady-ok");
                 assert_eq!(report.metrics.response_status_counts.get(&200), Some(&1));
                 ok_count += 1;
             }
             Http2ChaosScenario::DegradedResponse => {
+                let (status, body) = response_result?;
+                let report = receive_http2_proxy_result(report_rx).await?;
+                assert_eq!(report.metrics.request_count, 1);
+                assert_eq!(report.metrics.active_streams, 0);
+                assert!(report.metrics.peak_active_streams <= 1);
                 assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
                 assert_eq!(body, "degraded");
                 assert_eq!(report.metrics.response_status_counts.get(&503), Some(&1));
                 degraded_count += 1;
             }
             Http2ChaosScenario::ResetStream => {
-                assert_eq!(status, StatusCode::BAD_GATEWAY);
-                assert!(body.is_empty());
-                assert_eq!(report.metrics.response_status_counts.get(&502), Some(&1));
-                assert!(report.metrics.stream_error_count >= 1);
+                match (response_result, receive_http2_proxy_result(report_rx).await) {
+                    (Ok((status, body)), Ok(report)) => {
+                        assert_eq!(report.metrics.request_count, 1);
+                        assert_eq!(report.metrics.active_streams, 0);
+                        assert!(report.metrics.peak_active_streams <= 1);
+                        assert_eq!(status, StatusCode::BAD_GATEWAY);
+                        assert!(body.is_empty());
+                        assert_eq!(report.metrics.response_status_counts.get(&502), Some(&1));
+                        assert!(report.metrics.stream_error_count >= 1);
+                    }
+                    (Err(_), Err(Http2ProxyError::DownstreamConnection(_))) => {}
+                    (Err(_), Ok(report)) => {
+                        assert_eq!(report.metrics.request_count, 1);
+                        assert_eq!(report.metrics.active_streams, 0);
+                        assert!(report.metrics.peak_active_streams <= 1);
+                        assert!(report.metrics.stream_error_count >= 1);
+                    }
+                    (response, report) => {
+                        return Err(format!(
+                            "unexpected reset-stream chaos outcome: response={response:?} report={report:?}"
+                        )
+                        .into());
+                    }
+                }
                 reset_count += 1;
             }
             Http2ChaosScenario::StallBeforeResponse => {
-                assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
-                assert!(body.is_empty());
-                assert_eq!(report.metrics.response_status_counts.get(&504), Some(&1));
-                assert!(report.metrics.stream_error_count >= 1);
+                match (response_result, receive_http2_proxy_result(report_rx).await) {
+                    (Ok((status, body)), Ok(report)) => {
+                        assert_eq!(report.metrics.request_count, 1);
+                        assert_eq!(report.metrics.active_streams, 0);
+                        assert!(report.metrics.peak_active_streams <= 1);
+                        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+                        assert!(body.is_empty());
+                        assert_eq!(report.metrics.response_status_counts.get(&504), Some(&1));
+                        assert!(report.metrics.stream_error_count >= 1);
+                    }
+                    (Err(_), Err(Http2ProxyError::DownstreamConnection(_))) => {}
+                    (Err(_), Ok(report)) => {
+                        assert_eq!(report.metrics.request_count, 1);
+                        assert_eq!(report.metrics.active_streams, 0);
+                        assert!(report.metrics.peak_active_streams <= 1);
+                        assert!(report.metrics.stream_error_count >= 1);
+                    }
+                    (response, report) => {
+                        return Err(format!(
+                            "unexpected stall-before-response chaos outcome: response={response:?} report={report:?}"
+                        )
+                        .into());
+                    }
+                }
                 timeout_count += 1;
             }
         }

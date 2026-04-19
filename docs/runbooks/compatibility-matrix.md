@@ -1,25 +1,5 @@
 # Compatibility Matrix
 
-## Supported Runtime Surfaces
-
-- typed `WorkspaceConfig` snapshots using `api_version: v1_alpha1`
-- runtime dataplane activation through published, attested snapshots
-- shared HTTP cache policies configured through `policies.http_caches`
-- opt-in upstream affinity policies configured through `upstream_clusters[].traffic_policy.affinity`
-
-## Skew Policy
-
-- Control-plane publish/apply flows must use a snapshot format supported by the active runtime release.
-- Cache policy changes should be rolled out only after all targeted dataplanes support the same cache-policy schema.
-
-## Security Patch Process
-
-Security-sensitive runtime behavior changes, especially around cache keying, auth-aware bypass, or invalidation, should be rolled out with the same artifact verification and release evidence process as other dataplane changes.
-
-## Validation
-
-- `check-release-artifacts.sh` verifies this document is present and structurally complete.# Compatibility Matrix
-
 ## Release Line
 
 - Workspace release line: `0.1.x`
@@ -35,6 +15,17 @@ Security-sensitive runtime behavior changes, especially around cache keying, aut
 | Upstream affinity policy | Same `v1_alpha1` schema and `0.1.x` release line | `header_hash` and `cookie_hash` remain opt-in and preserve healthy fallback semantics only. |
 | Kubernetes translation output | Same workspace release line only | Generated `WorkspaceConfig` must remain on supported config API versions and secure defaults. |
 | Artifact attestation | Required by default | Unsigned artifacts are rejected unless `security.insecure_dev_mode` is explicitly acknowledged. |
+| Supported performance claims | Named supported profile evidence only | Absolute capacity claims require a supported artifact such as `lab_small_non_loopback_v1`; loopback-only artifacts stay regression-only. |
+
+## Topology Matrix
+
+| Topology | Support state | Notes |
+| --- | --- | --- |
+| Single-node dataplane with local admin plane | Supported | Default operational topology for `0.1.x`. |
+| Active-active dataplane fleet with shared control plane | Supported | Uses `FleetRolloutCoordinator` and `bounded_eventual` convergence only. |
+| HTTP cache peer fan-out across multiple nodes | Supported with degraded partial-convergence semantics | Local purge correctness is primary; peer failure remains operator-visible and does not imply hidden consensus. |
+| Kubernetes controller deployment | Supported as single replica | Do not scale above one replica until leader election exists. |
+| Mixed release-line production fleet | Unsupported | GA evidence for `0.1.x` assumes one supported release line across targeted components. |
 
 ## Skew Policy
 
@@ -55,6 +46,7 @@ Security-sensitive runtime behavior changes, especially around cache keying, aut
 - Runtime release metadata is asserted in `cargo test -p lb-runtime` and `cargo test -p lb-test-support --test upgrade_rollback_smoke`.
 - DR restore validation is documented in `docs/runbooks/disaster-recovery.md` and asserted by `cargo test -p lb-test-support --test snapshot_restore_smoke`.
 - Stability boundaries, deprecation policy, and experimental labels are defined in `docs/runbooks/stability-contract.md`.
+- Deployment-shape and support-boundary rules are defined in `docs/runbooks/support-boundaries.md`.
 
 ## Release Gate Reference
 

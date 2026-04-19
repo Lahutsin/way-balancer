@@ -2,7 +2,9 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::fs;
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -16,7 +18,7 @@ use lb_runtime::{
     Http2ConnectionReport, Http2ProxyConfig, Http2ProxyError, ListenerHandle,
 };
 use rcgen::generate_simple_self_signed;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
@@ -33,7 +35,7 @@ pub type DynError = Box<dyn std::error::Error + Send + Sync>;
 const HTTP1_BENCH_BODY: &str = "bench-http1";
 const HTTP2_BENCH_BODY: &str = "bench-http2";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EnvelopeMode {
     Smoke,
@@ -71,7 +73,236 @@ impl EnvelopeMode {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PerformanceClaimTier {
+    Experimental,
+    Supported,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeploymentProfile {
+    LoopbackRegressionV1,
+    LabSmallNonLoopbackV1,
+}
+
+impl DeploymentProfile {
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "loopback_regression_v1" => Some(Self::LoopbackRegressionV1),
+            "lab_small_non_loopback_v1" => Some(Self::LabSmallNonLoopbackV1),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn spec(self) -> DeploymentProfileSpec {
+        match self {
+            Self::LoopbackRegressionV1 => DeploymentProfileSpec {
+                name: String::from("loopback_regression_v1"),
+                claim_tier: PerformanceClaimTier::Experimental,
+                summary: String::from(
+                    "fast local regression profile for loopback-only throughput, latency, and memory trend detection",
+                ),
+                host_class: HostClassSpec {
+                    label: String::from("developer_loopback_host"),
+                    cpu_cores: None,
+                    memory_gib: None,
+                    nic_gbps: None,
+                },
+                network_profile: NetworkProfileSpec {
+                    label: String::from("loopback_only"),
+                    path: String::from("single-host local sockets"),
+                    expected_rtt_ms: Some(0.1),
+                },
+                tls_mode: String::from("rustls_terminated_downstream_optional"),
+                connection_mix: String::from("http1_batch + http2_stream_batch + mixed interleaved"),
+                request_payload_bytes: 0,
+                hostile_edge_posture: String::from("not a supported external capacity claim"),
+                supported_envelope: None,
+                regression_guardrails: RegressionGuardrails::default(),
+                evidence_requirements: vec![
+                    String::from("use this profile for relative regressions only"),
+                    String::from("do not treat loopback-only numbers as supportable customer capacity claims"),
+                ],
+            },
+            Self::LabSmallNonLoopbackV1 => DeploymentProfileSpec {
+                name: String::from("lab_small_non_loopback_v1"),
+                claim_tier: PerformanceClaimTier::Supported,
+                summary: String::from(
+                    "initial supported small-host non-loopback profile for release evidence and conservative capacity claims",
+                ),
+                host_class: HostClassSpec {
+                    label: String::from("small_host_v1"),
+                    cpu_cores: Some(4),
+                    memory_gib: Some(16),
+                    nic_gbps: Some(10),
+                },
+                network_profile: NetworkProfileSpec {
+                    label: String::from("single_az_non_loopback"),
+                    path: String::from("client host to dataplane host over dedicated lab network"),
+                    expected_rtt_ms: Some(1.5),
+                },
+                tls_mode: String::from("tls_terminated_downstream_with_hostile_edge_controls_enabled"),
+                connection_mix: String::from("http1 + http2 + persistent mixed traffic with reload and failover timing evidence"),
+                request_payload_bytes: 1024,
+                hostile_edge_posture: String::from(
+                    "source quota and handshake guard enabled during supported envelope validation",
+                ),
+                supported_envelope: Some(SupportedEnvelopeThresholds {
+                    min_http1_ops_per_sec: 2_500.0,
+                    min_http2_ops_per_sec: 8_000.0,
+                    max_mixed_p50_us: 5_000,
+                    max_mixed_p95_us: 12_000,
+                    max_mixed_p99_us: 20_000,
+                    max_idle_connection_rss_kib_per_unit: 16.0,
+                    max_http2_stream_rss_kib_per_unit: 24.0,
+                    max_reload_success_ms: 5_000,
+                    max_reload_degraded_success_ms: 15_000,
+                    max_failover_ms: 3_000,
+                }),
+                regression_guardrails: RegressionGuardrails::default(),
+                evidence_requirements: vec![
+                    String::from("record the measured reload timing from GET /status reload_last_success_duration_ms"),
+                    String::from("record degraded-success timing when reload_applied_overlap_drain_timeout occurs"),
+                    String::from("record failover timing from the supported lab procedure before promoting claims to release evidence"),
+                ],
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HostClassSpec {
+    pub label: String,
+    pub cpu_cores: Option<usize>,
+    pub memory_gib: Option<usize>,
+    pub nic_gbps: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NetworkProfileSpec {
+    pub label: String,
+    pub path: String,
+    pub expected_rtt_ms: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeploymentProfileSpec {
+    pub name: String,
+    pub claim_tier: PerformanceClaimTier,
+    pub summary: String,
+    pub host_class: HostClassSpec,
+    pub network_profile: NetworkProfileSpec,
+    pub tls_mode: String,
+    pub connection_mix: String,
+    pub request_payload_bytes: usize,
+    pub hostile_edge_posture: String,
+    pub supported_envelope: Option<SupportedEnvelopeThresholds>,
+    pub regression_guardrails: RegressionGuardrails,
+    pub evidence_requirements: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SupportedEnvelopeThresholds {
+    pub min_http1_ops_per_sec: f64,
+    pub min_http2_ops_per_sec: f64,
+    pub max_mixed_p50_us: u64,
+    pub max_mixed_p95_us: u64,
+    pub max_mixed_p99_us: u64,
+    pub max_idle_connection_rss_kib_per_unit: f64,
+    pub max_http2_stream_rss_kib_per_unit: f64,
+    pub max_reload_success_ms: u64,
+    pub max_reload_degraded_success_ms: u64,
+    pub max_failover_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RegressionGuardrails {
+    pub max_throughput_drop_pct: f64,
+    pub max_latency_increase_pct: f64,
+    pub max_memory_growth_pct: f64,
+    pub max_timing_regression_pct: f64,
+}
+
+impl Default for RegressionGuardrails {
+    fn default() -> Self {
+        Self {
+            max_throughput_drop_pct: 15.0,
+            max_latency_increase_pct: 20.0,
+            max_memory_growth_pct: 15.0,
+            max_timing_regression_pct: 10.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ControlPlaneTimingEvidence {
+    pub reload_success_ms: Option<u64>,
+    pub reload_degraded_success_ms: Option<u64>,
+    pub failover_ms: Option<u64>,
+    pub evidence_source: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckStatus {
+    Passed,
+    Failed,
+    NotEvaluated,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ThresholdCheck {
+    pub metric: String,
+    pub unit: String,
+    pub comparator: String,
+    pub expected: f64,
+    pub actual: Option<f64>,
+    pub status: CheckStatus,
+    pub note: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ThresholdEvaluation {
+    pub claim_tier: PerformanceClaimTier,
+    pub supported_claim_ready: bool,
+    pub checks: Vec<ThresholdCheck>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BaselineComparisonCheck {
+    pub metric: String,
+    pub unit: String,
+    pub baseline: Option<f64>,
+    pub candidate: Option<f64>,
+    pub regression_pct: Option<f64>,
+    pub allowed_regression_pct: f64,
+    pub status: CheckStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BaselineComparison {
+    pub baseline_profile: String,
+    pub baseline_mode: EnvelopeMode,
+    pub passed: bool,
+    pub checks: Vec<BaselineComparisonCheck>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PerformanceEnvelopeArtifact {
+    pub schema_version: String,
+    pub generated_at_unix_ms: u64,
+    pub profile: DeploymentProfileSpec,
+    pub report: PerformanceEnvelopeReport,
+    pub control_plane_timing: ControlPlaneTimingEvidence,
+    pub threshold_evaluation: ThresholdEvaluation,
+    pub baseline_comparison: Option<BaselineComparison>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct ScenarioConfig {
     pub http1_requests: usize,
     pub http2_streams: usize,
@@ -80,7 +311,7 @@ pub struct ScenarioConfig {
     pub active_streams: usize,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ThroughputMeasurement {
     pub scenario: String,
     pub operations: usize,
@@ -88,7 +319,7 @@ pub struct ThroughputMeasurement {
     pub operations_per_sec: f64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LatencySummary {
     pub scenario: String,
     pub samples: usize,
@@ -99,7 +330,7 @@ pub struct LatencySummary {
     pub max_us: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MemoryMeasurement {
     pub scenario: String,
     pub units: usize,
@@ -110,14 +341,14 @@ pub struct MemoryMeasurement {
     pub note: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TlsOverheadMeasurement {
     pub plain_ops_per_sec: f64,
     pub tls_ops_per_sec: f64,
     pub throughput_penalty_pct: f64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PerformanceEnvelopeReport {
     pub mode: EnvelopeMode,
     pub scenario: ScenarioConfig,
@@ -177,6 +408,350 @@ pub async fn run_performance_envelope(
             String::from("TLS overhead is measured against the same HTTP/1 batch through a local Rustls-terminated downstream connection"),
         ],
     })
+}
+
+pub async fn build_performance_envelope_artifact(
+    mode: EnvelopeMode,
+    profile: DeploymentProfile,
+    control_plane_timing: ControlPlaneTimingEvidence,
+    baseline_path: Option<&str>,
+) -> Result<PerformanceEnvelopeArtifact, DynError> {
+    let report = run_performance_envelope(mode).await?;
+    let profile = profile.spec();
+    let threshold_evaluation = evaluate_supported_envelope(&profile, &report, &control_plane_timing);
+    let baseline_comparison = baseline_path
+        .map(load_performance_envelope_artifact)
+        .transpose()?
+        .map(|baseline| compare_against_baseline(&profile, &report, &control_plane_timing, &baseline));
+
+    Ok(PerformanceEnvelopeArtifact {
+        schema_version: String::from("v1"),
+        generated_at_unix_ms: unix_time_ms(),
+        profile,
+        report,
+        control_plane_timing,
+        threshold_evaluation,
+        baseline_comparison,
+    })
+}
+
+pub fn load_performance_envelope_artifact(
+    path: &str,
+) -> Result<PerformanceEnvelopeArtifact, DynError> {
+    let raw = fs::read_to_string(path)?;
+    serde_json::from_str(&raw).map_err(Into::into)
+}
+
+fn evaluate_supported_envelope(
+    profile: &DeploymentProfileSpec,
+    report: &PerformanceEnvelopeReport,
+    control_plane_timing: &ControlPlaneTimingEvidence,
+) -> ThresholdEvaluation {
+    let Some(thresholds) = &profile.supported_envelope else {
+        return ThresholdEvaluation {
+            claim_tier: profile.claim_tier,
+            supported_claim_ready: false,
+            checks: Vec::new(),
+        };
+    };
+
+    let checks = vec![
+        at_least_check(
+            "http1_ops_per_sec",
+            "ops_per_sec",
+            thresholds.min_http1_ops_per_sec,
+            Some(report.http1_throughput.operations_per_sec),
+            "minimum sustained HTTP/1 throughput for supported profile",
+        ),
+        at_least_check(
+            "http2_ops_per_sec",
+            "ops_per_sec",
+            thresholds.min_http2_ops_per_sec,
+            Some(report.http2_throughput.operations_per_sec),
+            "minimum sustained HTTP/2 throughput for supported profile",
+        ),
+        at_most_check(
+            "mixed_latency_p50",
+            "us",
+            thresholds.max_mixed_p50_us as f64,
+            Some(report.mixed_latency.p50_us as f64),
+            "mixed-traffic p50 latency ceiling",
+        ),
+        at_most_check(
+            "mixed_latency_p95",
+            "us",
+            thresholds.max_mixed_p95_us as f64,
+            Some(report.mixed_latency.p95_us as f64),
+            "mixed-traffic p95 latency ceiling",
+        ),
+        at_most_check(
+            "mixed_latency_p99",
+            "us",
+            thresholds.max_mixed_p99_us as f64,
+            Some(report.mixed_latency.p99_us as f64),
+            "mixed-traffic p99 latency ceiling",
+        ),
+        at_most_check(
+            "idle_connection_rss_per_unit",
+            "kib",
+            thresholds.max_idle_connection_rss_kib_per_unit,
+            report.idle_connection_memory.per_unit_rss_kib,
+            "idle accepted-connection memory growth ceiling",
+        ),
+        at_most_check(
+            "http2_stream_rss_per_unit",
+            "kib",
+            thresholds.max_http2_stream_rss_kib_per_unit,
+            report.http2_stream_memory.per_unit_rss_kib,
+            "active HTTP/2 stream memory growth ceiling",
+        ),
+        at_most_check(
+            "reload_success_ms",
+            "ms",
+            thresholds.max_reload_success_ms as f64,
+            control_plane_timing.reload_success_ms.map(|value| value as f64),
+            "reload success timing from workspace status evidence",
+        ),
+        at_most_check(
+            "reload_degraded_success_ms",
+            "ms",
+            thresholds.max_reload_degraded_success_ms as f64,
+            control_plane_timing.reload_degraded_success_ms.map(|value| value as f64),
+            "degraded-success reload timing from workspace status evidence",
+        ),
+        at_most_check(
+            "failover_ms",
+            "ms",
+            thresholds.max_failover_ms as f64,
+            control_plane_timing.failover_ms.map(|value| value as f64),
+            "failover timing from supported lab evidence",
+        ),
+    ];
+
+    let supported_claim_ready = checks.iter().all(|check| check.status == CheckStatus::Passed);
+    ThresholdEvaluation { claim_tier: profile.claim_tier, supported_claim_ready, checks }
+}
+
+fn compare_against_baseline(
+    profile: &DeploymentProfileSpec,
+    report: &PerformanceEnvelopeReport,
+    control_plane_timing: &ControlPlaneTimingEvidence,
+    baseline: &PerformanceEnvelopeArtifact,
+) -> BaselineComparison {
+    let guardrails = &profile.regression_guardrails;
+    let checks = vec![
+        throughput_regression_check(
+            "http1_ops_per_sec",
+            report.http1_throughput.operations_per_sec,
+            baseline.report.http1_throughput.operations_per_sec,
+            guardrails.max_throughput_drop_pct,
+        ),
+        throughput_regression_check(
+            "http2_ops_per_sec",
+            report.http2_throughput.operations_per_sec,
+            baseline.report.http2_throughput.operations_per_sec,
+            guardrails.max_throughput_drop_pct,
+        ),
+        increase_regression_check(
+            "mixed_latency_p95",
+            "us",
+            report.mixed_latency.p95_us as f64,
+            baseline.report.mixed_latency.p95_us as f64,
+            guardrails.max_latency_increase_pct,
+        ),
+        increase_regression_check(
+            "mixed_latency_p99",
+            "us",
+            report.mixed_latency.p99_us as f64,
+            baseline.report.mixed_latency.p99_us as f64,
+            guardrails.max_latency_increase_pct,
+        ),
+        increase_regression_check_optional(
+            "idle_connection_rss_per_unit",
+            "kib",
+            report.idle_connection_memory.per_unit_rss_kib,
+            baseline.report.idle_connection_memory.per_unit_rss_kib,
+            guardrails.max_memory_growth_pct,
+        ),
+        increase_regression_check_optional(
+            "http2_stream_rss_per_unit",
+            "kib",
+            report.http2_stream_memory.per_unit_rss_kib,
+            baseline.report.http2_stream_memory.per_unit_rss_kib,
+            guardrails.max_memory_growth_pct,
+        ),
+        increase_regression_check_optional(
+            "reload_success_ms",
+            "ms",
+            control_plane_timing.reload_success_ms.map(|value| value as f64),
+            baseline.control_plane_timing.reload_success_ms.map(|value| value as f64),
+            guardrails.max_timing_regression_pct,
+        ),
+        increase_regression_check_optional(
+            "failover_ms",
+            "ms",
+            control_plane_timing.failover_ms.map(|value| value as f64),
+            baseline.control_plane_timing.failover_ms.map(|value| value as f64),
+            guardrails.max_timing_regression_pct,
+        ),
+    ];
+    let passed = checks.iter().all(|check| check.status != CheckStatus::Failed);
+
+    BaselineComparison {
+        baseline_profile: baseline.profile.name.clone(),
+        baseline_mode: baseline.report.mode,
+        passed,
+        checks,
+    }
+}
+
+fn at_least_check(
+    metric: &str,
+    unit: &str,
+    expected: f64,
+    actual: Option<f64>,
+    note: &str,
+) -> ThresholdCheck {
+    let status = match actual {
+        Some(actual) if actual >= expected => CheckStatus::Passed,
+        Some(_) => CheckStatus::Failed,
+        None => CheckStatus::NotEvaluated,
+    };
+
+    ThresholdCheck {
+        metric: String::from(metric),
+        unit: String::from(unit),
+        comparator: String::from(">="),
+        expected,
+        actual,
+        status,
+        note: String::from(note),
+    }
+}
+
+fn at_most_check(
+    metric: &str,
+    unit: &str,
+    expected: f64,
+    actual: Option<f64>,
+    note: &str,
+) -> ThresholdCheck {
+    let status = match actual {
+        Some(actual) if actual <= expected => CheckStatus::Passed,
+        Some(_) => CheckStatus::Failed,
+        None => CheckStatus::NotEvaluated,
+    };
+
+    ThresholdCheck {
+        metric: String::from(metric),
+        unit: String::from(unit),
+        comparator: String::from("<="),
+        expected,
+        actual,
+        status,
+        note: String::from(note),
+    }
+}
+
+fn throughput_regression_check(
+    metric: &str,
+    candidate: f64,
+    baseline: f64,
+    allowed_regression_pct: f64,
+) -> BaselineComparisonCheck {
+    let regression_pct = percentage_drop(baseline, candidate);
+    let status = match regression_pct {
+        Some(regression_pct) if regression_pct <= allowed_regression_pct => CheckStatus::Passed,
+        Some(_) => CheckStatus::Failed,
+        None => CheckStatus::NotEvaluated,
+    };
+
+    BaselineComparisonCheck {
+        metric: String::from(metric),
+        unit: String::from("pct"),
+        baseline: Some(baseline),
+        candidate: Some(candidate),
+        regression_pct,
+        allowed_regression_pct,
+        status,
+    }
+}
+
+fn increase_regression_check(
+    metric: &str,
+    unit: &str,
+    candidate: f64,
+    baseline: f64,
+    allowed_regression_pct: f64,
+) -> BaselineComparisonCheck {
+    let regression_pct = percentage_increase(baseline, candidate);
+    let status = match regression_pct {
+        Some(regression_pct) if regression_pct <= allowed_regression_pct => CheckStatus::Passed,
+        Some(_) => CheckStatus::Failed,
+        None => CheckStatus::NotEvaluated,
+    };
+
+    BaselineComparisonCheck {
+        metric: String::from(metric),
+        unit: String::from(unit),
+        baseline: Some(baseline),
+        candidate: Some(candidate),
+        regression_pct,
+        allowed_regression_pct,
+        status,
+    }
+}
+
+fn increase_regression_check_optional(
+    metric: &str,
+    unit: &str,
+    candidate: Option<f64>,
+    baseline: Option<f64>,
+    allowed_regression_pct: f64,
+) -> BaselineComparisonCheck {
+    let regression_pct = baseline.zip(candidate).and_then(|(baseline, candidate)| percentage_increase(baseline, candidate));
+    let status = match regression_pct {
+        Some(regression_pct) if regression_pct <= allowed_regression_pct => CheckStatus::Passed,
+        Some(_) => CheckStatus::Failed,
+        None => CheckStatus::NotEvaluated,
+    };
+
+    BaselineComparisonCheck {
+        metric: String::from(metric),
+        unit: String::from(unit),
+        baseline,
+        candidate,
+        regression_pct,
+        allowed_regression_pct,
+        status,
+    }
+}
+
+fn percentage_drop(baseline: f64, candidate: f64) -> Option<f64> {
+    if baseline <= f64::EPSILON {
+        None
+    } else if candidate >= baseline {
+        Some(0.0)
+    } else {
+        Some(((baseline - candidate) / baseline) * 100.0)
+    }
+}
+
+fn percentage_increase(baseline: f64, candidate: f64) -> Option<f64> {
+    if baseline <= f64::EPSILON {
+        None
+    } else if candidate <= baseline {
+        Some(0.0)
+    } else {
+        Some(((candidate - baseline) / baseline) * 100.0)
+    }
+}
+
+fn unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().try_into().unwrap_or(u64::MAX))
+        .unwrap_or(0)
 }
 
 pub async fn measure_http1_throughput(requests: usize) -> Result<ThroughputMeasurement, DynError> {
@@ -906,4 +1481,238 @@ pub fn run_or_exit<T>(result: Result<T, DynError>) -> T {
 pub async fn shutdown_listener(handle: ListenerHandle) -> Result<(), DynError> {
     handle.shutdown().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_report() -> PerformanceEnvelopeReport {
+        PerformanceEnvelopeReport {
+            mode: EnvelopeMode::Smoke,
+            scenario: ScenarioConfig {
+                http1_requests: 64,
+                http2_streams: 64,
+                mixed_operations: 64,
+                idle_connections: 24,
+                active_streams: 24,
+            },
+            http1_throughput: ThroughputMeasurement {
+                scenario: String::from("http1"),
+                operations: 64,
+                elapsed_ms: 20,
+                operations_per_sec: 3_200.0,
+            },
+            http2_throughput: ThroughputMeasurement {
+                scenario: String::from("http2"),
+                operations: 64,
+                elapsed_ms: 5,
+                operations_per_sec: 12_800.0,
+            },
+            mixed_latency: LatencySummary {
+                scenario: String::from("mixed"),
+                samples: 64,
+                mean_us: 2_100.0,
+                p50_us: 2_000,
+                p95_us: 7_000,
+                p99_us: 10_000,
+                max_us: 11_000,
+            },
+            http1_tls_throughput: ThroughputMeasurement {
+                scenario: String::from("http1_tls"),
+                operations: 64,
+                elapsed_ms: 30,
+                operations_per_sec: 2_100.0,
+            },
+            tls_overhead: super::TlsOverheadMeasurement {
+                plain_ops_per_sec: 3_200.0,
+                tls_ops_per_sec: 2_100.0,
+                throughput_penalty_pct: 34.375,
+            },
+            idle_connection_memory: MemoryMeasurement {
+                scenario: String::from("idle"),
+                units: 24,
+                baseline_rss_kib: Some(1_000),
+                peak_rss_kib: Some(1_240),
+                delta_rss_kib: Some(240),
+                per_unit_rss_kib: Some(10.0),
+                note: String::from("sample"),
+            },
+            http2_stream_memory: MemoryMeasurement {
+                scenario: String::from("h2"),
+                units: 24,
+                baseline_rss_kib: Some(1_000),
+                peak_rss_kib: Some(1_336),
+                delta_rss_kib: Some(336),
+                per_unit_rss_kib: Some(14.0),
+                note: String::from("sample"),
+            },
+            assumptions: vec![String::from("sample")],
+        }
+    }
+
+    #[test]
+    fn deployment_profile_parses_supported_names() {
+        assert_eq!(
+            DeploymentProfile::parse("loopback_regression_v1"),
+            Some(DeploymentProfile::LoopbackRegressionV1)
+        );
+        assert_eq!(
+            DeploymentProfile::parse("lab_small_non_loopback_v1"),
+            Some(DeploymentProfile::LabSmallNonLoopbackV1)
+        );
+        assert_eq!(DeploymentProfile::parse("unknown"), None);
+    }
+
+    #[test]
+    fn supported_profile_requires_external_timing_evidence_to_be_ready() {
+        let profile = DeploymentProfile::LabSmallNonLoopbackV1.spec();
+        let evaluation = evaluate_supported_envelope(
+            &profile,
+            &sample_report(),
+            &ControlPlaneTimingEvidence {
+                reload_success_ms: Some(2_000),
+                reload_degraded_success_ms: None,
+                failover_ms: Some(1_500),
+                evidence_source: Some(String::from("status")),
+            },
+        );
+
+        assert_eq!(evaluation.claim_tier, PerformanceClaimTier::Supported);
+        assert!(!evaluation.supported_claim_ready);
+        assert!(evaluation.checks.iter().any(|check| {
+            check.metric == "reload_degraded_success_ms"
+                && check.status == super::CheckStatus::NotEvaluated
+        }));
+    }
+
+    #[test]
+    fn baseline_comparison_flags_material_throughput_regression() {
+        let profile = DeploymentProfile::LabSmallNonLoopbackV1.spec();
+        let baseline = PerformanceEnvelopeArtifact {
+            schema_version: String::from("v1"),
+            generated_at_unix_ms: 1,
+            profile: profile.clone(),
+            report: sample_report(),
+            control_plane_timing: ControlPlaneTimingEvidence {
+                reload_success_ms: Some(2_000),
+                reload_degraded_success_ms: Some(8_000),
+                failover_ms: Some(1_500),
+                evidence_source: Some(String::from("baseline")),
+            },
+            threshold_evaluation: evaluate_supported_envelope(
+                &profile,
+                &sample_report(),
+                &ControlPlaneTimingEvidence {
+                    reload_success_ms: Some(2_000),
+                    reload_degraded_success_ms: Some(8_000),
+                    failover_ms: Some(1_500),
+                    evidence_source: Some(String::from("baseline")),
+                },
+            ),
+            baseline_comparison: None,
+        };
+
+        let mut candidate = sample_report();
+        candidate.http1_throughput.operations_per_sec = 2_000.0;
+        let comparison = compare_against_baseline(
+            &profile,
+            &candidate,
+            &ControlPlaneTimingEvidence {
+                reload_success_ms: Some(2_000),
+                reload_degraded_success_ms: Some(8_000),
+                failover_ms: Some(1_500),
+                evidence_source: Some(String::from("candidate")),
+            },
+            &baseline,
+        );
+
+        assert!(!comparison.passed);
+        assert!(comparison.checks.iter().any(|check| {
+            check.metric == "http1_ops_per_sec" && check.status == super::CheckStatus::Failed
+        }));
+    }
+
+    #[test]
+    fn artifact_round_trip_preserves_profile_contract() -> Result<(), DynError> {
+        let artifact = PerformanceEnvelopeArtifact {
+            schema_version: String::from("v1"),
+            generated_at_unix_ms: 1,
+            profile: DeploymentProfileSpec {
+                name: String::from("lab_small_non_loopback_v1"),
+                claim_tier: PerformanceClaimTier::Supported,
+                summary: String::from("sample"),
+                host_class: HostClassSpec {
+                    label: String::from("small_host_v1"),
+                    cpu_cores: Some(4),
+                    memory_gib: Some(16),
+                    nic_gbps: Some(10),
+                },
+                network_profile: NetworkProfileSpec {
+                    label: String::from("single_az_non_loopback"),
+                    path: String::from("lab"),
+                    expected_rtt_ms: Some(1.5),
+                },
+                tls_mode: String::from("tls"),
+                connection_mix: String::from("mixed"),
+                request_payload_bytes: 1024,
+                hostile_edge_posture: String::from("enabled"),
+                supported_envelope: Some(SupportedEnvelopeThresholds {
+                    min_http1_ops_per_sec: 2_500.0,
+                    min_http2_ops_per_sec: 8_000.0,
+                    max_mixed_p50_us: 5_000,
+                    max_mixed_p95_us: 12_000,
+                    max_mixed_p99_us: 20_000,
+                    max_idle_connection_rss_kib_per_unit: 16.0,
+                    max_http2_stream_rss_kib_per_unit: 24.0,
+                    max_reload_success_ms: 5_000,
+                    max_reload_degraded_success_ms: 15_000,
+                    max_failover_ms: 3_000,
+                }),
+                regression_guardrails: RegressionGuardrails::default(),
+                evidence_requirements: vec![String::from("status")],
+            },
+            report: sample_report(),
+            control_plane_timing: ControlPlaneTimingEvidence {
+                reload_success_ms: Some(2_000),
+                reload_degraded_success_ms: Some(8_000),
+                failover_ms: Some(1_500),
+                evidence_source: Some(String::from("status")),
+            },
+            threshold_evaluation: evaluate_supported_envelope(
+                &DeploymentProfile::LabSmallNonLoopbackV1.spec(),
+                &sample_report(),
+                &ControlPlaneTimingEvidence {
+                    reload_success_ms: Some(2_000),
+                    reload_degraded_success_ms: Some(8_000),
+                    failover_ms: Some(1_500),
+                    evidence_source: Some(String::from("status")),
+                },
+            ),
+            baseline_comparison: None,
+        };
+
+        let json = serde_json::to_string_pretty(&artifact)?;
+        let decoded: PerformanceEnvelopeArtifact = serde_json::from_str(&json)?;
+        assert_eq!(decoded.profile.name, "lab_small_non_loopback_v1");
+        assert_eq!(decoded.profile.claim_tier, PerformanceClaimTier::Supported);
+        assert_eq!(decoded.control_plane_timing.failover_ms, Some(1_500));
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn artifact_builder_returns_loopback_profile_without_supported_claim() -> Result<(), DynError> {
+        let artifact = build_performance_envelope_artifact(
+            EnvelopeMode::Smoke,
+            DeploymentProfile::LoopbackRegressionV1,
+            ControlPlaneTimingEvidence::default(),
+            None,
+        )
+        .await?;
+
+        assert_eq!(artifact.profile.claim_tier, PerformanceClaimTier::Experimental);
+        assert!(!artifact.threshold_evaluation.supported_claim_ready);
+        assert!(artifact.threshold_evaluation.checks.is_empty());
+        Ok(())
+    }
 }

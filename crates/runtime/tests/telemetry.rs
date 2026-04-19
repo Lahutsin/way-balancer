@@ -5,9 +5,9 @@ use lb_net_core::ListenerClass;
 use lb_observability::TraceHookPhase;
 use lb_observability::{FailureManagementEventKind, OverloadEvent, OverloadEventKind};
 use lb_runtime::{
-    HttpCacheRequestOutcome, HttpCacheRevalidationResult, HttpCacheStoreMetrics, ListenerEvent,
-    ListenerEventKind, ListenerSnapshot, ListenerState, OverloadSnapshot, OverloadState,
-    RuntimeTelemetry,
+    AbuseRejectionReason, HttpCacheRequestOutcome, HttpCacheRevalidationResult,
+    HttpCacheStoreMetrics, ListenerAbuseProtectionSnapshot, ListenerEvent, ListenerEventKind,
+    ListenerSnapshot, ListenerState, OverloadSnapshot, OverloadState, RuntimeTelemetry,
 };
 
 #[test]
@@ -40,6 +40,21 @@ fn runtime_telemetry_emits_structured_logs_and_metrics() -> Result<(), Box<dyn s
         rejected_connections: 1,
         recent_events: Vec::new(),
     })?;
+    telemetry.record_listener_abuse_rejection(
+        "Ingress TCP",
+        AbuseRejectionReason::SourceQuotaExceeded,
+        "hostile-edge source quota exhausted",
+    )?;
+    telemetry.record_listener_abuse_snapshot(
+        "Ingress TCP",
+        &ListenerAbuseProtectionSnapshot {
+            source_quota_rejections: 1,
+            tracked_source_limit_rejections: 0,
+            handshake_guard_rejections: 0,
+            tracked_sources: 2,
+            active_handshakes: 1,
+        },
+    )?;
     telemetry.record_overload_snapshot(
         "dataplane",
         &OverloadSnapshot {
@@ -105,6 +120,15 @@ fn runtime_telemetry_emits_structured_logs_and_metrics() -> Result<(), Box<dyn s
     ));
     assert!(metrics.contains("runtime_listener_accepted_connections{listener=\"ingress_tcp\"} 5"));
     assert!(metrics.contains("runtime_listener_rejected_connections{listener=\"ingress_tcp\"} 1"));
+    assert!(metrics.contains(
+        "runtime_listener_abuse_rejections_total{listener=\"ingress_tcp\",reason=\"source_quota_exceeded\"} 1"
+    ));
+    assert!(metrics.contains(
+        "runtime_listener_abuse_tracked_sources{listener=\"ingress_tcp\"} 2"
+    ));
+    assert!(metrics.contains(
+        "runtime_listener_abuse_active_handshakes{listener=\"ingress_tcp\"} 1"
+    ));
     assert!(metrics.contains("runtime_listener_events_total{listener=\"ingress_tcp\",event_code=\"runtime.listener.started\"} 1"));
     assert!(metrics.contains(
         "runtime_breaker_events_total{scope=\"payments\",event_code=\"failure.breaker.opened\"} 1"
@@ -150,8 +174,9 @@ fn runtime_telemetry_emits_structured_logs_and_metrics() -> Result<(), Box<dyn s
     ));
 
     let snapshot = telemetry.snapshot();
-    assert_eq!(snapshot.events.len(), 8);
+    assert_eq!(snapshot.events.len(), 9);
     assert!(snapshot.logs.iter().any(|record| record.code.as_str() == "runtime.listener.started"));
+    assert!(snapshot.logs.iter().any(|record| record.code.as_str() == "runtime.listener.rejected"));
     assert!(snapshot.logs.iter().any(|record| record.code.as_str() == "failure.breaker.opened"));
     assert!(snapshot.logs.iter().any(|record| record.code.as_str() == "overload.request.shed"));
     assert!(snapshot.logs.iter().any(|record| record.code.as_str() == "cache.hit"));

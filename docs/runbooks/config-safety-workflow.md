@@ -22,7 +22,7 @@ curl -H "Authorization: Bearer $LB_CTL_ADMIN_SECRET" http://127.0.0.1:9900/valid
 
 This endpoint is the primary preflight for operators editing a config in place.
 
-For the checked-in localhost and Docker Compose bearer-auth examples, the same admin listener also exposes `GET /status`, `GET /healthz`, and `GET /audit`. Use `GET /audit` after a rejected reload or denied action to confirm who attempted the operation and why it was blocked.
+For the checked-in localhost and Docker Compose bearer-auth examples, the same admin listener also exposes `GET /healthz`, `GET /readyz`, `GET /status`, and `GET /audit`. Use `GET /audit` after a rejected reload or denied action to confirm who attempted the operation and why it was blocked.
 
 ## Warning Semantics
 
@@ -46,6 +46,17 @@ Use reload only after a clean validate preview:
 curl -X POST -H "Authorization: Bearer $LB_CTL_ADMIN_SECRET" http://127.0.0.1:9900/reload
 ```
 
+## Reload Targets
+
+The current operator target is:
+
+- treat in-place reload and overlap-and-drain replacement as rollback-safe by default
+- treat zero-drop for already accepted connections as the target outcome during normal replacement, not a promise under every disruptive or stalled-drain case
+- use `reload_last_duration_ms`, `reload_last_success_duration_ms`, `reload_last_failure_duration_ms`, and `reload_max_duration_ms` as the primary live signals for whether reload latency is staying within your environment budget
+- investigate any `reload_applied_overlap_drain_timeout` outcome as degraded success, even if the replacement stayed active
+
+This repository does not yet publish a hard global millisecond SLO for every environment. The current contract is that reload latency and degraded-success cases are surfaced explicitly so operators can set environment-specific alert thresholds without inferring from free-form text.
+
 The current serve-mode apply path is rollback-safe in these ways:
 
 - the candidate config is fully parsed, validated, and compiled before apply
@@ -57,7 +68,11 @@ The current serve-mode apply path is rollback-safe in these ways:
 This means a failed reload should be treated as a rejected candidate, not as a partially applied rollout.
 
 If a reload is rejected because of authz, source policy, replay detection, or rate limiting, inspect `GET /audit` before retrying. That gives you the exact admin-plane outcome instead of inferring it only from the HTTP status code.
-If a reload is accepted and needs overlap-and-drain replacement, `GET /audit` records a `started` entry before apply completes, and `GET /status` shows which listener is desired, which prior listener is draining, and whether a failed replacement start was preserved.
+If a reload is accepted and needs overlap-and-drain replacement, `GET /audit` records a `started` entry before apply completes, and `GET /status` shows which listener is desired, which prior listener is draining, whether a failed replacement start was preserved, and whether an old listener exceeded its configured drain timeout.
+If that drain timeout expires after the replacement is already active, treat the reload as a degraded success rather than a rollback failure: `GET /status` and `GET /audit` surface a dedicated drain-timeout outcome code instead of the clean overlap-and-drain success code.
+If operators submit repeated reloads while one apply is still running, the runtime serializes them through a single reload guard. Later requests wait behind the active apply rather than interleaving listener mutation.
+If a reload fails, `GET /readyz` becomes the fast serving-readiness signal that the instance should stop receiving new traffic until the operator either restores a known-good config and reloads successfully or otherwise clears the failed state.
+After a later successful reload, the runtime clears that prior failed readiness/reload state and replaces it with the new success outcome. Operators should therefore always trust the latest `last_reload_outcome_code`, `last_reload_result`, and `GET /readyz` response rather than caching an older failure.
 
 ## Rollback Workflow
 
@@ -89,8 +104,11 @@ The current migration strategy is strict compatibility, not live auto-migration.
 ## Operational Notes
 
 - `GET /status` remains the runtime state endpoint.
+- `GET /healthz` is liveness only.
+- `GET /readyz` is the serving-readiness endpoint.
 - `GET /status` now includes per-listener replacement lifecycle data under `replacement`, including `state`, `desired`, `draining`, recent retired identities, and any preserved failed-start detail.
+- `GET /status` now also includes rolled-up `readiness`, `reload_health`, `last_reload_outcome_code`, and reload duration metrics (`reload_total_duration_ms`, `reload_max_duration_ms`, `reload_last_duration_ms`, `reload_last_success_duration_ms`, `reload_last_failure_duration_ms`).
 - `GET /validate` is the preflight and diff endpoint.
-- `GET /audit` is the recent admin activity endpoint and is especially useful after denied reload attempts or while a replacement-capable reload is still in progress.
+- `GET /audit` is the recent admin activity endpoint and is especially useful after denied reload attempts or while a replacement-capable reload is still in progress. Reload entries now include machine-readable `code` values for blocked candidate changes, overlap-and-drain success, rollback-preserved failure, and generic apply failure.
 - `POST /reload` is the only state-mutating config action.
 - A successful validate preview does not replace post-apply smoke checks; it only reduces rollout risk before mutation.

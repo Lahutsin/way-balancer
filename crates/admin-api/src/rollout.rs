@@ -1,5 +1,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde::{Deserialize, Serialize};
+
 use crate::{PublishedSnapshotRecord, SnapshotControlService, SnapshotLookupError};
 
 const MAX_VERSION_LEN: usize = 128;
@@ -20,7 +22,8 @@ pub struct RollbackRequest {
     pub reason: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RolloutActionKind {
     Rollout,
     Rollback,
@@ -479,7 +482,7 @@ impl RolloutCoordinator {
     }
 }
 
-fn validate_rollout_request(
+pub(crate) fn validate_rollout_request(
     version: &str,
     requested_by: &Option<String>,
     reason: &Option<String>,

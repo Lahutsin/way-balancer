@@ -6,7 +6,7 @@ These examples target the typed JSON configuration accepted by `lb_config_model:
 
 - `basic-http.json`: minimal HTTP/1.1 edge listener with a single upstream cluster, local-friendly hostname filters, and a conservative public-cache policy
 - `http-cache-public.json`: public HTTP example with a named shared-cache policy, local-friendly hostname filters, and route-level cache binding
-- `docker-compose-public-admin.json`: container-friendly public plus admin HTTP listener for `docker compose up`, with cache enabled on the public route, hostname filters matching local Docker Compose curls, and explicit bearer-auth admin policy for `healthz`, `status`, `validate`, `audit`, and `reload`
+- `docker-compose-public-admin.json`: container-friendly public plus admin HTTP listener for `docker compose up`, with cache enabled on the public route, hostname filters matching local Docker Compose curls, and explicit bearer-auth admin policy for `healthz`, `readyz`, `status`, `validate`, `audit`, and `reload`
 - `grpc-retries.json`: HTTP/2 or gRPC-style listener with retry-budget policy wiring and hostname-aware route matching
 - `https-termination.json`: HTTPS listener with file-backed TLS termination material, hostname-aware route matching, and a conservative public-cache policy
 - `public-admin.json`: public application listener plus a separate localhost-only admin HTTP listener, with cache enabled on the public route, local-friendly hostname filters, and explicit admin auth, rate-limit, and audit retention settings
@@ -17,6 +17,7 @@ These examples target the typed JSON configuration accepted by `lb_config_model:
 - `cache-peer-node-a.json`: node A of a two-node cache topology, using signed admin headers and a listener-scoped shared-cache policy suitable for HTTP peer invalidation
 - `cache-peer-node-b.json`: node B companion config for the same two-node cache topology, using the same signed peer secret contract on a different public/admin bind pair
 - `cache-peer-topology.md`: operational note for wiring `HttpCachePeerTransport` across the two checked-in node configs without inventing unsupported config schema
+- `multi-node-rollout-example.md`: control-plane example showing canary or sequential fleet rollout semantics and bounded convergence checks
 
 ## Important Note
 
@@ -28,7 +29,7 @@ Examples that keep `security.artifact_verification.mode` set to `enforced` are i
 
 The HTTPS example uses file paths for PEM certificate and key material. Those files are operator-provided deployment inputs rather than repository fixtures.
 
-The Docker Compose example binds `0.0.0.0` explicitly and points at a fixed backend IP on the compose network so the current `SocketAddr`-based upstream model can resolve the demo backend without extra service discovery. The admin listener is HTTP/1, is intended to be used with `LB_CTL_ADMIN_SECRET` bearer authorization, exposes `GET /healthz`, `GET /status`, `GET /validate`, `GET /audit`, and `POST /reload`, and the compose file publishes port `9900` on `127.0.0.1` only.
+The Docker Compose example binds `0.0.0.0` explicitly and points at a fixed backend IP on the compose network so the current `SocketAddr`-based upstream model can resolve the demo backend without extra service discovery. The admin listener is HTTP/1, is intended to be used with `LB_CTL_ADMIN_SECRET` bearer authorization, exposes `GET /healthz`, `GET /readyz`, `GET /status`, `GET /validate`, `GET /audit`, and `POST /reload`, and the compose file publishes port `9900` on `127.0.0.1` only.
 
 The HTTP examples now include `match.hostnames` filters. Query parameters are still not configured in route rules; they pass through automatically as part of the forwarded request target and continue to participate in cache key construction when the selected cache policy includes query strings.
 

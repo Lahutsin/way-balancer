@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -15,7 +15,7 @@ use crate::{
 const SNAPSHOT_FORMAT_VERSION: &str = "v1";
 
 /// Immutable snapshot compiler metadata.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotMetadata {
     format_version: String,
     api_version: ConfigApiVersion,
@@ -40,7 +40,7 @@ impl SnapshotMetadata {
 }
 
 /// Immutable normalized listener snapshot.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListenerSnapshot {
     name: String,
     class: ListenerClassConfig,
@@ -64,7 +64,7 @@ impl ListenerSnapshot {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListenerTlsTerminationSnapshot {
     certificate_source: ListenerCertificateSourceSnapshot,
     sni_certificates: Vec<ListenerTlsSniCertificateSnapshot>,
@@ -73,13 +73,13 @@ pub struct ListenerTlsTerminationSnapshot {
     alpn_protocols: Vec<crate::ListenerAlpnProtocolConfig>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListenerTlsSniCertificateSnapshot {
     server_names: Vec<String>,
     certificate_source: ListenerCertificateSourceSnapshot,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ListenerCertificateSourceSnapshot {
     Files { cert_path: String, key_path: String, ocsp_path: Option<String> },
@@ -99,8 +99,22 @@ fn snapshot_certificate_source(
     }
 }
 
+fn config_certificate_source(
+    source: &ListenerCertificateSourceSnapshot,
+) -> ListenerCertificateSourceConfig {
+    match source {
+        ListenerCertificateSourceSnapshot::Files { cert_path, key_path, ocsp_path } => {
+            ListenerCertificateSourceConfig::Files {
+                cert_path: cert_path.clone(),
+                key_path: key_path.clone(),
+                ocsp_path: ocsp_path.clone(),
+            }
+        }
+    }
+}
+
 /// Immutable normalized route snapshot.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RouteSnapshot {
     name: String,
     match_rule: RouteMatchConfig,
@@ -116,7 +130,7 @@ impl RouteSnapshot {
 }
 
 /// Immutable normalized upstream endpoint snapshot.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpstreamEndpointSnapshot {
     id: String,
     address: SocketAddr,
@@ -127,7 +141,7 @@ pub struct UpstreamEndpointSnapshot {
 }
 
 /// Immutable normalized upstream cluster snapshot.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpstreamClusterSnapshot {
     name: String,
     endpoints: Vec<UpstreamEndpointSnapshot>,
@@ -143,7 +157,7 @@ impl UpstreamClusterSnapshot {
 }
 
 /// Diff-friendly immutable view of the compiled snapshot.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceSnapshotView {
     metadata: SnapshotMetadata,
     workspace_name: String,
@@ -177,6 +191,10 @@ pub struct WorkspaceSnapshot {
 }
 
 impl WorkspaceSnapshot {
+    pub fn from_view(view: WorkspaceSnapshotView) -> Result<Self, SnapshotCompileError> {
+        compile_workspace_snapshot(&workspace_config_from_snapshot_view(&view))
+    }
+
     #[must_use]
     pub fn metadata(&self) -> &SnapshotMetadata {
         &self.metadata
@@ -476,6 +494,83 @@ pub(crate) fn compile_workspace_snapshot(
     })
 }
 
+fn workspace_config_from_snapshot_view(view: &WorkspaceSnapshotView) -> WorkspaceConfig {
+    WorkspaceConfig {
+        api_version: view.metadata.api_version,
+        name: view.workspace_name.clone(),
+        security: view.security.clone(),
+        policies: view.policies.clone(),
+        listeners: view
+            .listeners
+            .iter()
+            .map(|listener| crate::ListenerResourceConfig {
+                name: listener.name.clone(),
+                class: listener.class,
+                bind_address: listener.bind_address,
+                protocol: listener.protocol,
+                tls_termination: listener.tls_termination.as_ref().map(|tls| {
+                    crate::ListenerTlsTerminationConfig {
+                        certificate_source: config_certificate_source(&tls.certificate_source),
+                        sni_certificates: tls
+                            .sni_certificates
+                            .iter()
+                            .map(|certificate| crate::ListenerTlsSniCertificateConfig {
+                                server_names: certificate.server_names.clone(),
+                                certificate_source: config_certificate_source(
+                                    &certificate.certificate_source,
+                                ),
+                            })
+                            .collect(),
+                        session_resumption: tls.session_resumption.clone(),
+                        minimum_version: tls.minimum_version,
+                        alpn_protocols: tls.alpn_protocols.clone(),
+                    }
+                }),
+                allow_unspecified_bind: listener.allow_unspecified_bind,
+                max_connections: Some(listener.max_connections),
+                backlog: Some(listener.backlog),
+                idle_timeout_ms: Some(listener.idle_timeout_ms),
+                drain_timeout_ms: Some(listener.drain_timeout_ms),
+                routes: listener.routes.clone(),
+                policies: listener.policies.clone(),
+                admin: listener.admin.clone(),
+            })
+            .collect(),
+        routes: view
+            .routes
+            .iter()
+            .map(|route| crate::RouteConfig {
+                name: route.name.clone(),
+                match_rule: route.match_rule.clone(),
+                upstream_cluster: route.upstream_cluster.clone(),
+                policies: route.policies.clone(),
+            })
+            .collect(),
+        upstream_clusters: view
+            .upstream_clusters
+            .iter()
+            .map(|cluster| crate::UpstreamClusterConfig {
+                name: cluster.name.clone(),
+                endpoints: cluster
+                    .endpoints
+                    .iter()
+                    .map(|endpoint| crate::UpstreamEndpointConfig {
+                        id: endpoint.id.clone(),
+                        address: endpoint.address,
+                        state: endpoint.state,
+                        zone: endpoint.zone.clone(),
+                        locality: endpoint.locality.clone(),
+                        weight: endpoint.weight,
+                    })
+                    .collect(),
+                traffic_policy: cluster.traffic_policy.clone(),
+                policies: cluster.policies.clone(),
+            })
+            .collect(),
+        ..WorkspaceConfig::foundation()
+    }
+}
+
 fn duration_to_millis(value: Duration) -> u64 {
     let millis = value.as_millis();
     if millis > u128::from(u64::MAX) {
@@ -638,6 +733,16 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_view_round_trip_rehydrates_snapshot() -> Result<(), Box<dyn std::error::Error>> {
+        let snapshot = compile_workspace_snapshot(&valid_workspace())?;
+        let restored = super::WorkspaceSnapshot::from_view(snapshot.view())?;
+
+        assert_eq!(snapshot.metadata(), restored.metadata());
+        assert_eq!(snapshot.view(), restored.view());
+        Ok(())
+    }
+
+    #[test]
     fn snapshot_view_matches_expected_golden_json() -> Result<(), Box<dyn std::error::Error>> {
         let snapshot = compile_workspace_snapshot(&valid_workspace())?;
 
@@ -650,7 +755,7 @@ mod tests {
                 "  \"metadata\": {\n",
                 "    \"format_version\": \"v1\",\n",
                 "    \"api_version\": \"v1_alpha1\",\n",
-                "    \"digest_sha256\": \"b88f3c2e0cef791c8a20c365f396c73cd3834fa07ebe7ed60c7306d1b4933fb7\"\n",
+                "    \"digest_sha256\": \"19276cec3d1af7643389bae05cddde463e35263e7fd51b27cb397f86df8e45b6\"\n",
                 "  },\n",
                 "  \"workspace_name\": \"edge\",\n",
                 "  \"security\": {\n",
@@ -666,6 +771,7 @@ mod tests {
                 "  \"policies\": {\n",
                 "    \"local_rate_limits\": [],\n",
                 "    \"local_concurrency_limits\": [],\n",
+                "    \"hostile_edge_protections\": [],\n",
                 "    \"retry_budgets\": [],\n",
                 "    \"timeout_hierarchies\": [],\n",
                 "    \"circuit_breakers\": [],\n",
@@ -709,6 +815,7 @@ mod tests {
                 "      \"policies\": {\n",
                 "        \"local_rate_limits\": [],\n",
                 "        \"local_concurrency_limits\": [],\n",
+                "        \"hostile_edge_protection\": null,\n",
                 "        \"retry_budget\": null,\n",
                 "        \"timeout_hierarchy\": null,\n",
                 "        \"circuit_breaker\": null,\n",
@@ -728,6 +835,7 @@ mod tests {
                 "      \"policies\": {\n",
                 "        \"local_rate_limits\": [],\n",
                 "        \"local_concurrency_limits\": [],\n",
+                "        \"hostile_edge_protection\": null,\n",
                 "        \"retry_budget\": null,\n",
                 "        \"timeout_hierarchy\": null,\n",
                 "        \"circuit_breaker\": null,\n",
@@ -757,6 +865,7 @@ mod tests {
                 "      \"policies\": {\n",
                 "        \"local_rate_limits\": [],\n",
                 "        \"local_concurrency_limits\": [],\n",
+                "        \"hostile_edge_protection\": null,\n",
                 "        \"retry_budget\": null,\n",
                 "        \"timeout_hierarchy\": null,\n",
                 "        \"circuit_breaker\": null,\n",

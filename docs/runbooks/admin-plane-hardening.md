@@ -8,10 +8,12 @@ This runbook defines the operator-facing security model for the privileged admin
 
 The admin listener supports two explicit auth modes:
 
-- `bearer`: legacy shared bearer secret resolved from an environment variable such as `LB_CTL_ADMIN_SECRET`
+- `bearer`: legacy shared bearer secret resolved from an environment variable such as `LB_CTL_ADMIN_SECRET` or a file-backed source such as `LB_CTL_ADMIN_SECRET_FILE`
 - `signed_headers`: stronger per-operator request signing with explicit permissions and replay resistance
 
 For production exposure, prefer `signed_headers`. The bearer mode remains useful for localhost-only or tightly isolated bootstrap environments, but it does not give per-operator attribution.
+
+File-backed secrets are the supported rotation path for both bearer mode and signed-header operator secrets. When `<SECRET_ENV>_FILE` is set, the runtime reads the current secret material from that file on every authenticated request. That avoids ambiguous overlap windows during secret rotation and lets projected Kubernetes secrets update without a dataplane restart.
 
 ## Signed Header Contract
 
@@ -41,7 +43,7 @@ The runtime validates:
 - the request signature matches the operator secret
 - the referenced operator secret is configured; missing secrets fail closed with `503 Service Unavailable` rather than silently falling back to an empty key
 
-`GET /status`, `GET /validate`, and `GET /healthz` require `read` permission. `GET /audit` requires `audit` permission. `POST /reload` requires `write` permission.
+`GET /healthz`, `GET /readyz`, `GET /status`, and `GET /validate` require `read` permission. `GET /audit` requires `audit` permission. `POST /reload` requires `write` permission.
 
 ## Source Policy And Rate Limiting
 
@@ -76,6 +78,8 @@ or the signed equivalent to inspect recent admin actions. Audit entries include:
 
 This gives operators direct visibility into successful reloads, denied writes, replay rejections, rate limiting, and source-policy denials.
 
+`GET /status` also exposes `admin_auth.secret_sources`, which summarizes each configured admin secret source by listener, actor, source kind, health, and whether the source supports rotation without reload. Use that surface to verify that projected secret files are healthy before and after a rotation.
+
 ## Recommended Production Posture
 
 Use this baseline unless you have a narrower local-only deployment:
@@ -85,6 +89,7 @@ Use this baseline unless you have a narrower local-only deployment:
 3. Restrict admin access further with `allowed_source_cidrs`.
 4. Keep audit retention large enough to preserve recent operator activity during incident review.
 5. Treat bearer mode as transitional or local-only unless compensating controls are strong.
+6. Prefer file-backed secret delivery for production rotation workflows so credentials can change without restarting the process.
 
 ## Validation Coverage
 

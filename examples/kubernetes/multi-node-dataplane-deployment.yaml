@@ -1,0 +1,58 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: way-balancer-dataplane
+  namespace: edge
+spec:
+  serviceName: way-balancer-dataplane
+  replicas: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: way-balancer-dataplane
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: way-balancer-dataplane
+    spec:
+      containers:
+        - name: dataplane
+          image: ghcr.io/your-org/way-balancer-dataplane:0.1.0
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: DATAPLANE_FLEET_ID
+              value: edge-shared
+            - name: DATAPLANE_NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: LB_CTL_ADMIN_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: way-balancer-admin
+                  key: bearer-token
+          ports:
+            - containerPort: 8080
+              name: public
+            - containerPort: 9900
+              name: admin
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: admin
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: admin
+          volumeMounts:
+            - name: config
+              mountPath: /etc/way-balancer
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: way-balancer-config
+
+# This example documents a supported active-active dataplane shape only.
+# Fleet rollout, rollback, and convergence visibility are still driven by
+# the control-plane admin API layer rather than an embedded Kubernetes-native
+# distributed transaction controller inside the dataplane pods.

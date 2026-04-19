@@ -1,4 +1,5 @@
-1. The controller is intentionally single-replica in the current pre-GA runtime. Do not scale it above one replica until leader election exists.
+1. The controller uses Kubernetes lease-based leader election. Keep at least two replicas for warm failover and inspect the active lease holder with:
+   kubectl get lease {{ .Values.controller.leaderElection.leaseName }} -n {{ default (include "lb-k8s-controller.namespace" .) .Values.controller.leaderElection.leaseNamespace }} -o yaml
 
 2. Check rollout state:
    kubectl rollout status deployment/{{ include "lb-k8s-controller.fullname" . }} -n {{ include "lb-k8s-controller.namespace" . }}

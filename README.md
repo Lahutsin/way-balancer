@@ -1,10 +1,10 @@
 # way-balancer
 
-Production-oriented Rust load-balance
+Production-oriented Rust load-balancer
 
 ## Current Scope
 
-This repository now contains a substantial pre-GA product foundation:
+This repository now defines a production-oriented `0.1.x` product line with explicit release evidence, support boundaries, and operator runbooks:
 
 - listener lifecycle and connection admission runtime
 - TCP, HTTP/1.1, HTTP/2, and gRPC proxy foundations
@@ -15,7 +15,9 @@ This repository now contains a substantial pre-GA product foundation:
 - secure-default posture, mTLS/certificate validation, and artifact integrity checks
 - release compatibility, DR, and GA-readiness runbooks and evidence artifacts
 
-The workspace is still pre-GA, but it already includes runnable dataplane/control-plane foundations and productization gates rather than only repo scaffolding.
+A candidate should be treated as a supported GA release only when the evidence set in `docs/runbooks/release-evidence-checklist.md` is complete, including the final decision record in `docs/runbooks/ga-readiness-review-template.md` and any required supported performance evidence under `artifacts/performance-envelope/`.
+
+The supported product boundaries for `0.1.x`, including stable topologies, unsupported cases, and operational failure-mode expectations, are documented in `docs/runbooks/support-boundaries.md`.
 
 ## Implemented Subsystems
 
@@ -34,7 +36,7 @@ The diagram below shows how the main control-plane and dataplane pieces fit toge
 ```mermaid
 flowchart LR
 	user[Clients] --> public[Public listeners\nHTTP HTTPS gRPC TCP]
-	operator[Operators and CI] --> admin[Admin listeners\nhealthz status validate audit reload\ncache purge cache invalidate]
+	operator[Operators and CI] --> admin[Admin listeners\nhealthz readyz status validate audit reload\ncache purge cache invalidate]
 	operator --> ctl[lb-ctl]
 	k8s[Kubernetes Gateway API] --> k8s_integration[crates/k8s-integration]
 
@@ -269,12 +271,13 @@ export LB_CTL_ADMIN_SECRET=<admin-bearer-token>
 docker compose up --build
 curl http://localhost:8080/
 curl -H "Authorization: Bearer $LB_CTL_ADMIN_SECRET" http://localhost:9900/healthz
+curl -H "Authorization: Bearer $LB_CTL_ADMIN_SECRET" http://localhost:9900/readyz
 curl -H "Authorization: Bearer $LB_CTL_ADMIN_SECRET" http://localhost:9900/status
 curl -H "Authorization: Bearer $LB_CTL_ADMIN_SECRET" http://localhost:9900/validate
 curl -H "Authorization: Bearer $LB_CTL_ADMIN_SECRET" http://localhost:9900/audit
 ```
 
-The compose file now builds a generic `lb-dataplane` image and injects only runtime environment needed by the checked-in workspace admin example. The admin listener remains bound to `0.0.0.0` inside the container so Docker can publish it, but Compose publishes `9900` only on `127.0.0.1`, and the listener itself requires bearer authorization. Use `GET /validate` before `POST /reload`, and inspect recent control-plane activity through `GET /audit`.
+The compose file now builds a generic `lb-dataplane` image and injects only runtime environment needed by the checked-in workspace admin example. The admin listener remains bound to `0.0.0.0` inside the container so Docker can publish it, but Compose publishes `9900` only on `127.0.0.1`, and the listener itself requires bearer authorization. `GET /healthz` remains a liveness check, while `GET /readyz` reports whether the instance should receive new traffic based on current listener state, unsafe overload, and reload health. Use `GET /validate` before `POST /reload`, and inspect recent control-plane activity through `GET /audit`.
 
 ## Runbooks And Release Artifacts
 

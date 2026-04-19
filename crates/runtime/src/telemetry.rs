@@ -10,8 +10,9 @@ use lb_observability::{
 };
 
 use crate::{
+    AbuseRejectionReason,
     HttpCacheStoreMetrics, HttpCacheStoreSnapshot, ListenerEvent, ListenerEventKind,
-    ListenerSnapshot, OverloadSnapshot, OverloadState,
+    ListenerAbuseProtectionSnapshot, ListenerSnapshot, OverloadSnapshot, OverloadState,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,6 +102,24 @@ impl RuntimeTelemetry {
                     name: String::from("runtime_listener_rejected_connections"),
                     kind: MetricKind::Gauge,
                     help: String::from("Total rejected listener connections observed in the latest snapshot"),
+                    allowed_labels: vec![TelemetryLabelKey::Listener],
+                },
+                MetricDescriptor {
+                    name: String::from("runtime_listener_abuse_rejections_total"),
+                    kind: MetricKind::Counter,
+                    help: String::from("Total hostile-edge listener rejections by reason code"),
+                    allowed_labels: vec![TelemetryLabelKey::Listener, TelemetryLabelKey::Reason],
+                },
+                MetricDescriptor {
+                    name: String::from("runtime_listener_abuse_tracked_sources"),
+                    kind: MetricKind::Gauge,
+                    help: String::from("Current number of tracked hostile-edge source buckets"),
+                    allowed_labels: vec![TelemetryLabelKey::Listener],
+                },
+                MetricDescriptor {
+                    name: String::from("runtime_listener_abuse_active_handshakes"),
+                    kind: MetricKind::Gauge,
+                    help: String::from("Current number of in-flight guarded handshakes"),
                     allowed_labels: vec![TelemetryLabelKey::Listener],
                 },
                 MetricDescriptor {
@@ -299,6 +318,47 @@ impl RuntimeTelemetry {
             "runtime_listener_rejected_connections",
             vec![TelemetryLabel::new(TelemetryLabelKey::Listener, &snapshot.name)],
             snapshot.rejected_connections as f64,
+        )
+    }
+
+    pub fn record_listener_abuse_rejection(
+        &self,
+        listener_name: &str,
+        reason: AbuseRejectionReason,
+        detail: &str,
+    ) -> Result<(), TelemetryError> {
+        let labels = vec![
+            TelemetryLabel::new(TelemetryLabelKey::Listener, listener_name),
+            TelemetryLabel::new(TelemetryLabelKey::Reason, reason.code()),
+        ];
+        self.metrics.increment_counter(
+            "runtime_listener_abuse_rejections_total",
+            labels.clone(),
+            1,
+        )?;
+        self.collector.push_event(TelemetryEvent::new(
+            TelemetryEventCode::RuntimeListenerRejected,
+            listener_name,
+            detail,
+            labels,
+        ));
+        Ok(())
+    }
+
+    pub fn record_listener_abuse_snapshot(
+        &self,
+        listener_name: &str,
+        snapshot: &ListenerAbuseProtectionSnapshot,
+    ) -> Result<(), TelemetryError> {
+        self.metrics.set_gauge(
+            "runtime_listener_abuse_tracked_sources",
+            vec![TelemetryLabel::new(TelemetryLabelKey::Listener, listener_name)],
+            snapshot.tracked_sources as f64,
+        )?;
+        self.metrics.set_gauge(
+            "runtime_listener_abuse_active_handshakes",
+            vec![TelemetryLabel::new(TelemetryLabelKey::Listener, listener_name)],
+            snapshot.active_handshakes as f64,
         )
     }
 

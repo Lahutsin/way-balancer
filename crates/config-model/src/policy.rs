@@ -14,6 +14,8 @@ pub struct PolicyResourcesConfig {
     pub local_rate_limits: Vec<NamedLocalRateLimitPolicyConfig>,
     /// Reusable local concurrency-limit policies.
     pub local_concurrency_limits: Vec<NamedLocalConcurrencyLimitPolicyConfig>,
+    /// Reusable hostile-edge protection policies.
+    pub hostile_edge_protections: Vec<NamedHostileEdgeProtectionPolicyConfig>,
     /// Reusable retry-budget policies.
     pub retry_budgets: Vec<NamedRetryBudgetPolicyConfig>,
     /// Reusable timeout hierarchy policies.
@@ -34,6 +36,8 @@ pub struct PolicyBindingConfig {
     pub local_rate_limits: Vec<String>,
     /// Referenced local concurrency-limit policy names.
     pub local_concurrency_limits: Vec<String>,
+    /// Referenced hostile-edge protection policy name.
+    pub hostile_edge_protection: Option<String>,
     /// Referenced retry-budget policy name.
     pub retry_budget: Option<String>,
     /// Referenced timeout hierarchy policy name.
@@ -199,6 +203,74 @@ pub struct NamedLocalConcurrencyLimitPolicyConfig {
     pub spec: LocalConcurrencyLimitPolicyConfig,
 }
 
+/// Source aggregation strategy for hostile-edge fairness controls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HostileEdgeSourceAggregationConfig {
+    #[default]
+    ExactIp,
+    Ipv4Subnet24,
+    Ipv6Subnet64,
+}
+
+/// Declarative source quota guard for hostile-edge admission fairness.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HostileEdgeSourceQuotaConfig {
+    /// Source key aggregation strategy.
+    pub aggregation: HostileEdgeSourceAggregationConfig,
+    /// Maximum active connections admitted for a single source bucket.
+    pub max_active_per_source: usize,
+    /// Maximum number of concurrently tracked source buckets.
+    pub max_tracked_sources: usize,
+}
+
+impl Default for HostileEdgeSourceQuotaConfig {
+    fn default() -> Self {
+        Self {
+            aggregation: HostileEdgeSourceAggregationConfig::ExactIp,
+            max_active_per_source: 32,
+            max_tracked_sources: 4096,
+        }
+    }
+}
+
+/// Declarative handshake concurrency guard for hostile-edge traffic.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HostileEdgeHandshakeGuardConfig {
+    /// Maximum concurrent handshakes allowed for the listener.
+    pub max_inflight: usize,
+    /// Timeout applied to the protected handshake window in milliseconds.
+    pub timeout_ms: u64,
+}
+
+impl Default for HostileEdgeHandshakeGuardConfig {
+    fn default() -> Self {
+        Self { max_inflight: 256, timeout_ms: 5_000 }
+    }
+}
+
+/// Declarative hostile-edge listener protections.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct HostileEdgeProtectionPolicyConfig {
+    /// Optional per-source active connection quota.
+    pub source_quota: Option<HostileEdgeSourceQuotaConfig>,
+    /// Optional concurrent handshake guard.
+    pub handshake_guard: Option<HostileEdgeHandshakeGuardConfig>,
+}
+
+/// Named hostile-edge protection resource.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NamedHostileEdgeProtectionPolicyConfig {
+    /// Stable policy name.
+    pub name: String,
+    /// Policy specification.
+    pub spec: HostileEdgeProtectionPolicyConfig,
+}
+
 /// Named retry-budget resource.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -252,8 +324,10 @@ pub struct NamedBrownoutFeatureConfig {
 #[cfg(test)]
 mod tests {
     use super::{
-        HttpCachePolicyConfig, NamedHttpCachePolicyConfig, NamedRetryBudgetPolicyConfig,
-        PolicyBindingConfig, PolicyResourcesConfig,
+        HostileEdgeHandshakeGuardConfig, HostileEdgeProtectionPolicyConfig,
+        HostileEdgeSourceQuotaConfig, HttpCachePolicyConfig, NamedHostileEdgeProtectionPolicyConfig,
+        NamedHttpCachePolicyConfig, NamedRetryBudgetPolicyConfig, PolicyBindingConfig,
+        PolicyResourcesConfig,
     };
     use crate::RetryBudgetPolicyConfig;
 
@@ -272,9 +346,17 @@ mod tests {
                 name: String::from("public-cache"),
                 spec: HttpCachePolicyConfig::default(),
             }],
+            hostile_edge_protections: vec![NamedHostileEdgeProtectionPolicyConfig {
+                name: String::from("edge-default"),
+                spec: HostileEdgeProtectionPolicyConfig {
+                    source_quota: Some(HostileEdgeSourceQuotaConfig::default()),
+                    handshake_guard: Some(HostileEdgeHandshakeGuardConfig::default()),
+                },
+            }],
             ..PolicyResourcesConfig::default()
         };
         let binding = PolicyBindingConfig {
+            hostile_edge_protection: Some(String::from("edge-default")),
             retry_budget: Some(String::from("standard")),
             cache_policy: Some(String::from("public-cache")),
             ..PolicyBindingConfig::default()
@@ -282,6 +364,8 @@ mod tests {
 
         assert_eq!(resources.retry_budgets.len(), 1);
         assert_eq!(resources.http_caches.len(), 1);
+        assert_eq!(resources.hostile_edge_protections.len(), 1);
+        assert_eq!(binding.hostile_edge_protection.as_deref(), Some("edge-default"));
         assert_eq!(binding.retry_budget.as_deref(), Some("standard"));
         assert_eq!(binding.cache_policy.as_deref(), Some("public-cache"));
     }

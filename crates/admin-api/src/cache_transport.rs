@@ -1,6 +1,7 @@
 use std::fmt;
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -8,6 +9,34 @@ use sha2::{Digest, Sha256};
 
 const DEFAULT_INVALIDATION_PATH: &str = "/cache/invalidate";
 const DEFAULT_MAX_FAILURE_DETAILS: usize = 8;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HttpCachePeerRetryPolicy {
+    pub max_attempts: usize,
+    pub initial_backoff: Duration,
+    pub max_backoff: Duration,
+}
+
+impl Default for HttpCachePeerRetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: 3,
+            initial_backoff: Duration::from_millis(25),
+            max_backoff: Duration::from_millis(250),
+        }
+    }
+}
+
+impl HttpCachePeerRetryPolicy {
+    #[must_use]
+    pub fn normalized(self) -> Self {
+        Self {
+            max_attempts: self.max_attempts.max(1),
+            initial_backoff: self.initial_backoff,
+            max_backoff: self.max_backoff.max(self.initial_backoff),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum HttpCacheInvalidationDeliveryMode {
@@ -155,10 +184,44 @@ pub struct HttpCachePeerInvalidationResponse {
     pub occurred_at_unix_ms: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HttpCachePeerDeliveryResult {
+    Applied,
+    Duplicate,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HttpCachePeerDeliveryRecord {
+    pub node_id: String,
+    pub result: HttpCachePeerDeliveryResult,
+    pub attempts: usize,
+    pub purged_entries: usize,
+    pub latency_ms: u64,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HttpCachePeerFanoutReport {
+    pub event_id: String,
+    pub scope: String,
+    pub degraded: bool,
+    pub partition_detected: bool,
+    pub delivery_success_count: usize,
+    pub delivery_failure_count: usize,
+    pub duplicate_count: usize,
+    pub subscriber_count: usize,
+    pub max_attempts: usize,
+    pub peer_results: Vec<HttpCachePeerDeliveryRecord>,
+}
+
 #[derive(Debug, Clone)]
 pub struct HttpCachePeerTransport {
     peers: Vec<HttpCachePeerConfig>,
     max_failure_details: usize,
+    retry_policy: HttpCachePeerRetryPolicy,
+    last_report: Arc<Mutex<Option<HttpCachePeerFanoutReport>>>,
 }
 
 impl HttpCachePeerTransport {
@@ -169,13 +232,34 @@ impl HttpCachePeerTransport {
         for peer in &peers {
             peer.validate()?;
         }
-        Ok(Self { peers, max_failure_details: DEFAULT_MAX_FAILURE_DETAILS })
+        Ok(Self {
+            peers,
+            max_failure_details: DEFAULT_MAX_FAILURE_DETAILS,
+            retry_policy: HttpCachePeerRetryPolicy::default(),
+            last_report: Arc::new(Mutex::new(None)),
+        })
     }
 
     #[must_use]
     pub fn with_max_failure_details(mut self, max_failure_details: usize) -> Self {
         self.max_failure_details = max_failure_details.max(1);
         self
+    }
+
+    #[must_use]
+    pub fn with_retry_policy(mut self, retry_policy: HttpCachePeerRetryPolicy) -> Self {
+        self.retry_policy = retry_policy.normalized();
+        self
+    }
+
+    #[must_use]
+    pub fn retry_policy(&self) -> HttpCachePeerRetryPolicy {
+        self.retry_policy
+    }
+
+    #[must_use]
+    pub fn last_report(&self) -> Option<HttpCachePeerFanoutReport> {
+        self.last_report.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
     }
 }
 
@@ -194,9 +278,35 @@ impl lb_runtime::HttpCacheInvalidationTransport for HttpCachePeerTransport {
         event.validate().map_err(lb_runtime::HttpCacheInvalidationTransportError::InvalidEvent)?;
 
         let mut result = lb_runtime::HttpCacheInvalidationPublishResult::default();
+        let mut peer_results = Vec::with_capacity(self.peers.len());
         for peer in &self.peers {
             result.subscriber_count += 1;
-            match publish_to_peer(peer, event) {
+            let started = std::time::Instant::now();
+            let mut attempts = 0;
+            let outcome = loop {
+                attempts += 1;
+                match publish_to_peer(peer, event) {
+                    Ok(response) => break Ok(response),
+                    Err(error) => {
+                        if attempts >= self.retry_policy.max_attempts {
+                            break Err(error);
+                        }
+                        let shift = u32::try_from(attempts.saturating_sub(1)).unwrap_or(u32::MAX);
+                        let multiplier = 1_u32.checked_shl(shift.min(20)).unwrap_or(u32::MAX);
+                        let backoff = self
+                            .retry_policy
+                            .initial_backoff
+                            .checked_mul(multiplier)
+                            .unwrap_or(self.retry_policy.max_backoff)
+                            .min(self.retry_policy.max_backoff);
+                        if !backoff.is_zero() {
+                            std::thread::sleep(backoff);
+                        }
+                    }
+                }
+            };
+            let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            match outcome {
                 Ok(HttpCachePeerInvalidationResponse {
                     result: HttpCachePeerInvalidationResult::Applied,
                     purged_entries,
@@ -205,6 +315,14 @@ impl lb_runtime::HttpCacheInvalidationTransport for HttpCachePeerTransport {
                     result.applied_count += 1;
                     result.delivery_success_count += 1;
                     result.purged_entries += purged_entries;
+                    peer_results.push(HttpCachePeerDeliveryRecord {
+                        node_id: peer.node_id.clone(),
+                        result: HttpCachePeerDeliveryResult::Applied,
+                        attempts,
+                        purged_entries,
+                        latency_ms,
+                        detail: None,
+                    });
                 }
                 Ok(HttpCachePeerInvalidationResponse {
                     result: HttpCachePeerInvalidationResult::Duplicate,
@@ -212,15 +330,45 @@ impl lb_runtime::HttpCacheInvalidationTransport for HttpCachePeerTransport {
                 }) => {
                     result.duplicate_count += 1;
                     result.delivery_success_count += 1;
+                    peer_results.push(HttpCachePeerDeliveryRecord {
+                        node_id: peer.node_id.clone(),
+                        result: HttpCachePeerDeliveryResult::Duplicate,
+                        attempts,
+                        purged_entries: 0,
+                        latency_ms,
+                        detail: None,
+                    });
                 }
                 Err(error) => {
                     result.delivery_failure_count += 1;
                     if result.failed_targets.len() < self.max_failure_details {
                         result.failed_targets.push(format!("{}:{error}", peer.node_id));
                     }
+                    peer_results.push(HttpCachePeerDeliveryRecord {
+                        node_id: peer.node_id.clone(),
+                        result: HttpCachePeerDeliveryResult::Failed,
+                        attempts,
+                        purged_entries: 0,
+                        latency_ms,
+                        detail: Some(error),
+                    });
                 }
             }
         }
+
+        *self.last_report.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(HttpCachePeerFanoutReport {
+                event_id: event.event_id.clone(),
+                scope: event.scope.clone(),
+                degraded: result.delivery_failure_count > 0,
+                partition_detected: result.delivery_failure_count > 0,
+                delivery_success_count: result.delivery_success_count,
+                delivery_failure_count: result.delivery_failure_count,
+                duplicate_count: result.duplicate_count,
+                subscriber_count: result.subscriber_count,
+                max_attempts: self.retry_policy.max_attempts,
+                peer_results,
+            });
 
         Ok(result)
     }
@@ -284,9 +432,25 @@ fn publish_to_peer(
         .map_err(|error| format!("write request {}: {error}", peer.node_id))?;
 
     let mut response = Vec::new();
-    stream
-        .read_to_end(&mut response)
-        .map_err(|error| format!("read response {}: {error}", peer.node_id))?;
+    let mut chunk = [0_u8; 4096];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => response.extend_from_slice(&chunk[..read]),
+            Err(error)
+                if !response.is_empty()
+                    && matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::UnexpectedEof
+                    ) =>
+            {
+                break;
+            }
+            Err(error) => {
+                return Err(format!("read response {}: {error}", peer.node_id));
+            }
+        }
+    }
 
     parse_peer_response(&response).map_err(|error| format!("{} response: {error}", peer.node_id))
 }
@@ -361,4 +525,177 @@ pub fn sign_http_cache_peer_request(
     outer.update(inner_digest);
     let digest = outer.finalize();
     digest.iter().map(|byte| format!("{byte:02x}")).collect::<String>()
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod tests {
+    use std::io::{Read, Write};
+    use std::net::Shutdown;
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::Duration;
+
+    use lb_runtime::{HttpCacheInvalidationEvent, HttpCacheInvalidationTarget, HttpCacheInvalidationTransport};
+
+    use super::{
+        HttpCachePeerConfig, HttpCachePeerDeliveryResult, HttpCachePeerRetryPolicy,
+        HttpCachePeerTransport,
+    };
+
+    fn spawn_peer_server(
+        responses: Vec<&'static str>,
+        attempts: Arc<AtomicUsize>,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        thread::spawn(move || {
+            for response in responses {
+                let (mut stream, _) = listener.accept().expect("accept connection");
+                attempts.fetch_add(1, Ordering::SeqCst);
+                let mut buffer = [0_u8; 2048];
+                let _ = stream.read(&mut buffer);
+                stream.write_all(response.as_bytes()).expect("write response");
+                stream.flush().expect("flush response");
+                stream.shutdown(Shutdown::Write).expect("shutdown write half");
+            }
+        });
+        Ok(format!("http://{addr}"))
+    }
+
+    fn publish_event(
+        transport: &HttpCachePeerTransport,
+        event_id: &str,
+    ) -> Result<lb_runtime::HttpCacheInvalidationPublishResult, Box<dyn std::error::Error>> {
+        Ok(transport.publish(&HttpCacheInvalidationEvent::new(
+            event_id,
+            "shared-cache",
+            "operator",
+            HttpCacheInvalidationTarget::PathPrefix(String::from("/assets")),
+            100,
+        )?)?)
+    }
+
+    #[test]
+    fn peer_transport_retries_then_succeeds() -> Result<(), Box<dyn std::error::Error>> {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let applied_body = "{\"result\":\"applied\",\"event_id\":\"evt-1\",\"scope\":\"shared-cache\",\"purged_entries\":3,\"occurred_at_unix_ms\":100}";
+        let origin = spawn_peer_server(
+            vec![
+                "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n",
+                Box::leak(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        applied_body.len(),
+                        applied_body,
+                    )
+                    .into_boxed_str(),
+                ),
+            ],
+            attempts.clone(),
+        )?;
+        std::env::set_var("LB_CACHE_TEST_SECRET", "peer-secret");
+        let transport = HttpCachePeerTransport::new([HttpCachePeerConfig::new(
+            "node-b",
+            origin,
+            "peer-a",
+            "LB_CACHE_TEST_SECRET",
+        )])?
+        .with_retry_policy(HttpCachePeerRetryPolicy {
+            max_attempts: 2,
+            initial_backoff: Duration::ZERO,
+            max_backoff: Duration::ZERO,
+        });
+
+        let result = publish_event(&transport, "evt-1")?;
+
+        assert_eq!(result.delivery_success_count, 1);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        let report = transport.last_report().expect("last report");
+        assert!(!report.degraded);
+        assert_eq!(report.peer_results[0].result, HttpCachePeerDeliveryResult::Applied);
+        assert_eq!(report.peer_results[0].attempts, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn peer_transport_reports_partition_when_peer_is_unreachable(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        std::env::set_var("LB_CACHE_TEST_SECRET_UNREACHABLE", "peer-secret");
+        let transport = HttpCachePeerTransport::new([HttpCachePeerConfig::new(
+            "node-z",
+            "http://127.0.0.1:9",
+            "peer-a",
+            "LB_CACHE_TEST_SECRET_UNREACHABLE",
+        )])?
+        .with_retry_policy(HttpCachePeerRetryPolicy {
+            max_attempts: 2,
+            initial_backoff: Duration::ZERO,
+            max_backoff: Duration::ZERO,
+        });
+
+        let result = publish_event(&transport, "evt-2")?;
+
+        assert_eq!(result.delivery_failure_count, 1);
+        let report = transport.last_report().expect("last report");
+        assert!(report.degraded);
+        assert!(report.partition_detected);
+        assert_eq!(report.peer_results[0].result, HttpCachePeerDeliveryResult::Failed);
+        assert_eq!(report.peer_results[0].attempts, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn peer_transport_reports_duplicate_delivery() -> Result<(), Box<dyn std::error::Error>> {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let duplicate_body = "{\"result\":\"duplicate\",\"event_id\":\"evt-3\",\"scope\":\"shared-cache\",\"purged_entries\":0,\"occurred_at_unix_ms\":100}";
+        let origin = spawn_peer_server(
+            vec![Box::leak(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    duplicate_body.len(),
+                    duplicate_body,
+                )
+                .into_boxed_str(),
+            )],
+            attempts,
+        )?;
+        std::env::set_var("LB_CACHE_TEST_SECRET_DUPLICATE", "peer-secret");
+        let transport = HttpCachePeerTransport::new([HttpCachePeerConfig::new(
+            "node-b",
+            origin,
+            "peer-a",
+            "LB_CACHE_TEST_SECRET_DUPLICATE",
+        )])?
+        .with_retry_policy(HttpCachePeerRetryPolicy {
+            max_attempts: 1,
+            initial_backoff: Duration::ZERO,
+            max_backoff: Duration::ZERO,
+        });
+
+        let result = publish_event(&transport, "evt-3")?;
+
+        assert_eq!(
+            result.delivery_success_count,
+            1,
+            "unexpected publish result: {:?}",
+            result
+        );
+        let report = transport.last_report().expect("last report");
+        assert_eq!(
+            report.peer_results[0].result,
+            HttpCachePeerDeliveryResult::Duplicate,
+            "unexpected fanout report: {:?}",
+            report
+        );
+        assert_eq!(
+            report.duplicate_count,
+            1,
+            "unexpected fanout report: {:?}",
+            report
+        );
+        Ok(())
+    }
 }

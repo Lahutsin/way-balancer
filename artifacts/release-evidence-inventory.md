@@ -1,17 +1,5 @@
 # Release Evidence Inventory
 
-- `EVID-001`: `docs/runbooks/compatibility-matrix.md`
-- `EVID-002`: `docs/runbooks/upgrade-rollback-policy.md`
-- `EVID-003`: `docs/runbooks/disaster-recovery.md`
-- `EVID-004`: workspace tests plus coverage gate
-- `EVID-005`: `docs/runbooks/cache-performance.md`
-- `EVID-006`: `artifacts/sbom/README.md` and `artifacts/provenance/README.md`
-- `EVID-007`: security review and secret-scanning outputs
-- `EVID-008`: `docs/runbooks/ga-readiness-review-template.md`
-- `EVID-009`: `docs/runbooks/stability-contract.md`
-
-# Release Evidence Inventory
-
 | Evidence ID | Artifact path | Purpose |
 | --- | --- | --- |
 | `EVID-001` | `docs/runbooks/compatibility-matrix.md` | Supported versions and skew policy |
@@ -23,5 +11,6 @@
 | `EVID-007` | `artifacts/provenance/README.md` | Provenance artifact location |
 | `EVID-008` | `docs/runbooks/ga-readiness-review-template.md` | Final GA decision record |
 | `EVID-009` | `docs/runbooks/stability-contract.md` | Stability boundaries, deprecation policy, and breaking-change contract |
+| `EVID-010` | `artifacts/performance-envelope/README.md` | Supported non-loopback performance envelope evidence |
 
-The release owner should attach generated outputs or references for each artifact path before declaring GA readiness.
+The release owner should attach generated outputs or references for each artifact path before declaring GA readiness, and should review `docs/runbooks/support-boundaries.md` alongside the final GA decision so the candidate is not presented outside its documented operating envelope.

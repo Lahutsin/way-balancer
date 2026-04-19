@@ -51,6 +51,8 @@ If you need multi-node convergence, use the distributed invalidation flow descri
 
 For cross-process or cross-host deployments, the current production-oriented path is HTTP peer fan-out from `HttpCacheAdminService`. That path is best-effort: the initiating node purges locally first, then pushes a signed invalidation event to each configured peer, and reports any partial failure back to the operator instead of pretending the cluster converged.
 
+In `F24`, that peer path also gained a bounded retry policy and a machine-readable last fan-out report. The semantics stay intentionally conservative: retries improve delivery odds, but they do not upgrade the contract into hidden consensus.
+
 ## Observability And Diagnostics
 
 The cache emits bounded metrics and events only. Operators should rely on:
@@ -68,6 +70,13 @@ For purge workflows, treat the admin response as part of the operator contract:
 - `fanout_delivery_success_count` and `fanout_delivery_failure_count` indicate whether remote convergence was complete.
 - `fanout_failed_targets` provides bounded peer failure detail suitable for tickets and paging notes.
 - `degraded = true` means retry or follow-up is required before considering the cluster converged.
+
+If you are using `HttpCachePeerTransport` directly, also inspect its last fan-out report:
+
+- per-peer `attempts`
+- per-peer `latency_ms`
+- per-peer result `applied`, `duplicate`, or `failed`
+- `partition_detected = true` when one or more peers remained unreachable after bounded retries
 
 ## Capacity Pressure And Failure Modes
 
