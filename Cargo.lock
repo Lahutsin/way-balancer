@@ -700,6 +700,7 @@ dependencies = [
  "lb-runtime",
  "lb-test-support",
  "rcgen",
+ "rustls",
  "serde",
  "serde_json",
  "sha2",

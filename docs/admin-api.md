@@ -106,7 +106,10 @@ method
 target
 timestamp
 nonce
+sha256_hex(request_body)
 ```
+
+For empty-body requests, the final line is the SHA-256 of the empty payload. Any body mutation after signing invalidates the request.
 
 The signature path enforces:
 

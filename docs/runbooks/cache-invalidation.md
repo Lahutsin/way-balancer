@@ -15,8 +15,9 @@ Distributed fan-out mode:
 HTTP peer fan-out mode:
 - Build each node's `HttpCacheAdminService` with `with_http_peer_transport(node_id, peers)`.
 - Use `with_http_peer_transport_and_retry_policy(...)` when the control plane needs explicit retry tuning.
-- Configure one `HttpCachePeerConfig` per remote node using an `http://host:port` origin, a dedicated admin actor, and a shared secret exposed through `secret_env`.
-- Peer delivery uses signed `POST /cache/invalidate` requests carrying the bounded `HttpCacheInvalidationEvent` envelope.
+- Configure one `HttpCachePeerConfig` per remote node using an `https://host:port` origin, a dedicated admin actor, a shared secret exposed through `secret_env`, and a trust anchor exposed through `tls_ca_cert_env`.
+- Plaintext `http://` origins are accepted only for loopback peers in local development.
+- Peer delivery uses signed `POST /cache/invalidate` requests carrying the bounded `HttpCacheInvalidationEvent` envelope, and the signature includes a SHA-256 digest of the serialized request body.
 - The initiating node always applies the invalidation locally first and then attempts best-effort remote delivery.
 
 ## Operational Guarantees

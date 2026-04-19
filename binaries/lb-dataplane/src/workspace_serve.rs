@@ -24,7 +24,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::{ProducesTickets, ResolvesServerCert};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{oneshot, watch, Mutex, RwLock};
 use tokio::task::JoinSet;
@@ -103,6 +103,12 @@ enum ManagedProxyConfig {
 struct ManagedHttpsProxyConfig {
     http1: lb_runtime::Http1ProxyConfig,
     http2: lb_runtime::Http2ProxyConfig,
+    tls_server_config: Arc<rustls::ServerConfig>,
+    tls_status: ListenerTlsStatus,
+}
+
+#[derive(Debug, Clone)]
+struct ManagedAdminTlsConfig {
     tls_server_config: Arc<rustls::ServerConfig>,
     tls_status: ListenerTlsStatus,
 }
@@ -224,7 +230,7 @@ impl ListenerRuntimeCounters {
 #[derive(Debug)]
 enum ManagedListenerKind {
     Public { shared_proxy: Arc<RwLock<ManagedProxyConfig>> },
-    Admin { runtime: AdminRuntimeHandles },
+    Admin { runtime: AdminRuntimeHandles, tls_status: Option<ListenerTlsStatus> },
 }
 
 #[derive(Debug, Clone)]
@@ -362,10 +368,7 @@ struct JournalInFlightOperation {
 }
 
 impl JournalInFlightOperation {
-    fn from_reload_plan(
-        desired_snapshot: DurableSnapshotIdentity,
-        plan: &ReloadAuditPlan,
-    ) -> Self {
+    fn from_reload_plan(desired_snapshot: DurableSnapshotIdentity, plan: &ReloadAuditPlan) -> Self {
         let affected_listeners = if !plan.supported_replacements.is_empty() {
             plan.supported_replacements.clone()
         } else {
@@ -688,21 +691,20 @@ impl ControlPlaneRecoveryInfo {
             .in_flight_operation
             .as_ref()
             .and_then(|operation| operation.expected_completion_within_ms);
-        let exceeded_expected_completion =
-            match (operation_age_ms, expected_completion_within_ms) {
-                (Some(age_ms), Some(expected_ms)) => age_ms > expected_ms,
-                _ => false,
-            };
+        let exceeded_expected_completion = match (operation_age_ms, expected_completion_within_ms) {
+            (Some(age_ms), Some(expected_ms)) => age_ms > expected_ms,
+            _ => false,
+        };
         if self.state == "needs_operator_action" {
-            let (recommended_action, urgency) = match reconciliation_summary.overall_verdict.as_str()
+            let (recommended_action, urgency) = match reconciliation_summary
+                .overall_verdict
+                .as_str()
             {
                 "replacement_still_draining" if exceeded_expected_completion => {
                     ("investigate_stalled_drain", "action_required")
                 }
                 "replacement_still_draining" => ("wait_for_drain_completion", "watch"),
-                "replacement_failed_preserved" => {
-                    ("validate_and_retry_reload", "action_required")
-                }
+                "replacement_failed_preserved" => ("validate_and_retry_reload", "action_required"),
                 "replacement_drain_timeout" => ("investigate_drain_timeout", "urgent"),
                 "needs_review" => ("investigate_and_validate_reload", "urgent"),
                 _ => ("validate_and_retry_reload", "action_required"),
@@ -930,7 +932,10 @@ fn versioned_admin_target_parts(target: &str) -> Option<(String, String)> {
         Some((segment, remainder)) => (segment, format!("/{remainder}")),
         None => (trimmed, String::from("/")),
     };
-    if segment.len() < 2 || !segment.starts_with('v') || !segment[1..].chars().all(|c| c.is_ascii_digit()) {
+    if segment.len() < 2
+        || !segment.starts_with('v')
+        || !segment[1..].chars().all(|c| c.is_ascii_digit())
+    {
         return None;
     }
     Some((segment.to_ascii_lowercase(), remainder))
@@ -954,13 +959,17 @@ fn versioned_admin_response_headers(extra_headers: &[&'static str]) -> Vec<&'sta
     headers
 }
 
-async fn write_versioned_admin_success<T: Serialize>(
-    stream: &mut TcpStream,
+async fn write_versioned_admin_success<S, T>(
+    stream: &mut S,
     status: &'static str,
     extra_headers: &[&'static str],
     request_id: &str,
     data: T,
-) -> io::Result<()> {
+) -> io::Result<()>
+where
+    S: AsyncWrite + Unpin,
+    T: Serialize,
+{
     let body = serde_json::to_string(&lb_admin_api::VersionedAdminApiSuccessEnvelope::new(
         request_id.to_string(),
         data,
@@ -977,15 +986,18 @@ async fn write_versioned_admin_success<T: Serialize>(
     .await
 }
 
-async fn write_versioned_admin_error(
-    stream: &mut TcpStream,
+async fn write_versioned_admin_error<S>(
+    stream: &mut S,
     status: &'static str,
     extra_headers: &[&'static str],
     request_id: &str,
     code: lb_admin_api::AdminApiErrorCode,
     message: impl Into<String>,
     retryable: bool,
-) -> io::Result<()> {
+) -> io::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
     let body = serde_json::to_string(&lb_admin_api::VersionedAdminApiErrorEnvelope::new(
         request_id.to_string(),
         lb_admin_api::VersionedAdminApiError::new(code, message, retryable),
@@ -1006,9 +1018,7 @@ fn json_body_to_value(body: &str) -> io::Result<serde_json::Value> {
     serde_json::from_str(body).map_err(|error| io::Error::other(error.to_string()))
 }
 
-fn admin_auth_error_contract(
-    error: &AdminAuthFailure,
-) -> (lb_admin_api::AdminApiErrorCode, bool) {
+fn admin_auth_error_contract(error: &AdminAuthFailure) -> (lb_admin_api::AdminApiErrorCode, bool) {
     match (error.status, error.outcome) {
         ("503 Service Unavailable", _) => (lb_admin_api::AdminApiErrorCode::Misconfigured, false),
         ("409 Conflict", _) => (lb_admin_api::AdminApiErrorCode::ReplayRejected, false),
@@ -1351,12 +1361,14 @@ enum CompiledServeListener {
         proxy: ManagedProxyConfig,
     },
     Admin {
+        protocol: lb_config_model::ListenerProtocolConfig,
         bind_address: SocketAddr,
         max_connections: usize,
         drain_timeout: Duration,
         overload_policy: Option<CompiledListenerOverloadPolicy>,
         abuse_protection_policy: Option<CompiledListenerAbuseProtectionPolicy>,
         admin_policy: CompiledAdminPolicy,
+        tls: Option<ManagedAdminTlsConfig>,
     },
 }
 
@@ -1371,7 +1383,7 @@ impl CompiledServeListener {
     fn protocol(&self) -> lb_config_model::ListenerProtocolConfig {
         match self {
             Self::Public { protocol, .. } => *protocol,
-            Self::Admin { .. } => lb_config_model::ListenerProtocolConfig::Http1,
+            Self::Admin { protocol, .. } => *protocol,
         }
     }
 
@@ -1425,7 +1437,7 @@ struct CompiledWorkspaceRuntime {
 struct WorkspaceServeState {
     started_at: Instant,
     config_path: String,
-    telemetry: lb_runtime::RuntimeTelemetry,
+    telemetry: Arc<lb_runtime::RuntimeTelemetry>,
     proxied_connections: AtomicU64,
     proxied_requests: AtomicU64,
     admin_requests: AtomicU64,
@@ -1452,7 +1464,7 @@ impl WorkspaceServeState {
         Ok(Self {
             started_at: Instant::now(),
             config_path: config_path.clone(),
-            telemetry: lb_runtime::RuntimeTelemetry::new().map_err(to_dyn_error)?,
+            telemetry: Arc::new(lb_runtime::RuntimeTelemetry::new().map_err(to_dyn_error)?),
             proxied_connections: AtomicU64::new(0),
             proxied_requests: AtomicU64::new(0),
             admin_requests: AtomicU64::new(0),
@@ -1620,9 +1632,7 @@ impl WorkspaceServeState {
         abuse_protection: &RwLock<lb_runtime::ListenerAbuseProtectionState>,
     ) {
         let snapshot = abuse_protection.read().await.snapshot();
-        if let Err(error) = self
-            .telemetry
-            .record_listener_abuse_snapshot(listener_name, &snapshot)
+        if let Err(error) = self.telemetry.record_listener_abuse_snapshot(listener_name, &snapshot)
         {
             eprintln!("listener abuse snapshot emission failed: {error}");
         }
@@ -1698,11 +1708,12 @@ impl WorkspaceServeState {
         }
 
         let raw = fs::read_to_string(&journal_path).map_err(to_dyn_error)?;
-        let envelope: ControlPlaneJournalEnvelope = serde_json::from_str(&raw).map_err(|error| {
-            to_dyn_error(format!(
-                "control-plane journal at {journal_path} is unreadable: {error}"
-            ))
-        })?;
+        let envelope: ControlPlaneJournalEnvelope =
+            serde_json::from_str(&raw).map_err(|error| {
+                to_dyn_error(format!(
+                    "control-plane journal at {journal_path} is unreadable: {error}"
+                ))
+            })?;
         if envelope.version != CONTROL_PLANE_JOURNAL_VERSION {
             return Err(to_dyn_error(format!(
                 "control-plane journal at {journal_path} uses unsupported version {}",
@@ -1715,8 +1726,8 @@ impl WorkspaceServeState {
                 "control-plane journal at {journal_path} failed checksum validation"
             )));
         }
-        let payload: ControlPlaneJournalPayload =
-            serde_json::from_str(&envelope.payload_json).map_err(|error| {
+        let payload: ControlPlaneJournalPayload = serde_json::from_str(&envelope.payload_json)
+            .map_err(|error| {
                 to_dyn_error(format!(
                     "control-plane journal payload at {journal_path} is invalid: {error}"
                 ))
@@ -1751,15 +1762,13 @@ impl WorkspaceServeState {
             restored_recent_admin_audit.remove(0);
         }
 
-        self.reload_health
-            .store(reload_health_index(restored_reload_health), Ordering::SeqCst);
+        self.reload_health.store(reload_health_index(restored_reload_health), Ordering::SeqCst);
         *self.last_reload_outcome_code.lock().await = restored_last_reload_outcome_code;
         *self.last_reload_result.lock().await = restored_last_reload_result;
-        *self.recent_admin_audit.lock().await = restored_recent_admin_audit.iter().cloned().collect();
-        self.admin_audit_sequence.store(
-            next_admin_sequence_from_events(&restored_recent_admin_audit),
-            Ordering::SeqCst,
-        );
+        *self.recent_admin_audit.lock().await =
+            restored_recent_admin_audit.iter().cloned().collect();
+        self.admin_audit_sequence
+            .store(next_admin_sequence_from_events(&restored_recent_admin_audit), Ordering::SeqCst);
 
         let mut journal = self.control_plane_journal.lock().await;
         journal.desired_snapshot = payload.desired_snapshot.clone();
@@ -1804,9 +1813,7 @@ impl WorkspaceServeState {
         listener_statuses: &[ListenerStatus],
     ) -> Result<(), DynError> {
         let mut journal = self.control_plane_journal.lock().await;
-        journal
-            .recovery
-            .reconcile_with_listener_statuses(listener_statuses);
+        journal.recovery.reconcile_with_listener_statuses(listener_statuses);
         drop(journal);
         self.persist_control_plane_journal().await
     }
@@ -2471,7 +2478,10 @@ impl ListenerAbuseProtectionStatus {
     ) -> Self {
         let mut reason_codes = Vec::new();
         if snapshot.source_quota_rejections > 0 {
-            push_unique_reason(&mut reason_codes, lb_runtime::AbuseRejectionReason::SourceQuotaExceeded.code());
+            push_unique_reason(
+                &mut reason_codes,
+                lb_runtime::AbuseRejectionReason::SourceQuotaExceeded.code(),
+            );
         }
         if snapshot.tracked_source_limit_rejections > 0 {
             push_unique_reason(
@@ -2493,10 +2503,9 @@ impl ListenerAbuseProtectionStatus {
                 max_tracked_sources: source_quota.max_tracked_sources,
             })
         });
-        if source_quota
-            .as_ref()
-            .is_some_and(|source_quota| snapshot.tracked_sources >= source_quota.max_tracked_sources)
-        {
+        if source_quota.as_ref().is_some_and(|source_quota| {
+            snapshot.tracked_sources >= source_quota.max_tracked_sources
+        }) {
             push_unique_reason(&mut reason_codes, "tracked_source_capacity_saturated");
         }
 
@@ -2506,10 +2515,9 @@ impl ListenerAbuseProtectionStatus {
                 timeout_ms: handshake_guard.timeout.as_millis() as u64,
             })
         });
-        if handshake_guard
-            .as_ref()
-            .is_some_and(|handshake_guard| snapshot.active_handshakes >= handshake_guard.max_inflight)
-        {
+        if handshake_guard.as_ref().is_some_and(|handshake_guard| {
+            snapshot.active_handshakes >= handshake_guard.max_inflight
+        }) {
             push_unique_reason(&mut reason_codes, "handshake_guard_saturated");
         }
 
@@ -2558,14 +2566,8 @@ impl ListenerAbuseProtectionStatus {
             || String::from("null"),
             |handshake_guard| {
                 format!(
-                    concat!(
-                        "{{",
-                        "\"max_inflight\":{},",
-                        "\"timeout_ms\":{}",
-                        "}}"
-                    ),
-                    handshake_guard.max_inflight,
-                    handshake_guard.timeout_ms,
+                    concat!("{{", "\"max_inflight\":{},", "\"timeout_ms\":{}", "}}"),
+                    handshake_guard.max_inflight, handshake_guard.timeout_ms,
                 )
             },
         );
@@ -2763,15 +2765,13 @@ impl ServeSupervisor {
         };
         let _ = supervisor.reload_with_recovery_resolution(false).await?;
         let listener_statuses = supervisor.listener_statuses().await;
-        supervisor
-            .shared
-            .state
-            .reconcile_control_plane_recovery(&listener_statuses)
-            .await?;
+        supervisor.shared.state.reconcile_control_plane_recovery(&listener_statuses).await?;
         Ok(supervisor)
     }
 
-    fn reload(&self) -> Pin<Box<dyn Future<Output = Result<ReloadApplyOutcome, DynError>> + Send + '_>> {
+    fn reload(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<ReloadApplyOutcome, DynError>> + Send + '_>> {
         self.reload_with_recovery_resolution(true)
     }
 
@@ -2795,7 +2795,8 @@ impl ServeSupervisor {
                     .map(|(name, listener)| (name.clone(), listener.current_identity()))
                     .collect::<BTreeMap<_, _>>()
             };
-            let reload_plan = ReloadAuditPlan::from_candidate(&current_identities, &compiled.listeners);
+            let reload_plan =
+                ReloadAuditPlan::from_candidate(&current_identities, &compiled.listeners);
             self.shared
                 .state
                 .prepare_reload_persistence(JournalInFlightOperation::from_reload_plan(
@@ -2831,10 +2832,7 @@ impl ServeSupervisor {
                     *self.shared.state.last_reload_outcome_code.lock().await =
                         String::from("reload_failed_apply");
                     *self.shared.state.last_reload_result.lock().await = error.to_string();
-                    self.shared
-                        .state
-                        .finish_reload_persistence(None, resolve_recovery)
-                        .await?;
+                    self.shared.state.finish_reload_persistence(None, resolve_recovery).await?;
                 }
             }
             result
@@ -2868,10 +2866,9 @@ impl ServeSupervisor {
                 .listeners
                 .iter()
                 .filter_map(|(listener_name, slot)| match &slot.active.kind {
-                    ManagedListenerKind::Admin { runtime } => Some((
-                        listener_name.clone(),
-                        Arc::clone(&runtime.shared_policy),
-                    )),
+                    ManagedListenerKind::Admin { runtime, .. } => {
+                        Some((listener_name.clone(), Arc::clone(&runtime.shared_policy)))
+                    }
                     ManagedListenerKind::Public { .. } => None,
                 })
                 .collect::<Vec<_>>()
@@ -3079,9 +3076,11 @@ impl ServeSupervisor {
                         Arc::clone(&slot.active.abuse_protection),
                         match &slot.active.kind {
                             ManagedListenerKind::Public { shared_proxy } => {
-                                Some(Arc::clone(shared_proxy))
+                                (Some(Arc::clone(shared_proxy)), None)
                             }
-                            ManagedListenerKind::Admin { .. } => None,
+                            ManagedListenerKind::Admin { tls_status, .. } => {
+                                (None, tls_status.clone())
+                            }
                         },
                         slot.lifecycle.clone(),
                     )
@@ -3100,7 +3099,7 @@ impl ServeSupervisor {
             overload_runtime,
             abuse_policy,
             abuse_protection,
-            shared_proxy,
+            (shared_proxy, admin_tls_status),
             lifecycle,
         ) in listeners
         {
@@ -3118,7 +3117,7 @@ impl ServeSupervisor {
                     ManagedProxyConfig::Http1(_) | ManagedProxyConfig::Http2(_) => None,
                 }
             } else {
-                None
+                admin_tls_status
             };
             statuses.push(ListenerStatus {
                 name,
@@ -3162,7 +3161,7 @@ impl ManagedServeListener {
         {
             *shared_proxy.write().await = proxy.clone();
         } else if let (
-            ManagedListenerKind::Admin { runtime },
+            ManagedListenerKind::Admin { runtime, .. },
             CompiledServeListener::Admin { admin_policy, .. },
         ) = (&self.kind, spec)
         {
@@ -3201,8 +3200,9 @@ async fn start_managed_listener(
     let overload_runtime =
         Arc::new(StdMutex::new(build_listener_overload_runtime(spec.overload_policy())?));
     let abuse_policy = Arc::new(RwLock::new(spec.abuse_protection_policy().cloned()));
-    let abuse_protection =
-        Arc::new(RwLock::new(build_listener_abuse_protection_state(spec.abuse_protection_policy())));
+    let abuse_protection = Arc::new(RwLock::new(build_listener_abuse_protection_state(
+        spec.abuse_protection_policy(),
+    )));
     let counters = Arc::new(ListenerRuntimeCounters::new());
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -3249,7 +3249,7 @@ async fn start_managed_listener(
             )
             .await
         }
-        CompiledServeListener::Admin { bind_address, admin_policy, .. } => {
+        CompiledServeListener::Admin { protocol, bind_address, admin_policy, tls, .. } => {
             let (ready_tx, ready_rx) = oneshot::channel();
             let admin_runtime = AdminRuntimeHandles {
                 shared_policy: Arc::new(RwLock::new(admin_policy)),
@@ -3267,6 +3267,7 @@ async fn start_managed_listener(
                 shutdown_rx,
                 drain_timeout,
                 admin_runtime.clone(),
+                tls.clone(),
                 Arc::clone(&supervisor.shared.admin_secret),
                 supervisor,
                 ready_tx,
@@ -3275,7 +3276,7 @@ async fn start_managed_listener(
                 ManagedServeListener {
                     name,
                     class: lb_config_model::ListenerClassConfig::Admin,
-                    protocol: lb_config_model::ListenerProtocolConfig::Http1,
+                    protocol,
                     configured_bind: bind_address,
                     local_addr,
                     drain_timeout,
@@ -3284,7 +3285,10 @@ async fn start_managed_listener(
                     abuse_policy,
                     abuse_protection,
                     counters,
-                    kind: ManagedListenerKind::Admin { runtime: admin_runtime },
+                    kind: ManagedListenerKind::Admin {
+                        runtime: admin_runtime,
+                        tls_status: tls.as_ref().map(|config| config.tls_status.clone()),
+                    },
                     shutdown_tx,
                     task,
                     probe_task: None,
@@ -3531,19 +3535,17 @@ async fn run_public_listener_loop(
     }
 
     *counters.state.write().await = String::from("draining");
-    let drain_outcome = if time::timeout(
-        drain_timeout,
-        async { while tasks.join_next().await.is_some() {} },
-    )
-    .await
-    .is_ok()
-    {
-        *counters.state.write().await = String::from("stopped");
-        ListenerDrainOutcome::Completed
-    } else {
-        *counters.state.write().await = String::from("drain_timeout_expired");
-        ListenerDrainOutcome::TimedOut
-    };
+    let drain_outcome =
+        if time::timeout(drain_timeout, async { while tasks.join_next().await.is_some() {} })
+            .await
+            .is_ok()
+        {
+            *counters.state.write().await = String::from("stopped");
+            ListenerDrainOutcome::Completed
+        } else {
+            *counters.state.write().await = String::from("drain_timeout_expired");
+            ListenerDrainOutcome::TimedOut
+        };
     Ok(drain_outcome)
 }
 
@@ -3558,6 +3560,7 @@ async fn run_admin_listener_loop(
     mut shutdown_rx: watch::Receiver<bool>,
     drain_timeout: Duration,
     admin_runtime: AdminRuntimeHandles,
+    admin_tls: Option<ManagedAdminTlsConfig>,
     admin_secret: Arc<String>,
     supervisor: ServeSupervisor,
     ready_tx: oneshot::Sender<()>,
@@ -3582,7 +3585,9 @@ async fn run_admin_listener_loop(
                         Err(reason) => {
                             state.record_listener_abuse_rejection(&listener_name, reason);
                             state.sync_listener_abuse_snapshot(&listener_name, &abuse_protection).await;
-                            let _ = write_abuse_rejection_response(&mut stream, reason).await;
+                            if admin_tls.is_none() {
+                                let _ = write_abuse_rejection_response(&mut stream, reason).await;
+                            }
                             continue;
                         }
                     }
@@ -3595,18 +3600,23 @@ async fn run_admin_listener_loop(
                             drop(source_lease);
                             state.record_listener_abuse_rejection(&listener_name, reason);
                             state.sync_listener_abuse_snapshot(&listener_name, &abuse_protection).await;
-                            let _ = write_abuse_rejection_response(&mut stream, reason).await;
+                            if admin_tls.is_none() {
+                                let _ = write_abuse_rejection_response(&mut stream, reason).await;
+                            }
                             continue;
                         }
                     }
                 };
-                if let Some(handshake_permit) = handshake_permit.as_mut() {
-                    handshake_permit.release();
+                if admin_tls.is_none() {
+                    if let Some(handshake_permit) = handshake_permit.as_mut() {
+                        handshake_permit.release();
+                    }
                 }
                 state.sync_listener_abuse_snapshot(&listener_name, &abuse_protection).await;
                 counters.accepted_connections.fetch_add(1, Ordering::SeqCst);
                 if !try_acquire_listener_slot(&counters, &admission_limit) {
                     drop(source_lease);
+                    drop(handshake_permit);
                     counters.shed_connections.fetch_add(1, Ordering::SeqCst);
                     state.record_overload_event(
                         &listener_name,
@@ -3623,7 +3633,9 @@ async fn run_admin_listener_loop(
                         &overload_runtime,
                         true,
                     );
-                    let _ = write_overload_response(&mut stream).await;
+                    if admin_tls.is_none() {
+                        let _ = write_overload_response(&mut stream).await;
+                    }
                     continue;
                 }
                 state.sync_listener_overload_snapshot(
@@ -3642,19 +3654,38 @@ async fn run_admin_listener_loop(
                 let admission_limit = Arc::clone(&admission_limit);
                 let overload_runtime = Arc::clone(&overload_runtime);
                 let abuse_protection = Arc::clone(&abuse_protection);
+                let admin_tls = admin_tls.clone();
                 tasks.spawn(async move {
                     let _source_lease = source_lease;
                     let state_for_connection = Arc::clone(&state);
-                    let _ = handle_workspace_admin_connection(
-                        stream,
-                        peer_addr,
-                        listener_name.clone(),
-                        state_for_connection,
-                        admin_runtime,
-                        admin_secret,
-                        supervisor,
-                    )
-                    .await;
+                    let _ = match admin_tls {
+                        Some(config) => {
+                            handle_workspace_admin_tls_connection(
+                                stream,
+                                peer_addr,
+                                listener_name.clone(),
+                                state_for_connection,
+                                admin_runtime,
+                                admin_secret,
+                                supervisor,
+                                config,
+                                handshake_permit,
+                            )
+                            .await
+                        }
+                        None => {
+                            handle_workspace_admin_connection(
+                                stream,
+                                peer_addr,
+                                listener_name.clone(),
+                                state_for_connection,
+                                admin_runtime,
+                                admin_secret,
+                                supervisor,
+                            )
+                            .await
+                        }
+                    };
                     counters.active_connections.fetch_sub(1, Ordering::SeqCst);
                     counters.completed_connections.fetch_add(1, Ordering::SeqCst);
                     state.sync_listener_overload_snapshot(
@@ -3671,31 +3702,62 @@ async fn run_admin_listener_loop(
     }
 
     *counters.state.write().await = String::from("draining");
-    let drain_outcome = if time::timeout(
-        drain_timeout,
-        async { while tasks.join_next().await.is_some() {} },
-    )
-    .await
-    .is_ok()
-    {
-        *counters.state.write().await = String::from("stopped");
-        ListenerDrainOutcome::Completed
-    } else {
-        *counters.state.write().await = String::from("drain_timeout_expired");
-        ListenerDrainOutcome::TimedOut
-    };
+    let drain_outcome =
+        if time::timeout(drain_timeout, async { while tasks.join_next().await.is_some() {} })
+            .await
+            .is_ok()
+        {
+            *counters.state.write().await = String::from("stopped");
+            ListenerDrainOutcome::Completed
+        } else {
+            *counters.state.write().await = String::from("drain_timeout_expired");
+            ListenerDrainOutcome::TimedOut
+        };
     Ok(drain_outcome)
 }
 
-async fn handle_workspace_admin_connection(
-    mut stream: TcpStream,
+async fn handle_workspace_admin_tls_connection(
+    stream: TcpStream,
     peer_addr: SocketAddr,
     listener_name: String,
     state: Arc<WorkspaceServeState>,
     admin_runtime: AdminRuntimeHandles,
     admin_secret: Arc<String>,
     supervisor: ServeSupervisor,
+    config: ManagedAdminTlsConfig,
+    mut handshake_permit: Option<lb_runtime::HandshakePermit>,
 ) -> io::Result<()> {
+    let acceptor = TlsAcceptor::from(Arc::clone(&config.tls_server_config));
+    let tls_stream =
+        acceptor.accept(stream).await.map_err(|error| io::Error::other(error.to_string()))?;
+    if let Some(handshake_permit) = handshake_permit.as_mut() {
+        handshake_permit.release();
+    }
+
+    handle_workspace_admin_connection(
+        tls_stream,
+        peer_addr,
+        listener_name,
+        state,
+        admin_runtime,
+        admin_secret,
+        supervisor,
+    )
+    .await
+}
+
+async fn handle_workspace_admin_connection<S>(
+    mut stream: S,
+    peer_addr: SocketAddr,
+    listener_name: String,
+    state: Arc<WorkspaceServeState>,
+    admin_runtime: AdminRuntimeHandles,
+    admin_secret: Arc<String>,
+    supervisor: ServeSupervisor,
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     state.admin_requests.fetch_add(1, Ordering::SeqCst);
     let request = crate::read_http_request_head_and_body(&mut stream).await?;
     let Some((request, request_body)) = request else {
@@ -3751,6 +3813,7 @@ async fn handle_workspace_admin_connection(
 
     let request_context = match authenticate_admin_request(
         &request,
+        &request_body,
         action,
         source_ip,
         &policy,
@@ -3865,85 +3928,127 @@ async fn handle_workspace_admin_connection(
         (String::from("failed"), detail.clone())
     } else {
         match action {
-        AdminRequestAction::Healthz => {
-            if api_mode.uses_versioned_contract() {
-                write_versioned_admin_success(
-                    &mut stream,
-                    "200 OK",
-                    &[],
-                    &request_context.request_id,
-                    serde_json::json!({
-                        "status": "ok",
-                        "live": true,
-                    }),
-                )
-                .await?;
-            } else {
-                crate::write_http_response(
-                    &mut stream,
-                    "200 OK",
-                    "text/plain; charset=utf-8",
-                    b"ok\n",
-                )
-                .await?;
-            }
-            (String::from("served"), String::from("health check completed"))
-        }
-        AdminRequestAction::Readyz => {
-            let listener_statuses = supervisor.listener_statuses().await;
-            let readiness = evaluate_workspace_readiness(&listener_statuses, state.reload_health());
-            let response_status = if readiness.ready {
-                "200 OK"
-            } else {
-                "503 Service Unavailable"
-            };
-            let detail = if readiness.ready {
-                String::from("readiness check completed: ready")
-            } else {
-                format!(
-                    "readiness check completed: not ready ({})",
-                    readiness.reason_codes.join(", ")
-                )
-            };
-            if api_mode.uses_versioned_contract() {
-                write_versioned_admin_success(
-                    &mut stream,
-                    response_status,
-                    &[],
-                    &request_context.request_id,
-                    json_body_to_value(&readiness.to_json())?,
-                )
-                .await?;
-            } else {
-                let body = format!("{}\n", readiness.to_json());
-                crate::write_http_response(
-                    &mut stream,
-                    response_status,
-                    "application/json",
-                    body.as_bytes(),
-                )
-                .await?;
-            }
-            (
-                String::from(if readiness.ready { "served" } else { "degraded" }),
-                detail,
-            )
-        }
-        AdminRequestAction::Validate => match supervisor.validate_current_config().await {
-            Ok(preview) => {
+            AdminRequestAction::Healthz => {
                 if api_mode.uses_versioned_contract() {
                     write_versioned_admin_success(
                         &mut stream,
                         "200 OK",
                         &[],
                         &request_context.request_id,
-                        preview,
+                        serde_json::json!({
+                            "status": "ok",
+                            "live": true,
+                        }),
                     )
                     .await?;
                 } else {
-                    let body = preview
-                        .render_json()
-                        .map_err(|error| io::Error::other(error.to_string()))?;
+                    crate::write_http_response(
+                        &mut stream,
+                        "200 OK",
+                        "text/plain; charset=utf-8",
+                        b"ok\n",
+                    )
+                    .await?;
+                }
+                (String::from("served"), String::from("health check completed"))
+            }
+            AdminRequestAction::Readyz => {
+                let listener_statuses = supervisor.listener_statuses().await;
+                let readiness =
+                    evaluate_workspace_readiness(&listener_statuses, state.reload_health());
+                let response_status =
+                    if readiness.ready { "200 OK" } else { "503 Service Unavailable" };
+                let detail = if readiness.ready {
+                    String::from("readiness check completed: ready")
+                } else {
+                    format!(
+                        "readiness check completed: not ready ({})",
+                        readiness.reason_codes.join(", ")
+                    )
+                };
+                if api_mode.uses_versioned_contract() {
+                    write_versioned_admin_success(
+                        &mut stream,
+                        response_status,
+                        &[],
+                        &request_context.request_id,
+                        json_body_to_value(&readiness.to_json())?,
+                    )
+                    .await?;
+                } else {
+                    let body = format!("{}\n", readiness.to_json());
+                    crate::write_http_response(
+                        &mut stream,
+                        response_status,
+                        "application/json",
+                        body.as_bytes(),
+                    )
+                    .await?;
+                }
+                (String::from(if readiness.ready { "served" } else { "degraded" }), detail)
+            }
+            AdminRequestAction::Validate => match supervisor.validate_current_config().await {
+                Ok(preview) => {
+                    if api_mode.uses_versioned_contract() {
+                        write_versioned_admin_success(
+                            &mut stream,
+                            "200 OK",
+                            &[],
+                            &request_context.request_id,
+                            preview,
+                        )
+                        .await?;
+                    } else {
+                        let body = preview
+                            .render_json()
+                            .map_err(|error| io::Error::other(error.to_string()))?;
+                        crate::write_http_response(
+                            &mut stream,
+                            "200 OK",
+                            "application/json",
+                            body.as_bytes(),
+                        )
+                        .await?;
+                    }
+                    (String::from("served"), String::from("validation preview generated"))
+                }
+                Err(error) => {
+                    let detail = format!("validation preview failed: {error}");
+                    if api_mode.uses_versioned_contract() {
+                        write_versioned_admin_error(
+                            &mut stream,
+                            "400 Bad Request",
+                            &[],
+                            &request_context.request_id,
+                            lb_admin_api::AdminApiErrorCode::ValidationFailed,
+                            detail.clone(),
+                            false,
+                        )
+                        .await?;
+                    } else {
+                        crate::write_http_response(
+                            &mut stream,
+                            "400 Bad Request",
+                            "text/plain; charset=utf-8",
+                            format!("{detail}\n").as_bytes(),
+                        )
+                        .await?;
+                    }
+                    (String::from("failed"), detail)
+                }
+            },
+            AdminRequestAction::Status => {
+                let body = state.status_body(&supervisor).await;
+                if api_mode.uses_versioned_contract() {
+                    write_versioned_admin_success(
+                        &mut stream,
+                        "200 OK",
+                        &[],
+                        &request_context.request_id,
+                        json_body_to_value(&body)?,
+                    )
+                    .await?;
+                } else {
                     crate::write_http_response(
                         &mut stream,
                         "200 OK",
@@ -3952,329 +4057,286 @@ async fn handle_workspace_admin_connection(
                     )
                     .await?;
                 }
-                (String::from("served"), String::from("validation preview generated"))
+                (String::from("served"), String::from("status response generated"))
             }
-            Err(error) => {
-                let detail = format!("validation preview failed: {error}");
+            AdminRequestAction::Audit => {
+                let body = state
+                    .audit_body()
+                    .await
+                    .map_err(|error| io::Error::other(error.to_string()))?;
+                if api_mode.uses_versioned_contract() {
+                    write_versioned_admin_success(
+                        &mut stream,
+                        "200 OK",
+                        &[],
+                        &request_context.request_id,
+                        json_body_to_value(&body)?,
+                    )
+                    .await?;
+                } else {
+                    crate::write_http_response(
+                        &mut stream,
+                        "200 OK",
+                        "application/json",
+                        body.as_bytes(),
+                    )
+                    .await?;
+                }
+                (String::from("served"), String::from("audit log response generated"))
+            }
+            AdminRequestAction::Reload => {
+                let reload_plan = supervisor.describe_reload_audit_plan().await.ok();
+                let started_detail = reload_plan.as_ref().map_or_else(
+                    || String::from("reload started; plan preview unavailable before apply"),
+                    ReloadAuditPlan::start_detail,
+                );
+                let started_code = reload_plan.as_ref().map_or_else(
+                    || String::from("reload_started_unknown"),
+                    |plan| String::from(plan.start_code()),
+                );
+                record_admin_audit(
+                    &state,
+                    AdminAuditEvent {
+                        observed_at_unix_ms: unix_time_ms(),
+                        request_id: request_context.request_id.clone(),
+                        listener: listener_name.clone(),
+                        actor: request_context.actor.clone(),
+                        auth_mode: request_context.auth_mode.clone(),
+                        action: action_name.clone(),
+                        code: started_code,
+                        source: request_context.source.to_string(),
+                        outcome: String::from("started"),
+                        detail: started_detail,
+                    },
+                )
+                .await
+                .map_err(|error| io::Error::other(error.to_string()))?;
+
+                match supervisor.reload().await {
+                    Ok(outcome) => {
+                        let success_code = reload_plan.as_ref().map_or_else(
+                            || String::from(outcome.generic_success_code()),
+                            |plan| String::from(plan.success_code(&outcome)),
+                        );
+                        let success_detail = reload_plan.as_ref().map_or_else(
+                            || outcome.generic_success_detail(),
+                            |plan| plan.success_detail(&outcome),
+                        );
+                        *state.last_reload_outcome_code.lock().await = success_code;
+                        *state.last_reload_result.lock().await = success_detail.clone();
+                        if api_mode.uses_versioned_contract() {
+                            let last_reload_outcome_code =
+                                state.last_reload_outcome_code.lock().await.clone();
+                            let last_reload_result = state.last_reload_result.lock().await.clone();
+                            write_versioned_admin_success(
+                                &mut stream,
+                                "200 OK",
+                                &[],
+                                &request_context.request_id,
+                                serde_json::json!({
+                                    "result": "configuration_applied",
+                                    "outcome_code": last_reload_outcome_code,
+                                    "detail": last_reload_result,
+                                    "reload_health": reload_health_name(state.reload_health()),
+                                    "degraded": outcome.timed_out_during_drain(),
+                                }),
+                            )
+                            .await?;
+                        } else {
+                            crate::write_http_response(
+                                &mut stream,
+                                "200 OK",
+                                "text/plain; charset=utf-8",
+                                b"configuration applied\n",
+                            )
+                            .await?;
+                        }
+                        (String::from("executed"), success_detail)
+                    }
+                    Err(error) => {
+                        let failure_code = reload_plan.as_ref().map_or_else(
+                            || String::from("reload_failed_apply"),
+                            |plan| String::from(plan.failure_code()),
+                        );
+                        *state.last_reload_outcome_code.lock().await = failure_code;
+                        let detail = reload_plan.as_ref().map_or_else(
+                            || format!("reload failed: {error}"),
+                            |plan| plan.failure_detail(&error),
+                        );
+                        if api_mode.uses_versioned_contract() {
+                            let error_code = if state.last_reload_outcome_code.lock().await.as_str()
+                                == "reload_failed_blocked_change"
+                            {
+                                lb_admin_api::AdminApiErrorCode::UnsupportedMutation
+                            } else {
+                                lb_admin_api::AdminApiErrorCode::ReloadFailed
+                            };
+                            write_versioned_admin_error(
+                                &mut stream,
+                                "500 Internal Server Error",
+                                &[],
+                                &request_context.request_id,
+                                error_code,
+                                detail.clone(),
+                                false,
+                            )
+                            .await?;
+                        } else {
+                            crate::write_http_response(
+                                &mut stream,
+                                "500 Internal Server Error",
+                                "text/plain; charset=utf-8",
+                                format!("{detail}\n").as_bytes(),
+                            )
+                            .await?;
+                        }
+                        (String::from("failed"), detail)
+                    }
+                }
+            }
+            AdminRequestAction::CachePurge => {
+                match handle_admin_cache_purge(&state, &request_body).await {
+                    Ok(response) => {
+                        if api_mode.uses_versioned_contract() {
+                            write_versioned_admin_success(
+                                &mut stream,
+                                "200 OK",
+                                &[],
+                                &request_context.request_id,
+                                &response,
+                            )
+                            .await?;
+                        } else {
+                            let body = serde_json::to_string_pretty(&response)
+                                .map_err(|error| io::Error::other(error.to_string()))?;
+                            crate::write_http_response(
+                                &mut stream,
+                                "200 OK",
+                                "application/json",
+                                body.as_bytes(),
+                            )
+                            .await?;
+                        }
+                        (
+                            String::from(if response.degraded { "degraded" } else { "executed" }),
+                            format!(
+                                "cache purge for scope {} purged {} entries",
+                                response.scope, response.purged_entries
+                            ),
+                        )
+                    }
+                    Err(error) => {
+                        if api_mode.uses_versioned_contract() {
+                            write_versioned_admin_error(
+                                &mut stream,
+                                "400 Bad Request",
+                                &[],
+                                &request_context.request_id,
+                                lb_admin_api::AdminApiErrorCode::ValidationFailed,
+                                error.clone(),
+                                false,
+                            )
+                            .await?;
+                        } else {
+                            crate::write_http_response(
+                                &mut stream,
+                                "400 Bad Request",
+                                "text/plain; charset=utf-8",
+                                format!("{error}\n").as_bytes(),
+                            )
+                            .await?;
+                        }
+                        (String::from("failed"), error)
+                    }
+                }
+            }
+            AdminRequestAction::CacheInvalidate => {
+                match handle_admin_cache_invalidate(&state, &request_body).await {
+                    Ok(response) => {
+                        if api_mode.uses_versioned_contract() {
+                            write_versioned_admin_success(
+                                &mut stream,
+                                "200 OK",
+                                &[],
+                                &request_context.request_id,
+                                &response,
+                            )
+                            .await?;
+                        } else {
+                            let body = serde_json::to_string(&response)
+                                .map_err(|error| io::Error::other(error.to_string()))?;
+                            crate::write_http_response(
+                                &mut stream,
+                                "200 OK",
+                                "application/json",
+                                body.as_bytes(),
+                            )
+                            .await?;
+                        }
+                        (
+                            String::from(match response.result {
+                                lb_admin_api::HttpCachePeerInvalidationResult::Applied => {
+                                    "executed"
+                                }
+                                lb_admin_api::HttpCachePeerInvalidationResult::Duplicate => {
+                                    "duplicate"
+                                }
+                            }),
+                            format!(
+                                "cache invalidation for scope {} applied with {} purged entries",
+                                response.scope, response.purged_entries
+                            ),
+                        )
+                    }
+                    Err(error) => {
+                        if api_mode.uses_versioned_contract() {
+                            write_versioned_admin_error(
+                                &mut stream,
+                                "400 Bad Request",
+                                &[],
+                                &request_context.request_id,
+                                lb_admin_api::AdminApiErrorCode::ValidationFailed,
+                                error.clone(),
+                                false,
+                            )
+                            .await?;
+                        } else {
+                            crate::write_http_response(
+                                &mut stream,
+                                "400 Bad Request",
+                                "text/plain; charset=utf-8",
+                                format!("{error}\n").as_bytes(),
+                            )
+                            .await?;
+                        }
+                        (String::from("failed"), error)
+                    }
+                }
+            }
+            AdminRequestAction::Unknown => {
                 if api_mode.uses_versioned_contract() {
                     write_versioned_admin_error(
                         &mut stream,
-                        "400 Bad Request",
+                        "404 Not Found",
                         &[],
                         &request_context.request_id,
-                        lb_admin_api::AdminApiErrorCode::ValidationFailed,
-                        detail.clone(),
+                        lb_admin_api::AdminApiErrorCode::NotFound,
+                        "unknown admin endpoint",
                         false,
                     )
                     .await?;
                 } else {
                     crate::write_http_response(
                         &mut stream,
-                        "400 Bad Request",
+                        "404 Not Found",
                         "text/plain; charset=utf-8",
-                        format!("{detail}\n").as_bytes(),
+                        b"not found\n",
                     )
                     .await?;
                 }
-                (String::from("failed"), detail)
-            }
-        },
-        AdminRequestAction::Status => {
-            let body = state.status_body(&supervisor).await;
-            if api_mode.uses_versioned_contract() {
-                write_versioned_admin_success(
-                    &mut stream,
-                    "200 OK",
-                    &[],
-                    &request_context.request_id,
-                    json_body_to_value(&body)?,
-                )
-                .await?;
-            } else {
-                crate::write_http_response(
-                    &mut stream,
-                    "200 OK",
-                    "application/json",
-                    body.as_bytes(),
-                )
-                .await?;
-            }
-            (String::from("served"), String::from("status response generated"))
-        }
-        AdminRequestAction::Audit => {
-            let body =
-                state.audit_body().await.map_err(|error| io::Error::other(error.to_string()))?;
-            if api_mode.uses_versioned_contract() {
-                write_versioned_admin_success(
-                    &mut stream,
-                    "200 OK",
-                    &[],
-                    &request_context.request_id,
-                    json_body_to_value(&body)?,
-                )
-                .await?;
-            } else {
-                crate::write_http_response(
-                    &mut stream,
-                    "200 OK",
-                    "application/json",
-                    body.as_bytes(),
-                )
-                .await?;
-            }
-            (String::from("served"), String::from("audit log response generated"))
-        }
-        AdminRequestAction::Reload => {
-            let reload_plan = supervisor.describe_reload_audit_plan().await.ok();
-            let started_detail = reload_plan.as_ref().map_or_else(
-                || String::from("reload started; plan preview unavailable before apply"),
-                ReloadAuditPlan::start_detail,
-            );
-            let started_code = reload_plan
-                .as_ref()
-                .map_or_else(|| String::from("reload_started_unknown"), |plan| {
-                    String::from(plan.start_code())
-                });
-            record_admin_audit(
-                &state,
-                AdminAuditEvent {
-                    observed_at_unix_ms: unix_time_ms(),
-                    request_id: request_context.request_id.clone(),
-                    listener: listener_name.clone(),
-                    actor: request_context.actor.clone(),
-                    auth_mode: request_context.auth_mode.clone(),
-                    action: action_name.clone(),
-                    code: started_code,
-                    source: request_context.source.to_string(),
-                    outcome: String::from("started"),
-                    detail: started_detail,
-                },
-            )
-            .await
-            .map_err(|error| io::Error::other(error.to_string()))?;
-
-            match supervisor.reload().await {
-                Ok(outcome) => {
-                    let success_code = reload_plan
-                        .as_ref()
-                        .map_or_else(|| String::from(outcome.generic_success_code()), |plan| {
-                            String::from(plan.success_code(&outcome))
-                        });
-                    let success_detail = reload_plan.as_ref().map_or_else(
-                        || outcome.generic_success_detail(),
-                        |plan| plan.success_detail(&outcome),
-                    );
-                    *state.last_reload_outcome_code.lock().await = success_code;
-                    *state.last_reload_result.lock().await = success_detail.clone();
-                    if api_mode.uses_versioned_contract() {
-                        let last_reload_outcome_code = state.last_reload_outcome_code.lock().await.clone();
-                        let last_reload_result = state.last_reload_result.lock().await.clone();
-                        write_versioned_admin_success(
-                            &mut stream,
-                            "200 OK",
-                            &[],
-                            &request_context.request_id,
-                            serde_json::json!({
-                                "result": "configuration_applied",
-                                "outcome_code": last_reload_outcome_code,
-                                "detail": last_reload_result,
-                                "reload_health": reload_health_name(state.reload_health()),
-                                "degraded": outcome.timed_out_during_drain(),
-                            }),
-                        )
-                        .await?;
-                    } else {
-                        crate::write_http_response(
-                            &mut stream,
-                            "200 OK",
-                            "text/plain; charset=utf-8",
-                            b"configuration applied\n",
-                        )
-                        .await?;
-                    }
-                    (String::from("executed"), success_detail)
-                }
-                Err(error) => {
-                    let failure_code = reload_plan
-                        .as_ref()
-                        .map_or_else(|| String::from("reload_failed_apply"), |plan| {
-                            String::from(plan.failure_code())
-                        });
-                    *state.last_reload_outcome_code.lock().await = failure_code;
-                    let detail = reload_plan.as_ref().map_or_else(
-                        || format!("reload failed: {error}"),
-                        |plan| plan.failure_detail(&error),
-                    );
-                    if api_mode.uses_versioned_contract() {
-                        let error_code = if state.last_reload_outcome_code.lock().await.as_str()
-                            == "reload_failed_blocked_change"
-                        {
-                            lb_admin_api::AdminApiErrorCode::UnsupportedMutation
-                        } else {
-                            lb_admin_api::AdminApiErrorCode::ReloadFailed
-                        };
-                        write_versioned_admin_error(
-                            &mut stream,
-                            "500 Internal Server Error",
-                            &[],
-                            &request_context.request_id,
-                            error_code,
-                            detail.clone(),
-                            false,
-                        )
-                        .await?;
-                    } else {
-                        crate::write_http_response(
-                            &mut stream,
-                            "500 Internal Server Error",
-                            "text/plain; charset=utf-8",
-                            format!("{detail}\n").as_bytes(),
-                        )
-                        .await?;
-                    }
-                    (String::from("failed"), detail)
-                }
+                (String::from("not_found"), String::from("unknown admin endpoint"))
             }
         }
-        AdminRequestAction::CachePurge => {
-            match handle_admin_cache_purge(&state, &request_body).await {
-                Ok(response) => {
-                    if api_mode.uses_versioned_contract() {
-                        write_versioned_admin_success(
-                            &mut stream,
-                            "200 OK",
-                            &[],
-                            &request_context.request_id,
-                            &response,
-                        )
-                        .await?;
-                    } else {
-                        let body = serde_json::to_string_pretty(&response)
-                            .map_err(|error| io::Error::other(error.to_string()))?;
-                        crate::write_http_response(
-                            &mut stream,
-                            "200 OK",
-                            "application/json",
-                            body.as_bytes(),
-                        )
-                        .await?;
-                    }
-                    (
-                        String::from(if response.degraded { "degraded" } else { "executed" }),
-                        format!(
-                            "cache purge for scope {} purged {} entries",
-                            response.scope, response.purged_entries
-                        ),
-                    )
-                }
-                Err(error) => {
-                    if api_mode.uses_versioned_contract() {
-                        write_versioned_admin_error(
-                            &mut stream,
-                            "400 Bad Request",
-                            &[],
-                            &request_context.request_id,
-                            lb_admin_api::AdminApiErrorCode::ValidationFailed,
-                            error.clone(),
-                            false,
-                        )
-                        .await?;
-                    } else {
-                        crate::write_http_response(
-                            &mut stream,
-                            "400 Bad Request",
-                            "text/plain; charset=utf-8",
-                            format!("{error}\n").as_bytes(),
-                        )
-                        .await?;
-                    }
-                    (String::from("failed"), error)
-                }
-            }
-        }
-        AdminRequestAction::CacheInvalidate => {
-            match handle_admin_cache_invalidate(&state, &request_body).await {
-                Ok(response) => {
-                    if api_mode.uses_versioned_contract() {
-                        write_versioned_admin_success(
-                            &mut stream,
-                            "200 OK",
-                            &[],
-                            &request_context.request_id,
-                            &response,
-                        )
-                        .await?;
-                    } else {
-                        let body = serde_json::to_string(&response)
-                            .map_err(|error| io::Error::other(error.to_string()))?;
-                        crate::write_http_response(
-                            &mut stream,
-                            "200 OK",
-                            "application/json",
-                            body.as_bytes(),
-                        )
-                        .await?;
-                    }
-                    (
-                        String::from(match response.result {
-                            lb_admin_api::HttpCachePeerInvalidationResult::Applied => "executed",
-                            lb_admin_api::HttpCachePeerInvalidationResult::Duplicate => "duplicate",
-                        }),
-                        format!(
-                            "cache invalidation for scope {} applied with {} purged entries",
-                            response.scope, response.purged_entries
-                        ),
-                    )
-                }
-                Err(error) => {
-                    if api_mode.uses_versioned_contract() {
-                        write_versioned_admin_error(
-                            &mut stream,
-                            "400 Bad Request",
-                            &[],
-                            &request_context.request_id,
-                            lb_admin_api::AdminApiErrorCode::ValidationFailed,
-                            error.clone(),
-                            false,
-                        )
-                        .await?;
-                    } else {
-                        crate::write_http_response(
-                            &mut stream,
-                            "400 Bad Request",
-                            "text/plain; charset=utf-8",
-                            format!("{error}\n").as_bytes(),
-                        )
-                        .await?;
-                    }
-                    (String::from("failed"), error)
-                }
-            }
-        }
-        AdminRequestAction::Unknown => {
-            if api_mode.uses_versioned_contract() {
-                write_versioned_admin_error(
-                    &mut stream,
-                    "404 Not Found",
-                    &[],
-                    &request_context.request_id,
-                    lb_admin_api::AdminApiErrorCode::NotFound,
-                    "unknown admin endpoint",
-                    false,
-                )
-                .await?;
-            } else {
-                crate::write_http_response(
-                    &mut stream,
-                    "404 Not Found",
-                    "text/plain; charset=utf-8",
-                    b"not found\n",
-                )
-                .await?;
-            }
-            (String::from("not_found"), String::from("unknown admin endpoint"))
-        }
-    }
     };
 
     let audit_code = if matches!(action, AdminRequestAction::Reload) {
@@ -4348,19 +4410,21 @@ async fn handle_admin_cache_purge(
             lb_admin_api::HttpCachePurgeTarget::PathPrefix(path_prefix)
         }
     };
-    let response = scope
-        .service
-        .lock()
-        .await
-        .purge(
+    let telemetry = Arc::clone(&state.telemetry);
+    let service = Arc::clone(&scope.service);
+    let response = tokio::task::spawn_blocking(move || {
+        service.blocking_lock().purge(
             lb_admin_api::HttpCachePurgeRequest {
                 target,
                 requested_by: request.requested_by,
                 reason: request.reason,
             },
-            Some(&state.telemetry),
+            Some(telemetry.as_ref()),
         )
-        .map_err(|error| error.to_string())?;
+    })
+    .await
+    .map_err(|error| format!("cache purge task failed: {error}"))?
+    .map_err(|error| error.to_string())?;
     Ok(AdminHttpCachePurgeResponse {
         action: match response.action {
             lb_admin_api::HttpCachePurgeActionKind::ExactKey => String::from("exact_key"),
@@ -4471,6 +4535,7 @@ struct ResolvedAdminSecret {
 
 fn authenticate_admin_request(
     request: &crate::DemoRequestHead,
+    request_body: &[u8],
     action: AdminRequestAction,
     source_ip: IpAddr,
     policy: &CompiledAdminPolicy,
@@ -4637,6 +4702,7 @@ fn authenticate_admin_request(
                 request.target.as_str(),
                 timestamp,
                 nonce,
+                request_body,
             );
             if !crate::constant_time_eq(signature.as_bytes(), expected.as_bytes()) {
                 return Err(AdminAuthFailure {
@@ -4722,9 +4788,7 @@ fn resolve_secret_material(
                     source_kind: "file",
                     source_reference: secret_file_path,
                     state: "empty",
-                    detail: format!(
-                        "admin secret file configured via {secret_file_env} was empty"
-                    ),
+                    detail: format!("admin secret file configured via {secret_file_env} was empty"),
                 });
             }
             return Ok(ResolvedSecretMaterial {
@@ -4801,6 +4865,7 @@ fn sign_admin_request(
     target: &str,
     timestamp: u64,
     nonce: &str,
+    body: &[u8],
 ) -> String {
     let block_size = 64;
     let mut key = secret.as_bytes().to_vec();
@@ -4816,7 +4881,10 @@ fn sign_admin_request(
         outer_pad[index] ^= *key_byte;
     }
 
-    let payload = format!("{actor}\n{method}\n{target}\n{timestamp}\n{nonce}\n");
+    let payload = format!(
+        "{actor}\n{method}\n{target}\n{timestamp}\n{nonce}\n{}\n",
+        request_body_digest(body)
+    );
     let mut inner = Sha256::new();
     inner.update(&inner_pad);
     inner.update(payload.as_bytes());
@@ -4829,6 +4897,11 @@ fn sign_admin_request(
     digest.iter().map(|byte| format!("{byte:02x}")).collect::<String>()
 }
 
+fn request_body_digest(body: &[u8]) -> String {
+    let digest = Sha256::digest(body);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect::<String>()
+}
+
 fn admin_permission_name(permission: AdminPermission) -> &'static str {
     match permission {
         AdminPermission::Read => "read",
@@ -4837,7 +4910,10 @@ fn admin_permission_name(permission: AdminPermission) -> &'static str {
     }
 }
 
-async fn record_admin_audit(state: &WorkspaceServeState, event: AdminAuditEvent) -> Result<(), DynError> {
+async fn record_admin_audit(
+    state: &WorkspaceServeState,
+    event: AdminAuditEvent,
+) -> Result<(), DynError> {
     state.record_admin_audit(event).await;
     Ok(())
 }
@@ -4873,13 +4949,9 @@ fn write_control_plane_journal_atomic(
         payload_json,
     };
     let serialized = serde_json::to_vec_pretty(&envelope).map_err(to_dyn_error)?;
-    let write_sequence =
-        NEXT_CONTROL_PLANE_JOURNAL_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let temporary_path = format!(
-        "{journal_path}.tmp-{}-{}-{write_sequence}",
-        std::process::id(),
-        unix_time_ms()
-    );
+    let write_sequence = NEXT_CONTROL_PLANE_JOURNAL_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temporary_path =
+        format!("{journal_path}.tmp-{}-{}-{write_sequence}", std::process::id(), unix_time_ms());
     fs::write(&temporary_path, serialized).map_err(to_dyn_error)?;
     fs::rename(&temporary_path, journal_path).map_err(to_dyn_error)?;
     Ok(())
@@ -4970,26 +5042,24 @@ async fn write_abuse_rejection_response(
 fn build_listener_abuse_protection_state(
     policy: Option<&CompiledListenerAbuseProtectionPolicy>,
 ) -> lb_runtime::ListenerAbuseProtectionState {
-    lb_runtime::ListenerAbuseProtectionState::new(
-        policy.map_or_else(
-            lb_runtime::ListenerAbuseProtectionPolicy::default,
-            |policy| lb_runtime::ListenerAbuseProtectionPolicy {
-                source_quota: policy.source_quota.map(|source_quota| {
-                    lb_runtime::SourceQuotaPolicy::new(
-                        source_quota.aggregation,
-                        source_quota.max_active_per_source,
-                        source_quota.max_tracked_sources,
-                    )
-                }),
-                handshake_guard: policy.handshake_guard.map(|handshake_guard| {
-                    lb_runtime::HandshakeGuardPolicy::new(
-                        handshake_guard.max_inflight,
-                        handshake_guard.timeout,
-                    )
-                }),
-            },
-        ),
-    )
+    lb_runtime::ListenerAbuseProtectionState::new(policy.map_or_else(
+        lb_runtime::ListenerAbuseProtectionPolicy::default,
+        |policy| lb_runtime::ListenerAbuseProtectionPolicy {
+            source_quota: policy.source_quota.map(|source_quota| {
+                lb_runtime::SourceQuotaPolicy::new(
+                    source_quota.aggregation,
+                    source_quota.max_active_per_source,
+                    source_quota.max_tracked_sources,
+                )
+            }),
+            handshake_guard: policy.handshake_guard.map(|handshake_guard| {
+                lb_runtime::HandshakeGuardPolicy::new(
+                    handshake_guard.max_inflight,
+                    handshake_guard.timeout,
+                )
+            }),
+        },
+    ))
 }
 
 fn build_listener_overload_runtime(
@@ -5320,7 +5390,9 @@ fn compile_workspace_runtime(config_path: &str) -> Result<CompiledWorkspaceRunti
                 max_connections: compiled_listener.max_connections,
                 drain_timeout: compiled_listener.drain_timeout,
                 overload_policy: compile_listener_overload_policy(&config, listener)?,
-                abuse_protection_policy: compile_listener_abuse_protection_policy(&config, listener)?,
+                abuse_protection_policy: compile_listener_abuse_protection_policy(
+                    &config, listener,
+                )?,
                 proxy: ManagedProxyConfig::Http1(compile_http1_proxy_config(
                     &config,
                     listener,
@@ -5340,7 +5412,9 @@ fn compile_workspace_runtime(config_path: &str) -> Result<CompiledWorkspaceRunti
                 max_connections: compiled_listener.max_connections,
                 drain_timeout: compiled_listener.drain_timeout,
                 overload_policy: compile_listener_overload_policy(&config, listener)?,
-                abuse_protection_policy: compile_listener_abuse_protection_policy(&config, listener)?,
+                abuse_protection_policy: compile_listener_abuse_protection_policy(
+                    &config, listener,
+                )?,
                 proxy: ManagedProxyConfig::Http2(compile_http2_proxy_config(
                     &config,
                     listener,
@@ -5357,7 +5431,9 @@ fn compile_workspace_runtime(config_path: &str) -> Result<CompiledWorkspaceRunti
                 max_connections: compiled_listener.max_connections,
                 drain_timeout: compiled_listener.drain_timeout,
                 overload_policy: compile_listener_overload_policy(&config, listener)?,
-                abuse_protection_policy: compile_listener_abuse_protection_policy(&config, listener)?,
+                abuse_protection_policy: compile_listener_abuse_protection_policy(
+                    &config, listener,
+                )?,
                 proxy: ManagedProxyConfig::Https(compile_https_proxy_config(
                     &config,
                     listener,
@@ -5379,12 +5455,48 @@ fn compile_workspace_runtime(config_path: &str) -> Result<CompiledWorkspaceRunti
                 lb_config_model::ListenerClassConfig::Admin,
                 lb_config_model::ListenerProtocolConfig::Http1,
             ) => CompiledServeListener::Admin {
+                protocol: listener.protocol,
                 bind_address: compiled_listener.bind_address,
                 max_connections: compiled_listener.max_connections,
                 drain_timeout: compiled_listener.drain_timeout,
                 overload_policy: compile_listener_overload_policy(&config, listener)?,
-                abuse_protection_policy: compile_listener_abuse_protection_policy(&config, listener)?,
+                abuse_protection_policy: compile_listener_abuse_protection_policy(
+                    &config, listener,
+                )?,
                 admin_policy: compile_admin_policy(listener)?,
+                tls: None,
+            },
+            (
+                lb_config_model::ListenerClassConfig::Admin,
+                lb_config_model::ListenerProtocolConfig::Https,
+            ) => CompiledServeListener::Admin {
+                protocol: listener.protocol,
+                bind_address: compiled_listener.bind_address,
+                max_connections: compiled_listener.max_connections,
+                drain_timeout: compiled_listener.drain_timeout,
+                overload_policy: compile_listener_overload_policy(&config, listener)?,
+                abuse_protection_policy: compile_listener_abuse_protection_policy(
+                    &config, listener,
+                )?,
+                admin_policy: compile_admin_policy(listener)?,
+                tls: Some(ManagedAdminTlsConfig {
+                    tls_server_config: Arc::new(build_tls_server_config(
+                        listener.tls_termination.as_ref().ok_or_else(|| {
+                            to_dyn_error(format!(
+                                "listener {} is missing tls_termination",
+                                listener.name
+                            ))
+                        })?,
+                    )?),
+                    tls_status: build_listener_tls_status(
+                        listener.tls_termination.as_ref().ok_or_else(|| {
+                            to_dyn_error(format!(
+                                "listener {} is missing tls_termination",
+                                listener.name
+                            ))
+                        })?,
+                    )?,
+                }),
             },
             (lb_config_model::ListenerClassConfig::Admin, protocol) => {
                 return Err(format!(
@@ -5773,11 +5885,8 @@ fn load_certified_key_from_source(
 fn build_listener_tls_status(
     tls_termination: &lb_config_model::ListenerTlsTerminationConfig,
 ) -> Result<ListenerTlsStatus, DynError> {
-    let default_certificate = build_tls_certificate_status(
-        "default",
-        Vec::new(),
-        &tls_termination.certificate_source,
-    )?;
+    let default_certificate =
+        build_tls_certificate_status("default", Vec::new(), &tls_termination.certificate_source)?;
     let mut sni_certificates = Vec::with_capacity(tls_termination.sni_certificates.len());
     let mut reason_codes = Vec::new();
 
@@ -6380,12 +6489,10 @@ mod tests {
         sign_admin_request, to_dyn_error, unix_time_ms, write_control_plane_journal_atomic,
         AdminAuditEvent, CompiledServeListener, ControlPlaneJournalEnvelope,
         ControlPlaneJournalPayload, ControlPlaneRecoveryInfo, DurableSnapshotIdentity, DynError,
-        JournalInFlightOperation, ListenerDrainOutcome, ListenerIdentity,
-        ListenerAbuseProtectionStatus, ListenerIdentityStatus, ListenerLifecycleEntry,
-        ListenerLifecycleModel, ListenerLifecycleState, ListenerReplacementStatus,
-        ListenerStatus,
-        ManagedProxyConfig, RecoveredListenerStatus, RecoveryReconciliationSummary,
-        ReloadHealthState, ServeSupervisor,
+        JournalInFlightOperation, ListenerAbuseProtectionStatus, ListenerDrainOutcome,
+        ListenerIdentity, ListenerIdentityStatus, ListenerLifecycleEntry, ListenerLifecycleModel,
+        ListenerLifecycleState, ListenerReplacementStatus, ListenerStatus, ManagedProxyConfig,
+        RecoveredListenerStatus, RecoveryReconciliationSummary, ReloadHealthState, ServeSupervisor,
         ACTIVE_HEALTH_PROBE_INTERVAL, CONTROL_PLANE_JOURNAL_VERSION,
         RECOVERY_UNFINISHED_RELOAD_CODE, ROUTE_BACKEND_WARMUP_DURATION,
     };
@@ -6454,21 +6561,9 @@ mod tests {
     fn recovered_listener_status_assigns_machine_readable_verdicts() {
         let cases = [
             ("running", "stable", "settled"),
-            (
-                "running",
-                "replacement_draining",
-                "replacement_still_draining",
-            ),
-            (
-                "running",
-                "failed_start_preserved",
-                "replacement_failed_preserved",
-            ),
-            (
-                "running",
-                "drain_timeout_expired",
-                "replacement_drain_timeout",
-            ),
+            ("running", "replacement_draining", "replacement_still_draining"),
+            ("running", "failed_start_preserved", "replacement_failed_preserved"),
+            ("running", "drain_timeout_expired", "replacement_drain_timeout"),
             ("missing", "missing", "missing"),
             ("draining", "stable", "needs_review"),
         ];
@@ -6765,133 +6860,130 @@ mod tests {
         Ok(())
     }
 
-                fn test_listener_status(
-                    class: lb_config_model::ListenerClassConfig,
-                    state: &str,
-                    overload_state: &str,
-                ) -> Result<ListenerStatus, DynError> {
-                    let configured_bind: SocketAddr = "127.0.0.1:8080".parse()?;
-                    Ok(ListenerStatus {
-                        name: String::from("listener-under-test"),
-                        class,
-                        protocol: lb_config_model::ListenerProtocolConfig::Http1,
-                        configured_bind,
-                        local_addr: configured_bind,
-                        state: String::from(state),
-                        overload_state: String::from(overload_state),
-                        accepted_connections: 0,
-                        active_connections: 0,
-                        completed_connections: 0,
-                        shed_connections: 0,
-                        abuse_protection: ListenerAbuseProtectionStatus {
-                            state: String::from("disabled"),
-                            source_quota: None,
-                            handshake_guard: None,
-                            source_quota_rejections: 0,
-                            tracked_source_limit_rejections: 0,
-                            handshake_guard_rejections: 0,
-                            tracked_sources: 0,
-                            active_handshakes: 0,
-                            reason_codes: Vec::new(),
-                        },
-                        brownout_features: Vec::new(),
-                        recent_overload_events: Vec::new(),
-                        replacement: ListenerReplacementStatus {
-                            state: String::from("stable"),
-                            desired: ListenerIdentityStatus {
-                                class,
-                                protocol: lb_config_model::ListenerProtocolConfig::Http1,
-                                configured_bind,
-                            },
-                            draining: Vec::new(),
-                            retired_recent: Vec::new(),
-                            drain_timeout_recent: Vec::new(),
-                            failed_start: None,
-                        },
-                        tls: None,
-                    })
-                }
+    fn test_listener_status(
+        class: lb_config_model::ListenerClassConfig,
+        state: &str,
+        overload_state: &str,
+    ) -> Result<ListenerStatus, DynError> {
+        let configured_bind: SocketAddr = "127.0.0.1:8080".parse()?;
+        Ok(ListenerStatus {
+            name: String::from("listener-under-test"),
+            class,
+            protocol: lb_config_model::ListenerProtocolConfig::Http1,
+            configured_bind,
+            local_addr: configured_bind,
+            state: String::from(state),
+            overload_state: String::from(overload_state),
+            accepted_connections: 0,
+            active_connections: 0,
+            completed_connections: 0,
+            shed_connections: 0,
+            abuse_protection: ListenerAbuseProtectionStatus {
+                state: String::from("disabled"),
+                source_quota: None,
+                handshake_guard: None,
+                source_quota_rejections: 0,
+                tracked_source_limit_rejections: 0,
+                handshake_guard_rejections: 0,
+                tracked_sources: 0,
+                active_handshakes: 0,
+                reason_codes: Vec::new(),
+            },
+            brownout_features: Vec::new(),
+            recent_overload_events: Vec::new(),
+            replacement: ListenerReplacementStatus {
+                state: String::from("stable"),
+                desired: ListenerIdentityStatus {
+                    class,
+                    protocol: lb_config_model::ListenerProtocolConfig::Http1,
+                    configured_bind,
+                },
+                draining: Vec::new(),
+                retired_recent: Vec::new(),
+                drain_timeout_recent: Vec::new(),
+                failed_start: None,
+            },
+            tls: None,
+        })
+    }
 
-                #[test]
-                fn workspace_readiness_is_ready_for_running_public_listener() -> Result<(), DynError> {
-                    let readiness = evaluate_workspace_readiness(
-                        &[test_listener_status(
-                            lb_config_model::ListenerClassConfig::Public,
-                            "running",
-                            "normal",
-                        )?],
-                        ReloadHealthState::Healthy,
-                    );
+    #[test]
+    fn workspace_readiness_is_ready_for_running_public_listener() -> Result<(), DynError> {
+        let readiness = evaluate_workspace_readiness(
+            &[test_listener_status(
+                lb_config_model::ListenerClassConfig::Public,
+                "running",
+                "normal",
+            )?],
+            ReloadHealthState::Healthy,
+        );
 
-                    assert!(readiness.ready);
-                    assert_eq!(readiness.status, "ready");
-                    assert_eq!(readiness.reload_status, reload_health_name(ReloadHealthState::Healthy));
-                    assert!(readiness.reason_codes.is_empty());
-                    Ok(())
-                }
+        assert!(readiness.ready);
+        assert_eq!(readiness.status, "ready");
+        assert_eq!(readiness.reload_status, reload_health_name(ReloadHealthState::Healthy));
+        assert!(readiness.reason_codes.is_empty());
+        Ok(())
+    }
 
-                #[test]
-                fn workspace_readiness_is_not_ready_for_draining_public_listener() -> Result<(), DynError> {
-                    let readiness = evaluate_workspace_readiness(
-                        &[test_listener_status(
-                            lb_config_model::ListenerClassConfig::Public,
-                            "draining",
-                            "normal",
-                        )?],
-                        ReloadHealthState::Healthy,
-                    );
+    #[test]
+    fn workspace_readiness_is_not_ready_for_draining_public_listener() -> Result<(), DynError> {
+        let readiness = evaluate_workspace_readiness(
+            &[test_listener_status(
+                lb_config_model::ListenerClassConfig::Public,
+                "draining",
+                "normal",
+            )?],
+            ReloadHealthState::Healthy,
+        );
 
-                    assert!(!readiness.ready);
-                    assert_eq!(readiness.reason_codes, vec![String::from("listener_draining")]);
-                    Ok(())
-                }
+        assert!(!readiness.ready);
+        assert_eq!(readiness.reason_codes, vec![String::from("listener_draining")]);
+        Ok(())
+    }
 
-                #[test]
-                fn workspace_readiness_is_not_ready_for_failed_reload_and_shedding_listener(
-                ) -> Result<(), DynError> {
-                    let readiness = evaluate_workspace_readiness(
-                        &[test_listener_status(
-                            lb_config_model::ListenerClassConfig::Public,
-                            "running",
-                            "shedding",
-                        )?],
-                        ReloadHealthState::Failed,
-                    );
+    #[test]
+    fn workspace_readiness_is_not_ready_for_failed_reload_and_shedding_listener(
+    ) -> Result<(), DynError> {
+        let readiness = evaluate_workspace_readiness(
+            &[test_listener_status(
+                lb_config_model::ListenerClassConfig::Public,
+                "running",
+                "shedding",
+            )?],
+            ReloadHealthState::Failed,
+        );
 
-                    assert!(!readiness.ready);
-                    assert_eq!(
-                        readiness.reason_codes,
-                        vec![
-                            String::from("reload_failed"),
-                            String::from("listener_overload_shedding"),
-                        ]
-                    );
-                    Ok(())
-                }
+        assert!(!readiness.ready);
+        assert_eq!(
+            readiness.reason_codes,
+            vec![String::from("reload_failed"), String::from("listener_overload_shedding"),]
+        );
+        Ok(())
+    }
 
-                #[test]
-                fn workspace_readiness_evaluates_public_listeners_only_when_present() -> Result<(), DynError> {
-                    let readiness = evaluate_workspace_readiness(
-                        &[
-                            test_listener_status(
-                                lb_config_model::ListenerClassConfig::Public,
-                                "running",
-                                "normal",
-                            )?,
-                            test_listener_status(
-                                lb_config_model::ListenerClassConfig::Admin,
-                                "draining",
-                                "normal",
-                            )?,
-                        ],
-                        ReloadHealthState::Healthy,
-                    );
+    #[test]
+    fn workspace_readiness_evaluates_public_listeners_only_when_present() -> Result<(), DynError> {
+        let readiness = evaluate_workspace_readiness(
+            &[
+                test_listener_status(
+                    lb_config_model::ListenerClassConfig::Public,
+                    "running",
+                    "normal",
+                )?,
+                test_listener_status(
+                    lb_config_model::ListenerClassConfig::Admin,
+                    "draining",
+                    "normal",
+                )?,
+            ],
+            ReloadHealthState::Healthy,
+        );
 
-                    assert!(readiness.ready);
-                    assert_eq!(readiness.evaluated_listener_scope, "public");
-                    assert_eq!(readiness.listeners.len(), 1);
-                    Ok(())
-                }
+        assert!(readiness.ready);
+        assert_eq!(readiness.evaluated_listener_scope, "public");
+        assert_eq!(readiness.listeners.len(), 1);
+        Ok(())
+    }
 
     #[test]
     fn compile_route_backend_pool_supports_locality_preferences() -> Result<(), DynError> {
@@ -7794,7 +7886,8 @@ mod tests {
                 baseline_failure + step.failure_delta
             );
             assert!(status.contains(&format!("\"reload_health\": \"{}\"", step.expected_health)));
-            assert!(status.contains(&format!("\"last_reload_outcome_code\": \"{}\"", step.expected_code)));
+            assert!(status
+                .contains(&format!("\"last_reload_outcome_code\": \"{}\"", step.expected_code)));
 
             let total_duration = json_u64_field(&status_json, "reload_total_duration_ms")?;
             assert!(total_duration >= last_total_duration);
@@ -7877,9 +7970,8 @@ mod tests {
                 .ok_or_else(|| to_dyn_error("missing journal path"))?,
             journal_path
         );
-        let recovery = journal
-            .get("recovery")
-            .ok_or_else(|| to_dyn_error("missing recovery block"))?;
+        let recovery =
+            journal.get("recovery").ok_or_else(|| to_dyn_error("missing recovery block"))?;
         assert_eq!(
             recovery
                 .get("state")
@@ -8051,12 +8143,10 @@ mod tests {
             .and_then(|value| value.get("operation_age_ms"))
             .and_then(serde_json::Value::as_u64)
             .ok_or_else(|| to_dyn_error("missing operator guidance operation age"))?;
-        assert!(
-            recovery
-                .get("operator_guidance")
-                .and_then(|value| value.get("expected_completion_within_ms"))
-                .map_or(true, serde_json::Value::is_null)
-        );
+        assert!(recovery
+            .get("operator_guidance")
+            .and_then(|value| value.get("expected_completion_within_ms"))
+            .map_or(true, serde_json::Value::is_null));
         assert!(!recovery
             .get("operator_guidance")
             .and_then(|value| value.get("exceeded_expected_completion"))
@@ -8189,9 +8279,7 @@ mod tests {
             "resolved"
         );
         assert_eq!(
-            recovery
-                .get("in_flight_operation")
-                .and_then(serde_json::Value::as_null),
+            recovery.get("in_flight_operation").and_then(serde_json::Value::as_null),
             Some(())
         );
 
@@ -8204,8 +8292,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn unfinished_overlap_drain_recovery_surfaces_affected_listeners(
-    ) -> Result<(), DynError> {
+    async fn unfinished_overlap_drain_recovery_surfaces_affected_listeners() -> Result<(), DynError>
+    {
         std::env::set_var("LB_CTL_ADMIN_SECRET", "admin-secret");
         let public_bind = reserve_unused_addr().await?;
         let admin_bind = reserve_unused_addr().await?;
@@ -8383,7 +8471,9 @@ mod tests {
             operator_guidance
                 .get("expected_completion_within_ms")
                 .and_then(serde_json::Value::as_u64)
-                .ok_or_else(|| to_dyn_error("missing operator guidance expected completion window"))?,
+                .ok_or_else(|| to_dyn_error(
+                    "missing operator guidance expected completion window"
+                ))?,
             50
         );
         assert!(operator_guidance
@@ -8429,7 +8519,9 @@ mod tests {
                 applied_snapshot: Some(desired_snapshot),
                 reload_health: String::from("healthy"),
                 last_reload_outcome_code: String::from("reload_started_overlap_drain"),
-                last_reload_result: String::from("replacement reload started before prior process exited"),
+                last_reload_result: String::from(
+                    "replacement reload started before prior process exited",
+                ),
                 recent_admin_audit: Vec::new(),
                 in_flight_operation: Some(JournalInFlightOperation {
                     kind: String::from("reload_overlap_drain"),
@@ -8439,7 +8531,9 @@ mod tests {
                         &compiled.snapshot,
                     ),
                     lifecycle_code: String::from("reload_started_overlap_drain"),
-                    detail: String::from("reload started; overlap-and-drain replacement planned for: ghost-listener"),
+                    detail: String::from(
+                        "reload started; overlap-and-drain replacement planned for: ghost-listener",
+                    ),
                     expected_completion_within_ms: Some(50),
                     affected_listeners: vec![String::from("ghost-listener")],
                 }),
@@ -8531,7 +8625,9 @@ mod tests {
             operator_guidance
                 .get("expected_completion_within_ms")
                 .and_then(serde_json::Value::as_u64)
-                .ok_or_else(|| to_dyn_error("missing operator guidance expected completion window"))?,
+                .ok_or_else(|| to_dyn_error(
+                    "missing operator guidance expected completion window"
+                ))?,
             50
         );
         assert!(!operator_guidance
@@ -8683,16 +8779,12 @@ mod tests {
         assert!(reload.starts_with("HTTP/1.1 200 OK"));
 
         let status = send_admin_status(admin_addr).await?;
-        assert!(
-            status.contains("\"last_reload_outcome_code\": \"reload_applied_overlap_drain_timeout\"")
-        );
+        assert!(status
+            .contains("\"last_reload_outcome_code\": \"reload_applied_overlap_drain_timeout\""));
         assert!(status.contains("drain timeout expired for: public"));
         assert!(status.contains("\"replacement\":{\"state\":\"drain_timeout_expired\""));
         assert!(status.contains("\"drain_timeout_recent\":[{"));
-        assert!(status.contains(&format!(
-            "\"configured_bind\":\"{}\"",
-            initial_public_bind
-        )));
+        assert!(status.contains(&format!("\"configured_bind\":\"{}\"", initial_public_bind)));
 
         let audit = send_admin_audit(admin_addr).await?;
         assert!(audit.contains("\"code\": \"reload_applied_overlap_drain_timeout\""));
@@ -8849,7 +8941,9 @@ mod tests {
 
         let status = send_admin_status(admin_addr).await?;
         assert!(status.contains("\"reload_health\": \"failed\""));
-        assert!(status.contains("\"last_reload_outcome_code\": \"reload_failed_rollback_preserved\""));
+        assert!(
+            status.contains("\"last_reload_outcome_code\": \"reload_failed_rollback_preserved\"")
+        );
         assert!(status.contains("\"last_reload_result\":"));
         assert!(status.contains("\"reload_failed\""));
         let status_json = parse_http_json_body(&status)?;
@@ -8991,8 +9085,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn concurrent_reload_requests_are_serialized_without_state_loss(
-    ) -> Result<(), DynError> {
+    async fn concurrent_reload_requests_are_serialized_without_state_loss() -> Result<(), DynError>
+    {
         std::env::set_var("LB_CTL_ADMIN_SECRET", "admin-secret");
         let initial_public_bind = reserve_unused_addr().await?;
         let replacement_public_bind_one = reserve_unused_addr().await?;
@@ -10292,7 +10386,12 @@ mod tests {
         let upstream_addr = spawn_tagged_http1_upstream("upstream-a").await?;
         let path = write_temp_config(
             "versioned-status-envelope",
-            &workspace_config_json("127.0.0.1:0", "127.0.0.1:0", "http1", &upstream_addr.to_string()),
+            &workspace_config_json(
+                "127.0.0.1:0",
+                "127.0.0.1:0",
+                "http1",
+                &upstream_addr.to_string(),
+            ),
         )?;
         let supervisor = ServeSupervisor::start(
             path.to_str().ok_or("utf8 path")?.to_string(),
@@ -10314,8 +10413,20 @@ mod tests {
         let envelope = parse_http_json_body(&response)?;
         assert_eq!(envelope.get("api_version").and_then(serde_json::Value::as_str), Some("v1"));
         assert_eq!(envelope.get("status").and_then(serde_json::Value::as_str), Some("ok"));
-        assert_eq!(envelope.get("data").and_then(|value| value.get("service")).and_then(serde_json::Value::as_str), Some("lb-dataplane"));
-        assert_eq!(envelope.get("data").and_then(|value| value.get("mode")).and_then(serde_json::Value::as_str), Some("workspace"));
+        assert_eq!(
+            envelope
+                .get("data")
+                .and_then(|value| value.get("service"))
+                .and_then(serde_json::Value::as_str),
+            Some("lb-dataplane")
+        );
+        assert_eq!(
+            envelope
+                .get("data")
+                .and_then(|value| value.get("mode"))
+                .and_then(serde_json::Value::as_str),
+            Some("workspace")
+        );
 
         supervisor.shutdown().await?;
         Ok(())
@@ -10369,22 +10480,18 @@ mod tests {
         let tls = public_listener.get("tls").ok_or("missing tls status")?;
 
         assert_eq!(tls.get("state").and_then(serde_json::Value::as_str), Some("healthy"));
-        assert_eq!(
-            tls.get("minimum_version").and_then(serde_json::Value::as_str),
-            Some("tls12")
-        );
+        assert_eq!(tls.get("minimum_version").and_then(serde_json::Value::as_str), Some("tls12"));
         assert_eq!(
             tls.get("default_certificate")
                 .and_then(|value| value.get("cert_path"))
                 .and_then(serde_json::Value::as_str),
             Some(cert_path.as_str())
         );
-        assert!(
-            tls.get("default_certificate")
-                .and_then(|value| value.get("fingerprint_sha256"))
-                .and_then(serde_json::Value::as_str)
-                .is_some()
-        );
+        assert!(tls
+            .get("default_certificate")
+            .and_then(|value| value.get("fingerprint_sha256"))
+            .and_then(serde_json::Value::as_str)
+            .is_some());
 
         supervisor.shutdown().await?;
         Ok(())
@@ -10442,15 +10549,11 @@ mod tests {
             .ok_or("missing secret sources")?;
         assert_eq!(secret_sources.len(), 1);
         assert_eq!(
-            secret_sources[0]
-                .get("source_kind")
-                .and_then(serde_json::Value::as_str),
+            secret_sources[0].get("source_kind").and_then(serde_json::Value::as_str),
             Some("file")
         );
         assert_eq!(
-            secret_sources[0]
-                .get("source_reference")
-                .and_then(serde_json::Value::as_str),
+            secret_sources[0].get("source_reference").and_then(serde_json::Value::as_str),
             Some(secret_file_path.as_str())
         );
         assert_eq!(
@@ -10493,13 +10596,18 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn unsupported_admin_api_version_returns_machine_readable_error(
-    ) -> Result<(), DynError> {
+    async fn unsupported_admin_api_version_returns_machine_readable_error() -> Result<(), DynError>
+    {
         std::env::set_var("LB_CTL_ADMIN_SECRET", "admin-secret");
         let upstream_addr = spawn_tagged_http1_upstream("upstream-a").await?;
         let path = write_temp_config(
             "unsupported-admin-api-version",
-            &workspace_config_json("127.0.0.1:0", "127.0.0.1:0", "http1", &upstream_addr.to_string()),
+            &workspace_config_json(
+                "127.0.0.1:0",
+                "127.0.0.1:0",
+                "http1",
+                &upstream_addr.to_string(),
+            ),
         )?;
         let supervisor = ServeSupervisor::start(
             path.to_str().ok_or("utf8 path")?.to_string(),
@@ -10533,8 +10641,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn versioned_reload_failure_uses_typed_unsupported_mutation_error(
-    ) -> Result<(), DynError> {
+    async fn versioned_reload_failure_uses_typed_unsupported_mutation_error() -> Result<(), DynError>
+    {
         std::env::set_var("LB_CTL_ADMIN_SECRET", "admin-secret");
         let public_bind = reserve_unused_addr().await?;
         let upstream_addr = spawn_tagged_http1_upstream("upstream-a").await?;
@@ -10619,8 +10727,8 @@ mod tests {
         upstream_addr: &str,
         drain_timeout_ms: u64,
     ) -> String {
-                format!(
-                        r#"{{
+        format!(
+            r#"{{
     "api_version": "v1_alpha1",
     "name": "workspace-runtime",
     "listeners": [
@@ -10665,7 +10773,7 @@ mod tests {
         }}
     ]
 }}"#
-                )
+        )
     }
 
     fn workspace_config_json_with_admin_policy(
@@ -11531,9 +11639,9 @@ mod tests {
     }
 
     fn parse_http_json_body(response: &str) -> Result<serde_json::Value, DynError> {
-        let (_, body) = response.split_once("\r\n\r\n").ok_or_else(|| {
-            to_dyn_error("http response did not contain a header/body separator")
-        })?;
+        let (_, body) = response
+            .split_once("\r\n\r\n")
+            .ok_or_else(|| to_dyn_error("http response did not contain a header/body separator"))?;
         serde_json::from_str(body).map_err(to_dyn_error)
     }
 
@@ -11568,7 +11676,7 @@ mod tests {
         timestamp: u64,
         nonce: &str,
     ) -> Result<String, DynError> {
-        let signature = sign_admin_request(secret, actor, method, target, timestamp, nonce);
+        let signature = sign_admin_request(secret, actor, method, target, timestamp, nonce, b"");
         let request = format!(
             "{method} {target} HTTP/1.1\r\nHost: localhost\r\nX-LB-Admin-Actor: {actor}\r\nX-LB-Admin-Timestamp: {timestamp}\r\nX-LB-Admin-Nonce: {nonce}\r\nX-LB-Admin-Signature: {signature}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
         );
@@ -11595,8 +11703,31 @@ mod tests {
         nonce: &str,
         body: &str,
     ) -> Result<String, DynError> {
+        send_signed_admin_json_request_with_signed_body(
+            address, secret, actor, target, nonce, body, body,
+        )
+        .await
+    }
+
+    async fn send_signed_admin_json_request_with_signed_body(
+        address: SocketAddr,
+        secret: &str,
+        actor: &str,
+        target: &str,
+        nonce: &str,
+        signed_body: &str,
+        body: &str,
+    ) -> Result<String, DynError> {
         let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-        let signature = sign_admin_request(secret, actor, "POST", target, timestamp, nonce);
+        let signature = sign_admin_request(
+            secret,
+            actor,
+            "POST",
+            target,
+            timestamp,
+            nonce,
+            signed_body.as_bytes(),
+        );
         let request = format!(
             "POST {target} HTTP/1.1\r\nHost: localhost\r\nX-LB-Admin-Actor: {actor}\r\nX-LB-Admin-Timestamp: {timestamp}\r\nX-LB-Admin-Nonce: {nonce}\r\nX-LB-Admin-Signature: {signature}\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
             body.len()
@@ -11617,6 +11748,69 @@ mod tests {
             Err(error) => return Err(to_dyn_error(error)),
         }
         String::from_utf8(response).map_err(to_dyn_error)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn signed_cache_invalidation_rejects_body_tampering() -> Result<(), DynError> {
+        std::env::set_var("LB_CTL_OPERATOR_READ_SECRET", "reader-secret");
+        std::env::set_var("LB_CTL_OPERATOR_AUDIT_SECRET", "auditor-secret");
+        std::env::set_var("LB_CTL_OPERATOR_WRITE_SECRET", "writer-secret");
+        let (upstream_addr, request_count) = spawn_counting_http1_upstream().await?;
+        let path = write_temp_config(
+            "cache-invalidate-body-tamper",
+            &workspace_config_json_with_admin_policy_and_cache(
+                "127.0.0.1:0",
+                "127.0.0.1:0",
+                "http1",
+                &upstream_addr.to_string(),
+                signed_headers_admin_policy_json(),
+            ),
+        )?;
+        let supervisor = ServeSupervisor::start(
+            path.to_str().ok_or("utf8 path")?.to_string(),
+            Arc::new(String::from("admin-secret")),
+        )
+        .await?;
+
+        let statuses = supervisor.listener_statuses().await;
+        let public_addr = statuses
+            .iter()
+            .find(|status| status.class == lb_config_model::ListenerClassConfig::Public)
+            .ok_or("missing public listener")?
+            .local_addr;
+        let admin_addr = statuses
+            .iter()
+            .find(|status| status.class == lb_config_model::ListenerClassConfig::Admin)
+            .ok_or("missing admin listener")?
+            .local_addr;
+
+        let first = send_http1_request(public_addr, "/catalog").await?;
+        let second = send_http1_request(public_addr, "/catalog").await?;
+        assert!(first.contains("count:1"));
+        assert!(second.contains("count:1"));
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+
+        let signed_body = r#"{"event_id":"node-a-1","scope":"public","issuer":"node-a","target":{"PathPrefix":"/catalog"},"occurred_at_unix_ms":1700000000000}"#;
+        let tampered_body = r#"{"event_id":"node-a-1","scope":"public","issuer":"node-a","target":{"PathPrefix":"/admin"},"occurred_at_unix_ms":1700000000000}"#;
+        let response = send_signed_admin_json_request_with_signed_body(
+            admin_addr,
+            "writer-secret",
+            "writer",
+            "/cache/invalidate",
+            "cache-invalidate-body-tamper",
+            signed_body,
+            tampered_body,
+        )
+        .await?;
+        assert!(response.starts_with("HTTP/1.1 401 Unauthorized"));
+        assert!(response.contains("signed admin authorization required"));
+
+        let third = send_http1_request(public_addr, "/catalog").await?;
+        assert!(third.contains("count:1"));
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+
+        supervisor.shutdown().await?;
+        Ok(())
     }
 
     async fn reserve_unused_addr() -> io::Result<SocketAddr> {

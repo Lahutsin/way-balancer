@@ -32,7 +32,10 @@ method
 target
 timestamp
 nonce
+sha256_hex(request_body)
 ```
+
+That final body digest binds signed `POST` and `PUT` style requests to their exact payload bytes. Remote admin exposure should use `https`; plaintext `http1` is reserved for loopback-only admin listeners.
 
 The runtime validates:
 

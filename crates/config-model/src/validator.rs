@@ -607,6 +607,16 @@ fn validate_admin_listener_policy(
         return;
     }
 
+    if listener.protocol == ListenerProtocolConfig::Http1
+        && !listener.bind_address.ip().is_loopback()
+    {
+        report.errors.push(ValidationError::semantic(
+            ValidationCode::InvalidListenerField,
+            format!("{base_path}.protocol"),
+            "admin listeners exposed beyond loopback must use https",
+        ));
+    }
+
     for (index, cidr) in listener.admin.allowed_source_cidrs.iter().enumerate() {
         if cidr.parse::<ipnet::IpNet>().is_err() {
             report.errors.push(ValidationError::schema(
@@ -990,7 +1000,9 @@ fn validate_policy_binding(
         &registry.hostile_edge_protections,
         report,
     );
-    if binding.hostile_edge_protection.is_some() && !matches!(target, PolicyBindingTarget::Listener(_)) {
+    if binding.hostile_edge_protection.is_some()
+        && !matches!(target, PolicyBindingTarget::Listener(_))
+    {
         report.errors.push(ValidationError::semantic(
             ValidationCode::InvalidPolicyScope,
             format!("{base_path}.hostile_edge_protection"),
@@ -1720,14 +1732,14 @@ mod tests {
         HostileEdgeHandshakeGuardConfig, HostileEdgeProtectionPolicyConfig,
         HostileEdgeSourceQuotaConfig, HttpCacheMethodConfig, HttpCachePolicyConfig,
         HttpCacheStorageConfig, ListenerCertificateSourceConfig, ListenerClassConfig,
-        ListenerResourceConfig, ListenerTlsTerminationConfig,
-        LocalConcurrencyLimitPolicyConfig, LocalLimitKeyKindConfig, LocalLimitScopeConfig,
-        LocalRateLimitPolicyConfig, NamedHostileEdgeProtectionPolicyConfig,
-        NamedHttpCachePolicyConfig, NamedLocalConcurrencyLimitPolicyConfig,
-        NamedLocalRateLimitPolicyConfig, NamedOverloadResponsePolicyConfig,
-        NamedRetryBudgetPolicyConfig, OverloadResponsePolicyConfig, PolicyBindingConfig,
-        PolicyResourcesConfig, RouteConfig, UpstreamClusterConfig, UpstreamEndpointConfig,
-        UpstreamTrafficPolicyConfig, WorkspaceConfig,
+        ListenerResourceConfig, ListenerTlsTerminationConfig, LocalConcurrencyLimitPolicyConfig,
+        LocalLimitKeyKindConfig, LocalLimitScopeConfig, LocalRateLimitPolicyConfig,
+        NamedHostileEdgeProtectionPolicyConfig, NamedHttpCachePolicyConfig,
+        NamedLocalConcurrencyLimitPolicyConfig, NamedLocalRateLimitPolicyConfig,
+        NamedOverloadResponsePolicyConfig, NamedRetryBudgetPolicyConfig,
+        OverloadResponsePolicyConfig, PolicyBindingConfig, PolicyResourcesConfig, RouteConfig,
+        UpstreamClusterConfig, UpstreamEndpointConfig, UpstreamTrafficPolicyConfig,
+        WorkspaceConfig,
     };
 
     fn valid_workspace() -> Result<WorkspaceConfig, Box<dyn std::error::Error>> {
@@ -2364,6 +2376,27 @@ mod tests {
         assert!(report.to_string().contains(
             "https listeners must use a non-empty ocsp_path when OCSP stapling is configured"
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn validator_rejects_remote_plaintext_admin_listener() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut config = valid_workspace()?;
+        let mut admin_listener =
+            ListenerResourceConfig::foundation("admin", ListenerClassConfig::Admin, 9900);
+        admin_listener.bind_address = "192.0.2.10:9900".parse()?;
+        admin_listener.protocol = crate::ListenerProtocolConfig::Http1;
+        config.listeners.push(admin_listener);
+
+        let report = validate_workspace_config(&config);
+
+        assert!(report.errors.iter().any(|error| {
+            error.code == ValidationCode::InvalidListenerField
+                && error.category == ValidationCategory::Semantic
+                && error.path == "listeners[1].protocol"
+                && error.message == "admin listeners exposed beyond loopback must use https"
+        }));
         Ok(())
     }
 

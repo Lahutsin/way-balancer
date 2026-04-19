@@ -1,14 +1,30 @@
 use std::fmt;
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{SocketAddr, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use rustls::pki_types::{CertificateDer, ServerName};
+use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 const DEFAULT_INVALIDATION_PATH: &str = "/cache/invalidate";
 const DEFAULT_MAX_FAILURE_DETAILS: usize = 8;
+const MAX_CACHE_PEER_NODE_ID_LEN: usize = lb_runtime::HTTP_CACHE_INVALIDATION_MAX_ISSUER_LEN;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeerOriginScheme {
+    Http,
+    Https,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedPeerOrigin {
+    authority: String,
+    socket_addr: SocketAddr,
+    scheme: PeerOriginScheme,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HttpCachePeerRetryPolicy {
@@ -50,6 +66,7 @@ pub struct HttpCachePeerConfig {
     pub origin: String,
     pub actor: String,
     pub secret_env: String,
+    pub tls_ca_cert_env: Option<String>,
     pub invalidation_path: String,
     pub connect_timeout: Duration,
     pub response_timeout: Duration,
@@ -68,10 +85,17 @@ impl HttpCachePeerConfig {
             origin: origin.into(),
             actor: actor.into(),
             secret_env: secret_env.into(),
+            tls_ca_cert_env: None,
             invalidation_path: String::from(DEFAULT_INVALIDATION_PATH),
             connect_timeout: Duration::from_millis(500),
             response_timeout: Duration::from_millis(1000),
         }
+    }
+
+    #[must_use]
+    pub fn with_tls_ca_cert_env(mut self, tls_ca_cert_env: impl Into<String>) -> Self {
+        self.tls_ca_cert_env = Some(tls_ca_cert_env.into());
+        self
     }
 
     #[must_use]
@@ -96,10 +120,28 @@ impl HttpCachePeerConfig {
         if self.node_id.trim().is_empty() {
             return Err(InvalidHttpCachePeerConfig::EmptyNodeId);
         }
+        if self.node_id.len() > MAX_CACHE_PEER_NODE_ID_LEN {
+            return Err(InvalidHttpCachePeerConfig::NodeIdTooLong);
+        }
         if self.origin.trim().is_empty() {
             return Err(InvalidHttpCachePeerConfig::EmptyOrigin);
         }
-        if parse_http_origin(&self.origin).is_err() {
+        let parsed_origin = parse_peer_origin(&self.origin)
+            .map_err(|_| InvalidHttpCachePeerConfig::InvalidOrigin)?;
+        if matches!(parsed_origin.scheme, PeerOriginScheme::Http)
+            && !parsed_origin.socket_addr.ip().is_loopback()
+        {
+            return Err(InvalidHttpCachePeerConfig::InsecureHttpOrigin);
+        }
+        if matches!(parsed_origin.scheme, PeerOriginScheme::Https) && self.tls_ca_cert_env.is_none()
+        {
+            return Err(InvalidHttpCachePeerConfig::MissingTlsCaCertEnv);
+        }
+        if self.tls_ca_cert_env.as_deref().is_some_and(|value| value.trim().is_empty()) {
+            return Err(InvalidHttpCachePeerConfig::EmptyTlsCaCertEnv);
+        }
+        if self.actor.trim().contains(['\r', '\n']) || self.invalidation_path.contains(['\r', '\n'])
+        {
             return Err(InvalidHttpCachePeerConfig::InvalidOrigin);
         }
         if self.actor.trim().is_empty() {
@@ -130,10 +172,14 @@ impl HttpCachePeerConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InvalidHttpCachePeerConfig {
     EmptyNodeId,
+    NodeIdTooLong,
     EmptyOrigin,
     InvalidOrigin,
+    InsecureHttpOrigin,
     EmptyActor,
     EmptySecretEnv,
+    MissingTlsCaCertEnv,
+    EmptyTlsCaCertEnv,
     EmptyInvalidationPath,
     InvalidInvalidationPath,
     ZeroConnectTimeout,
@@ -144,12 +190,24 @@ impl fmt::Display for InvalidHttpCachePeerConfig {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptyNodeId => formatter.write_str("cache peer node_id must not be empty"),
+            Self::NodeIdTooLong => formatter.write_str("cache peer node_id exceeds max length"),
             Self::EmptyOrigin => formatter.write_str("cache peer origin must not be empty"),
             Self::InvalidOrigin => {
-                formatter.write_str("cache peer origin must be an http://host:port origin")
+                formatter.write_str(
+                    "cache peer origin must be an authority-only http://host:port or https://host:port origin",
+                )
             }
+            Self::InsecureHttpOrigin => formatter.write_str(
+                "cache peer http origins must target loopback; use https:// for remote peers",
+            ),
             Self::EmptyActor => formatter.write_str("cache peer actor must not be empty"),
             Self::EmptySecretEnv => formatter.write_str("cache peer secret_env must not be empty"),
+            Self::MissingTlsCaCertEnv => formatter.write_str(
+                "cache peer https origins must declare tls_ca_cert_env",
+            ),
+            Self::EmptyTlsCaCertEnv => formatter.write_str(
+                "cache peer tls_ca_cert_env must not be empty when configured",
+            ),
             Self::EmptyInvalidationPath => {
                 formatter.write_str("cache peer invalidation path must not be empty")
             }
@@ -378,7 +436,7 @@ fn publish_to_peer(
     peer: &HttpCachePeerConfig,
     event: &lb_runtime::HttpCacheInvalidationEvent,
 ) -> Result<HttpCachePeerInvalidationResponse, String> {
-    let (authority, socket_addr) = parse_http_origin(&peer.origin)?;
+    let origin = parse_peer_origin(&peer.origin)?;
     let secret = std::env::var(&peer.secret_env)
         .map_err(|_| format!("secret env {} is not configured", peer.secret_env))?;
     if secret.is_empty() {
@@ -395,16 +453,8 @@ fn publish_to_peer(
         &peer.invalidation_path,
         timestamp,
         &nonce,
+        &body,
     );
-
-    let mut stream = TcpStream::connect_timeout(&socket_addr, peer.connect_timeout)
-        .map_err(|error| format!("connect {}: {error}", peer.node_id))?;
-    stream
-        .set_read_timeout(Some(peer.response_timeout))
-        .map_err(|error| format!("set read timeout {}: {error}", peer.node_id))?;
-    stream
-        .set_write_timeout(Some(peer.response_timeout))
-        .map_err(|error| format!("set write timeout {}: {error}", peer.node_id))?;
 
     let request = format!(
         concat!(
@@ -419,18 +469,91 @@ fn publish_to_peer(
             "Content-Length: {length}\r\n\r\n"
         ),
         path = peer.invalidation_path,
-        host = authority,
+        host = origin.authority,
         actor = peer.actor,
         timestamp = timestamp,
         nonce = nonce,
         signature = signature,
         length = body.len(),
     );
+    let mut request_bytes = request.into_bytes();
+    request_bytes.extend_from_slice(&body);
+
+    match origin.scheme {
+        PeerOriginScheme::Http => publish_to_http_peer(peer, origin.socket_addr, &request_bytes),
+        PeerOriginScheme::Https => publish_to_https_peer(peer, &origin, &request_bytes),
+    }
+}
+
+fn publish_to_http_peer(
+    peer: &HttpCachePeerConfig,
+    socket_addr: SocketAddr,
+    request_bytes: &[u8],
+) -> Result<HttpCachePeerInvalidationResponse, String> {
+    let mut stream = TcpStream::connect_timeout(&socket_addr, peer.connect_timeout)
+        .map_err(|error| format!("connect {}: {error}", peer.node_id))?;
     stream
-        .write_all(request.as_bytes())
-        .and_then(|_| stream.write_all(&body))
+        .set_read_timeout(Some(peer.response_timeout))
+        .map_err(|error| format!("set read timeout {}: {error}", peer.node_id))?;
+    stream
+        .set_write_timeout(Some(peer.response_timeout))
+        .map_err(|error| format!("set write timeout {}: {error}", peer.node_id))?;
+    stream
+        .write_all(request_bytes)
         .map_err(|error| format!("write request {}: {error}", peer.node_id))?;
 
+    let response = read_peer_response(&mut stream, &peer.node_id)?;
+    parse_peer_response(&response).map_err(|error| format!("{} response: {error}", peer.node_id))
+}
+
+fn publish_to_https_peer(
+    peer: &HttpCachePeerConfig,
+    origin: &ParsedPeerOrigin,
+    request_bytes: &[u8],
+) -> Result<HttpCachePeerInvalidationResponse, String> {
+    let tls_ca_cert_env = peer
+        .tls_ca_cert_env
+        .as_deref()
+        .ok_or_else(|| format!("peer {} is missing tls_ca_cert_env", peer.node_id))?;
+    let ca_pem = std::env::var(tls_ca_cert_env)
+        .map_err(|_| format!("tls ca env {} is not configured", tls_ca_cert_env))?;
+    if ca_pem.trim().is_empty() {
+        return Err(format!("tls ca env {} is empty", tls_ca_cert_env));
+    }
+    let mut root_store = RootCertStore::empty();
+    for certificate in lb_proto_tls::load_certificates_from_pem(&ca_pem)
+        .map_err(|error| format!("load CA certificates from {tls_ca_cert_env}: {error}"))?
+    {
+        root_store
+            .add(CertificateDer::from(certificate))
+            .map_err(|error| format!("load CA certificate from {tls_ca_cert_env}: {error}"))?;
+    }
+
+    let client_config =
+        ClientConfig::builder().with_root_certificates(root_store).with_no_client_auth();
+    let server_name = ServerName::IpAddress(origin.socket_addr.ip().into());
+
+    let stream = TcpStream::connect_timeout(&origin.socket_addr, peer.connect_timeout)
+        .map_err(|error| format!("connect {}: {error}", peer.node_id))?;
+    stream
+        .set_read_timeout(Some(peer.response_timeout))
+        .map_err(|error| format!("set read timeout {}: {error}", peer.node_id))?;
+    stream
+        .set_write_timeout(Some(peer.response_timeout))
+        .map_err(|error| format!("set write timeout {}: {error}", peer.node_id))?;
+
+    let connection = ClientConnection::new(Arc::new(client_config), server_name)
+        .map_err(|error| format!("tls {}: {error}", peer.node_id))?;
+    let mut tls_stream = StreamOwned::new(connection, stream);
+    tls_stream
+        .write_all(request_bytes)
+        .map_err(|error| format!("write https request {}: {error}", peer.node_id))?;
+
+    let response = read_peer_response(&mut tls_stream, &peer.node_id)?;
+    parse_peer_response(&response).map_err(|error| format!("{} response: {error}", peer.node_id))
+}
+
+fn read_peer_response(stream: &mut impl Read, node_id: &str) -> Result<Vec<u8>, String> {
     let mut response = Vec::new();
     let mut chunk = [0_u8; 4096];
     loop {
@@ -446,26 +569,26 @@ fn publish_to_peer(
             {
                 break;
             }
-            Err(error) => {
-                return Err(format!("read response {}: {error}", peer.node_id));
-            }
+            Err(error) => return Err(format!("read response {node_id}: {error}")),
         }
     }
-
-    parse_peer_response(&response).map_err(|error| format!("{} response: {error}", peer.node_id))
+    Ok(response)
 }
-
-fn parse_http_origin(origin: &str) -> Result<(String, std::net::SocketAddr), String> {
-    let authority = origin
-        .strip_prefix("http://")
-        .ok_or_else(|| String::from("origin must start with http://"))?;
+fn parse_peer_origin(origin: &str) -> Result<ParsedPeerOrigin, String> {
+    let (scheme, authority) = if let Some(authority) = origin.strip_prefix("http://") {
+        (PeerOriginScheme::Http, authority)
+    } else if let Some(authority) = origin.strip_prefix("https://") {
+        (PeerOriginScheme::Https, authority)
+    } else {
+        return Err(String::from("origin must start with http:// or https://"));
+    };
     if authority.is_empty() || authority.contains('/') {
-        return Err(String::from("origin must be an authority-only http origin"));
+        return Err(String::from("origin must be an authority-only HTTP origin"));
     }
     let socket_addr = authority
         .parse::<std::net::SocketAddr>()
         .map_err(|_| String::from("origin authority must be a socket address"))?;
-    Ok((authority.to_string(), socket_addr))
+    Ok(ParsedPeerOrigin { authority: authority.to_string(), socket_addr, scheme })
 }
 
 fn parse_peer_response(bytes: &[u8]) -> Result<HttpCachePeerInvalidationResponse, String> {
@@ -499,6 +622,7 @@ pub fn sign_http_cache_peer_request(
     target: &str,
     timestamp: u64,
     nonce: &str,
+    body: &[u8],
 ) -> String {
     let block_size = 64;
     let mut key = secret.as_bytes().to_vec();
@@ -514,7 +638,10 @@ pub fn sign_http_cache_peer_request(
         outer_pad[index] ^= *key_byte;
     }
 
-    let payload = format!("{actor}\n{method}\n{target}\n{timestamp}\n{nonce}\n");
+    let payload = format!(
+        "{actor}\n{method}\n{target}\n{timestamp}\n{nonce}\n{}\n",
+        request_body_digest(body)
+    );
     let mut inner = Sha256::new();
     inner.update(&inner_pad);
     inner.update(payload.as_bytes());
@@ -524,6 +651,11 @@ pub fn sign_http_cache_peer_request(
     outer.update(&outer_pad);
     outer.update(inner_digest);
     let digest = outer.finalize();
+    digest.iter().map(|byte| format!("{byte:02x}")).collect::<String>()
+}
+
+fn request_body_digest(body: &[u8]) -> String {
+    let digest = Sha256::digest(body);
     digest.iter().map(|byte| format!("{byte:02x}")).collect::<String>()
 }
 
@@ -538,11 +670,13 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
-    use lb_runtime::{HttpCacheInvalidationEvent, HttpCacheInvalidationTarget, HttpCacheInvalidationTransport};
+    use lb_runtime::{
+        HttpCacheInvalidationEvent, HttpCacheInvalidationTarget, HttpCacheInvalidationTransport,
+    };
 
     use super::{
         HttpCachePeerConfig, HttpCachePeerDeliveryResult, HttpCachePeerRetryPolicy,
-        HttpCachePeerTransport,
+        HttpCachePeerTransport, InvalidHttpCachePeerConfig,
     };
 
     fn spawn_peer_server(
@@ -569,13 +703,14 @@ mod tests {
         transport: &HttpCachePeerTransport,
         event_id: &str,
     ) -> Result<lb_runtime::HttpCacheInvalidationPublishResult, Box<dyn std::error::Error>> {
-        Ok(transport.publish(&HttpCacheInvalidationEvent::new(
+        let event = HttpCacheInvalidationEvent::new(
             event_id,
             "shared-cache",
             "operator",
             HttpCacheInvalidationTarget::PathPrefix(String::from("/assets")),
             100,
-        )?)?)
+        )?;
+        Ok(transport.publish(&event)?)
     }
 
     #[test]
@@ -677,12 +812,7 @@ mod tests {
 
         let result = publish_event(&transport, "evt-3")?;
 
-        assert_eq!(
-            result.delivery_success_count,
-            1,
-            "unexpected publish result: {:?}",
-            result
-        );
+        assert_eq!(result.delivery_success_count, 1, "unexpected publish result: {:?}", result);
         let report = transport.last_report().expect("last report");
         assert_eq!(
             report.peer_results[0].result,
@@ -690,12 +820,31 @@ mod tests {
             "unexpected fanout report: {:?}",
             report
         );
-        assert_eq!(
-            report.duplicate_count,
-            1,
-            "unexpected fanout report: {:?}",
-            report
-        );
+        assert_eq!(report.duplicate_count, 1, "unexpected fanout report: {:?}", report);
         Ok(())
+    }
+
+    #[test]
+    fn peer_config_rejects_remote_plaintext_origin() {
+        let result = HttpCachePeerTransport::new([HttpCachePeerConfig::new(
+            "node-b",
+            "http://198.51.100.10:8443",
+            "peer-a",
+            "LB_CACHE_TEST_SECRET",
+        )]);
+
+        assert!(matches!(result, Err(InvalidHttpCachePeerConfig::InsecureHttpOrigin)));
+    }
+
+    #[test]
+    fn peer_config_requires_tls_ca_env_for_https_origins() {
+        let result = HttpCachePeerTransport::new([HttpCachePeerConfig::new(
+            "node-b",
+            "https://127.0.0.1:8443",
+            "peer-a",
+            "LB_CACHE_TEST_SECRET",
+        )]);
+
+        assert!(matches!(result, Err(InvalidHttpCachePeerConfig::MissingTlsCaCertEnv)));
     }
 }

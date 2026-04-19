@@ -11,6 +11,7 @@ const MAX_SCOPE_LEN: usize = lb_runtime::HTTP_CACHE_INVALIDATION_MAX_SCOPE_LEN;
 const MAX_ACTOR_LEN: usize = 128;
 const MAX_REASON_LEN: usize = 256;
 const MAX_PATH_PREFIX_LEN: usize = lb_runtime::HTTP_CACHE_INVALIDATION_MAX_PATH_PREFIX_LEN;
+const MAX_DISTRIBUTED_NODE_ID_LEN: usize = lb_runtime::HTTP_CACHE_INVALIDATION_MAX_ISSUER_LEN;
 const MAX_HISTORY: usize = 64;
 
 static NEXT_INVALIDATION_EVENT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -143,9 +144,31 @@ impl std::fmt::Display for InvalidHttpCachePurgeRequest {
 
 impl std::error::Error for InvalidHttpCachePurgeRequest {}
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InvalidDistributedInvalidationConfig {
+    EmptyNodeId,
+    NodeIdTooLong,
+}
+
+impl std::fmt::Display for InvalidDistributedInvalidationConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyNodeId => {
+                formatter.write_str("distributed invalidation node_id must not be empty")
+            }
+            Self::NodeIdTooLong => {
+                formatter.write_str("distributed invalidation node_id exceeds max length")
+            }
+        }
+    }
+}
+
+impl std::error::Error for InvalidDistributedInvalidationConfig {}
+
 #[derive(Debug)]
 pub enum HttpCachePurgeError {
     InvalidRequest(InvalidHttpCachePurgeRequest),
+    InvalidDistributedConfig(InvalidDistributedInvalidationConfig),
     InvalidPeerConfig(InvalidHttpCachePeerConfig),
     PurgeDisabled,
     Invalidation(lb_runtime::HttpCacheInvalidationTransportError),
@@ -157,6 +180,9 @@ impl std::fmt::Display for HttpCachePurgeError {
         match self {
             Self::InvalidRequest(error) => {
                 write!(formatter, "invalid cache purge request: {error}")
+            }
+            Self::InvalidDistributedConfig(error) => {
+                write!(formatter, "invalid distributed invalidation config: {error}")
             }
             Self::InvalidPeerConfig(error) => {
                 write!(formatter, "invalid cache peer config: {error}")
@@ -178,6 +204,7 @@ impl std::error::Error for HttpCachePurgeError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::InvalidRequest(error) => Some(error),
+            Self::InvalidDistributedConfig(error) => Some(error),
             Self::InvalidPeerConfig(error) => Some(error),
             Self::Invalidation(error) => Some(error),
             Self::Internal(error) => Some(error),
@@ -233,13 +260,15 @@ impl HttpCacheAdminService {
         mut self,
         node_id: impl Into<String>,
         bus: Arc<lb_runtime::HttpCacheInvalidationBus>,
-    ) -> Self {
+    ) -> Result<Self, HttpCachePurgeError> {
+        let node_id = validate_distributed_node_id(node_id.into())
+            .map_err(HttpCachePurgeError::InvalidDistributedConfig)?;
         self.distributed_invalidation = Some(DistributedInvalidationConfig {
-            node_id: node_id.into(),
+            node_id,
             transport: Arc::new(lb_runtime::HttpCacheInvalidationBusTransport::new(bus)),
             delivery_mode: HttpCacheInvalidationDeliveryMode::BestEffort,
         });
-        self
+        Ok(self)
     }
 
     #[must_use]
@@ -248,13 +277,12 @@ impl HttpCacheAdminService {
         node_id: impl Into<String>,
         transport: Arc<dyn lb_runtime::HttpCacheInvalidationTransport>,
         delivery_mode: HttpCacheInvalidationDeliveryMode,
-    ) -> Self {
-        self.distributed_invalidation = Some(DistributedInvalidationConfig {
-            node_id: node_id.into(),
-            transport,
-            delivery_mode,
-        });
-        self
+    ) -> Result<Self, HttpCachePurgeError> {
+        let node_id = validate_distributed_node_id(node_id.into())
+            .map_err(HttpCachePurgeError::InvalidDistributedConfig)?;
+        self.distributed_invalidation =
+            Some(DistributedInvalidationConfig { node_id, transport, delivery_mode });
+        Ok(self)
     }
 
     pub fn with_http_peer_transport(
@@ -278,11 +306,11 @@ impl HttpCacheAdminService {
         let transport = HttpCachePeerTransport::new(peers)
             .map_err(HttpCachePurgeError::InvalidPeerConfig)?
             .with_retry_policy(retry_policy);
-        Ok(self.with_invalidation_transport(
+        self.with_invalidation_transport(
             node_id,
             Arc::new(transport),
             HttpCacheInvalidationDeliveryMode::BestEffort,
-        ))
+        )
     }
 
     pub fn purge(
@@ -474,6 +502,18 @@ fn validate_scope(scope: &str) -> Result<(), InvalidHttpCachePurgeRequest> {
     Ok(())
 }
 
+fn validate_distributed_node_id(
+    node_id: String,
+) -> Result<String, InvalidDistributedInvalidationConfig> {
+    if node_id.trim().is_empty() {
+        return Err(InvalidDistributedInvalidationConfig::EmptyNodeId);
+    }
+    if node_id.len() > MAX_DISTRIBUTED_NODE_ID_LEN {
+        return Err(InvalidDistributedInvalidationConfig::NodeIdTooLong);
+    }
+    Ok(node_id)
+}
+
 fn validate_actor_reason(
     requested_by: Option<&str>,
     reason: Option<&str>,
@@ -648,8 +688,9 @@ mod tests {
     };
 
     use super::{
-        HttpCacheAdminService, HttpCachePurgeRequest, HttpCachePurgeResultKind,
-        HttpCachePurgeTarget,
+        HttpCacheAdminService, HttpCachePurgeError, HttpCachePurgeRequest,
+        HttpCachePurgeResultKind, HttpCachePurgeTarget, InvalidDistributedInvalidationConfig,
+        MAX_DISTRIBUTED_NODE_ID_LEN,
     };
 
     enum MockPeerMode {
@@ -756,6 +797,7 @@ mod tests {
                 target,
                 timestamp,
                 &nonce_header,
+                body.as_bytes(),
             );
             assert_eq!(signature_header, expected_signature);
 
@@ -945,7 +987,7 @@ mod tests {
             Arc::clone(&second),
         )));
         let mut service = HttpCacheAdminService::new("public-http", true, Arc::clone(&first))
-            .with_invalidation_bus("node-a", Arc::clone(&bus));
+            .with_invalidation_bus("node-a", Arc::clone(&bus))?;
 
         let response = service.purge(
             HttpCachePurgeRequest {
@@ -985,7 +1027,7 @@ mod tests {
 
         let bus = Arc::new(lb_runtime::HttpCacheInvalidationBus::new());
         let mut service = HttpCacheAdminService::new("public-http", true, Arc::clone(&store))
-            .with_invalidation_bus("node-a", Arc::clone(&bus));
+            .with_invalidation_bus("node-a", Arc::clone(&bus))?;
 
         let first = service.purge(
             HttpCachePurgeRequest {
@@ -1256,6 +1298,29 @@ mod tests {
         let metrics = telemetry.export_metrics();
         assert!(metrics.contains(
             "runtime_http_cache_invalidation_peer_deliveries_total{scope=\"public-http\",result=\"duplicate\",reason=\"http_peer\"} 1"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn distributed_invalidation_rejects_overlong_node_id() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let store = Arc::new(lb_runtime::HttpCacheStore::new(lb_runtime::HttpCacheStoreConfig {
+            max_entries: 8,
+            max_bytes: 2048,
+            max_object_bytes: 512,
+        })?);
+        let bus = Arc::new(lb_runtime::HttpCacheInvalidationBus::new());
+
+        let error = HttpCacheAdminService::new("public-http", true, store)
+            .with_invalidation_bus("n".repeat(MAX_DISTRIBUTED_NODE_ID_LEN + 1), bus)
+            .expect_err("overlong distributed node id must fail");
+
+        assert!(matches!(
+            error,
+            HttpCachePurgeError::InvalidDistributedConfig(
+                InvalidDistributedInvalidationConfig::NodeIdTooLong
+            )
         ));
         Ok(())
     }
