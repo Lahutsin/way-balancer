@@ -4,17 +4,17 @@ Production-oriented Rust load-balancer
 
 way-balancer is a production-oriented Rust load balancer with a typed config model, runtime reload mechanics, admin-plane controls, cache and policy surfaces, Kubernetes translation, and explicit `0.1.x` support-boundary plus release-evidence discipline.
 
-Detailed architecture, support boundaries, configuration shape, and runbooks now live under [docs/](/Volumes/DATA/Coding/way-balancer/docs) instead of being duplicated in this file.
+Detailed architecture, support boundaries, configuration shape, and runbooks now live under [docs/](docs/) instead of being duplicated in this file.
 
 Start here:
 
-- [docs/index.md](/Volumes/DATA/Coding/way-balancer/docs/index.md): documentation home
-- [docs/getting-started.md](/Volumes/DATA/Coding/way-balancer/docs/getting-started.md): local bring-up and developer workflow
-- [docs/architecture.md](/Volumes/DATA/Coding/way-balancer/docs/architecture.md): system architecture and crate boundaries
-- [docs/configuration.md](/Volumes/DATA/Coding/way-balancer/docs/configuration.md): typed `WorkspaceConfig` model and examples
-- [docs/admin-api.md](/Volumes/DATA/Coding/way-balancer/docs/admin-api.md): admin endpoints and operator sequencing
-- [docs/runbooks/support-boundaries.md](/Volumes/DATA/Coding/way-balancer/docs/runbooks/support-boundaries.md): supported and unsupported deployment shapes
-- [examples/load-balancer/README.md](/Volumes/DATA/Coding/way-balancer/examples/load-balancer/README.md): checked-in example configs
+- [docs/index.md](docs/index.md): documentation home
+- [docs/getting-started.md](docs/getting-started.md): local bring-up and developer workflow
+- [docs/architecture.md](docs/architecture.md): system architecture and crate boundaries
+- [docs/configuration.md](docs/configuration.md): typed `WorkspaceConfig` model and examples
+- [docs/admin-api.md](docs/admin-api.md): admin endpoints and operator sequencing
+- [docs/runbooks/support-boundaries.md](docs/runbooks/support-boundaries.md): supported and unsupported deployment shapes
+- [examples/load-balancer/README.md](examples/load-balancer/README.md): checked-in example configs
 
 ## Documentation Site
 
@@ -75,7 +75,7 @@ cargo test -p lb-test-support --test snapshot_restore_smoke
 cargo test -p lb-test-support --test example_configs
 ```
 
-Full developer, configuration, cache, security, TLS, support-boundary, and Kubernetes guidance is documented under [docs/](/Volumes/DATA/Coding/way-balancer/docs).
+Full developer, configuration, cache, security, TLS, support-boundary, and Kubernetes guidance is documented under [docs/](docs/).
 
 The checked-in `serve --config` admin examples require an environment-provided bearer secret instead of embedded credentials:
 

@@ -98,7 +98,7 @@ Example:
 }
 ```
 
-See [examples/load-balancer/proxy-protocol-fronted.json](/Volumes/DATA/Coding/way-balancer/examples/load-balancer/proxy-protocol-fronted.json).
+See [examples/load-balancer/proxy-protocol-fronted.json](../examples/load-balancer/proxy-protocol-fronted.json).
 
 ## HTTP/3 Listener Model
 
@@ -145,7 +145,7 @@ Minimal example:
 }
 ```
 
-See [examples/load-balancer/http3-public.json](/Volumes/DATA/Coding/way-balancer/examples/load-balancer/http3-public.json).
+See [examples/load-balancer/http3-public.json](../examples/load-balancer/http3-public.json).
 
 The HTTP/3 serve path now emits a dedicated `runtime_http3_requests_total` counter labeled by listener scope, result, and response class or local failure reason.
 
@@ -197,7 +197,7 @@ Runtime behavior now follows the declared bind mode:
 - `dual_stack` on `[::]:port` enables a shared IPv6 socket that also accepts IPv4 connections through the same listener
 - reload planning treats `bind_mode` as part of listener identity, so changing it on the same live socket is surfaced as a rebind-required change instead of an in-place update
 
-See the checked-in example in [examples/load-balancer/dual-stack-public.json](/Volumes/DATA/Coding/way-balancer/examples/load-balancer/dual-stack-public.json).
+See the checked-in example in [examples/load-balancer/dual-stack-public.json](../examples/load-balancer/dual-stack-public.json).
 
 ## Route Matching
 
@@ -310,7 +310,7 @@ The same effective source identity is also used by listener hostile-edge `source
 }
 ```
 
-See the checked-in examples in [examples/load-balancer/route-matchers-http.json](/Volumes/DATA/Coding/way-balancer/examples/load-balancer/route-matchers-http.json), [examples/load-balancer/source-aware-routing.json](/Volumes/DATA/Coding/way-balancer/examples/load-balancer/source-aware-routing.json), and [examples/load-balancer/grpc-retries.json](/Volumes/DATA/Coding/way-balancer/examples/load-balancer/grpc-retries.json).
+See the checked-in examples in [examples/load-balancer/route-matchers-http.json](../examples/load-balancer/route-matchers-http.json), [examples/load-balancer/source-aware-routing.json](../examples/load-balancer/source-aware-routing.json), and [examples/load-balancer/grpc-retries.json](../examples/load-balancer/grpc-retries.json).
 
 ## Route Destinations
 
@@ -371,9 +371,9 @@ The intended precedence shape is listener -> route -> destination. This slice on
 
 Current compiled-runtime diagnostics now resolve that precedence explicitly for request transforms, response transforms, retry budgets, timeout hierarchies, circuit breakers, traffic mirroring, fault injection, and local limit references. Singular bindings pick the most specific non-empty layer, while local rate-limit and concurrency-limit references accumulate in listener-then-route-then-destination order.
 
-See the checked-in rollout examples in [examples/load-balancer/weighted-route-canary.json](/Volumes/DATA/Coding/way-balancer/examples/load-balancer/weighted-route-canary.json) and [examples/load-balancer/weighted-route-blue-green.json](/Volumes/DATA/Coding/way-balancer/examples/load-balancer/weighted-route-blue-green.json).
+See the checked-in rollout examples in [examples/load-balancer/weighted-route-canary.json](../examples/load-balancer/weighted-route-canary.json) and [examples/load-balancer/weighted-route-blue-green.json](../examples/load-balancer/weighted-route-blue-green.json).
 
-See the checked-in binding examples in [examples/load-balancer/destination-policy-bindings.json](/Volumes/DATA/Coding/way-balancer/examples/load-balancer/destination-policy-bindings.json) and [examples/load-balancer/destination-traffic-mirror.json](/Volumes/DATA/Coding/way-balancer/examples/load-balancer/destination-traffic-mirror.json).
+See the checked-in binding examples in [examples/load-balancer/destination-policy-bindings.json](../examples/load-balancer/destination-policy-bindings.json) and [examples/load-balancer/destination-traffic-mirror.json](../examples/load-balancer/destination-traffic-mirror.json).
 
 ## Fault Injection Policy
 
@@ -430,7 +430,7 @@ Current non-goals and limits for this slice:
 - delay is fixed-duration only; jitter, ranges, and bandwidth throttling are not part of this slice
 - fault injection currently reuses destination-local routing scope rather than introducing a separate listener-wide chaos surface
 
-See the checked-in example in [examples/load-balancer/destination-fault-injection.json](/Volumes/DATA/Coding/way-balancer/examples/load-balancer/destination-fault-injection.json).
+See the checked-in example in [examples/load-balancer/destination-fault-injection.json](../examples/load-balancer/destination-fault-injection.json).
 
 ## Traffic Mirroring Policy
 
@@ -483,7 +483,7 @@ Current non-goals and limits for this slice:
 - upgrade traffic is not mirrored
 - mirror delivery is best-effort only and does not affect retry, timeout, or status handling for the primary response
 
-See the checked-in example in [examples/load-balancer/destination-traffic-mirror.json](/Volumes/DATA/Coding/way-balancer/examples/load-balancer/destination-traffic-mirror.json).
+See the checked-in example in [examples/load-balancer/destination-traffic-mirror.json](../examples/load-balancer/destination-traffic-mirror.json).
 
 ## Upgrade Policy
 
@@ -534,7 +534,7 @@ Explicit non-goals for the current slice:
 - no RFC 8441 or other HTTP/2 upgrade tunneling
 - no implicit upgrade support on admin listeners
 
-See the checked-in example in [examples/load-balancer/websocket-upgrade.json](/Volumes/DATA/Coding/way-balancer/examples/load-balancer/websocket-upgrade.json).
+See the checked-in example in [examples/load-balancer/websocket-upgrade.json](../examples/load-balancer/websocket-upgrade.json).
 
 ## Transform Policy
 
@@ -587,7 +587,7 @@ Destination-local transform bindings are schema-valid now, but they are not enfo
 
 Transform validation rejects illegal mutations of hop-by-hop or framing-sensitive headers such as `connection`, `transfer-encoding`, `upgrade`, and `content-length`. Request header mutation also rejects `host`; use `request.host_rewrite` instead.
 
-See the checked-in schema example in [examples/load-balancer/path-rewrite.json](/Volumes/DATA/Coding/way-balancer/examples/load-balancer/path-rewrite.json).
+See the checked-in schema example in [examples/load-balancer/path-rewrite.json](../examples/load-balancer/path-rewrite.json).
 
 ## Cache Policy
 
