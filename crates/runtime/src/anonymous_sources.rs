@@ -2,6 +2,7 @@ use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ipnet::IpNet;
+use lb_net_core::canonicalize_ip;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AnonymousSourceCategory {
@@ -63,6 +64,8 @@ impl AnonymousSourceFilterState {
         if !self.policy.enabled {
             return None;
         }
+
+        let ip = canonicalize_ip(ip);
 
         if self.policy.deny_cidrs.iter().any(|cidr| cidr.contains(&ip)) {
             self.blocked_direct_count.fetch_add(1, Ordering::SeqCst);
@@ -177,5 +180,26 @@ mod tests {
         let snapshot = filter.snapshot();
         assert_eq!(snapshot.blocked_tor_count, 1);
         assert_eq!(snapshot.blocked_proxy_count, 0);
+    }
+
+    #[test]
+    fn blocks_ipv4_mapped_ipv6_against_ipv4_cidrs() {
+        let filter = AnonymousSourceFilterState::new(AnonymousSourceFilterPolicy {
+            enabled: true,
+            deny_cidrs: vec!["127.0.0.0/8".parse::<IpNet>().expect("direct cidr")],
+            deny_vpn: false,
+            deny_proxy: false,
+            deny_socks: false,
+            deny_tor: false,
+            vpn_cidrs: Vec::new(),
+            proxy_cidrs: Vec::new(),
+            socks_cidrs: Vec::new(),
+            tor_exit_cidrs: Vec::new(),
+        });
+
+        let category =
+            filter.classify_and_record("::ffff:127.0.0.1".parse::<IpAddr>().expect("mapped ip"));
+        assert_eq!(category, Some(AnonymousSourceCategory::Direct));
+        assert_eq!(filter.snapshot().blocked_direct_count, 1);
     }
 }

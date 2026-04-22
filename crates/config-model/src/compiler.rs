@@ -8,11 +8,16 @@ use sha2::{Digest, Sha256};
 use crate::{
     ConfigApiVersion, EndpointStateConfig, ListenerCertificateSourceConfig, ListenerClassConfig,
     ListenerProtocolConfig, PolicyBindingConfig, PolicyResourcesConfig, RouteMatchConfig,
+    RouteDestinationConfig, UpgradePolicyConfig,
     UpstreamTrafficPolicyConfig, ValidationReport, WorkspaceConfig, WorkspaceConfigError,
     WorkspaceSecurityConfig,
 };
 
 const SNAPSHOT_FORMAT_VERSION: &str = "v1";
+
+fn upgrade_policy_is_default(policy: &UpgradePolicyConfig) -> bool {
+    policy.is_default()
+}
 
 /// Immutable snapshot compiler metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,6 +50,8 @@ pub struct ListenerSnapshot {
     name: String,
     class: ListenerClassConfig,
     protocol: ListenerProtocolConfig,
+    bind_mode: crate::ListenerBindModeConfig,
+    proxy_protocol: crate::ProxyProtocolModeConfig,
     admin: crate::AdminListenerPolicyConfig,
     tls_termination: Option<ListenerTlsTerminationSnapshot>,
     bind_address: SocketAddr,
@@ -55,6 +62,8 @@ pub struct ListenerSnapshot {
     allow_unspecified_bind: bool,
     routes: Vec<String>,
     policies: PolicyBindingConfig,
+    #[serde(default, skip_serializing_if = "upgrade_policy_is_default")]
+    upgrade: UpgradePolicyConfig,
 }
 
 impl ListenerSnapshot {
@@ -118,14 +127,21 @@ fn config_certificate_source(
 pub struct RouteSnapshot {
     name: String,
     match_rule: RouteMatchConfig,
-    upstream_cluster: String,
+    destinations: Vec<RouteDestinationConfig>,
     policies: PolicyBindingConfig,
+    #[serde(default, skip_serializing_if = "upgrade_policy_is_default")]
+    upgrade: UpgradePolicyConfig,
 }
 
 impl RouteSnapshot {
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    #[must_use]
+    pub fn destinations(&self) -> &[RouteDestinationConfig] {
+        &self.destinations
     }
 }
 
@@ -268,7 +284,7 @@ impl WorkspaceSnapshot {
             previous_digest_sha256: self.metadata.digest_sha256.clone(),
             next_digest_sha256: next.metadata.digest_sha256.clone(),
             listener_changes: diff_named_resources(&self.listeners, &next.listeners),
-            route_changes: diff_named_resources(&self.routes, &next.routes),
+            route_changes: diff_route_resources(&self.routes, &next.routes),
             upstream_cluster_changes: diff_named_resources(
                 &self.upstream_clusters,
                 &next.upstream_clusters,
@@ -291,6 +307,8 @@ pub enum SnapshotChangeKind {
 pub struct SnapshotResourceChange {
     pub name: String,
     pub kind: SnapshotChangeKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 /// Diff-friendly representation between two compiled snapshots.
@@ -398,6 +416,8 @@ pub(crate) fn compile_workspace_snapshot(
             name: listener.name.clone(),
             class: listener.class,
             protocol: listener.protocol,
+            bind_mode: listener.bind_mode,
+            proxy_protocol: listener.proxy_protocol,
             admin: listener.admin.clone(),
             tls_termination: listener.tls_termination.as_ref().map(|tls_termination| {
                 ListenerTlsTerminationSnapshot {
@@ -427,6 +447,7 @@ pub(crate) fn compile_workspace_snapshot(
             allow_unspecified_bind: compiled.allow_unspecified_bind,
             routes: listener.routes.clone(),
             policies: listener.policies.clone(),
+            upgrade: listener.upgrade.clone(),
         })
         .collect::<Vec<_>>();
     let routes = config
@@ -435,8 +456,9 @@ pub(crate) fn compile_workspace_snapshot(
         .map(|route| RouteSnapshot {
             name: route.name.clone(),
             match_rule: route.match_rule.clone(),
-            upstream_cluster: route.upstream_cluster.clone(),
+            destinations: route.normalized_destinations(),
             policies: route.policies.clone(),
+            upgrade: route.upgrade.clone(),
         })
         .collect::<Vec<_>>();
     let upstream_clusters = config
@@ -507,7 +529,9 @@ fn workspace_config_from_snapshot_view(view: &WorkspaceSnapshotView) -> Workspac
                 name: listener.name.clone(),
                 class: listener.class,
                 bind_address: listener.bind_address,
+                bind_mode: listener.bind_mode,
                 protocol: listener.protocol,
+                proxy_protocol: listener.proxy_protocol,
                 tls_termination: listener.tls_termination.as_ref().map(|tls| {
                     crate::ListenerTlsTerminationConfig {
                         certificate_source: config_certificate_source(&tls.certificate_source),
@@ -533,6 +557,7 @@ fn workspace_config_from_snapshot_view(view: &WorkspaceSnapshotView) -> Workspac
                 drain_timeout_ms: Some(listener.drain_timeout_ms),
                 routes: listener.routes.clone(),
                 policies: listener.policies.clone(),
+                upgrade: listener.upgrade.clone(),
                 admin: listener.admin.clone(),
             })
             .collect(),
@@ -542,8 +567,10 @@ fn workspace_config_from_snapshot_view(view: &WorkspaceSnapshotView) -> Workspac
             .map(|route| crate::RouteConfig {
                 name: route.name.clone(),
                 match_rule: route.match_rule.clone(),
-                upstream_cluster: route.upstream_cluster.clone(),
+                upstream_cluster: None,
+                destinations: route.destinations.clone(),
                 policies: route.policies.clone(),
+                upgrade: route.upgrade.clone(),
             })
             .collect(),
         upstream_clusters: view
@@ -641,20 +668,109 @@ where
     for name in names {
         match (previous_by_name.get(&name), next_by_name.get(&name)) {
             (None, Some(_)) => {
-                changes.push(SnapshotResourceChange { name, kind: SnapshotChangeKind::Added })
+                changes.push(SnapshotResourceChange {
+                    name,
+                    kind: SnapshotChangeKind::Added,
+                    detail: None,
+                })
             }
             (Some(_), None) => {
-                changes.push(SnapshotResourceChange { name, kind: SnapshotChangeKind::Removed })
+                changes.push(SnapshotResourceChange {
+                    name,
+                    kind: SnapshotChangeKind::Removed,
+                    detail: None,
+                })
             }
             (Some(previous_fingerprint), Some(next_fingerprint))
                 if previous_fingerprint != next_fingerprint =>
             {
-                changes.push(SnapshotResourceChange { name, kind: SnapshotChangeKind::Updated });
+                changes.push(SnapshotResourceChange {
+                    name,
+                    kind: SnapshotChangeKind::Updated,
+                    detail: None,
+                });
             }
             _ => {}
         }
     }
     changes
+}
+
+fn diff_route_resources(
+    previous: &[RouteSnapshot],
+    next: &[RouteSnapshot],
+) -> Vec<SnapshotResourceChange> {
+    let previous_by_name = previous
+        .iter()
+        .map(|resource| (resource.resource_name().to_string(), resource))
+        .collect::<BTreeMap<_, _>>();
+    let next_by_name = next
+        .iter()
+        .map(|resource| (resource.resource_name().to_string(), resource))
+        .collect::<BTreeMap<_, _>>();
+
+    let mut names = BTreeSet::new();
+    names.extend(previous_by_name.keys().cloned());
+    names.extend(next_by_name.keys().cloned());
+
+    let mut changes = Vec::new();
+    for name in names {
+        match (previous_by_name.get(&name), next_by_name.get(&name)) {
+            (None, Some(_)) => changes.push(SnapshotResourceChange {
+                name,
+                kind: SnapshotChangeKind::Added,
+                detail: None,
+            }),
+            (Some(_), None) => changes.push(SnapshotResourceChange {
+                name,
+                kind: SnapshotChangeKind::Removed,
+                detail: None,
+            }),
+            (Some(previous_route), Some(next_route))
+                if resource_fingerprint(*previous_route) != resource_fingerprint(*next_route) =>
+            {
+                changes.push(SnapshotResourceChange {
+                    name,
+                    kind: SnapshotChangeKind::Updated,
+                    detail: describe_route_change(previous_route, next_route),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    changes
+}
+
+fn describe_route_change(previous: &RouteSnapshot, next: &RouteSnapshot) -> Option<String> {
+    let mut parts = Vec::new();
+    if previous.destinations != next.destinations {
+        parts.push(format!(
+            "destinations {} -> {}",
+            format_route_destinations(&previous.destinations),
+            format_route_destinations(&next.destinations)
+        ));
+    }
+    if previous.match_rule != next.match_rule {
+        parts.push(String::from("match rule changed"));
+    }
+    if previous.policies != next.policies {
+        parts.push(String::from("policies changed"));
+    }
+
+    if parts.is_empty() { None } else { Some(parts.join("; ")) }
+}
+
+fn format_route_destinations(destinations: &[RouteDestinationConfig]) -> String {
+    if destinations.is_empty() {
+        return String::from("<none>");
+    }
+
+    destinations
+        .iter()
+        .map(|destination| format!("{}:{}", destination.upstream_cluster, destination.weight))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn resource_fingerprint<T>(resource: &T) -> String
@@ -682,7 +798,9 @@ mod tests {
     use crate::{
         AdminAuditConfig, AdminAuthPolicyConfig, AdminAuthorizationScopeConfig,
         AdminListenerPolicyConfig, AdminOperatorConfig, AdminRateLimitConfig, ListenerClassConfig,
-        ListenerProtocolConfig, ListenerResourceConfig, PolicyBindingConfig, RouteConfig,
+        ListenerProtocolConfig, ListenerResourceConfig, NamedRetryBudgetPolicyConfig,
+        PolicyBindingConfig, PolicyResourcesConfig, RetryBudgetPolicyConfig, RouteConfig,
+        RouteDestinationConfig, UpgradePolicyConfig,
         UpstreamClusterConfig, UpstreamEndpointConfig, UpstreamTrafficPolicyConfig,
         WorkspaceConfig,
     };
@@ -694,7 +812,9 @@ mod tests {
                 name: String::from("public"),
                 class: ListenerClassConfig::Public,
                 bind_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080),
+                bind_mode: crate::ListenerBindModeConfig::SingleStack,
                 protocol: ListenerProtocolConfig::Http1,
+                proxy_protocol: crate::ProxyProtocolModeConfig::Disabled,
                 tls_termination: None,
                 allow_unspecified_bind: false,
                 max_connections: None,
@@ -703,6 +823,7 @@ mod tests {
                 drain_timeout_ms: None,
                 routes: vec![String::from("api")],
                 policies: PolicyBindingConfig::default(),
+                upgrade: UpgradePolicyConfig::default(),
                 admin: AdminListenerPolicyConfig::default(),
             }],
             routes: vec![RouteConfig::foundation_path_prefix("api", "/api", "payments")],
@@ -743,6 +864,45 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_view_round_trip_preserves_destination_policy_bindings(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = valid_workspace();
+        config.routes[0].upstream_cluster = None;
+        config.routes[0].destinations = vec![RouteDestinationConfig {
+            upstream_cluster: String::from("payments"),
+            weight: 1,
+            policies: PolicyBindingConfig {
+                retry_budget: Some(String::from("canary-retry")),
+                ..PolicyBindingConfig::default()
+            },
+        }];
+        config.policies = PolicyResourcesConfig {
+            retry_budgets: vec![NamedRetryBudgetPolicyConfig {
+                name: String::from("canary-retry"),
+                spec: RetryBudgetPolicyConfig {
+                    min_retry_tokens: 3,
+                    retry_percent: 20,
+                    window_ms: 10_000,
+                },
+            }],
+            ..PolicyResourcesConfig::default()
+        };
+
+        let snapshot = compile_workspace_snapshot(&config)?;
+        let restored = super::WorkspaceSnapshot::from_view(snapshot.view())?;
+
+        assert_eq!(snapshot.routes()[0].destinations(), restored.routes()[0].destinations());
+        assert_eq!(
+            restored.routes()[0].destinations()[0]
+                .policies
+                .retry_budget
+                .as_deref(),
+            Some("canary-retry")
+        );
+        Ok(())
+    }
+
+    #[test]
     fn snapshot_view_matches_expected_golden_json() -> Result<(), Box<dyn std::error::Error>> {
         let snapshot = compile_workspace_snapshot(&valid_workspace())?;
 
@@ -755,7 +915,7 @@ mod tests {
                 "  \"metadata\": {\n",
                 "    \"format_version\": \"v1\",\n",
                 "    \"api_version\": \"v1_alpha1\",\n",
-                "    \"digest_sha256\": \"19276cec3d1af7643389bae05cddde463e35263e7fd51b27cb397f86df8e45b6\"\n",
+                "    \"digest_sha256\": \"4d9f8de7a3f2e0fc3054b496871a09e8adec54bbb900fa0a76bf3b9b35b5d0a8\"\n",
                 "  },\n",
                 "  \"workspace_name\": \"edge\",\n",
                 "  \"security\": {\n",
@@ -776,13 +936,16 @@ mod tests {
                 "    \"timeout_hierarchies\": [],\n",
                 "    \"circuit_breakers\": [],\n",
                 "    \"overload_responses\": [],\n",
-                "    \"http_caches\": []\n",
+                "    \"http_caches\": [],\n",
+                "    \"transforms\": [],\n",
+                "    \"traffic_mirrors\": []\n",
                 "  },\n",
                 "  \"listeners\": [\n",
                 "    {\n",
                 "      \"name\": \"public\",\n",
                 "      \"class\": \"public\",\n",
                 "      \"protocol\": \"http1\",\n",
+                "      \"proxy_protocol\": \"disabled\",\n",
                 "      \"admin\": {\n",
                 "        \"auth\": {\n",
                 "          \"mode\": \"bearer\",\n",
@@ -804,6 +967,7 @@ mod tests {
                 "      },\n",
                 "      \"tls_termination\": null,\n",
                 "      \"bind_address\": \"127.0.0.1:8080\",\n",
+                "      \"bind_mode\": \"single_stack\",\n",
                 "      \"max_connections\": 128,\n",
                 "      \"backlog\": 1024,\n",
                 "      \"idle_timeout_ms\": 30000,\n",
@@ -820,7 +984,9 @@ mod tests {
                 "        \"timeout_hierarchy\": null,\n",
                 "        \"circuit_breaker\": null,\n",
                 "        \"overload_response\": null,\n",
-                "        \"cache_policy\": null\n",
+                "        \"cache_policy\": null,\n",
+                "        \"transform_policy\": null,\n",
+                "        \"traffic_mirror\": null\n",
                 "      }\n",
                 "    }\n",
                 "  ],\n",
@@ -831,7 +997,11 @@ mod tests {
                 "        \"type\": \"path_prefix\",\n",
                 "        \"prefix\": \"/api\"\n",
                 "      },\n",
-                "      \"upstream_cluster\": \"payments\",\n",
+                "      \"destinations\": [\n",
+                "        {\n",
+                "          \"upstream_cluster\": \"payments\"\n",
+                "        }\n",
+                "      ],\n",
                 "      \"policies\": {\n",
                 "        \"local_rate_limits\": [],\n",
                 "        \"local_concurrency_limits\": [],\n",
@@ -840,7 +1010,9 @@ mod tests {
                 "        \"timeout_hierarchy\": null,\n",
                 "        \"circuit_breaker\": null,\n",
                 "        \"overload_response\": null,\n",
-                "        \"cache_policy\": null\n",
+                "        \"cache_policy\": null,\n",
+                "        \"transform_policy\": null,\n",
+                "        \"traffic_mirror\": null\n",
                 "      }\n",
                 "    }\n",
                 "  ],\n",
@@ -870,7 +1042,9 @@ mod tests {
                 "        \"timeout_hierarchy\": null,\n",
                 "        \"circuit_breaker\": null,\n",
                 "        \"overload_response\": null,\n",
-                "        \"cache_policy\": null\n",
+                "        \"cache_policy\": null,\n",
+                "        \"transform_policy\": null,\n",
+                "        \"traffic_mirror\": null\n",
                 "      }\n",
                 "    }\n",
                 "  ]\n",
@@ -967,7 +1141,12 @@ mod tests {
         let previous = compile_workspace_snapshot(&valid_workspace())?;
         let mut next_config = valid_workspace();
         next_config.listeners[0].backlog = Some(2048);
-        next_config.routes[0].upstream_cluster = String::from("payments-v2");
+        next_config.routes[0].upstream_cluster = None;
+        next_config.routes[0].destinations = vec![RouteDestinationConfig {
+            upstream_cluster: String::from("payments-v2"),
+            weight: 1,
+            policies: PolicyBindingConfig::default(),
+        }];
         next_config.routes.push(RouteConfig::foundation_path_prefix(
             "grpc",
             "/grpc",
@@ -981,16 +1160,83 @@ mod tests {
         assert_eq!(diff.listener_changes.len(), 1);
         assert_eq!(diff.listener_changes[0].name, "public");
         assert_eq!(diff.listener_changes[0].kind, SnapshotChangeKind::Updated);
+        assert_eq!(diff.listener_changes[0].detail, None);
         assert_eq!(diff.route_changes.len(), 2);
         assert_eq!(diff.route_changes[0].name, "api");
         assert_eq!(diff.route_changes[0].kind, SnapshotChangeKind::Updated);
+        assert_eq!(
+            diff.route_changes[0].detail.as_deref(),
+            Some("destinations payments:1 -> payments-v2:1")
+        );
         assert_eq!(diff.route_changes[1].name, "grpc");
         assert_eq!(diff.route_changes[1].kind, SnapshotChangeKind::Added);
+        assert_eq!(diff.route_changes[1].detail, None);
         assert_eq!(diff.upstream_cluster_changes.len(), 2);
         assert_eq!(diff.upstream_cluster_changes[0].name, "payments");
         assert_eq!(diff.upstream_cluster_changes[0].kind, SnapshotChangeKind::Removed);
+        assert_eq!(diff.upstream_cluster_changes[0].detail, None);
         assert_eq!(diff.upstream_cluster_changes[1].name, "payments-v2");
         assert_eq!(diff.upstream_cluster_changes[1].kind, SnapshotChangeKind::Added);
+        assert_eq!(diff.upstream_cluster_changes[1].detail, None);
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_diff_reports_route_destination_weight_shift_details(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut previous_config = valid_workspace();
+        previous_config.routes[0].upstream_cluster = None;
+        previous_config.routes[0].destinations = vec![
+            RouteDestinationConfig {
+                upstream_cluster: String::from("payments-canary"),
+                weight: 10,
+                policies: PolicyBindingConfig::default(),
+            },
+            RouteDestinationConfig {
+                upstream_cluster: String::from("payments-stable"),
+                weight: 90,
+                policies: PolicyBindingConfig::default(),
+            },
+        ];
+        previous_config.upstream_clusters[0].name = String::from("payments-stable");
+        previous_config.upstream_clusters.push(UpstreamClusterConfig {
+            name: String::from("payments-canary"),
+            endpoints: vec![UpstreamEndpointConfig::foundation(
+                "payments-canary-a",
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9001),
+            )],
+            traffic_policy: UpstreamTrafficPolicyConfig::default(),
+            policies: PolicyBindingConfig::default(),
+        });
+
+        let previous = compile_workspace_snapshot(&previous_config)?;
+
+        let mut next_config = previous_config.clone();
+        next_config.routes[0].destinations = vec![
+            RouteDestinationConfig {
+                upstream_cluster: String::from("payments-canary"),
+                weight: 20,
+                policies: PolicyBindingConfig::default(),
+            },
+            RouteDestinationConfig {
+                upstream_cluster: String::from("payments-stable"),
+                weight: 80,
+                policies: PolicyBindingConfig::default(),
+            },
+        ];
+
+        let next = compile_workspace_snapshot(&next_config)?;
+        let diff = previous.diff(&next);
+
+        assert_eq!(diff.route_changes.len(), 1);
+        assert_eq!(diff.route_changes[0].name, "api");
+        assert_eq!(diff.route_changes[0].kind, SnapshotChangeKind::Updated);
+        assert_eq!(
+            diff.route_changes[0].detail.as_deref(),
+            Some(
+                "destinations payments-canary:10, payments-stable:90 -> payments-canary:20, payments-stable:80"
+            )
+        );
         Ok(())
     }
 

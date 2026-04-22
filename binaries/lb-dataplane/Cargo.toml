@@ -10,7 +10,10 @@ publish.workspace = true
 bytes = "1.10"
 h2 = "0.3.27"
 http = "0.2"
+http1 = { package = "http", version = "1" }
 ipnet = "2.10"
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
 lb-admin-api = { path = "../../crates/admin-api" }
 lb-config-model = { path = "../../crates/config-model" }
 lb-runtime = { path = "../../crates/runtime" }
@@ -19,6 +22,7 @@ lb-proto-http = { path = "../../crates/proto-http" }
 lb-proto-tls = { path = "../../crates/proto-tls" }
 lb-observability = { path = "../../crates/observability" }
 rustls = "0.23"
+quinn = "0.11.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

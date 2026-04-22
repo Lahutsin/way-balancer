@@ -1,0 +1,61 @@
+{
+  "api_version": "v1_alpha1",
+  "name": "edge-weighted-route-blue-green",
+  "listeners": [
+    {
+      "name": "public-http",
+      "class": "public",
+      "bind_address": "127.0.0.1:8080",
+      "protocol": "http1",
+      "routes": ["payments-api"]
+    }
+  ],
+  "routes": [
+    {
+      "name": "payments-api",
+      "match": {
+        "type": "path_prefix",
+        "prefix": "/api",
+        "hostnames": ["payments.localhost", "127.0.0.1:8080"]
+      },
+      "destinations": [
+        {
+          "upstream_cluster": "payments-blue",
+          "weight": 50
+        },
+        {
+          "upstream_cluster": "payments-green",
+          "weight": 50
+        }
+      ]
+    }
+  ],
+  "upstream_clusters": [
+    {
+      "name": "payments-blue",
+      "endpoints": [
+        {
+          "id": "payments-blue-a",
+          "address": "127.0.0.1:9000",
+          "state": "ready",
+          "zone": null,
+          "locality": null,
+          "weight": 1
+        }
+      ]
+    },
+    {
+      "name": "payments-green",
+      "endpoints": [
+        {
+          "id": "payments-green-a",
+          "address": "127.0.0.1:9001",
+          "state": "ready",
+          "zone": null,
+          "locality": null,
+          "weight": 1
+        }
+      ]
+    }
+  ]
+}

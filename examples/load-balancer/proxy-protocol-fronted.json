@@ -1,0 +1,45 @@
+{
+  "api_version": "v1_alpha1",
+  "name": "edge-proxy-protocol-fronted",
+  "listeners": [
+    {
+      "name": "public-web",
+      "class": "public",
+      "bind_address": "127.0.0.1:8080",
+      "protocol": "http1",
+      "proxy_protocol": "v1",
+      "routes": ["web"]
+    },
+    {
+      "name": "admin-http",
+      "class": "admin",
+      "bind_address": "127.0.0.1:9900",
+      "protocol": "http1"
+    }
+  ],
+  "routes": [
+    {
+      "name": "web",
+      "match": {
+        "type": "path_prefix",
+        "prefix": "/"
+      },
+      "upstream_cluster": "frontend"
+    }
+  ],
+  "upstream_clusters": [
+    {
+      "name": "frontend",
+      "endpoints": [
+        {
+          "id": "frontend-a",
+          "address": "127.0.0.1:8081",
+          "state": "ready",
+          "zone": null,
+          "locality": null,
+          "weight": 1
+        }
+      ]
+    }
+  ]
+}

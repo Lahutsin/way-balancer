@@ -14,6 +14,8 @@ pub enum LocalLimitScope {
     Listener { name: String },
     /// Route-specific limit.
     Route { name: String },
+    /// Route-destination-specific limit.
+    RouteDestination { route: String, upstream_cluster: String },
     /// Upstream-cluster-specific limit.
     UpstreamCluster { name: String },
 }
@@ -379,6 +381,10 @@ fn validate_scope(scope: &LocalLimitScope) -> Result<(), LocalLimitError> {
         LocalLimitScope::Listener { name }
         | LocalLimitScope::Route { name }
         | LocalLimitScope::UpstreamCluster { name } => !normalize_component(name).is_empty(),
+        LocalLimitScope::RouteDestination { route, upstream_cluster } => {
+            !normalize_component(route).is_empty()
+                && !normalize_component(upstream_cluster).is_empty()
+        }
     };
     if valid {
         Ok(())
@@ -395,6 +401,11 @@ fn normalize_limit_key(
     let scope_prefix = match scope {
         LocalLimitScope::Listener { name } => format!("listener:{}", normalize_component(name)),
         LocalLimitScope::Route { name } => format!("route:{}", normalize_component(name)),
+        LocalLimitScope::RouteDestination { route, upstream_cluster } => format!(
+            "route-destination:{}:{}",
+            normalize_component(route),
+            normalize_component(upstream_cluster)
+        ),
         LocalLimitScope::UpstreamCluster { name } => {
             format!("upstream:{}", normalize_component(name))
         }

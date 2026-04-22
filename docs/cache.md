@@ -22,6 +22,12 @@ At a high level, each request flows through these questions:
 
 The runtime is intentionally fail-closed for unsafe shared-cache cases. Cookie-bearing traffic bypasses the shared cache even when a looser policy might appear to allow it.
 
+When transform policies are also attached, cache ordering works like this:
+
+- request transforms run before cache-key construction, so rewritten request path, host, and headers are what the cache evaluates
+- HTTP/1 cache storage keeps the normalized origin response headers, not the transformed downstream copy
+- response transforms are applied on the downstream write path for both origin fills and cache hits, which keeps route-level and listener-level response header policy stable even when multiple policies share one cache store
+
 ## Example Policy
 
 The checked-in `http-cache-public.json` example uses this posture:

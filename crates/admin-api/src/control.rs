@@ -3,7 +3,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use lb_config_model::{
     verify_snapshot_artifact_integrity, ArtifactAttestation, ArtifactIntegrityError,
-    SnapshotCompileError, WorkspaceSnapshot, WorkspaceSnapshotView,
+    SnapshotChangeKind, SnapshotCompileError, SnapshotResourceChange, WorkspaceSnapshot,
+    WorkspaceSnapshotDiff, WorkspaceSnapshotView,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -112,6 +113,8 @@ pub enum PublishResponseKind {
 pub struct PublishResponse {
     pub kind: PublishResponseKind,
     pub record: PublishedSnapshotRecord,
+    pub previous_version: Option<String>,
+    pub snapshot_diff: Option<WorkspaceSnapshotDiff>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -450,7 +453,12 @@ impl SnapshotControlService {
                     published_at_unix_ms,
                     String::from("idempotent duplicate publish ignored"),
                 );
-                return Ok(PublishResponse { kind: PublishResponseKind::Unchanged, record });
+                return Ok(PublishResponse {
+                    kind: PublishResponseKind::Unchanged,
+                    record,
+                    previous_version: None,
+                    snapshot_diff: None,
+                });
             }
 
             let error = PublishConflict::VersionAlreadyExists {
@@ -486,6 +494,11 @@ impl SnapshotControlService {
             return Err(SnapshotPublicationError::Conflict(error));
         }
 
+        let previous_record = self
+            .history
+            .last()
+            .and_then(|version| self.records_by_version.get(version))
+            .cloned();
         let record = PublishedSnapshotRecord {
             version: request.version.clone(),
             workspace_name: request.snapshot.workspace_name().to_owned(),
@@ -496,6 +509,10 @@ impl SnapshotControlService {
             reason: request.reason,
             snapshot: request.snapshot,
         };
+        let previous_version = previous_record.as_ref().map(|record| record.version.clone());
+        let snapshot_diff = previous_record
+            .as_ref()
+            .map(|previous_record| previous_record.snapshot.diff(&record.snapshot));
 
         self.version_by_digest.insert(digest_sha256.clone(), request.version.clone());
         self.history.push(request.version.clone());
@@ -508,10 +525,15 @@ impl SnapshotControlService {
             request.version,
             Some(digest_sha256),
             published_at_unix_ms,
-            String::from("snapshot version published"),
+            format_publish_detail(previous_version.as_deref(), snapshot_diff.as_ref()),
         );
 
-        Ok(PublishResponse { kind: PublishResponseKind::Published, record })
+        Ok(PublishResponse {
+            kind: PublishResponseKind::Published,
+            record,
+            previous_version,
+            snapshot_diff,
+        })
     }
 
     pub fn export_backup(&mut self) -> Result<SnapshotBackupBundle, SnapshotBackupError> {
@@ -802,6 +824,71 @@ fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+fn format_publish_detail(
+    previous_version: Option<&str>,
+    snapshot_diff: Option<&WorkspaceSnapshotDiff>,
+) -> String {
+    let mut detail = String::from("snapshot version published");
+    if let Some(previous_version) = previous_version {
+        detail.push_str("; previous version ");
+        detail.push_str(previous_version);
+    }
+    if let Some(snapshot_diff) = snapshot_diff {
+        let summary = summarize_snapshot_diff(snapshot_diff);
+        if !summary.is_empty() {
+            detail.push_str("; ");
+            detail.push_str(&summary);
+        }
+    }
+    detail
+}
+
+fn summarize_snapshot_diff(diff: &WorkspaceSnapshotDiff) -> String {
+    let mut parts = Vec::new();
+    let listener_summary = summarize_resource_changes("listener", &diff.listener_changes);
+    if !listener_summary.is_empty() {
+        parts.push(listener_summary);
+    }
+    let route_summary = summarize_resource_changes("route", &diff.route_changes);
+    if !route_summary.is_empty() {
+        parts.push(route_summary);
+    }
+    let upstream_summary =
+        summarize_resource_changes("upstream cluster", &diff.upstream_cluster_changes);
+    if !upstream_summary.is_empty() {
+        parts.push(upstream_summary);
+    }
+    parts.join("; ")
+}
+
+fn summarize_resource_changes(kind_label: &str, changes: &[SnapshotResourceChange]) -> String {
+    if changes.is_empty() {
+        return String::new();
+    }
+
+    let mut entries = changes
+        .iter()
+        .take(4)
+        .map(summarize_resource_change)
+        .collect::<Vec<_>>();
+    if changes.len() > 4 {
+        entries.push(format!("and {} more", changes.len() - 4));
+    }
+    format!("{kind_label} changes: {}", entries.join(", "))
+}
+
+fn summarize_resource_change(change: &SnapshotResourceChange) -> String {
+    let kind = match change.kind {
+        SnapshotChangeKind::Added => "added",
+        SnapshotChangeKind::Removed => "removed",
+        SnapshotChangeKind::Updated => "updated",
+    };
+    match &change.detail {
+        Some(detail) => format!("{} {} ({detail})", change.name, kind),
+        None => format!("{} {}", change.name, kind),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use lb_config_model::WorkspaceConfig;
@@ -830,6 +917,69 @@ mod tests {
         Ok(config.compile_snapshot()?)
     }
 
+    fn weighted_route_snapshot(
+        stable_weight: u16,
+        canary_weight: u16,
+    ) -> Result<lb_config_model::WorkspaceSnapshot, Box<dyn std::error::Error>> {
+        let mut config = WorkspaceConfig::foundation();
+        config.listeners.push(lb_config_model::ListenerResourceConfig {
+            protocol: lb_config_model::ListenerProtocolConfig::Http1,
+            routes: vec![String::from("payments-api")],
+            ..lb_config_model::ListenerResourceConfig::foundation(
+                "public-http",
+                lb_config_model::ListenerClassConfig::Public,
+                8080,
+            )
+        });
+        config.routes.push(lb_config_model::RouteConfig {
+            name: String::from("payments-api"),
+            match_rule: lb_config_model::RouteMatchConfig::PathPrefix {
+                prefix: String::from("/api"),
+                hostnames: vec![String::from("payments.localhost")],
+                methods: Vec::new(),
+                headers: Vec::new(),
+                query_params: Vec::new(),
+                content_types: Vec::new(),
+                source_cidrs: Vec::new(),
+            },
+            upstream_cluster: None,
+            destinations: vec![
+                lb_config_model::RouteDestinationConfig {
+                    upstream_cluster: String::from("payments-stable"),
+                    weight: stable_weight,
+                    policies: lb_config_model::PolicyBindingConfig::default(),
+                },
+                lb_config_model::RouteDestinationConfig {
+                    upstream_cluster: String::from("payments-canary"),
+                    weight: canary_weight,
+                    policies: lb_config_model::PolicyBindingConfig::default(),
+                },
+            ],
+            policies: lb_config_model::PolicyBindingConfig::default(),
+            upgrade: lb_config_model::UpgradePolicyConfig::default(),
+        });
+        config.upstream_clusters.push(lb_config_model::UpstreamClusterConfig {
+            name: String::from("payments-stable"),
+            endpoints: vec![lb_config_model::UpstreamEndpointConfig::foundation(
+                "payments-stable-a",
+                "127.0.0.1:9000".parse()?,
+            )],
+            traffic_policy: lb_config_model::UpstreamTrafficPolicyConfig::default(),
+            policies: lb_config_model::PolicyBindingConfig::default(),
+        });
+        config.upstream_clusters.push(lb_config_model::UpstreamClusterConfig {
+            name: String::from("payments-canary"),
+            endpoints: vec![lb_config_model::UpstreamEndpointConfig::foundation(
+                "payments-canary-a",
+                "127.0.0.1:9001".parse()?,
+            )],
+            traffic_policy: lb_config_model::UpstreamTrafficPolicyConfig::default(),
+            policies: lb_config_model::PolicyBindingConfig::default(),
+        });
+        configure_test_trusted_signers(&mut config)?;
+        Ok(config.compile_snapshot()?)
+    }
+
     #[test]
     fn publish_success_records_snapshot_and_audit_event() -> Result<(), Box<dyn std::error::Error>>
     {
@@ -853,12 +1003,68 @@ mod tests {
         assert_eq!(response.kind, PublishResponseKind::Published);
         assert_eq!(response.record.version, "v1.0.0");
         assert_eq!(response.record.digest_sha256, digest);
+        assert_eq!(response.previous_version, None);
+        assert_eq!(response.snapshot_diff, None);
         assert_eq!(service.list_versions().len(), 1);
         assert_eq!(service.get_version("v1.0.0")?.version, "v1.0.0");
         assert_eq!(service.audit_events().len(), 1);
         assert_eq!(service.audit_events()[0].kind, PublishEventKind::Published);
         assert_eq!(service.metrics().published_versions_count, 1);
         assert_eq!(service.metrics().active_registry_size, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn publish_response_includes_weight_shift_diff_and_audit_summary(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let stable_snapshot = weighted_route_snapshot(90, 10)?;
+        let canary_snapshot = weighted_route_snapshot(80, 20)?;
+        let mut service = SnapshotControlService::new();
+
+        service.publish_at(
+            SnapshotPublishRequest {
+                version: String::from("v1.0.0"),
+                snapshot: stable_snapshot.clone(),
+                artifact_attestation: Some(test_artifact_attestation(&stable_snapshot)?),
+                expected_digest_sha256: Some(
+                    stable_snapshot.metadata().digest_sha256().to_owned(),
+                ),
+                published_by: Some(String::from("ops")),
+                reason: Some(String::from("stable baseline")),
+            },
+            100,
+        )?;
+
+        let response = service.publish_at(
+            SnapshotPublishRequest {
+                version: String::from("v1.1.0"),
+                snapshot: canary_snapshot.clone(),
+                artifact_attestation: Some(test_artifact_attestation(&canary_snapshot)?),
+                expected_digest_sha256: Some(
+                    canary_snapshot.metadata().digest_sha256().to_owned(),
+                ),
+                published_by: Some(String::from("ops")),
+                reason: Some(String::from("increase canary weight")),
+            },
+            200,
+        )?;
+
+        assert_eq!(response.kind, PublishResponseKind::Published);
+        assert_eq!(response.previous_version.as_deref(), Some("v1.0.0"));
+        let diff = response.snapshot_diff.as_ref().expect("diff should be present");
+        assert_eq!(diff.route_changes.len(), 1);
+        assert_eq!(diff.route_changes[0].name, "payments-api");
+        assert_eq!(
+            diff.route_changes[0].detail.as_deref(),
+            Some(
+                "destinations payments-canary:10, payments-stable:90 -> payments-canary:20, payments-stable:80"
+            )
+        );
+        let audit_detail = &service.audit_events()[1].detail;
+        assert!(audit_detail.contains("previous version v1.0.0"));
+        assert!(audit_detail.contains("route changes: payments-api updated"));
+        assert!(audit_detail.contains("payments-canary:10"));
+        assert!(audit_detail.contains("payments-stable:80"));
         Ok(())
     }
 

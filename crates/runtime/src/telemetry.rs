@@ -63,6 +63,31 @@ impl HttpCacheRevalidationResult {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HttpUpgradeResult {
+    Accepted,
+    Rejected,
+    Failed,
+}
+
+impl HttpUpgradeResult {
+    const fn metric_result(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::Rejected => "rejected",
+            Self::Failed => "failed",
+        }
+    }
+
+    const fn event_code(self) -> TelemetryEventCode {
+        match self {
+            Self::Accepted => TelemetryEventCode::RuntimeHttpUpgradeAccepted,
+            Self::Rejected => TelemetryEventCode::RuntimeHttpUpgradeRejected,
+            Self::Failed => TelemetryEventCode::RuntimeHttpUpgradeFailed,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct RuntimeTelemetry {
     collector: TelemetryCollector,
@@ -254,6 +279,26 @@ impl RuntimeTelemetry {
                     name: String::from("runtime_http_cache_invalidation_peer_deliveries_total"),
                     kind: MetricKind::Counter,
                     help: String::from("Total peer delivery outcomes for distributed HTTP cache invalidation by transport"),
+                    allowed_labels: vec![
+                        TelemetryLabelKey::Scope,
+                        TelemetryLabelKey::Result,
+                        TelemetryLabelKey::Reason,
+                    ],
+                },
+                MetricDescriptor {
+                    name: String::from("runtime_http_upgrades_total"),
+                    kind: MetricKind::Counter,
+                    help: String::from("Total HTTP upgrade attempts by outcome and reason"),
+                    allowed_labels: vec![
+                        TelemetryLabelKey::Scope,
+                        TelemetryLabelKey::Result,
+                        TelemetryLabelKey::Reason,
+                    ],
+                },
+                MetricDescriptor {
+                    name: String::from("runtime_http3_requests_total"),
+                    kind: MetricKind::Counter,
+                    help: String::from("Total downstream HTTP/3 request outcomes by result and reason"),
                     allowed_labels: vec![
                         TelemetryLabelKey::Scope,
                         TelemetryLabelKey::Result,
@@ -588,6 +633,41 @@ impl RuntimeTelemetry {
                 TelemetryLabel::new(TelemetryLabelKey::Reason, transport),
             ],
             peer_count as u64,
+        )
+    }
+
+    pub fn record_http_upgrade(
+        &self,
+        scope: &str,
+        result: HttpUpgradeResult,
+        reason: &str,
+        detail: &str,
+    ) -> Result<(), TelemetryError> {
+        let labels = vec![
+            TelemetryLabel::new(TelemetryLabelKey::Scope, scope),
+            TelemetryLabel::new(TelemetryLabelKey::Result, result.metric_result()),
+            TelemetryLabel::new(TelemetryLabelKey::Reason, reason),
+        ];
+        self.metrics.increment_counter("runtime_http_upgrades_total", labels.clone(), 1)?;
+        self.collector
+            .push_event(TelemetryEvent::new(result.event_code(), scope, detail, labels));
+        Ok(())
+    }
+
+    pub fn record_http3_request(
+        &self,
+        scope: &str,
+        result: &str,
+        reason: &str,
+    ) -> Result<(), TelemetryError> {
+        self.metrics.increment_counter(
+            "runtime_http3_requests_total",
+            vec![
+                TelemetryLabel::new(TelemetryLabelKey::Scope, scope),
+                TelemetryLabel::new(TelemetryLabelKey::Result, result),
+                TelemetryLabel::new(TelemetryLabelKey::Reason, reason),
+            ],
+            1,
         )
     }
 

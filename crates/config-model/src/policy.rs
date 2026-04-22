@@ -26,10 +26,16 @@ pub struct PolicyResourcesConfig {
     pub overload_responses: Vec<NamedOverloadResponsePolicyConfig>,
     /// Reusable HTTP cache policies.
     pub http_caches: Vec<NamedHttpCachePolicyConfig>,
+    /// Reusable request and response transform policies.
+    pub transforms: Vec<NamedTransformPolicyConfig>,
+    /// Reusable traffic mirroring policies.
+    pub traffic_mirrors: Vec<NamedTrafficMirrorPolicyConfig>,
+    /// Reusable fault injection policies.
+    pub fault_injections: Vec<NamedFaultInjectionPolicyConfig>,
 }
 
 /// Reference set that attaches named policy resources to another resource.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct PolicyBindingConfig {
     /// Referenced local rate-limit policy names.
@@ -48,6 +54,117 @@ pub struct PolicyBindingConfig {
     pub overload_response: Option<String>,
     /// Referenced HTTP cache policy name.
     pub cache_policy: Option<String>,
+    /// Referenced request and response transform policy name.
+    pub transform_policy: Option<String>,
+    /// Referenced traffic mirroring policy name.
+    pub traffic_mirror: Option<String>,
+    /// Referenced fault injection policy name.
+    pub fault_injection: Option<String>,
+}
+
+impl PolicyBindingConfig {
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+/// Declarative request and response transform policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct TransformPolicyConfig {
+    /// Request-side transforms applied before upstream dispatch.
+    pub request: RequestTransformConfig,
+    /// Response-side header mutations applied after upstream normalization.
+    pub response: ResponseTransformConfig,
+}
+
+/// Declarative traffic mirroring policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TrafficMirrorPolicyConfig {
+    /// Percent of eligible requests to mirror.
+    pub percentage: u8,
+    /// Target upstream cluster that receives mirrored traffic.
+    pub target_upstream_cluster: String,
+}
+
+impl Default for TrafficMirrorPolicyConfig {
+    fn default() -> Self {
+        Self { percentage: 100, target_upstream_cluster: String::new() }
+    }
+}
+
+/// Declarative destination-local fault injection policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct FaultInjectionPolicyConfig {
+    /// Optional fixed delay injection.
+    pub delay: Option<FaultInjectionDelayConfig>,
+    /// Optional local abort injection.
+    pub abort: Option<FaultInjectionAbortConfig>,
+}
+
+/// Fixed delay fault injection settings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct FaultInjectionDelayConfig {
+    /// Percent of requests that should incur the delay.
+    pub percentage: u8,
+    /// Fixed delay to inject before upstream dispatch.
+    pub fixed_delay_ms: u64,
+}
+
+/// Local abort fault injection settings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct FaultInjectionAbortConfig {
+    /// Percent of requests that should abort locally.
+    pub percentage: u8,
+    /// Local HTTP status to return when the abort triggers.
+    pub http_status: u16,
+}
+
+/// Declarative request transform policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct RequestTransformConfig {
+    /// Optional path rewrite rule.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path_rewrite: Option<PathRewriteTransformConfig>,
+    /// Optional authority or host rewrite.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_rewrite: Option<String>,
+    /// Request header mutations.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub header_mutations: Vec<HeaderMutationConfig>,
+}
+
+/// Declarative response transform policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct ResponseTransformConfig {
+    /// Response header mutations.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub header_mutations: Vec<HeaderMutationConfig>,
+}
+
+/// Declarative path rewrite rule.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PathRewriteTransformConfig {
+    /// Replace a matched leading prefix with a new prefix.
+    ReplacePrefix { match_prefix: String, replacement: String },
+}
+
+/// Declarative request or response header mutation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum HeaderMutationConfig {
+    /// Set or replace a header value.
+    Set { name: String, value: String },
+    /// Remove a header.
+    Remove { name: String },
 }
 
 /// Declarative HTTP cache policy.
@@ -311,6 +428,36 @@ pub struct NamedOverloadResponsePolicyConfig {
     pub spec: OverloadResponsePolicyConfig,
 }
 
+/// Named transform policy resource.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NamedTransformPolicyConfig {
+    /// Stable policy name.
+    pub name: String,
+    /// Policy specification.
+    pub spec: TransformPolicyConfig,
+}
+
+/// Named traffic mirroring policy resource.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NamedTrafficMirrorPolicyConfig {
+    /// Stable policy name.
+    pub name: String,
+    /// Policy specification.
+    pub spec: TrafficMirrorPolicyConfig,
+}
+
+/// Named fault injection policy resource.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NamedFaultInjectionPolicyConfig {
+    /// Stable policy name.
+    pub name: String,
+    /// Policy specification.
+    pub spec: FaultInjectionPolicyConfig,
+}
+
 /// Named brownout feature placeholder for future standalone resource extraction.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -324,10 +471,13 @@ pub struct NamedBrownoutFeatureConfig {
 #[cfg(test)]
 mod tests {
     use super::{
-        HostileEdgeHandshakeGuardConfig, HostileEdgeProtectionPolicyConfig,
+        HeaderMutationConfig, HostileEdgeHandshakeGuardConfig, HostileEdgeProtectionPolicyConfig,
         HostileEdgeSourceQuotaConfig, HttpCachePolicyConfig, NamedHostileEdgeProtectionPolicyConfig,
-        NamedHttpCachePolicyConfig, NamedRetryBudgetPolicyConfig, PolicyBindingConfig,
-        PolicyResourcesConfig,
+        NamedHttpCachePolicyConfig, NamedRetryBudgetPolicyConfig, NamedTrafficMirrorPolicyConfig,
+        NamedTransformPolicyConfig, PathRewriteTransformConfig, PolicyBindingConfig,
+        PolicyResourcesConfig, RequestTransformConfig, ResponseTransformConfig,
+        TrafficMirrorPolicyConfig, TransformPolicyConfig, FaultInjectionPolicyConfig,
+        FaultInjectionDelayConfig, FaultInjectionAbortConfig, NamedFaultInjectionPolicyConfig,
     };
     use crate::RetryBudgetPolicyConfig;
 
@@ -353,20 +503,70 @@ mod tests {
                     handshake_guard: Some(HostileEdgeHandshakeGuardConfig::default()),
                 },
             }],
+            transforms: vec![NamedTransformPolicyConfig {
+                name: String::from("api-transform"),
+                spec: TransformPolicyConfig {
+                    request: RequestTransformConfig {
+                        path_rewrite: Some(PathRewriteTransformConfig::ReplacePrefix {
+                            match_prefix: String::from("/api"),
+                            replacement: String::from("/v1/api"),
+                        }),
+                        host_rewrite: Some(String::from("backend.internal")),
+                        header_mutations: vec![HeaderMutationConfig::Set {
+                            name: String::from("x-route"),
+                            value: String::from("api"),
+                        }],
+                    },
+                    response: ResponseTransformConfig {
+                        header_mutations: vec![HeaderMutationConfig::Remove {
+                            name: String::from("server"),
+                        }],
+                    },
+                },
+            }],
+            traffic_mirrors: vec![NamedTrafficMirrorPolicyConfig {
+                name: String::from("shadow-payments"),
+                spec: TrafficMirrorPolicyConfig {
+                    percentage: 20,
+                    target_upstream_cluster: String::from("payments-shadow"),
+                },
+            }],
+            fault_injections: vec![NamedFaultInjectionPolicyConfig {
+                name: String::from("canary-chaos"),
+                spec: FaultInjectionPolicyConfig {
+                    delay: Some(FaultInjectionDelayConfig {
+                        percentage: 10,
+                        fixed_delay_ms: 250,
+                    }),
+                    abort: Some(FaultInjectionAbortConfig {
+                        percentage: 5,
+                        http_status: 503,
+                    }),
+                },
+            }],
             ..PolicyResourcesConfig::default()
         };
         let binding = PolicyBindingConfig {
             hostile_edge_protection: Some(String::from("edge-default")),
             retry_budget: Some(String::from("standard")),
             cache_policy: Some(String::from("public-cache")),
+            transform_policy: Some(String::from("api-transform")),
+            traffic_mirror: Some(String::from("shadow-payments")),
+            fault_injection: Some(String::from("canary-chaos")),
             ..PolicyBindingConfig::default()
         };
 
         assert_eq!(resources.retry_budgets.len(), 1);
         assert_eq!(resources.http_caches.len(), 1);
         assert_eq!(resources.hostile_edge_protections.len(), 1);
+        assert_eq!(resources.transforms.len(), 1);
+        assert_eq!(resources.traffic_mirrors.len(), 1);
+        assert_eq!(resources.fault_injections.len(), 1);
         assert_eq!(binding.hostile_edge_protection.as_deref(), Some("edge-default"));
         assert_eq!(binding.retry_budget.as_deref(), Some("standard"));
         assert_eq!(binding.cache_policy.as_deref(), Some("public-cache"));
+        assert_eq!(binding.transform_policy.as_deref(), Some("api-transform"));
+        assert_eq!(binding.traffic_mirror.as_deref(), Some("shadow-payments"));
+        assert_eq!(binding.fault_injection.as_deref(), Some("canary-chaos"));
     }
 }

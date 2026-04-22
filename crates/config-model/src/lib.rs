@@ -10,6 +10,7 @@ mod policy;
 mod route;
 mod security;
 mod upstream;
+mod upgrade;
 mod validator;
 
 pub use compiler::{
@@ -32,8 +33,9 @@ pub use limits::{
 pub use listener::{
     AdminAuditConfig, AdminAuthPolicyConfig, AdminAuthorizationScopeConfig,
     AdminListenerPolicyConfig, AdminOperatorConfig, AdminRateLimitConfig,
-    ListenerAlpnProtocolConfig, ListenerCertificateSourceConfig, ListenerClassConfig,
+    ListenerAlpnProtocolConfig, ListenerBindModeConfig, ListenerCertificateSourceConfig, ListenerClassConfig,
     ListenerProtocolConfig, ListenerResourceConfig, ListenerTlsMinimumVersionConfig,
+    ProxyProtocolModeConfig,
     ListenerTlsSessionResumptionConfig, ListenerTlsSessionResumptionModeConfig,
     ListenerTlsSniCertificateConfig, ListenerTlsTerminationConfig,
 };
@@ -42,16 +44,24 @@ pub use overload_policy::{
 };
 pub use policy::{
     AuthorizationCacheBehaviorConfig, CacheKeyPolicyConfig, CacheQueryKeyBehaviorConfig,
-    HostileEdgeHandshakeGuardConfig, HostileEdgeProtectionPolicyConfig,
+    HeaderMutationConfig, HostileEdgeHandshakeGuardConfig, HostileEdgeProtectionPolicyConfig,
     HostileEdgeSourceAggregationConfig, HostileEdgeSourceQuotaConfig, HttpCacheMethodConfig,
     HttpCachePolicyConfig, HttpCacheStorageConfig, NamedBrownoutFeatureConfig,
     NamedCircuitBreakerPolicyConfig, NamedHostileEdgeProtectionPolicyConfig,
     NamedHttpCachePolicyConfig, NamedLocalConcurrencyLimitPolicyConfig,
     NamedLocalRateLimitPolicyConfig, NamedOverloadResponsePolicyConfig,
-    NamedRetryBudgetPolicyConfig, NamedTimeoutHierarchyPolicyConfig, PolicyBindingConfig,
-    PolicyResourcesConfig,
+    NamedFaultInjectionPolicyConfig,
+    NamedRetryBudgetPolicyConfig, NamedTimeoutHierarchyPolicyConfig,
+    NamedTrafficMirrorPolicyConfig,
+    NamedTransformPolicyConfig, PathRewriteTransformConfig, PolicyBindingConfig,
+    PolicyResourcesConfig, RequestTransformConfig, ResponseTransformConfig,
+    TrafficMirrorPolicyConfig, TransformPolicyConfig, FaultInjectionPolicyConfig,
+    FaultInjectionDelayConfig, FaultInjectionAbortConfig,
 };
-pub use route::{RouteConfig, RouteMatchConfig};
+pub use route::{
+    RouteConfig, RouteDestinationConfig, RouteHeaderMatchConfig, RouteMatchConfig,
+    RouteQueryMatchConfig,
+};
 pub use security::{
     verify_snapshot_artifact_integrity, AnonymousSourceFilterConfig, ArtifactAttestation,
     ArtifactIntegrityError, ArtifactSigner, ArtifactSigningError, ArtifactVerificationConfig,
@@ -64,6 +74,7 @@ pub use upstream::{
     UpstreamClusterConfig, UpstreamEndpointConfig, UpstreamTrafficPolicyConfig,
     WorkspaceConfigError,
 };
+pub use upgrade::{UpgradePolicyConfig, UpgradeProtocolConfig};
 pub use validator::{
     ConfigValidationStats, ValidationCategory, ValidationCode, ValidationError, ValidationReport,
     WorkspaceConfigValidator,
@@ -318,7 +329,21 @@ mod tests {
                 "routes": [
                     {
                         "name": "grpc",
-                        "match": { "type": "path_prefix", "prefix": "/grpc" },
+                        "match": {
+                            "type": "path_prefix",
+                            "prefix": "/",
+                            "methods": ["post"],
+                            "headers": [
+                                { "type": "exact", "name": "x-tenant", "value": "beta" }
+                            ],
+                            "query_params": [
+                                { "type": "exact", "name": "auth", "value": "user" }
+                            ],
+                            "content_types": ["application/grpc"],
+                            "grpc_services": ["grpc.payments.v1.Payments"],
+                            "grpc_methods": ["Capture"],
+                            "source_cidrs": ["198.51.100.0/24"]
+                        },
                         "upstream_cluster": "payments",
                         "policies": {
                             "retry_budget": "standard",
@@ -337,6 +362,17 @@ mod tests {
                                 "weight": 5
                             }
                         ]
+                    },
+                    {
+                        "name": "payments-shadow",
+                        "endpoints": [
+                            {
+                                "id": "payments-shadow-a",
+                                "address": "127.0.0.1:9001",
+                                "state": "ready",
+                                "weight": 1
+                            }
+                        ]
                     }
                 ],
                 "policies": {
@@ -347,6 +383,30 @@ mod tests {
                                 "min_retry_tokens": 3,
                                 "retry_percent": 20,
                                 "window_ms": 10000
+                            }
+                        }
+                    ],
+                    "traffic_mirrors": [
+                        {
+                            "name": "shadow-payments",
+                            "spec": {
+                                "percentage": 20,
+                                "target_upstream_cluster": "payments-shadow"
+                            }
+                        }
+                    ],
+                    "fault_injections": [
+                        {
+                            "name": "canary-chaos",
+                            "spec": {
+                                "delay": {
+                                    "percentage": 10,
+                                    "fixed_delay_ms": 250
+                                },
+                                "abort": {
+                                    "percentage": 5,
+                                    "http_status": 503
+                                }
                             }
                         }
                     ],
@@ -387,6 +447,37 @@ mod tests {
 
         assert_eq!(config.api_version, ConfigApiVersion::V1Alpha1);
         assert_eq!(config.listeners[0].protocol, ListenerProtocolConfig::Http2);
+        assert_eq!(config.policies.traffic_mirrors.len(), 1);
+        assert_eq!(config.policies.traffic_mirrors[0].spec.percentage, 20);
+        assert_eq!(config.policies.fault_injections.len(), 1);
+        assert_eq!(
+            config.policies.fault_injections[0]
+                .spec
+                .abort
+                .as_ref()
+                .map(|abort| abort.http_status),
+            Some(503)
+        );
+        match &config.routes[0].match_rule {
+            crate::RouteMatchConfig::PathPrefix {
+                methods,
+                headers,
+                query_params,
+                content_types,
+                grpc_services,
+                grpc_methods,
+                source_cidrs,
+                ..
+            } => {
+                assert_eq!(methods, &vec![String::from("post")]);
+                assert_eq!(headers.len(), 1);
+                assert_eq!(query_params.len(), 1);
+                assert_eq!(content_types, &vec![String::from("application/grpc")]);
+                assert_eq!(grpc_services, &vec![String::from("grpc.payments.v1.Payments")]);
+                assert_eq!(grpc_methods, &vec![String::from("Capture")]);
+                assert_eq!(source_cidrs, &vec![String::from("198.51.100.0/24")]);
+            }
+        }
         assert_eq!(config.routes[0].policies.retry_budget.as_deref(), Some("standard"));
         assert_eq!(config.routes[0].policies.cache_policy.as_deref(), Some("public-cache"));
         assert_eq!(config.upstream_clusters[0].endpoints[0].state, EndpointStateConfig::Ready);

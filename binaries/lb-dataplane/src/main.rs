@@ -324,34 +324,36 @@ fn serve_runtime_config_from_workspace(
             .iter()
             .find(|compiled| compiled.label == *route_name)
             .ok_or_else(|| format!("compiled route {route_name} is missing"))?;
-        let cluster = config
-            .upstream_clusters
-            .iter()
-            .find(|cluster| cluster.name == route.upstream_cluster)
-            .ok_or_else(|| {
-                format!(
-                    "route {} references unknown upstream cluster {}",
-                    route.name, route.upstream_cluster
-                )
-            })?;
-        if cluster.endpoints.is_empty() {
-            return Err(format!(
-                "upstream cluster {} must declare at least one endpoint",
-                cluster.name
-            )
-            .into());
-        }
-
         route_rules.push(compiled_route.clone());
-        route_upstreams.extend(cluster.endpoints.iter().map(|endpoint| {
-            lb_runtime::Http1RouteUpstream {
-                route_label: route.name.clone(),
-                upstream: lb_net_core::UpstreamTarget::new(
-                    format!("{}:{}", cluster.name, endpoint.id),
-                    endpoint.address,
-                ),
+        for destination in route.normalized_destinations() {
+            let cluster = config
+                .upstream_clusters
+                .iter()
+                .find(|cluster| cluster.name == destination.upstream_cluster)
+                .ok_or_else(|| {
+                    format!(
+                        "route {} references unknown upstream cluster {}",
+                        route.name, destination.upstream_cluster
+                    )
+                })?;
+            if cluster.endpoints.is_empty() {
+                return Err(format!(
+                    "upstream cluster {} must declare at least one endpoint",
+                    cluster.name
+                )
+                .into());
             }
-        }));
+
+            route_upstreams.extend(cluster.endpoints.iter().map(|endpoint| {
+                lb_runtime::Http1RouteUpstream {
+                    route_label: route.name.clone(),
+                    upstream: lb_net_core::UpstreamTarget::new(
+                        format!("{}:{}", cluster.name, endpoint.id),
+                        endpoint.address,
+                    ),
+                }
+            }));
+        }
     }
 
     let upstream_addr = route_upstreams

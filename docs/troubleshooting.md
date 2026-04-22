@@ -127,6 +127,136 @@ Check whether the control plane fleet report says:
 
 Then inspect per-node `desired_version`, `active_version`, and convergence detail. The safe remediation path is usually to retry failed nodes or roll back the whole fleet to a shared known-good version.
 
+## Route Matching Does Not Behave As Expected
+
+## WebSocket Upgrade Fails
+
+If a WebSocket client gets a local `400 Bad Request` before the request reaches upstream, check these first:
+
+- the matched route or listener explicitly allows `upgrade.protocols: ["websocket"]`
+- the request uses HTTP/1.1, not HTTP/2
+- the request includes both `Connection: Upgrade` and `Upgrade: websocket`
+- the request is a `GET` without an HTTP request body
+
+Current support boundary is narrow by design:
+
+- supported: HTTP/1.1 WebSocket upgrade on `public` `http1` listeners
+- supported: HTTP/1.1 WebSocket upgrade on `public` `https` listeners when ALPN negotiates HTTP/1.1
+- not supported: admin listeners
+- not supported: non-WebSocket upgrade protocols
+- not supported: HTTP/2 extended CONNECT or RFC 8441-style WebSocket bootstrapping
+
+If the route is allowed but the upstream still refuses the handshake, reproduce with a minimal request and verify the upstream returns `101 Switching Protocols` with both `Connection: Upgrade` and `Upgrade: websocket`.
+
+If a request seems to land on the wrong route or gets a local `403` unexpectedly, check the matcher layers in this order:
+
+1. path prefix
+2. hostname
+3. method
+4. header matchers
+5. query-parameter matchers
+6. content-type
+7. effective client IP against `source_cidrs`
+
+If the route itself is correct but a canary or blue-green split does not seem to follow the expected destination weights, inspect both rollout-time and runtime-time visibility:
+
+1. inspect snapshot publication diff or publish audit detail to confirm the intended weight shift actually landed
+2. reproduce one request through the runtime harness and inspect `Http1ConnectionReport.route_selection_metrics` or `Http2ConnectionReport.route_selection_metrics`
+3. confirm `route_destination_selection_counts` and `route_destination_fallback_count` match the intended behavior
+
+Use the fallback count to distinguish two different problems quickly:
+
+- `route_destination_fallback_count = 0`: the route destination policy is being applied without route-level failover
+- `route_destination_fallback_count > 0`: the runtime is bypassing a higher-priority destination because that destination pool had no eligible backend
+
+Common causes:
+
+- request host does not match the normalized `Host` or `:authority` value you expected
+- method filter is declared, but the client uses a different verb
+- header exact matcher fails because the value differs after trimming
+- query matcher fails because the parameter is missing or percent-encoding differs from what you assumed
+- content-type matcher is checking the media type only, but the request sends a different media type than expected
+- route-level source CIDRs are matching against the raw peer address because trusted forwarding was not configured
+
+### Effective Client IP Looks Wrong
+
+If source-based routing or blocking behaves incorrectly:
+
+1. verify whether `security.trusted_client_ip.enabled` is set
+2. confirm which address is acting as the immediate peer for trust evaluation: raw socket peer without Proxy Protocol, or Proxy Protocol source when `listeners[].proxy_protocol` is enabled
+3. confirm the forwarded chain is syntactically valid
+4. confirm the route `source_cidrs` include the effective client IP you actually want to match
+
+If the peer is not trusted, forwarded headers are ignored or rejected by design. In that case, route-level source matching evaluates the direct socket source.
+
+Header precedence is deterministic:
+
+1. direct socket peer, unless Proxy Protocol is enabled
+2. Proxy Protocol source, when the listener requires `v1` or `v2`
+3. trusted `Forwarded`
+4. trusted `X-Forwarded-For` when `Forwarded` is absent
+
+That same effective source is also what public-listener `hostile_edge_protection.source_quota` uses. If source quota looks like it is throttling every request as one shared proxy IP, check Proxy Protocol configuration first.
+
+On dual-stack listeners, IPv4 clients can arrive on the IPv6 socket as IPv4-mapped IPv6 addresses such as `::ffff:198.51.100.7`. The runtime now canonicalizes those back to plain IPv4 before:
+
+- trusted proxy CIDR checks
+- route `source_cidrs` matching
+- anonymous-source CIDR checks
+- hostile-edge and enumeration source aggregation such as `ipv4_subnet_24`
+
+If source policy still looks wrong on a dual-stack listener, compare the configured CIDRs against the canonical IPv4 client address, not the mapped `::ffff:` presentation.
+
+If the listener sits behind an L4 load balancer, also confirm that `listeners[].proxy_protocol` matches what the fronting hop actually sends. A listener configured for `v1` or `v2` will fail closed before HTTP parsing if the preface is absent or malformed.
+
+Quick check for a v1-enabled HTTP/1 listener:
+
+```sh
+printf 'PROXY TCP4 198.51.100.7 203.0.113.10 45678 8080\r\nGET / HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n' | nc 127.0.0.1 8080
+```
+
+### Route Specificity Rules
+
+Current precedence is:
+
+1. longest path prefix wins first
+2. for equal prefixes, a route with hostname filters wins over one without
+3. for equal prefixes and hostname specificity, a route with method filters wins over one without
+4. for equal earlier dimensions, routes with more header, query, content-type, and source constraints win over less specific routes
+
+Keep overlapping routes intentionally ordered by specificity rather than relying on declaration order.
+
+### Fast Reproduction Tip
+
+When debugging one route in isolation, send the request with every declared matcher visible in the curl command. For example:
+
+```sh
+curl \
+	-H 'Host: example.com' \
+	-H 'X-Tenant: beta' \
+	-H 'Content-Type: application/json; charset=utf-8' \
+	-H 'X-Forwarded-For: 198.51.100.7' \
+	'http://127.0.0.1:8080/api?auth=user'
+```
+
+If source matching is involved, remember that `X-Forwarded-For` only affects routing when the direct peer is configured as trusted.
+
+### Transformed Headers Or Rewrites Look Wrong
+
+Check the effective ordering before assuming the matcher or upstream is broken:
+
+1. route matching happens on the original downstream request
+2. request transforms run only after a route has already been selected
+3. cache lookup uses the transformed request shape
+4. response transforms change the downstream response headers, but the HTTP/1 cache stores the normalized origin headers and reapplies the effective response transform on cache hit
+
+Common causes:
+
+- expecting a path rewrite to influence which route wins
+- mutating a request header and then checking the upstream with the pre-transform value
+- expecting a cached response entry to preserve the already transformed header set from an earlier route or listener
+- trying to mutate restricted framing or hop-by-hop headers that validation rejects by design
+
 ### Cache Growth Or Churn Looks Wrong
 
 Check whether:
@@ -178,6 +308,7 @@ This is one of the strongest signals that you should inspect telemetry and the o
 | --- | --- |
 | admin auth, replay, source policy | [Admin Plane Hardening](runbooks/admin-plane-hardening.md) |
 | config preview and reload safety | [Config Safety Workflow](runbooks/config-safety-workflow.md) |
+| route matching and request classification | [Configuration](configuration.md) |
 | cache policy and purge behavior | [Cache Operations](runbooks/cache-operations.md) |
 | distributed invalidation | [Cache Invalidation](runbooks/cache-invalidation.md) |
 | active-active fleet rollout | [Multi-Node Topology](runbooks/multi-node-topology.md) |

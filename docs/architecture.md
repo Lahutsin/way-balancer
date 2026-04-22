@@ -6,7 +6,7 @@ The repository is organized around a typed control-plane model and a runtime dat
 
 ```mermaid
 flowchart LR
-    user[Clients] --> public[Public listeners\nHTTP HTTPS gRPC TCP]
+    user[Clients] --> public[Public listeners\nHTTP HTTPS HTTP3 gRPC TCP]
     operator[Operators and CI] --> admin[Admin listeners\nhealthz status validate audit reload\ncache purge cache invalidate]
     operator --> ctl[lb-ctl]
     k8s[Kubernetes Gateway API] --> k8s_integration[crates/k8s-integration]
@@ -70,7 +70,7 @@ flowchart LR
 
 ## Operational Boundaries
 
-- public listeners handle application traffic across HTTP, HTTPS, gRPC, and TCP surfaces
+- public listeners handle application traffic across HTTP, HTTPS, first-phase HTTP/3 over QUIC, gRPC, and TCP surfaces
 - admin listeners expose privileged control endpoints such as `healthz`, `status`, `validate`, `audit`, `reload`, `cache/purge`, and `cache/invalidate`
 - snapshots compile and validate before activation, allowing preview and rollback workflows
 - cache invalidation and sticky-session affinity are runtime features, but both are driven by typed configuration and bounded operator controls
@@ -85,6 +85,35 @@ The runtime is not one feature. It combines several operational planes that now 
 - upstream health, locality, and affinity selection
 - bounded HTTP cache with revalidation and invalidation
 - overload management, breaker signals, and source or protocol protection
+
+## Request Classification And Routing
+
+Route selection is split across two layers on purpose:
+
+- `crates/config-model` validates and compiles the typed route matcher surface
+- `crates/proto-http` canonicalizes request attributes into a shared route-match input used by the runtime
+- `crates/runtime` applies those compiled rules consistently for HTTP/1 and HTTP/2 before upstream selection, while the dataplane HTTP/3 listener reuses the same canonical route-match surface before bridging into the HTTP/1 upstream runtime
+
+The current route matcher surface starts with path-prefix matching and can narrow further by:
+
+- hostname
+- HTTP method
+- header matchers
+- query-parameter matchers
+- content-type media type
+- source CIDR against the effective client IP
+
+This split matters because HTTP/1 and HTTP/2 present request metadata differently. By normalizing method, authority, path, query pairs, header names, content type, and source address into one canonical shape inside `crates/proto-http`, the runtime avoids protocol-specific routing drift.
+
+Once a route matches, upstream selection is now also split in two stages: the runtime first chooses a route destination such as stable, canary, blue, or green according to the route weights, and then balances inside that destination's endpoint pool using the cluster traffic policy. That keeps rollout intent at the route layer while preserving health, affinity, and locality behavior inside each upstream cluster.
+
+HTTP/3 currently follows that same route-selection model, but its first supported topology is intentionally narrower than HTTPS: the downstream side terminates QUIC plus HTTP/3 on a public UDP listener, then reuses the existing HTTP/1 upstream proxy path. That gives operators a documented modern edge surface without yet claiming upstream HTTP/3 parity.
+
+The runtime also exposes that route-destination decision in its connection reports. When route backend pools are active, `Http1ConnectionReport` and `Http2ConnectionReport` now carry `route_selection_metrics`, including weighted route selection counts, per-destination selection counts, and route-destination fallback counts. That makes local reproductions and integration harnesses show not only which upstream answered, but whether the request stayed on the primary destination or had to fall back.
+
+Source-aware routing is evaluated after trusted client IP resolution. If a request arrives through a trusted proxy chain, the route `source_cidrs` filters use the effective client IP rather than the raw socket peer. If the peer is not trusted, the runtime keeps the direct peer address and ignores forwarded source hints.
+
+When multiple routes match, the runtime resolves them by specificity rather than declaration order. Longest path prefix wins first, then more constrained matcher sets win over less constrained ones for equal prefixes. The operator-facing matcher syntax and examples live in [Configuration](configuration.md), while failure analysis and precedence debugging live in [Troubleshooting](troubleshooting.md).
 
 The dedicated [Admin API](admin-api.md), [HTTP Cache](cache.md), [Affinity](affinity.md), and [Troubleshooting](troubleshooting.md) pages cover those surfaces in more operational detail.
 

@@ -1,8 +1,9 @@
 use std::io;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::net::TcpListener as StdTcpListener;
 use std::time::{Duration, Instant};
 
-use lb_net_core::{ListenerClass, ListenerConfig};
+use lb_net_core::{ListenerBindMode, ListenerClass, ListenerConfig};
 use lb_runtime::{start_listener, ListenerRuntimeError, ListenerState};
 use tokio::net::TcpStream;
 use tokio::time;
@@ -97,6 +98,55 @@ async fn burst_connections_do_not_break_listener() -> io::Result<()> {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ipv6_single_stack_listener_rejects_ipv4_connections() -> io::Result<()> {
+    let mut config = ListenerConfig::foundation_local("public", ListenerClass::Public);
+    config.bind_address = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0);
+    config.bind_mode = ListenerBindMode::SingleStack;
+    config.allow_unspecified_bind = true;
+    let handle = start_listener(config).await.map_err(runtime_error_to_io)?;
+
+    wait_for_state(&handle, ListenerState::Running).await?;
+    assert_ipv6_connect_succeeds(handle.local_addr().port()).await?;
+    assert_ipv4_connect_fails(handle.local_addr().port()).await?;
+    handle.shutdown().await.map_err(runtime_error_to_io)?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dual_stack_listener_accepts_ipv4_connections() -> io::Result<()> {
+    let mut config = ListenerConfig::foundation_local("public", ListenerClass::Public);
+    config.bind_address = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0);
+    config.bind_mode = ListenerBindMode::DualStack;
+    config.allow_unspecified_bind = true;
+    let handle = start_listener(config).await.map_err(runtime_error_to_io)?;
+
+    wait_for_state(&handle, ListenerState::Running).await?;
+    assert_ipv6_connect_succeeds(handle.local_addr().port()).await?;
+    let ipv4_stream = assert_ipv4_connect_succeeds(handle.local_addr().port()).await?;
+    drop(ipv4_stream);
+    handle.shutdown().await.map_err(runtime_error_to_io)?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ipv6_only_listener_rejects_ipv4_connections() -> io::Result<()> {
+    let mut config = ListenerConfig::foundation_local("public", ListenerClass::Public);
+    config.bind_address = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0);
+    config.bind_mode = ListenerBindMode::Ipv6Only;
+    config.allow_unspecified_bind = true;
+    let handle = start_listener(config).await.map_err(runtime_error_to_io)?;
+
+    wait_for_state(&handle, ListenerState::Running).await?;
+    assert_ipv6_connect_succeeds(handle.local_addr().port()).await?;
+    assert_ipv4_connect_fails(handle.local_addr().port()).await?;
+    handle.shutdown().await.map_err(runtime_error_to_io)?;
+
+    Ok(())
+}
+
 async fn wait_for_state(
     handle: &lb_runtime::ListenerHandle,
     target: ListenerState,
@@ -171,4 +221,29 @@ async fn wait_for_rejected_connections_at_least(
 
 fn runtime_error_to_io(error: ListenerRuntimeError) -> io::Error {
     io::Error::other(error.to_string())
+}
+
+async fn assert_ipv6_connect_succeeds(port: u16) -> io::Result<TcpStream> {
+    let address = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), port);
+    time::timeout(Duration::from_secs(1), TcpStream::connect(address))
+        .await
+        .map_err(|_| io::Error::other("timed out connecting over IPv6"))?
+}
+
+async fn assert_ipv4_connect_succeeds(port: u16) -> io::Result<TcpStream> {
+    let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+    time::timeout(Duration::from_secs(1), TcpStream::connect(address))
+        .await
+        .map_err(|_| io::Error::other("timed out connecting over IPv4"))?
+}
+
+async fn assert_ipv4_connect_fails(port: u16) -> io::Result<()> {
+    let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+    let result = time::timeout(Duration::from_secs(1), TcpStream::connect(address))
+        .await
+        .map_err(|_| io::Error::other("timed out waiting for IPv4 connection failure"))?;
+    if result.is_ok() {
+        return Err(io::Error::other("expected IPv4 connection to fail"));
+    }
+    Ok(())
 }

@@ -23,8 +23,12 @@
       "name": "grpc-payments",
       "match": {
         "type": "path_prefix",
-        "prefix": "/grpc.payments.v1.Payments",
-        "hostnames": ["localhost:8443", "127.0.0.1:8443"]
+        "prefix": "/",
+        "hostnames": ["localhost:8443", "127.0.0.1:8443"],
+        "methods": ["POST"],
+        "content_types": ["application/grpc"],
+        "grpc_services": ["grpc.payments.v1.Payments"],
+        "grpc_methods": ["ProcessPayment"]
       },
       "upstream_cluster": "payments-grpc",
       "policies": {

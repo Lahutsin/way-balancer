@@ -2,15 +2,17 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::hash::Hasher;
 use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::task::{Context, Poll};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::{
     build_http_cache_key_material, AnonymousSourceFilterPolicy, AnonymousSourceFilterState,
     HttpCacheEntry, HttpCacheHeader, HttpCacheKey, HttpCacheMetadata, HttpCacheRequest,
-    HttpCacheRequestOutcome, HttpCacheRevalidationResult, HttpCacheStore, ProtocolAnomalyCategory,
-    RouteEnumerationProtectionPolicy, RouteEnumerationProtectionState, RuntimeTelemetry,
-    SlowClientStage, TrustedClientIpPolicy,
+    HttpCacheRequestOutcome, HttpCacheRevalidationResult, HttpCacheStore, HttpUpgradeResult,
+    ProtocolAnomalyCategory, RouteEnumerationProtectionPolicy, RouteEnumerationProtectionState,
+    RuntimeTelemetry, SlowClientStage, TrustedClientIpPolicy,
 };
 use http::{HeaderName, HeaderValue, StatusCode};
 use httpdate::parse_http_date;
@@ -33,11 +35,12 @@ pub struct Http1ProxyConfig {
     pub route_upstreams: BTreeMap<String, Vec<lb_net_core::UpstreamTarget>>,
     /// Optional health-aware route backend pools keyed by route label.
     pub route_backend_pools: BTreeMap<String, crate::RouteBackendPool>,
+    /// Optional health-aware backend pools keyed by upstream cluster for shadow dispatch.
+    pub mirror_backend_pools: BTreeMap<String, crate::RouteBackendPool>,
     /// Deterministic round-robin cursors for route upstream pools.
     route_upstream_cursors: Arc<Mutex<BTreeMap<String, usize>>>,
     /// Whether requests with no matching route should be rejected locally.
     pub reject_unmatched_routes: bool,
-    /// Optional CIDR-based anonymous source filter.
     pub anonymous_source_filter: Option<Arc<AnonymousSourceFilterState>>,
     /// Optional progressive ban guard for route and query enumeration by source.
     pub route_enumeration_protection: Option<Arc<RouteEnumerationProtectionState>>,
@@ -45,6 +48,27 @@ pub struct Http1ProxyConfig {
     pub trusted_client_ip: Option<TrustedClientIpPolicy>,
     /// Optional response-cache runtime for GET/HEAD traffic.
     pub response_cache: Option<Http1ResponseCacheConfig>,
+    /// Optional listener-wide request transform applied before upstream dispatch.
+    pub listener_request_transform: Option<lb_config_model::RequestTransformConfig>,
+    /// Optional route-specific request transforms keyed by route label.
+    pub route_request_transforms: BTreeMap<String, lb_config_model::RequestTransformConfig>,
+    /// Optional listener-wide response transform applied before downstream write.
+    pub listener_response_transform: Option<lb_config_model::ResponseTransformConfig>,
+    /// Optional route-specific response transforms keyed by route label.
+    pub route_response_transforms: BTreeMap<String, lb_config_model::ResponseTransformConfig>,
+    /// Optional destination-specific policy runtime keyed by route label then upstream cluster.
+    pub route_destination_policies:
+        BTreeMap<String, BTreeMap<String, RouteDestinationPolicyRuntime>>,
+    /// Effective backend-policy diagnostics keyed by route label.
+    pub route_backend_policy_diagnostics:
+        BTreeMap<String, Vec<crate::EffectiveRouteDestinationPolicy>>,
+    /// Listener-wide upgrade allow-list.
+    pub listener_upgrade_protocols: Vec<lb_config_model::UpgradeProtocolConfig>,
+    /// Route-specific upgrade allow-lists keyed by route label.
+    pub route_upgrade_protocols:
+        BTreeMap<String, Vec<lb_config_model::UpgradeProtocolConfig>>,
+    /// Optional upgrade telemetry handle and scope.
+    pub upgrade_telemetry: Option<HttpUpgradeTelemetryConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,6 +92,26 @@ pub struct Http1ResponseCacheConfig {
 pub struct HttpCacheTelemetryConfig {
     pub scope: String,
     pub telemetry: Arc<RuntimeTelemetry>,
+}
+
+#[derive(Debug, Clone)]
+pub struct HttpUpgradeTelemetryConfig {
+    pub scope: String,
+    pub telemetry: Arc<RuntimeTelemetry>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RouteDestinationPolicyRuntime {
+    pub request_transform: Option<lb_config_model::RequestTransformConfig>,
+    pub response_transform: Option<lb_config_model::ResponseTransformConfig>,
+    pub traffic_mirror: Option<lb_config_model::TrafficMirrorPolicyConfig>,
+    pub fault_injection: Option<lb_config_model::FaultInjectionPolicyConfig>,
+    pub rate_limiters: Vec<Arc<crate::LocalRateLimiter>>,
+    pub concurrency_limiters: Vec<Arc<crate::LocalConcurrencyLimiter>>,
+    pub failure_manager: Option<Arc<crate::FailureManager>>,
+    pub enforce_retry_budget: bool,
+    pub enforce_timeout_hierarchy: bool,
+    pub enforce_circuit_breaker: bool,
 }
 
 impl Http1ResponseCacheConfig {
@@ -99,12 +143,22 @@ impl Http1ProxyConfig {
             routes: Vec::new(),
             route_upstreams: BTreeMap::new(),
             route_backend_pools: BTreeMap::new(),
+            mirror_backend_pools: BTreeMap::new(),
             route_upstream_cursors: Arc::new(Mutex::new(BTreeMap::new())),
             reject_unmatched_routes: false,
             anonymous_source_filter: None,
             route_enumeration_protection: None,
             trusted_client_ip: None,
             response_cache: None,
+            listener_request_transform: None,
+            route_request_transforms: BTreeMap::new(),
+            listener_response_transform: None,
+            route_response_transforms: BTreeMap::new(),
+            route_destination_policies: BTreeMap::new(),
+            route_backend_policy_diagnostics: BTreeMap::new(),
+            listener_upgrade_protocols: Vec::new(),
+            route_upgrade_protocols: BTreeMap::new(),
+            upgrade_telemetry: None,
         }
     }
 
@@ -129,6 +183,15 @@ impl Http1ProxyConfig {
         route_backend_pools: impl IntoIterator<Item = (String, crate::RouteBackendPool)>,
     ) -> Self {
         self.route_backend_pools = route_backend_pools.into_iter().collect();
+        self
+    }
+
+    #[must_use]
+    pub fn with_mirror_backend_pools(
+        mut self,
+        mirror_backend_pools: impl IntoIterator<Item = (String, crate::RouteBackendPool)>,
+    ) -> Self {
+        self.mirror_backend_pools = mirror_backend_pools.into_iter().collect();
         self
     }
 
@@ -166,6 +229,76 @@ impl Http1ProxyConfig {
         self.response_cache = Some(response_cache);
         self
     }
+
+    #[must_use]
+    pub fn with_request_transforms(
+        mut self,
+        listener_request_transform: Option<lb_config_model::RequestTransformConfig>,
+        route_request_transforms: impl IntoIterator<
+            Item = (String, lb_config_model::RequestTransformConfig),
+        >,
+    ) -> Self {
+        self.listener_request_transform = listener_request_transform;
+        self.route_request_transforms = route_request_transforms.into_iter().collect();
+        self
+    }
+
+    #[must_use]
+    pub fn with_response_transforms(
+        mut self,
+        listener_response_transform: Option<lb_config_model::ResponseTransformConfig>,
+        route_response_transforms: impl IntoIterator<
+            Item = (String, lb_config_model::ResponseTransformConfig),
+        >,
+    ) -> Self {
+        self.listener_response_transform = listener_response_transform;
+        self.route_response_transforms = route_response_transforms.into_iter().collect();
+        self
+    }
+
+    #[must_use]
+    pub fn with_route_backend_policy_diagnostics(
+        mut self,
+        diagnostics: impl IntoIterator<Item = (String, Vec<crate::EffectiveRouteDestinationPolicy>)>,
+    ) -> Self {
+        self.route_backend_policy_diagnostics = diagnostics.into_iter().collect();
+        self
+    }
+
+    #[must_use]
+    pub fn with_route_destination_policies(
+        mut self,
+        policies: impl IntoIterator<Item = (String, BTreeMap<String, RouteDestinationPolicyRuntime>)>,
+    ) -> Self {
+        self.route_destination_policies = policies.into_iter().collect();
+        self
+    }
+
+    #[must_use]
+    pub fn with_upgrade_policies(
+        mut self,
+        listener_upgrade_protocols: impl IntoIterator<Item = lb_config_model::UpgradeProtocolConfig>,
+        route_upgrade_protocols: impl IntoIterator<
+            Item = (String, Vec<lb_config_model::UpgradeProtocolConfig>),
+        >,
+    ) -> Self {
+        self.listener_upgrade_protocols = listener_upgrade_protocols.into_iter().collect();
+        self.route_upgrade_protocols = route_upgrade_protocols.into_iter().collect();
+        self
+    }
+
+    #[must_use]
+    pub fn with_upgrade_telemetry(
+        mut self,
+        scope: impl Into<String>,
+        telemetry: Arc<RuntimeTelemetry>,
+    ) -> Self {
+        self.upgrade_telemetry = Some(HttpUpgradeTelemetryConfig {
+            scope: scope.into(),
+            telemetry,
+        });
+        self
+    }
 }
 
 /// Observable counters for an HTTP/1.1 proxy connection.
@@ -185,6 +318,16 @@ pub struct Http1ConnectionMetrics {
     pub cache_fill_count: u64,
     /// Count of requests or responses bypassing cache participation.
     pub cache_bypass_count: u64,
+    /// Count of shadow requests launched asynchronously.
+    pub mirror_dispatch_count: u64,
+    /// Count of requests not mirrored because the mirror policy was not selected or unsupported.
+    pub mirror_skip_count: u64,
+    /// Count of mirror attempts that failed before dispatch could start.
+    pub mirror_dispatch_failure_count: u64,
+    /// Count of requests delayed by destination-local fault injection.
+    pub fault_injection_delay_count: u64,
+    /// Count of requests aborted locally by destination-local fault injection.
+    pub fault_injection_abort_count: u64,
     /// Count of responses by status code.
     pub response_status_counts: BTreeMap<u16, u64>,
 }
@@ -202,6 +345,17 @@ pub struct Http1ConnectionReport {
     pub connect_duration: Duration,
     /// Aggregate counters for the proxied connection.
     pub metrics: Http1ConnectionMetrics,
+    /// Snapshot of route-backend selection metrics when route backend pools are configured.
+    pub route_selection_metrics: Option<crate::UpstreamSelectionMetrics>,
+}
+
+/// Buffered response returned by one-shot HTTP/1 upstream dispatch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Http1SingleRequestResponse {
+    /// Parsed response head after normalization and transforms.
+    pub head: lb_proto_http::Http1ResponseHead,
+    /// Buffered response body.
+    pub body: Vec<u8>,
 }
 
 /// Errors returned by the HTTP/1.1 proxy runtime.
@@ -334,7 +488,7 @@ where
         .map_err(|_| Http1ProxyError::IdleTimeout("request head"))?
         .map_err(Http1ProxyError::ParseRequest)?;
 
-        let Some(request) = request else {
+        let Some(mut request) = request else {
             break;
         };
 
@@ -358,6 +512,16 @@ where
                     break;
                 }
             };
+        request.route = lb_proto_http::match_route_request_with_context(
+            &lb_proto_http::RouteMatchInput {
+                target: request.target.clone(),
+                host: request_authority(&request).map(String::from),
+                method: Some(request.method.clone()),
+                headers: request.headers.clone(),
+                source_ip: Some(effective_client_ip),
+            },
+            &config.routes,
+        );
         let effective_downstream_addr =
             SocketAddr::new(effective_client_ip, downstream_addr.port());
 
@@ -410,6 +574,73 @@ where
             break;
         }
 
+        let original_request = request.clone();
+        if let Some(transform) = effective_request_transform(config, request.route.as_ref()) {
+            if apply_request_transform(&mut request, &transform).is_err() {
+                write_local_response(
+                    &mut downstream,
+                    request.keep_alive,
+                    StatusCode::BAD_REQUEST,
+                    "invalid transformed request target\n",
+                )
+                .await
+                .map_err(Http1ProxyError::ResponseIo)?;
+                metrics.request_count += 1;
+                *metrics
+                    .response_status_counts
+                    .entry(StatusCode::BAD_REQUEST.as_u16())
+                    .or_insert(0) += 1;
+                if !request.keep_alive {
+                    break;
+                }
+                continue;
+            }
+        }
+
+        let requested_upgrade = match classify_requested_upgrade(&request) {
+            Ok(requested_upgrade) => requested_upgrade,
+            Err(error) => {
+                record_upgrade_telemetry(
+                    config,
+                    HttpUpgradeResult::Rejected,
+                    error.telemetry_reason(),
+                    error.message().trim_end(),
+                );
+                write_local_response(&mut downstream, false, StatusCode::BAD_REQUEST, error.message())
+                    .await
+                    .map_err(Http1ProxyError::ResponseIo)?;
+                metrics.request_count += 1;
+                *metrics
+                    .response_status_counts
+                    .entry(StatusCode::BAD_REQUEST.as_u16())
+                    .or_insert(0) += 1;
+                break;
+            }
+        };
+        if requested_upgrade.is_some() && !route_allows_requested_upgrade(config, request.route.as_ref())
+        {
+            record_upgrade_telemetry(
+                config,
+                HttpUpgradeResult::Rejected,
+                "policy_denied",
+                "route upgrade policy denied the requested protocol",
+            );
+            write_local_response(
+                &mut downstream,
+                false,
+                StatusCode::BAD_REQUEST,
+                "upgrade not allowed for the selected route\n",
+            )
+            .await
+            .map_err(Http1ProxyError::ResponseIo)?;
+            metrics.request_count += 1;
+            *metrics
+                .response_status_counts
+                .entry(StatusCode::BAD_REQUEST.as_u16())
+                .or_insert(0) += 1;
+            break;
+        }
+
         let selected_upstream = match resolve_request_upstream(config, &request) {
             RequestUpstreamResolution::Selected(upstream) => upstream,
             RequestUpstreamResolution::Reject(status, reason) => {
@@ -433,12 +664,87 @@ where
             }
         };
 
+        let destination_policy =
+            route_destination_policy_runtime(config, request.route.as_ref(), &selected_upstream);
+        if let Some(transform) = destination_policy.and_then(|policy| policy.request_transform.as_ref())
+        {
+            request = original_request;
+            if apply_request_transform(&mut request, transform).is_err() {
+                write_local_response(
+                    &mut downstream,
+                    request.keep_alive,
+                    StatusCode::BAD_REQUEST,
+                    "invalid transformed request target\n",
+                )
+                .await
+                .map_err(Http1ProxyError::ResponseIo)?;
+                metrics.request_count += 1;
+                *metrics
+                    .response_status_counts
+                    .entry(StatusCode::BAD_REQUEST.as_u16())
+                    .or_insert(0) += 1;
+                if !request.keep_alive {
+                    break;
+                }
+                continue;
+            }
+        }
+        let destination_response_transform = effective_destination_response_transform(
+            config,
+            request.route.as_ref(),
+            destination_policy,
+        );
+        let _destination_concurrency_leases = match enforce_destination_local_limits(
+            destination_policy,
+            &request,
+            &selected_upstream,
+            effective_client_ip,
+        ) {
+            Ok(leases) => leases,
+            Err((status, body)) => {
+                write_local_response(&mut downstream, request.keep_alive, status, body)
+                    .await
+                    .map_err(Http1ProxyError::ResponseIo)?;
+                metrics.request_count += 1;
+                *metrics.response_status_counts.entry(status.as_u16()).or_insert(0) += 1;
+                if !request.keep_alive {
+                    break;
+                }
+                continue;
+            }
+        };
+
+        if let Some(status) = maybe_inject_http1_fault(
+            &request,
+            &mut downstream,
+            destination_policy,
+            &mut metrics,
+        )
+        .await
+        .map_err(Http1ProxyError::ResponseIo)?
+        {
+            metrics.request_count += 1;
+            *metrics.response_status_counts.entry(status.as_u16()).or_insert(0) += 1;
+            if !request.keep_alive {
+                break;
+            }
+            continue;
+        }
+
+        maybe_spawn_shadow_http1_request(
+            config,
+            &request,
+            effective_client_ip,
+            requested_upgrade,
+            destination_policy,
+            &mut metrics,
+        );
+
         let now = config
             .response_cache
             .as_ref()
             .map_or(Duration::ZERO, |response_cache| response_cache.store.now());
-        if let Some(cache_result) =
-            resolve_cache_request(config.response_cache.as_ref(), &request, now)
+        if let Some(cache_result) = resolve_cache_request(config.response_cache.as_ref(), &request, now)
         {
             match cache_result {
                 CacheRequestOutcome::CacheHit { entry, outcome, reason } => {
@@ -447,6 +753,7 @@ where
                         &request.method,
                         request.keep_alive,
                         entry.as_ref(),
+                        destination_response_transform.as_ref(),
                     )
                     .await
                     .map_err(Http1ProxyError::ResponseIo)?;
@@ -492,6 +799,9 @@ where
                         config,
                         &selected_upstream.target,
                         &request,
+                        requested_upgrade,
+                        destination_policy,
+                        destination_response_transform.as_ref(),
                         key,
                         stale_fallback.as_deref(),
                         revalidation_entry.as_deref(),
@@ -501,7 +811,6 @@ where
                     .await;
                     record_passive_health_result(&selected_upstream, &result);
                     match result {
-                        Ok(_) => {}
                         Err(error)
                             if stale_fallback.is_some() && error_allows_stale_if_error(&error) =>
                         {
@@ -512,6 +821,7 @@ where
                                 &request.method,
                                 request.keep_alive,
                                 &stale_entry,
+                                destination_response_transform.as_ref(),
                             )
                             .await
                             .map_err(Http1ProxyError::ResponseIo)?;
@@ -529,6 +839,8 @@ where
                                 .or_insert(0) += 1;
                         }
                         Err(error) => return Err(error),
+                        Ok(status) if status == StatusCode::SWITCHING_PROTOCOLS.as_u16() => break,
+                        Ok(_) => {}
                     }
                 }
                 CacheRequestOutcome::Bypass(reason) => {
@@ -553,6 +865,9 @@ where
                         config,
                         &selected_upstream.target,
                         &request,
+                        requested_upgrade,
+                        destination_policy,
+                        destination_response_transform.as_ref(),
                         None,
                         None,
                         None,
@@ -561,7 +876,9 @@ where
                     )
                     .await;
                     record_passive_health_result(&selected_upstream, &result);
-                    result?;
+                    if result? == StatusCode::SWITCHING_PROTOCOLS.as_u16() {
+                        break;
+                    }
                 }
             }
         } else {
@@ -579,6 +896,9 @@ where
                 config,
                 &selected_upstream.target,
                 &request,
+                requested_upgrade,
+                destination_policy,
+                destination_response_transform.as_ref(),
                 None,
                 None,
                 None,
@@ -587,7 +907,9 @@ where
             )
             .await;
             record_passive_health_result(&selected_upstream, &result);
-            result?;
+            if result? == StatusCode::SWITCHING_PROTOCOLS.as_u16() {
+                break;
+            }
         }
         if !request.keep_alive {
             break;
@@ -603,7 +925,183 @@ where
             .unwrap_or_else(|| config.upstream.name.clone()),
         connect_duration,
         metrics,
+        route_selection_metrics: route_selection_metrics(&config.route_backend_pools),
     })
+}
+
+/// Dispatches one buffered request through the HTTP/1 upstream runtime.
+pub async fn proxy_http1_request_with_downstream_addr(
+    config: &Http1ProxyConfig,
+    downstream_addr: SocketAddr,
+    mut request: lb_proto_http::Http1RequestHead,
+    request_body: &[u8],
+) -> Result<Http1SingleRequestResponse, Http1ProxyError> {
+    let original_request = request.clone();
+    if let Some(transform) = effective_request_transform(config, request.route.as_ref()) {
+        if apply_request_transform(&mut request, &transform).is_err() {
+            return Ok(local_http1_response(
+                request.keep_alive,
+                StatusCode::BAD_REQUEST,
+                "invalid transformed request target\n",
+            ));
+        }
+    }
+
+    let selected_upstream = match resolve_request_upstream(config, &request) {
+        RequestUpstreamResolution::Selected(upstream) => upstream,
+        RequestUpstreamResolution::Reject(status, reason) => {
+            return Ok(local_http1_response(request.keep_alive, status, reason));
+        }
+    };
+
+    let destination_policy =
+        route_destination_policy_runtime(config, request.route.as_ref(), &selected_upstream);
+    if let Some(transform) = destination_policy.and_then(|policy| policy.request_transform.as_ref()) {
+        request = original_request;
+        if apply_request_transform(&mut request, transform).is_err() {
+            return Ok(local_http1_response(
+                request.keep_alive,
+                StatusCode::BAD_REQUEST,
+                "invalid transformed request target\n",
+            ));
+        }
+    }
+
+    let effective_client_ip = downstream_addr.ip();
+    let _destination_concurrency_leases = match enforce_destination_local_limits(
+        destination_policy,
+        &request,
+        &selected_upstream,
+        effective_client_ip,
+    ) {
+        Ok(leases) => leases,
+        Err((status, body)) => return Ok(local_http1_response(request.keep_alive, status, body)),
+    };
+    let response_transform =
+        effective_destination_response_transform(config, request.route.as_ref(), destination_policy);
+    let effective_timeouts =
+        effective_destination_upstream_timeouts(&config.timeouts, destination_policy);
+
+    let mut stream = time::timeout(
+        effective_timeouts.connect_timeout,
+        TcpStream::connect(selected_upstream.target.address),
+    )
+    .await
+    .map_err(|_| Http1ProxyError::ConnectTimeout {
+        target: selected_upstream.target.address,
+    })?
+    .map_err(|source| Http1ProxyError::Connect {
+        target: selected_upstream.target.address,
+        source,
+    })?;
+
+    let normalized_request_headers = lb_proto_http::normalize_request_headers(
+        &request.headers,
+        effective_client_ip,
+        request.keep_alive,
+        &request.body_kind,
+    );
+    let request_head = lb_proto_http::encode_request_head(
+        &request.method,
+        &request.target,
+        request.version,
+        &normalized_request_headers,
+    );
+    stream
+        .write_all(&request_head)
+        .await
+        .map_err(Http1ProxyError::RequestIo)?;
+    if !request_body.is_empty() {
+        stream
+            .write_all(request_body)
+            .await
+            .map_err(Http1ProxyError::RequestIo)?;
+    }
+
+    let mut upstream_buffer = Vec::new();
+    let response = time::timeout(
+        effective_timeouts.idle_timeout,
+        lb_proto_http::read_response_head(
+            &mut stream,
+            &mut upstream_buffer,
+            &config.limits,
+            &request.method,
+        ),
+    )
+    .await
+    .map_err(|_| Http1ProxyError::IdleTimeout("response head"))?
+    .map_err(Http1ProxyError::ParseResponse)?;
+
+    let mut body_writer = VecAsyncWriter::default();
+    relay_body(
+        &mut stream,
+        &mut upstream_buffer,
+        &mut body_writer,
+        &response.body_kind,
+        config.limits.max_body_bytes,
+        effective_timeouts.idle_timeout,
+        RelayDirection::Response,
+    )
+    .await?;
+
+    let mut normalized_response_headers = lb_proto_http::normalize_response_headers(
+        &response.headers,
+        false,
+        &response.body_kind,
+    );
+    if let Some(transform) = response_transform {
+        apply_http1_header_mutations(&mut normalized_response_headers, &transform.header_mutations);
+    }
+    match classify_http1_response_failure(response.status) {
+        Some(class) => record_destination_failure(destination_policy, class),
+        None => record_destination_success(destination_policy),
+    }
+
+    Ok(Http1SingleRequestResponse {
+        head: lb_proto_http::Http1ResponseHead {
+            version: response.version,
+            status: response.status,
+            reason: response.reason,
+            headers: normalized_response_headers,
+            body_kind: response.body_kind,
+            keep_alive: false,
+        },
+        body: body_writer.into_inner(),
+    })
+}
+
+fn route_selection_metrics(
+    route_backend_pools: &BTreeMap<String, crate::RouteBackendPool>,
+) -> Option<crate::UpstreamSelectionMetrics> {
+    if route_backend_pools.is_empty() {
+        return None;
+    }
+
+    Some(route_backend_pools.values().fold(
+        crate::UpstreamSelectionMetrics::default(),
+        |mut aggregate, pool| {
+            let metrics = pool.selection_metrics();
+            aggregate.round_robin_selection_count += metrics.round_robin_selection_count;
+            aggregate.weighted_round_robin_selection_count +=
+                metrics.weighted_round_robin_selection_count;
+            aggregate.weighted_route_selection_count += metrics.weighted_route_selection_count;
+            aggregate.power_of_two_selection_count += metrics.power_of_two_selection_count;
+            aggregate.locality_preference_hit_count += metrics.locality_preference_hit_count;
+            aggregate.no_healthy_endpoint_count += metrics.no_healthy_endpoint_count;
+            aggregate.unhealthy_fallback_selection_count +=
+                metrics.unhealthy_fallback_selection_count;
+            aggregate.affinity_hit_count += metrics.affinity_hit_count;
+            aggregate.affinity_fallback_count += metrics.affinity_fallback_count;
+            aggregate.route_destination_fallback_count += metrics.route_destination_fallback_count;
+            for (destination_name, count) in metrics.route_destination_selection_counts {
+                *aggregate
+                    .route_destination_selection_counts
+                    .entry(destination_name)
+                    .or_default() += count;
+            }
+            aggregate
+        },
+    ))
 }
 
 enum RequestUpstreamResolution {
@@ -699,6 +1197,619 @@ fn request_authority(request: &lb_proto_http::Http1RequestHead) -> Option<&str> 
         .map(|header| header.value.as_str())
 }
 
+fn effective_request_transform(
+    config: &Http1ProxyConfig,
+    route: Option<&lb_proto_http::RouteMatch>,
+) -> Option<lb_config_model::RequestTransformConfig> {
+    merge_request_transforms(
+        config.listener_request_transform.as_ref(),
+        route.and_then(|route| config.route_request_transforms.get(&route.label)),
+    )
+}
+
+fn effective_response_transform(
+    config: &Http1ProxyConfig,
+    route: Option<&lb_proto_http::RouteMatch>,
+) -> Option<lb_config_model::ResponseTransformConfig> {
+    merge_response_transforms(
+        config.listener_response_transform.as_ref(),
+        route.and_then(|route| config.route_response_transforms.get(&route.label)),
+    )
+}
+
+fn effective_destination_response_transform(
+    config: &Http1ProxyConfig,
+    route: Option<&lb_proto_http::RouteMatch>,
+    destination_policy: Option<&RouteDestinationPolicyRuntime>,
+) -> Option<lb_config_model::ResponseTransformConfig> {
+    destination_policy
+        .and_then(|policy| policy.response_transform.clone())
+        .or_else(|| effective_response_transform(config, route))
+}
+
+fn route_destination_policy_runtime<'a>(
+    config: &'a Http1ProxyConfig,
+    route: Option<&lb_proto_http::RouteMatch>,
+    selected_upstream: &SelectedUpstream,
+) -> Option<&'a RouteDestinationPolicyRuntime> {
+    let route = route?;
+    let route_backend = selected_upstream.route_backend.as_ref()?;
+    config
+        .route_destination_policies
+        .get(&route.label)
+        .and_then(|policies| policies.get(&route_backend.cluster_name().to_string()))
+}
+
+fn maybe_spawn_shadow_http1_request(
+    config: &Http1ProxyConfig,
+    request: &lb_proto_http::Http1RequestHead,
+    effective_client_ip: IpAddr,
+    requested_upgrade: Option<lb_config_model::UpgradeProtocolConfig>,
+    destination_policy: Option<&RouteDestinationPolicyRuntime>,
+    metrics: &mut Http1ConnectionMetrics,
+) {
+    let Some(mirror_policy) = destination_policy.and_then(|policy| policy.traffic_mirror.as_ref()) else {
+        return;
+    };
+    if !shadow_request_selected(mirror_policy, request) {
+        metrics.mirror_skip_count += 1;
+        return;
+    }
+    if requested_upgrade.is_some() || !matches!(request.body_kind, lb_proto_http::BodyKind::None) {
+        metrics.mirror_skip_count += 1;
+        return;
+    }
+    let Some(target) = resolve_shadow_upstream(config, request, mirror_policy) else {
+        metrics.mirror_dispatch_failure_count += 1;
+        return;
+    };
+
+    metrics.mirror_dispatch_count += 1;
+    let request = request.clone();
+    let limits = config.limits.clone();
+    let timeouts = config.timeouts;
+    tokio::spawn(async move {
+        let _ = dispatch_shadow_http1_request(target, request, effective_client_ip, timeouts, limits).await;
+    });
+}
+
+fn shadow_request_selected(
+    mirror_policy: &lb_config_model::TrafficMirrorPolicyConfig,
+    request: &lb_proto_http::Http1RequestHead,
+) -> bool {
+    fault_injection_action_selected("mirror", mirror_policy.percentage, request)
+}
+
+async fn maybe_inject_http1_fault<W>(
+    request: &lb_proto_http::Http1RequestHead,
+    downstream: &mut W,
+    destination_policy: Option<&RouteDestinationPolicyRuntime>,
+    metrics: &mut Http1ConnectionMetrics,
+) -> Result<Option<StatusCode>, std::io::Error>
+where
+    W: AsyncWrite + Unpin,
+{
+    let Some(fault_policy) = destination_policy.and_then(|policy| policy.fault_injection.as_ref()) else {
+        return Ok(None);
+    };
+
+    if let Some(delay) = fault_policy.delay.as_ref().filter(|delay| {
+        fault_injection_action_selected("delay", delay.percentage, request)
+    }) {
+        metrics.fault_injection_delay_count += 1;
+        time::sleep(Duration::from_millis(delay.fixed_delay_ms)).await;
+    }
+
+    let Some(abort) = fault_policy.abort.as_ref().filter(|abort| {
+        fault_injection_action_selected("abort", abort.percentage, request)
+    }) else {
+        return Ok(None);
+    };
+    metrics.fault_injection_abort_count += 1;
+    let status = StatusCode::from_u16(abort.http_status)
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    write_local_response(downstream, request.keep_alive, status, "fault injection abort\n").await?;
+    Ok(Some(status))
+}
+
+fn fault_injection_action_selected(
+    action: &str,
+    percentage: u8,
+    request: &lb_proto_http::Http1RequestHead,
+) -> bool {
+    if percentage >= 100 {
+        return true;
+    }
+    let authority = request_authority(request).unwrap_or_default();
+    let key = format!("{action} {} {} {}", request.method, request.target, authority);
+    stable_request_hash(key.as_bytes()) % 100 < u64::from(percentage)
+}
+
+fn resolve_shadow_upstream(
+    config: &Http1ProxyConfig,
+    request: &lb_proto_http::Http1RequestHead,
+    mirror_policy: &lb_config_model::TrafficMirrorPolicyConfig,
+) -> Option<lb_net_core::UpstreamTarget> {
+    let pool = config
+        .mirror_backend_pools
+        .get(&mirror_policy.target_upstream_cluster)?;
+    pool.select_backend_with_context(&selection_context_for_request(request, pool.affinity_policy()))
+        .ok()
+        .map(|selected| selected.into_upstream())
+}
+
+fn enforce_destination_local_limits(
+    destination_policy: Option<&RouteDestinationPolicyRuntime>,
+    request: &lb_proto_http::Http1RequestHead,
+    selected_upstream: &SelectedUpstream,
+    effective_client_ip: IpAddr,
+) -> Result<Vec<crate::LocalConcurrencyLease>, (StatusCode, &'static str)> {
+    let Some(destination_policy) = destination_policy else {
+        return Ok(Vec::new());
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO);
+    let context = crate::LimitContext {
+        source_ip: Some(effective_client_ip),
+        route_name: request.route.as_ref().map(|route| route.label.clone()),
+        upstream_cluster: selected_upstream
+            .route_backend
+            .as_ref()
+            .map(|route_backend| route_backend.cluster_name().to_string()),
+    };
+
+    for limiter in &destination_policy.rate_limiters {
+        match limiter.check(now, &context) {
+            Ok(decision) if decision.allowed => {}
+            Ok(_) | Err(_) => {
+                return Err((StatusCode::TOO_MANY_REQUESTS, "route destination rate limited\n"));
+            }
+        }
+    }
+
+    let mut leases = Vec::with_capacity(destination_policy.concurrency_limiters.len());
+    for limiter in &destination_policy.concurrency_limiters {
+        match limiter.try_acquire(&context) {
+            Ok(lease) => leases.push(lease),
+            Err(_) => {
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "route destination concurrency limited\n",
+                ));
+            }
+        }
+    }
+
+    Ok(leases)
+}
+
+fn destination_failure_manager(
+    destination_policy: Option<&RouteDestinationPolicyRuntime>,
+) -> Option<&crate::FailureManager> {
+    destination_policy.and_then(|policy| policy.failure_manager.as_deref())
+}
+
+fn failure_policy_now() -> Duration {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+}
+
+fn effective_destination_upstream_timeouts(
+    base: &lb_net_core::ConnectionTimeouts,
+    destination_policy: Option<&RouteDestinationPolicyRuntime>,
+) -> lb_net_core::ConnectionTimeouts {
+    let Some(destination_policy) = destination_policy else {
+        return *base;
+    };
+    if !destination_policy.enforce_timeout_hierarchy {
+        return *base;
+    }
+    let Some(manager) = destination_failure_manager(Some(destination_policy)) else {
+        return *base;
+    };
+
+    lb_net_core::ConnectionTimeouts {
+        connect_timeout: manager.effective_timeout(crate::TimeoutCategory::Connect),
+        preface_timeout: base.preface_timeout,
+        idle_timeout: manager.effective_timeout(crate::TimeoutCategory::Idle),
+    }
+}
+
+fn bounded_dispatch_timeout(
+    destination_policy: Option<&RouteDestinationPolicyRuntime>,
+    base_category: crate::TimeoutCategory,
+    base_timeout: Duration,
+    request_started: Instant,
+    attempt_started: Instant,
+) -> Result<(Duration, crate::TimeoutCategory), crate::TimeoutCategory> {
+    let Some(destination_policy) = destination_policy else {
+        return Ok((base_timeout, base_category));
+    };
+    if !destination_policy.enforce_timeout_hierarchy {
+        return Ok((base_timeout, base_category));
+    }
+    let Some(manager) = destination_failure_manager(Some(destination_policy)) else {
+        return Ok((base_timeout, base_category));
+    };
+
+    let mut selected = (base_timeout, base_category);
+    for (category, started_at) in [
+        (crate::TimeoutCategory::Request, request_started),
+        (crate::TimeoutCategory::Attempt, attempt_started),
+    ] {
+        let allowed = manager.effective_timeout(category);
+        let elapsed = started_at.elapsed();
+        if elapsed >= allowed {
+            return Err(category);
+        }
+        let remaining = allowed.saturating_sub(elapsed);
+        if remaining < selected.0 {
+            selected = (remaining, category);
+        }
+    }
+
+    Ok(selected)
+}
+
+fn record_destination_timeout(
+    destination_policy: Option<&RouteDestinationPolicyRuntime>,
+    category: crate::TimeoutCategory,
+) {
+    if let Some(policy) = destination_policy.filter(|policy| policy.enforce_timeout_hierarchy) {
+        if let Some(manager) = destination_failure_manager(Some(policy)) {
+            manager.record_timeout(category);
+            manager.record_failure(failure_policy_now(), crate::UpstreamFailureClass::Timeout);
+        }
+    }
+}
+
+fn record_destination_failure(
+    destination_policy: Option<&RouteDestinationPolicyRuntime>,
+    class: crate::UpstreamFailureClass,
+) {
+    if let Some(policy) = destination_policy.filter(|policy| policy.enforce_circuit_breaker) {
+        if let Some(manager) = destination_failure_manager(Some(policy)) {
+            manager.record_failure(failure_policy_now(), class);
+        }
+    }
+}
+
+fn record_destination_success(destination_policy: Option<&RouteDestinationPolicyRuntime>) {
+    if let Some(policy) = destination_policy.filter(|policy| policy.enforce_circuit_breaker) {
+        if let Some(manager) = destination_failure_manager(Some(policy)) {
+            manager.record_success();
+        }
+    }
+}
+
+fn allow_destination_retry(
+    destination_policy: Option<&RouteDestinationPolicyRuntime>,
+    class: crate::UpstreamFailureClass,
+) -> bool {
+    let Some(policy) = destination_policy else {
+        return true;
+    };
+    if !policy.enforce_retry_budget {
+        return true;
+    }
+    destination_failure_manager(Some(policy))
+        .is_some_and(|manager| manager.allow_retry(failure_policy_now(), class).allowed)
+}
+
+fn classify_http1_response_failure(status: u16) -> Option<crate::UpstreamFailureClass> {
+    match status {
+        503 => Some(crate::UpstreamFailureClass::Overloaded),
+        500 | 502 | 504 => Some(crate::UpstreamFailureClass::Temporary),
+        501 | 505 => Some(crate::UpstreamFailureClass::Permanent),
+        500..=599 => Some(crate::UpstreamFailureClass::Temporary),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpgradeRequestError {
+    MissingUpgradeHeader,
+    MissingConnectionToken,
+    UnsupportedProtocol,
+    InvalidMethod,
+    BodyNotAllowed,
+}
+
+impl UpgradeRequestError {
+    const fn message(self) -> &'static str {
+        match self {
+            Self::MissingUpgradeHeader => "malformed upgrade request: missing Upgrade header\n",
+            Self::MissingConnectionToken => {
+                "malformed upgrade request: missing Connection: upgrade token\n"
+            }
+            Self::UnsupportedProtocol => "unsupported upgrade protocol\n",
+            Self::InvalidMethod => "websocket upgrade requires GET\n",
+            Self::BodyNotAllowed => "websocket upgrade requests must not include a body\n",
+        }
+    }
+
+    const fn telemetry_reason(self) -> &'static str {
+        match self {
+            Self::MissingUpgradeHeader => "missing_upgrade_header",
+            Self::MissingConnectionToken => "missing_connection_upgrade",
+            Self::UnsupportedProtocol => "unsupported_protocol",
+            Self::InvalidMethod => "invalid_method",
+            Self::BodyNotAllowed => "body_not_allowed",
+        }
+    }
+}
+
+fn route_allows_requested_upgrade(
+    config: &Http1ProxyConfig,
+    route: Option<&lb_proto_http::RouteMatch>,
+) -> bool {
+    config
+        .listener_upgrade_protocols
+        .contains(&lb_config_model::UpgradeProtocolConfig::Websocket)
+        || route.is_some_and(|route| {
+            config
+                .route_upgrade_protocols
+                .get(&route.label)
+                .is_some_and(|protocols| {
+                    protocols.contains(&lb_config_model::UpgradeProtocolConfig::Websocket)
+                })
+        })
+}
+
+fn classify_requested_upgrade(
+    request: &lb_proto_http::Http1RequestHead,
+) -> Result<Option<lb_config_model::UpgradeProtocolConfig>, UpgradeRequestError> {
+    let connection_has_upgrade = header_value_contains_token(&request.headers, "connection", "upgrade");
+    let upgrade_header = single_header_value(&request.headers, "upgrade");
+
+    let Some(upgrade_header) = upgrade_header else {
+        return if connection_has_upgrade {
+            Err(UpgradeRequestError::MissingUpgradeHeader)
+        } else {
+            Ok(None)
+        };
+    };
+
+    if !connection_has_upgrade {
+        return Err(UpgradeRequestError::MissingConnectionToken);
+    }
+    if !upgrade_header.eq_ignore_ascii_case("websocket") {
+        return Err(UpgradeRequestError::UnsupportedProtocol);
+    }
+    if !request.method.eq_ignore_ascii_case("GET") {
+        return Err(UpgradeRequestError::InvalidMethod);
+    }
+    if !matches!(request.body_kind, lb_proto_http::BodyKind::None) {
+        return Err(UpgradeRequestError::BodyNotAllowed);
+    }
+
+    Ok(Some(lb_config_model::UpgradeProtocolConfig::Websocket))
+}
+
+fn single_header_value<'a>(headers: &'a [lb_proto_http::HttpHeader], name: &str) -> Option<&'a str> {
+    let mut matches = headers.iter().filter(|header| header.name.eq_ignore_ascii_case(name));
+    let first = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    Some(first.value.as_str())
+}
+
+fn header_value_contains_token(
+    headers: &[lb_proto_http::HttpHeader],
+    header_name: &str,
+    token: &str,
+) -> bool {
+    headers
+        .iter()
+        .filter(|header| header.name.eq_ignore_ascii_case(header_name))
+        .flat_map(|header| header.value.split(','))
+        .map(str::trim)
+        .any(|candidate| candidate.eq_ignore_ascii_case(token))
+}
+
+fn append_upgrade_headers(
+    target: &mut Vec<lb_proto_http::HttpHeader>,
+    source: &[lb_proto_http::HttpHeader],
+) {
+    target.extend(
+        source
+            .iter()
+            .filter(|header| {
+                header.name.eq_ignore_ascii_case("connection")
+                    || header.name.eq_ignore_ascii_case("upgrade")
+            })
+            .cloned(),
+    );
+}
+
+fn response_accepts_requested_upgrade(
+    response: &lb_proto_http::Http1ResponseHead,
+    requested_upgrade: lb_config_model::UpgradeProtocolConfig,
+) -> bool {
+    match requested_upgrade {
+        lb_config_model::UpgradeProtocolConfig::Websocket => {
+            header_value_contains_token(&response.headers, "connection", "upgrade")
+                && single_header_value(&response.headers, "upgrade")
+                    .is_some_and(|value| value.eq_ignore_ascii_case("websocket"))
+        }
+    }
+}
+
+fn record_upgrade_telemetry(
+    config: &Http1ProxyConfig,
+    result: HttpUpgradeResult,
+    reason: &str,
+    detail: &str,
+) {
+    if let Some(telemetry) = config.upgrade_telemetry.as_ref() {
+        let _ = telemetry
+            .telemetry
+            .record_http_upgrade(&telemetry.scope, result, reason, detail);
+    }
+}
+
+fn merge_request_transforms(
+    listener: Option<&lb_config_model::RequestTransformConfig>,
+    route: Option<&lb_config_model::RequestTransformConfig>,
+) -> Option<lb_config_model::RequestTransformConfig> {
+    if listener.is_none() && route.is_none() {
+        return None;
+    }
+
+    let mut merged = listener.cloned().unwrap_or_default();
+    if let Some(route) = route {
+        if route.path_rewrite.is_some() {
+            merged.path_rewrite = route.path_rewrite.clone();
+        }
+        if route.host_rewrite.is_some() {
+            merged.host_rewrite = route.host_rewrite.clone();
+        }
+        merged.header_mutations.extend(route.header_mutations.clone());
+    }
+    Some(merged)
+}
+
+fn merge_response_transforms(
+    listener: Option<&lb_config_model::ResponseTransformConfig>,
+    route: Option<&lb_config_model::ResponseTransformConfig>,
+) -> Option<lb_config_model::ResponseTransformConfig> {
+    if listener.is_none() && route.is_none() {
+        return None;
+    }
+
+    let mut merged = listener.cloned().unwrap_or_default();
+    if let Some(route) = route {
+        merged.header_mutations.extend(route.header_mutations.clone());
+    }
+    Some(merged)
+}
+
+fn apply_request_transform(
+    request: &mut lb_proto_http::Http1RequestHead,
+    transform: &lb_config_model::RequestTransformConfig,
+) -> Result<(), lb_proto_http::RequestTargetError> {
+    if transform.path_rewrite.is_some() || transform.host_rewrite.is_some() {
+        request.target = rewrite_http1_request_target(
+            &request.target,
+            transform.path_rewrite.as_ref(),
+            transform.host_rewrite.as_deref(),
+        )?;
+    }
+    apply_http1_header_mutations(&mut request.headers, &transform.header_mutations);
+    if let Some(host_rewrite) = transform.host_rewrite.as_deref() {
+        upsert_http1_header(&mut request.headers, "host", host_rewrite);
+    }
+    Ok(())
+}
+
+fn apply_http1_header_mutations(
+    headers: &mut Vec<lb_proto_http::HttpHeader>,
+    mutations: &[lb_config_model::HeaderMutationConfig],
+) {
+    for mutation in mutations {
+        match mutation {
+            lb_config_model::HeaderMutationConfig::Set { name, value } => {
+                let normalized = lb_proto_http::normalize_http_header_name(name)
+                    .unwrap_or_else(|| name.to_ascii_lowercase());
+                headers.retain(|header| !header.name.eq_ignore_ascii_case(&normalized));
+                headers.push(lb_proto_http::HttpHeader {
+                    name: normalized,
+                    value: value.clone(),
+                });
+            }
+            lb_config_model::HeaderMutationConfig::Remove { name } => {
+                headers.retain(|header| !header.name.eq_ignore_ascii_case(name));
+            }
+        }
+    }
+}
+
+fn upsert_http1_header(
+    headers: &mut Vec<lb_proto_http::HttpHeader>,
+    name: &str,
+    value: &str,
+) {
+    headers.retain(|header| !header.name.eq_ignore_ascii_case(name));
+    headers.push(lb_proto_http::HttpHeader {
+        name: name.to_ascii_lowercase(),
+        value: value.to_string(),
+    });
+}
+
+fn rewrite_http1_request_target(
+    target: &str,
+    path_rewrite: Option<&lb_config_model::PathRewriteTransformConfig>,
+    host_rewrite: Option<&str>,
+) -> Result<String, lb_proto_http::RequestTargetError> {
+    let target = target.trim();
+    if target.is_empty() || target == "*" {
+        return Err(lb_proto_http::RequestTargetError::UnsupportedForm);
+    }
+    if target.contains('#') {
+        return Err(lb_proto_http::RequestTargetError::FragmentNotAllowed);
+    }
+
+    let (scheme, authority, path_and_query) = if let Some(scheme_end) = target.find("://") {
+        let scheme = &target[..scheme_end];
+        if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+            return Err(lb_proto_http::RequestTargetError::UnsupportedForm);
+        }
+        let remainder = &target[scheme_end + 3..];
+        let split_index = remainder.find(['/', '?']).unwrap_or(remainder.len());
+        let authority = &remainder[..split_index];
+        if authority.trim().is_empty() {
+            return Err(lb_proto_http::RequestTargetError::EmptyAuthority);
+        }
+        let tail = &remainder[split_index..];
+        let path_and_query = if tail.is_empty() {
+            String::from("/")
+        } else if tail.starts_with('?') {
+            format!("/{tail}")
+        } else {
+            tail.to_string()
+        };
+        (Some(scheme), Some(authority), path_and_query)
+    } else if target.starts_with('/') {
+        (None, None, target.to_string())
+    } else {
+        return Err(lb_proto_http::RequestTargetError::UnsupportedForm);
+    };
+
+    let rewritten_path_and_query = rewrite_path_and_query(&path_and_query, path_rewrite);
+    if let Some(scheme) = scheme {
+        let authority = host_rewrite.or(authority).unwrap_or_default();
+        Ok(format!("{scheme}://{authority}{rewritten_path_and_query}"))
+    } else {
+        Ok(rewritten_path_and_query)
+    }
+}
+
+fn rewrite_path_and_query(
+    path_and_query: &str,
+    path_rewrite: Option<&lb_config_model::PathRewriteTransformConfig>,
+) -> String {
+    let Some(path_rewrite) = path_rewrite else {
+        return path_and_query.to_string();
+    };
+    let (path, query) = match path_and_query.split_once('?') {
+        Some((path, query)) => (if path.is_empty() { "/" } else { path }, Some(query)),
+        None => (path_and_query, None),
+    };
+    let rewritten_path = match path_rewrite {
+        lb_config_model::PathRewriteTransformConfig::ReplacePrefix {
+            match_prefix,
+            replacement,
+        } if path.starts_with(match_prefix) => {
+            format!("{replacement}{}", &path[match_prefix.len()..])
+        }
+        lb_config_model::PathRewriteTransformConfig::ReplacePrefix { .. } => path.to_string(),
+    };
+    query.map_or(rewritten_path.clone(), |query| format!("{rewritten_path}?{query}"))
+}
+
 fn selection_context_for_request(
     request: &lb_proto_http::Http1RequestHead,
     affinity_policy: Option<&crate::AffinityPolicy>,
@@ -766,7 +1877,9 @@ fn resolve_effective_client_ip(
     request: &lb_proto_http::Http1RequestHead,
 ) -> Result<IpAddr, crate::TrustedClientIpError> {
     config.trusted_client_ip.as_ref().map_or(Ok(downstream_addr.ip()), |policy| {
-        policy.resolve_from_http1_headers(downstream_addr.ip(), &request.headers)
+        policy
+            .resolve_resolution_from_http1_headers(downstream_addr.ip(), &request.headers)
+            .map(|resolution| resolution.client_ip)
     })
 }
 
@@ -956,6 +2069,9 @@ async fn process_uncached_request<S>(
     config: &Http1ProxyConfig,
     selected_upstream: &lb_net_core::UpstreamTarget,
     request: &lb_proto_http::Http1RequestHead,
+    requested_upgrade: Option<lb_config_model::UpgradeProtocolConfig>,
+    destination_policy: Option<&RouteDestinationPolicyRuntime>,
+    response_transform: Option<&lb_config_model::ResponseTransformConfig>,
     cache_lookup_key: Option<HttpCacheKey>,
     stale_fallback: Option<&HttpCacheEntry>,
     revalidation_entry: Option<&HttpCacheEntry>,
@@ -965,9 +2081,40 @@ async fn process_uncached_request<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    if let Some(policy) = destination_policy.filter(|policy| policy.enforce_retry_budget) {
+        if let Some(manager) = destination_failure_manager(Some(policy)) {
+            manager.record_base_request(failure_policy_now());
+        }
+    }
+
+    let effective_timeouts =
+        effective_destination_upstream_timeouts(&config.timeouts, destination_policy);
+    let request_started = Instant::now();
     let mut retried_stale_reuse = false;
     let mut close_upstream = false;
     loop {
+        let attempt_started = Instant::now();
+        if let Some(policy) = destination_policy.filter(|policy| policy.enforce_circuit_breaker) {
+            if let Some(manager) = destination_failure_manager(Some(policy)) {
+                if !manager.allow_request(failure_policy_now()) {
+                    write_local_response(
+                        downstream,
+                        request.keep_alive,
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "route destination circuit open\n",
+                    )
+                    .await
+                    .map_err(Http1ProxyError::ResponseIo)?;
+                    metrics.request_count += 1;
+                    *metrics
+                        .response_status_counts
+                        .entry(StatusCode::SERVICE_UNAVAILABLE.as_u16())
+                        .or_insert(0) += 1;
+                    break Ok(StatusCode::SERVICE_UNAVAILABLE.as_u16());
+                }
+            }
+        }
+
         let reused_existing_connection = ensure_upstream_connection(
             upstream,
             active_upstream,
@@ -976,9 +2123,21 @@ where
             upstream_addr,
             connect_duration,
             selected_upstream,
-            &config.timeouts,
+            &effective_timeouts,
         )
-        .await?;
+        .await
+        .map_err(|error| {
+            match &error {
+                Http1ProxyError::ConnectTimeout { .. } => {
+                    record_destination_timeout(destination_policy, crate::TimeoutCategory::Connect);
+                }
+                Http1ProxyError::Connect { .. } => {
+                    record_destination_failure(destination_policy, crate::UpstreamFailureClass::Connect);
+                }
+                _ => {}
+            }
+            error
+        })?;
         let retry_stale_reuse = reused_existing_connection
             && !retried_stale_reuse
             && request_is_safe_stale_reuse_retry_candidate(request);
@@ -994,10 +2153,13 @@ where
                 request.keep_alive,
                 &request.body_kind,
             );
-            let normalized_request_headers = append_conditional_revalidation_headers(
+            let mut normalized_request_headers = append_conditional_revalidation_headers(
                 normalized_request_headers,
                 revalidation_entry,
             );
+            if requested_upgrade.is_some() {
+                append_upgrade_headers(&mut normalized_request_headers, &request.headers);
+            }
             let request_head = lb_proto_http::encode_request_head(
                 &request.method,
                 &request.target,
@@ -1006,25 +2168,97 @@ where
             );
             if let Err(source) = upstream_stream.write_all(&request_head).await {
                 drop_upstream_connection(upstream, last_upstream_activity, upstream_connected_at);
-                if retry_stale_reuse {
+                record_destination_failure(destination_policy, crate::UpstreamFailureClass::Connect);
+                if retry_stale_reuse
+                    && allow_destination_retry(
+                        destination_policy,
+                        crate::UpstreamFailureClass::Connect,
+                    )
+                {
                     retried_stale_reuse = true;
                     continue;
                 }
                 break Err(Http1ProxyError::RequestIo(source));
             }
+            let (request_body_timeout, request_body_timeout_category) =
+                match bounded_dispatch_timeout(
+                    destination_policy,
+                    crate::TimeoutCategory::Idle,
+                    effective_timeouts.idle_timeout,
+                    request_started,
+                    attempt_started,
+                ) {
+                    Ok(value) => value,
+                    Err(category) => {
+                        record_destination_timeout(destination_policy, category);
+                        write_local_response(
+                            downstream,
+                            request.keep_alive,
+                            StatusCode::GATEWAY_TIMEOUT,
+                            "route destination timed out\n",
+                        )
+                        .await
+                        .map_err(Http1ProxyError::ResponseIo)?;
+                        metrics.request_count += 1;
+                        *metrics
+                            .response_status_counts
+                            .entry(StatusCode::GATEWAY_TIMEOUT.as_u16())
+                            .or_insert(0) += 1;
+                        break Ok(StatusCode::GATEWAY_TIMEOUT.as_u16());
+                    }
+                };
             relay_body(
                 downstream,
                 downstream_buffer,
                 upstream_stream,
                 &request.body_kind,
                 config.limits.max_body_bytes,
-                config.timeouts.idle_timeout,
+                request_body_timeout,
                 RelayDirection::Request,
             )
-            .await?;
+            .await
+            .map_err(|error| {
+                if matches!(error, Http1ProxyError::IdleTimeout(_)) {
+                    record_destination_timeout(destination_policy, request_body_timeout_category);
+                } else {
+                    record_destination_failure(
+                        destination_policy,
+                        crate::UpstreamFailureClass::Temporary,
+                    );
+                }
+                error
+            })?;
+
+            let (response_head_timeout, response_head_timeout_category) =
+                match bounded_dispatch_timeout(
+                    destination_policy,
+                    crate::TimeoutCategory::Idle,
+                    effective_timeouts.idle_timeout,
+                    request_started,
+                    attempt_started,
+                ) {
+                    Ok(value) => value,
+                    Err(category) => {
+                        record_destination_timeout(destination_policy, category);
+                        write_local_response(
+                            downstream,
+                            request.keep_alive,
+                            StatusCode::GATEWAY_TIMEOUT,
+                            "route destination timed out\n",
+                        )
+                        .await
+                        .map_err(Http1ProxyError::ResponseIo)?;
+                        metrics.request_count += 1;
+                        *metrics
+                            .response_status_counts
+                            .entry(StatusCode::GATEWAY_TIMEOUT.as_u16())
+                            .or_insert(0) += 1;
+                        break Ok(StatusCode::GATEWAY_TIMEOUT.as_u16());
+                    }
+                };
 
             let response = match time::timeout(
-                config.timeouts.idle_timeout,
+                response_head_timeout,
                 lb_proto_http::read_response_head(
                     upstream_stream,
                     upstream_buffer,
@@ -1042,13 +2276,24 @@ where
                         last_upstream_activity,
                         upstream_connected_at,
                     );
-                    if retry_stale_reuse && http1_stale_reuse_retryable_response_error(&error) {
+                    record_destination_failure(
+                        destination_policy,
+                        crate::UpstreamFailureClass::Temporary,
+                    );
+                    if retry_stale_reuse
+                        && http1_stale_reuse_retryable_response_error(&error)
+                        && allow_destination_retry(
+                            destination_policy,
+                            crate::UpstreamFailureClass::Temporary,
+                        )
+                    {
                         retried_stale_reuse = true;
                         continue;
                     }
                     break Err(error);
                 }
                 Err(_) => {
+                    record_destination_timeout(destination_policy, response_head_timeout_category);
                     drop_upstream_connection(
                         upstream,
                         last_upstream_activity,
@@ -1063,6 +2308,95 @@ where
                 response.keep_alive,
                 &response.body_kind,
             );
+            let mut normalized_response_headers = normalized_response_headers;
+            if let Some(requested_upgrade) = requested_upgrade {
+                if response.status == StatusCode::SWITCHING_PROTOCOLS.as_u16() {
+                    if !response_accepts_requested_upgrade(&response, requested_upgrade) {
+                        record_upgrade_telemetry(
+                            config,
+                            HttpUpgradeResult::Failed,
+                            "malformed_101",
+                            "upstream returned 101 without valid upgrade response headers",
+                        );
+                        drop_upstream_connection(
+                            upstream,
+                            last_upstream_activity,
+                            upstream_connected_at,
+                        );
+                        break Err(Http1ProxyError::ParseResponse(
+                            lb_proto_http::Http1ParseError::Invalid(
+                                "invalid upgrade response headers",
+                            ),
+                        ));
+                    }
+                    append_upgrade_headers(&mut normalized_response_headers, &response.headers);
+                    let response_head = lb_proto_http::encode_response_head(
+                        response.version,
+                        response.status,
+                        &response.reason,
+                        &normalized_response_headers,
+                    );
+                    downstream
+                        .write_all(&response_head)
+                        .await
+                        .map_err(Http1ProxyError::ResponseIo)?;
+                    record_upgrade_telemetry(
+                        config,
+                        HttpUpgradeResult::Accepted,
+                        "websocket",
+                        "upgrade tunnel established",
+                    );
+                    if let Err(error) = relay_upgraded_streams(
+                        downstream,
+                        downstream_buffer,
+                        upstream_stream,
+                        upstream_buffer,
+                        effective_timeouts.idle_timeout,
+                    )
+                    .await
+                    {
+                        let reason = match &error {
+                            Http1ProxyError::IdleTimeout("upgrade tunnel") => {
+                                "tunnel_idle_timeout"
+                            }
+                            _ => "tunnel_io",
+                        };
+                        record_upgrade_telemetry(
+                            config,
+                            HttpUpgradeResult::Failed,
+                            reason,
+                            "upgrade tunnel terminated before clean shutdown",
+                        );
+                        if matches!(error, Http1ProxyError::IdleTimeout(_)) {
+                            record_destination_timeout(
+                                destination_policy,
+                                crate::TimeoutCategory::Idle,
+                            );
+                        } else {
+                            record_destination_failure(
+                                destination_policy,
+                                crate::UpstreamFailureClass::Temporary,
+                            );
+                        }
+                        return Err(error);
+                    }
+                    metrics.request_count += 1;
+                    *metrics.response_status_counts.entry(response.status).or_insert(0) += 1;
+                    record_destination_success(destination_policy);
+                    drop_upstream_connection(
+                        upstream,
+                        last_upstream_activity,
+                        upstream_connected_at,
+                    );
+                    break Ok(response.status);
+                }
+                record_upgrade_telemetry(
+                    config,
+                    HttpUpgradeResult::Failed,
+                    "upstream_refused",
+                    "upstream declined the requested protocol upgrade",
+                );
+            }
             let upstream_response_status = response.status;
             let use_stale_if_error_response =
                 stale_fallback.is_some() && is_stale_if_error_response_status(response.status);
@@ -1098,6 +2432,7 @@ where
                         &request.method,
                         request.keep_alive,
                         &refreshed_entry,
+                        response_transform,
                     )
                     .await
                     .map_err(Http1ProxyError::ResponseIo)?;
@@ -1106,6 +2441,7 @@ where
                         .response_status_counts
                         .entry(refreshed_entry.metadata.status.as_u16())
                         .or_insert(0) += 1;
+                    record_destination_success(destination_policy);
                     close_upstream = !response.keep_alive;
                     if close_upstream {
                         drop_upstream_connection(
@@ -1125,6 +2461,7 @@ where
                         &request.method,
                         request.keep_alive,
                         stale_entry,
+                        response_transform,
                     )
                     .await
                     .map_err(Http1ProxyError::ResponseIo)?;
@@ -1140,6 +2477,7 @@ where
                         .response_status_counts
                         .entry(stale_entry.metadata.status.as_u16())
                         .or_insert(0) += 1;
+                    record_destination_success(destination_policy);
                     close_upstream = true;
                     if close_upstream {
                         drop_upstream_connection(
@@ -1151,11 +2489,18 @@ where
                     break Ok(upstream_response_status);
                 }
             } else {
+                let mut downstream_response_headers = normalized_response_headers.clone();
+                if let Some(transform) = response_transform {
+                    apply_http1_header_mutations(
+                        &mut downstream_response_headers,
+                        &transform.header_mutations,
+                    );
+                }
                 let response_head = lb_proto_http::encode_response_head(
                     response.version,
                     response.status,
                     &response.reason,
-                    &normalized_response_headers,
+                    &downstream_response_headers,
                 );
                 downstream.write_all(&response_head).await.map_err(Http1ProxyError::ResponseIo)?;
 
@@ -1208,20 +2553,65 @@ where
                     }
                 }
                 if !filled_cache {
+                    let (response_body_timeout, response_body_timeout_category) =
+                        match bounded_dispatch_timeout(
+                            destination_policy,
+                            crate::TimeoutCategory::Idle,
+                            effective_timeouts.idle_timeout,
+                            request_started,
+                            attempt_started,
+                        ) {
+                            Ok(value) => value,
+                            Err(category) => {
+                                record_destination_timeout(destination_policy, category);
+                                write_local_response(
+                                    downstream,
+                                    request.keep_alive,
+                                    StatusCode::GATEWAY_TIMEOUT,
+                                    "route destination timed out\n",
+                                )
+                                .await
+                                .map_err(Http1ProxyError::ResponseIo)?;
+                                metrics.request_count += 1;
+                                *metrics
+                                    .response_status_counts
+                                    .entry(StatusCode::GATEWAY_TIMEOUT.as_u16())
+                                    .or_insert(0) += 1;
+                                break Ok(StatusCode::GATEWAY_TIMEOUT.as_u16());
+                            }
+                        };
                     relay_body(
                         upstream_stream,
                         upstream_buffer,
                         downstream,
                         &response.body_kind,
                         config.limits.max_body_bytes,
-                        config.timeouts.idle_timeout,
+                        response_body_timeout,
                         RelayDirection::Response,
                     )
-                    .await?;
+                    .await
+                    .map_err(|error| {
+                        if matches!(error, Http1ProxyError::IdleTimeout(_)) {
+                            record_destination_timeout(
+                                destination_policy,
+                                response_body_timeout_category,
+                            );
+                        } else {
+                            record_destination_failure(
+                                destination_policy,
+                                crate::UpstreamFailureClass::Temporary,
+                            );
+                        }
+                        error
+                    })?;
                 }
 
                 metrics.request_count += 1;
                 *metrics.response_status_counts.entry(response.status).or_insert(0) += 1;
+                match classify_http1_response_failure(response.status) {
+                    Some(class) => record_destination_failure(destination_policy, class),
+                    None => record_destination_success(destination_policy),
+                }
                 if !response.keep_alive {
                     close_upstream = true;
                 }
@@ -1310,9 +2700,123 @@ fn drop_upstream_connection(
     let _ = upstream.take();
 }
 
+#[derive(Default)]
+struct VecAsyncWriter {
+    bytes: Vec<u8>,
+}
+
+impl VecAsyncWriter {
+    fn into_inner(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+impl AsyncWrite for VecAsyncWriter {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, std::io::Error>> {
+        self.bytes.extend_from_slice(buf);
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+fn local_http1_response(
+    keep_alive: bool,
+    status: StatusCode,
+    body: &'static str,
+) -> Http1SingleRequestResponse {
+    let mut headers = vec![lb_proto_http::HttpHeader {
+        name: String::from("content-type"),
+        value: String::from("text/plain; charset=utf-8"),
+    }];
+    if !keep_alive {
+        headers.push(lb_proto_http::HttpHeader {
+            name: String::from("connection"),
+            value: String::from("close"),
+        });
+    }
+    headers.push(lb_proto_http::HttpHeader {
+        name: String::from("content-length"),
+        value: body.len().to_string(),
+    });
+    Http1SingleRequestResponse {
+        head: lb_proto_http::Http1ResponseHead {
+            version: lb_proto_http::SupportedHttpVersion::Http1,
+            status: status.as_u16(),
+            reason: String::new(),
+            headers,
+            body_kind: lb_proto_http::BodyKind::ContentLength(body.len() as u64),
+            keep_alive,
+        },
+        body: body.as_bytes().to_vec(),
+    }
+}
+
 fn request_is_safe_stale_reuse_retry_candidate(request: &lb_proto_http::Http1RequestHead) -> bool {
     matches!(request.body_kind, lb_proto_http::BodyKind::None)
         && matches!(request.method.as_str(), "GET" | "HEAD" | "OPTIONS" | "TRACE")
+}
+
+async fn dispatch_shadow_http1_request(
+    target: lb_net_core::UpstreamTarget,
+    request: lb_proto_http::Http1RequestHead,
+    effective_client_ip: IpAddr,
+    timeouts: lb_net_core::ConnectionTimeouts,
+    limits: lb_proto_http::Http1Limits,
+) -> Result<(), Http1ProxyError> {
+    let mut stream = time::timeout(timeouts.connect_timeout, TcpStream::connect(target.address))
+        .await
+        .map_err(|_| Http1ProxyError::ConnectTimeout { target: target.address })?
+        .map_err(|source| Http1ProxyError::Connect { target: target.address, source })?;
+
+    let normalized_request_headers = lb_proto_http::normalize_request_headers(
+        &request.headers,
+        effective_client_ip,
+        request.keep_alive,
+        &request.body_kind,
+    );
+    let request_head = lb_proto_http::encode_request_head(
+        &request.method,
+        &request.target,
+        request.version,
+        &normalized_request_headers,
+    );
+    stream
+        .write_all(&request_head)
+        .await
+        .map_err(Http1ProxyError::RequestIo)?;
+
+    let mut upstream_buffer = Vec::new();
+    let response = time::timeout(
+        timeouts.idle_timeout,
+        lb_proto_http::read_response_head(&mut stream, &mut upstream_buffer, &limits, &request.method),
+    )
+    .await
+    .map_err(|_| Http1ProxyError::IdleTimeout("shadow response head"))?
+    .map_err(Http1ProxyError::ParseResponse)?;
+
+    let mut sink = tokio::io::sink();
+    relay_body(
+        &mut stream,
+        &mut upstream_buffer,
+        &mut sink,
+        &response.body_kind,
+        limits.max_body_bytes,
+        timeouts.idle_timeout,
+        RelayDirection::Response,
+    )
+    .await?;
+    Ok(())
 }
 
 fn http1_stale_reuse_retryable_response_error(error: &Http1ProxyError) -> bool {
@@ -1370,6 +2874,7 @@ async fn write_cached_response<W>(
     request_method: &str,
     keep_alive: bool,
     entry: &HttpCacheEntry,
+    response_transform: Option<&lb_config_model::ResponseTransformConfig>,
 ) -> Result<(), std::io::Error>
 where
     W: AsyncWrite + Unpin,
@@ -1385,6 +2890,9 @@ where
                 .map_or_else(|_| String::new(), std::string::ToString::to_string),
         })
         .collect::<Vec<_>>();
+    if let Some(transform) = response_transform {
+        apply_http1_header_mutations(&mut headers, &transform.header_mutations);
+    }
     if !keep_alive {
         headers.push(lb_proto_http::HttpHeader {
             name: String::from("connection"),
@@ -2113,6 +3621,87 @@ fn parse_side_error(
     match direction {
         RelayDirection::Request => Http1ProxyError::ParseRequest(source),
         RelayDirection::Response => Http1ProxyError::ParseResponse(source),
+    }
+}
+
+async fn relay_upgraded_streams<S>(
+    downstream: &mut S,
+    downstream_buffer: &mut Vec<u8>,
+    upstream: &mut TcpStream,
+    upstream_buffer: &mut Vec<u8>,
+    idle_timeout: Duration,
+) -> Result<(), Http1ProxyError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    if !downstream_buffer.is_empty() {
+        upstream.write_all(downstream_buffer).await.map_err(Http1ProxyError::RequestIo)?;
+        downstream_buffer.clear();
+    }
+    if !upstream_buffer.is_empty() {
+        downstream.write_all(upstream_buffer).await.map_err(Http1ProxyError::ResponseIo)?;
+        upstream_buffer.clear();
+    }
+
+    let (mut downstream_reader, mut downstream_writer) = tokio::io::split(downstream);
+    let (mut upstream_reader, mut upstream_writer) = upstream.split();
+
+    tokio::try_join!(
+        relay_upgrade_direction(
+            &mut downstream_reader,
+            &mut upstream_writer,
+            idle_timeout,
+            RelayDirection::Request,
+        ),
+        relay_upgrade_direction(
+            &mut upstream_reader,
+            &mut downstream_writer,
+            idle_timeout,
+            RelayDirection::Response,
+        ),
+    )?;
+    Ok(())
+}
+
+async fn relay_upgrade_direction<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    idle_timeout: Duration,
+    direction: RelayDirection,
+) -> Result<(), Http1ProxyError>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read_result = time::timeout(idle_timeout, reader.read(&mut buffer))
+            .await
+            .map_err(|_| relay_idle_timeout_error(direction))?;
+        let bytes_read = read_result.map_err(|source| relay_io_error(direction, source))?;
+        if bytes_read == 0 {
+            writer.shutdown().await.map_err(|source| relay_io_error(direction, source))?;
+            return Ok(());
+        }
+        writer
+            .write_all(&buffer[..bytes_read])
+            .await
+            .map_err(|source| relay_io_error(direction, source))?;
+    }
+}
+
+fn relay_idle_timeout_error(direction: RelayDirection) -> Http1ProxyError {
+    match direction {
+        RelayDirection::Request | RelayDirection::Response => {
+            Http1ProxyError::IdleTimeout("upgrade tunnel")
+        }
+    }
+}
+
+fn relay_io_error(direction: RelayDirection, source: std::io::Error) -> Http1ProxyError {
+    match direction {
+        RelayDirection::Request => Http1ProxyError::RequestIo(source),
+        RelayDirection::Response => Http1ProxyError::ResponseIo(source),
     }
 }
 

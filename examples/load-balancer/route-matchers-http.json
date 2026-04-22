@@ -1,0 +1,73 @@
+{
+  "api_version": "v1_alpha1",
+  "name": "edge-route-matchers-http",
+  "listeners": [
+    {
+      "name": "public-http",
+      "class": "public",
+      "bind_address": "127.0.0.1:8080",
+      "protocol": "http1",
+      "routes": ["tenant-write", "tenant-read"]
+    }
+  ],
+  "routes": [
+    {
+      "name": "tenant-write",
+      "match": {
+        "type": "path_prefix",
+        "prefix": "/api",
+        "hostnames": ["example.test"],
+        "methods": ["POST"],
+        "headers": [
+          { "type": "exact", "name": "x-tenant", "value": "beta" }
+        ],
+        "query_params": [
+          { "type": "exact", "name": "auth", "value": "user" },
+          { "type": "absent", "name": "debug" }
+        ],
+        "content_types": ["application/json"]
+      },
+      "upstream_cluster": "writes"
+    },
+    {
+      "name": "tenant-read",
+      "match": {
+        "type": "path_prefix",
+        "prefix": "/api",
+        "hostnames": ["example.test"],
+        "methods": ["GET"],
+        "headers": [
+          { "type": "present", "name": "x-tenant" }
+        ],
+        "query_params": [
+          { "type": "present", "name": "auth" }
+        ]
+      },
+      "upstream_cluster": "reads"
+    }
+  ],
+  "upstream_clusters": [
+    {
+      "name": "writes",
+      "endpoints": [
+        {
+          "id": "writes-a",
+          "address": "127.0.0.1:9000",
+          "state": "ready",
+          "weight": 1
+        }
+      ]
+    },
+    {
+      "name": "reads",
+      "endpoints": [
+        {
+          "id": "reads-a",
+          "address": "127.0.0.1:9001",
+          "state": "ready",
+          "weight": 1
+        }
+      ]
+    }
+  ]
+}

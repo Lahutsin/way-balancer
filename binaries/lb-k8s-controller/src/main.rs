@@ -263,6 +263,7 @@ fn parse_listener_protocol(value: &str) -> Result<ListenerProtocolConfig, Contro
     match value {
         "http1" => Ok(ListenerProtocolConfig::Http1),
         "http2" => Ok(ListenerProtocolConfig::Http2),
+        "http3" => Ok(ListenerProtocolConfig::Http3),
         "https" => Ok(ListenerProtocolConfig::Https),
         "tcp" => Ok(ListenerProtocolConfig::Tcp),
         _ => Err(ControllerConfigError::ListenerProtocol(String::from(value))),

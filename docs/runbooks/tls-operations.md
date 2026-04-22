@@ -2,17 +2,17 @@
 
 ## Scope
 
-This runbook describes the HTTPS listener TLS controls currently supported by `lb-dataplane serve`.
+This runbook describes the downstream TLS controls currently supported by `lb-dataplane serve` for `https` and first-phase `http3` listeners.
 
 ## Supported Listener TLS Policy
 
-For `protocol: "https"`, the `tls_termination` block supports:
+For `protocol: "https"` and `protocol: "http3"`, the `tls_termination` block supports:
 
 - `certificate_source`: default certificate and private key loaded from files.
 - `certificate_source.ocsp_path`: optional stapled OCSP response loaded from a DER file.
 - `sni_certificates`: additional file-backed certificates selected by SNI host name.
-- `minimum_version`: `tls12` or `tls13`.
-- `alpn_protocols`: ordered ALPN advertisement policy, currently `http2` and `http11`.
+- `minimum_version`: `tls12` or `tls13` for `https`, and `tls13` only for `http3`.
+- `alpn_protocols`: ordered ALPN advertisement policy. `https` currently supports `http2` and `http11`; `http3` must advertise only `http3`.
 - `session_resumption.mode`: `disabled`, `stateful`, `tickets`, or `hybrid`.
 - `session_resumption.session_cache_size`: in-memory cache size for modes that use stateful resumption.
 - `session_resumption.tls13_ticket_count`: number of TLS 1.3 tickets issued for modes that use tickets.
@@ -26,7 +26,9 @@ Certificate rotation is handled by config reload on stable listeners.
 3. Call the admin reload endpoint.
 4. Confirm listener status remains healthy and run an HTTPS probe against the intended SNI host names.
 
-Because HTTPS listeners rebuild their `rustls` config on reload, default certificates, SNI certificates, ALPN policy, and session resumption policy all move to the new configuration atomically for that listener.
+Because terminated TLS listeners rebuild their `rustls` config on reload, default certificates, SNI certificates, ALPN policy, and session resumption policy all move to the new configuration atomically for that listener.
+
+For `http3`, the same reload rule applies to the QUIC listener configuration because the QUIC server config is derived from the active `rustls` server config.
 
 ## SNI Operations
 
@@ -38,6 +40,8 @@ Use `sni_certificates` when one HTTPS bind address must terminate certificates f
 4. Reload the config and probe each host name with SNI enabled.
 
 Duplicate or syntactically invalid SNI names are rejected during config validation.
+
+`http3` support is currently limited to public listeners and downstream QUIC termination. Admin listeners and upstream HTTP/3 proxying are outside the first supported topology.
 
 ## Session Resumption Guidance
 

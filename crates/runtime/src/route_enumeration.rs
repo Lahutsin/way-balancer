@@ -4,6 +4,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use lb_net_core::canonicalize_ip;
+
 use crate::SourceAggregation;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -262,6 +264,7 @@ fn canonical_query_signature(query_pairs: &[(String, String)]) -> String {
 }
 
 fn normalize_source_key(ip: IpAddr, aggregation: SourceAggregation) -> String {
+    let ip = canonicalize_ip(ip);
     match (aggregation, ip) {
         (SourceAggregation::ExactIp, ip) => ip.to_string(),
         (SourceAggregation::Ipv4Subnet24, IpAddr::V4(ipv4)) => {
@@ -354,5 +357,24 @@ mod tests {
         assert!(!state.record_query_probe(source, Some("example.test"), "/api?q=one"));
         assert!(!state.record_query_probe(source, Some("example.test"), "/api-v2?debug=1"));
         assert!(!state.is_blocked(source));
+    }
+
+    #[test]
+    fn query_probing_uses_ipv4_subnet_for_mapped_dual_stack_peers() {
+        let state = RouteEnumerationProtectionState::new(RouteEnumerationProtectionPolicy {
+            source_aggregation: SourceAggregation::Ipv4Subnet24,
+            evaluation_window: std::time::Duration::from_secs(60),
+            max_unmatched_route_events: 8,
+            max_distinct_query_signatures_per_route: 1,
+            base_ban_duration: std::time::Duration::from_secs(1),
+            max_ban_duration: std::time::Duration::from_secs(8),
+            max_tracked_sources: 16,
+        });
+        let first = SocketAddr::new("::ffff:192.0.2.10".parse::<IpAddr>().expect("mapped ip"), 40000);
+        let second = SocketAddr::new("192.0.2.99".parse::<IpAddr>().expect("ipv4 ip"), 40001);
+
+        assert!(!state.record_query_probe(first, Some("example.test"), "/search?q=one"));
+        assert!(!state.record_query_probe(second, Some("example.test"), "/search?q=two"));
+        assert_eq!(state.snapshot().tracked_sources, 1);
     }
 }

@@ -44,10 +44,16 @@ Use this document together with the compatibility matrix, stability contract, an
 ## Protocol And Feature Boundaries
 
 - Supported config API surface for `0.1.x`: `v1_alpha1` as exposed by `lb_runtime::RuntimeMetadata`.
-- Supported proxy foundations: TCP, HTTP/1.1, HTTP/2, gRPC-shaped HTTP/2 traffic, HTTPS termination with configured PEM material, and documented admin HTTP control endpoints.
+- Supported proxy foundations: TCP, HTTP/1.1, HTTP/2, first-phase downstream HTTP/3 over QUIC, gRPC-shaped HTTP/2 traffic, HTTPS termination with configured PEM material, and documented admin HTTP control endpoints.
 - Supported configuration features include typed routing, cache policy, affinity, overload handling, hostile-edge guards, and attested snapshot rollout or rollback.
+- Supported listener deployment shapes include IPv4 single-stack, IPv6-only, and dual-stack public listeners when they follow the documented `bind_mode` constraints.
 - Loopback performance artifacts remain supported only as regression tools.
 - Absolute performance or capacity claims are supported only when backed by a named supported profile artifact such as `lab_small_non_loopback_v1`.
+
+The current HTTP/3 support boundary is intentionally narrow:
+
+- supported: public HTTP/3 listeners that terminate QUIC plus TLS 1.3 and route requests through the documented downstream HTTP/3 to upstream HTTP/1 bridge
+- not yet supported: upstream HTTP/3 proxying, admin HTTP/3 listeners, or proxy protocol on QUIC listeners
 
 ## Failure-Mode Support Boundaries
 

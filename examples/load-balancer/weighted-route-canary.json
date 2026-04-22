@@ -1,0 +1,61 @@
+{
+  "api_version": "v1_alpha1",
+  "name": "edge-weighted-route-canary",
+  "listeners": [
+    {
+      "name": "public-http",
+      "class": "public",
+      "bind_address": "127.0.0.1:8080",
+      "protocol": "http1",
+      "routes": ["payments-api"]
+    }
+  ],
+  "routes": [
+    {
+      "name": "payments-api",
+      "match": {
+        "type": "path_prefix",
+        "prefix": "/api",
+        "hostnames": ["payments.localhost", "127.0.0.1:8080"]
+      },
+      "destinations": [
+        {
+          "upstream_cluster": "payments-stable",
+          "weight": 90
+        },
+        {
+          "upstream_cluster": "payments-canary",
+          "weight": 10
+        }
+      ]
+    }
+  ],
+  "upstream_clusters": [
+    {
+      "name": "payments-stable",
+      "endpoints": [
+        {
+          "id": "payments-stable-a",
+          "address": "127.0.0.1:9000",
+          "state": "ready",
+          "zone": null,
+          "locality": null,
+          "weight": 1
+        }
+      ]
+    },
+    {
+      "name": "payments-canary",
+      "endpoints": [
+        {
+          "id": "payments-canary-a",
+          "address": "127.0.0.1:9001",
+          "state": "ready",
+          "zone": null,
+          "locality": null,
+          "weight": 1
+        }
+      ]
+    }
+  ]
+}

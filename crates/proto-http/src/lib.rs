@@ -3,6 +3,8 @@
 use std::fmt;
 use std::net::IpAddr;
 
+use ipnet::IpNet;
+use lb_net_core::canonicalize_ip;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 /// Returns the crate identifier for HTTP protocol abstractions.
@@ -58,13 +60,54 @@ pub struct RoutePrefixRule {
     pub prefix: String,
     /// Optional normalized hostnames matched against Host or :authority.
     pub hostnames: Vec<String>,
+    /// Optional normalized HTTP methods matched against the request method.
+    pub methods: Vec<String>,
+    /// Optional request-header matchers.
+    pub header_matches: Vec<RouteHeaderMatch>,
+    /// Optional query-parameter matchers.
+    pub query_matches: Vec<RouteQueryMatch>,
+    /// Optional normalized content types matched against the request content type.
+    pub content_types: Vec<String>,
+    /// Optional normalized gRPC service names matched against the canonical gRPC path service.
+    pub grpc_services: Vec<String>,
+    /// Optional normalized gRPC method names matched against the canonical gRPC path method.
+    pub grpc_methods: Vec<String>,
+    /// Optional source CIDRs matched against the effective client IP.
+    pub source_cidrs: Vec<IpNet>,
+}
+
+/// Supported route-header matcher shapes.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RouteHeaderMatch {
+    Exact { name: String, value: String },
+    Present { name: String },
+    Absent { name: String },
+}
+
+/// Supported route-query matcher shapes.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RouteQueryMatch {
+    Exact { name: String, value: String },
+    Present { name: String },
+    Absent { name: String },
 }
 
 impl RoutePrefixRule {
     /// Builds a prefix rule for basic route matching.
     #[must_use]
     pub fn new(label: impl Into<String>, prefix: impl Into<String>) -> Self {
-        Self { label: label.into(), prefix: prefix.into(), hostnames: Vec::new() }
+        Self {
+            label: label.into(),
+            prefix: prefix.into(),
+            hostnames: Vec::new(),
+            methods: Vec::new(),
+            header_matches: Vec::new(),
+            query_matches: Vec::new(),
+            content_types: Vec::new(),
+            grpc_services: Vec::new(),
+            grpc_methods: Vec::new(),
+            source_cidrs: Vec::new(),
+        }
     }
 
     /// Restricts a prefix rule to the provided normalized hostnames.
@@ -73,6 +116,194 @@ impl RoutePrefixRule {
         self.hostnames = hostnames;
         self
     }
+
+    /// Restricts a prefix rule to the provided normalized HTTP methods.
+    #[must_use]
+    pub fn with_methods(mut self, methods: Vec<String>) -> Self {
+        self.methods = methods.into_iter().map(|method| method.trim().to_ascii_uppercase()).collect();
+        self
+    }
+
+    #[must_use]
+    pub fn with_header_matches(mut self, header_matches: Vec<RouteHeaderMatch>) -> Self {
+        self.header_matches = header_matches;
+        self
+    }
+
+    #[must_use]
+    pub fn with_query_matches(mut self, query_matches: Vec<RouteQueryMatch>) -> Self {
+        self.query_matches = query_matches;
+        self
+    }
+
+    #[must_use]
+    pub fn with_content_types(mut self, content_types: Vec<String>) -> Self {
+        self.content_types = content_types;
+        self
+    }
+
+    #[must_use]
+    pub fn with_grpc_services(mut self, grpc_services: Vec<String>) -> Self {
+        self.grpc_services = grpc_services;
+        self
+    }
+
+    #[must_use]
+    pub fn with_grpc_methods(mut self, grpc_methods: Vec<String>) -> Self {
+        self.grpc_methods = grpc_methods;
+        self
+    }
+
+    #[must_use]
+    pub fn with_source_cidrs(mut self, source_cidrs: Vec<IpNet>) -> Self {
+        self.source_cidrs = source_cidrs;
+        self
+    }
+
+    fn specificity_key(&self) -> (usize, bool, bool, usize, usize, bool, usize, usize, bool) {
+        (
+            self.prefix.len(),
+            !self.hostnames.is_empty(),
+            !self.methods.is_empty(),
+            self.header_matches.len(),
+            self.query_matches.len(),
+            !self.content_types.is_empty(),
+            self.grpc_services.len(),
+            self.grpc_methods.len(),
+            !self.source_cidrs.is_empty(),
+        )
+    }
+}
+
+/// Normalizes an HTTP method for matching and validation.
+#[must_use]
+pub fn normalize_http_method(value: &str) -> Option<String> {
+    let normalized = value.trim();
+    if normalized.is_empty() || !normalized.chars().all(is_http_token_char) {
+        return None;
+    }
+    Some(normalized.to_ascii_uppercase())
+}
+
+#[must_use]
+pub fn normalize_grpc_service_match(value: &str) -> Option<String> {
+    let normalized = value.trim();
+    if normalized.is_empty()
+        || normalized.contains('/')
+        || normalized.chars().any(|character| character.is_ascii_whitespace())
+    {
+        return None;
+    }
+
+    normalized
+        .split('.')
+        .all(is_valid_grpc_identifier)
+        .then(|| normalized.to_string())
+}
+
+#[must_use]
+pub fn normalize_grpc_method_match(value: &str) -> Option<String> {
+    let normalized = value.trim();
+    is_valid_grpc_identifier(normalized).then(|| normalized.to_string())
+}
+
+fn is_valid_grpc_identifier(value: &str) -> bool {
+    let mut characters = value.chars();
+    let Some(first) = characters.next() else {
+        return false;
+    };
+
+    (first.is_ascii_alphabetic() || first == '_')
+        && characters.all(|character| character.is_ascii_alphanumeric() || character == '_')
+}
+
+/// Normalizes an HTTP header name for matching and validation.
+#[must_use]
+pub fn normalize_http_header_name(value: &str) -> Option<String> {
+    let normalized = value.trim();
+    if normalized.is_empty() || !normalized.chars().all(is_http_token_char) {
+        return None;
+    }
+    Some(normalized.to_ascii_lowercase())
+}
+
+/// Canonicalizes a query-parameter name used by route matchers.
+pub fn canonicalize_query_match_name(value: &str) -> Result<String, RequestTargetError> {
+    let normalized = canonicalize_percent_encoded(value)?;
+    if normalized.is_empty() || normalized.contains('&') || normalized.contains('=') {
+        return Err(RequestTargetError::InvalidQuery);
+    }
+    Ok(normalized)
+}
+
+/// Canonicalizes a query-parameter value used by route matchers.
+pub fn canonicalize_query_match_value(value: &str) -> Result<String, RequestTargetError> {
+    if value.contains('&') {
+        return Err(RequestTargetError::InvalidQuery);
+    }
+    canonicalize_percent_encoded(value)
+}
+
+/// Normalizes a content-type media type used for matching and validation.
+#[must_use]
+pub fn normalize_content_type_match(value: &str) -> Option<String> {
+    let media_type = value.split(';').next()?.trim().to_ascii_lowercase();
+    let (type_name, subtype_name) = media_type.split_once('/')?;
+    if type_name.is_empty()
+        || subtype_name.is_empty()
+        || !type_name.chars().all(is_http_token_char)
+        || !subtype_name.chars().all(is_http_token_char)
+    {
+        return None;
+    }
+    Some(media_type)
+}
+
+/// Canonical route-matching inputs shared across HTTP versions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteMatchInput {
+    pub target: String,
+    pub host: Option<String>,
+    pub method: Option<String>,
+    pub headers: Vec<HttpHeader>,
+    pub source_ip: Option<IpAddr>,
+}
+
+/// Canonical route-classification inputs derived from a request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalRouteMatchInput {
+    pub path: String,
+    pub authority: Option<String>,
+    pub method: Option<String>,
+    pub headers: Vec<HttpHeader>,
+    pub query_pairs: Vec<(String, String)>,
+    pub content_type: Option<String>,
+    pub grpc_service: Option<String>,
+    pub grpc_method: Option<String>,
+    pub source_ip: Option<IpAddr>,
+}
+
+/// Canonicalizes route-matching inputs once so callers can reuse them.
+pub fn canonicalize_route_match_input(
+    input: &RouteMatchInput,
+) -> Result<CanonicalRouteMatchInput, RequestTargetError> {
+    let canonical_target = canonicalize_request_target(&input.target)?;
+    let grpc_path = extract_grpc_path_components(&canonical_target.path);
+    Ok(CanonicalRouteMatchInput {
+        path: canonical_target.path,
+        authority: input
+            .host
+            .as_deref()
+            .and_then(|value| canonicalize_host(value).ok())
+            .or(canonical_target.authority),
+        method: input.method.as_deref().and_then(normalize_http_method),
+        headers: input.headers.clone(),
+        query_pairs: canonical_target.query_pairs,
+        content_type: extract_content_type_match(&input.headers),
+        grpc_service: grpc_path.as_ref().map(|(service, _)| service.clone()),
+        grpc_method: grpc_path.as_ref().map(|(_, method)| method.clone()),
+        source_ip: input.source_ip,
+    })
 }
 
 /// Resolved route placeholder for a request target.
@@ -313,7 +544,7 @@ where
         .map_err(|error| Http1ParseError::Invalid(hardening_message(error)))?;
     let body_kind = detect_request_body_kind(&headers)?;
     let keep_alive = detect_keep_alive(&headers, version);
-    let route = match_route(&target, extract_host_header(&headers), routes);
+    let route = match_route(&target, extract_host_header(&headers), Some(&method), routes);
     buffer.drain(..consumed);
 
     Ok(Some(Http1RequestHead { method, target, version, headers, body_kind, keep_alive, route }))
@@ -544,7 +775,7 @@ fn detect_keep_alive(headers: &[HttpHeader], version: SupportedHttpVersion) -> b
 /// Matches a target path against shared route-prefix rules.
 #[must_use]
 pub fn match_route_prefix(target: &str, rules: &[RoutePrefixRule]) -> Option<RouteMatch> {
-    match_route(target, None, rules)
+    match_route(target, None, None, rules)
 }
 
 /// Matches a target path and optional host against shared route-prefix rules.
@@ -554,7 +785,28 @@ pub fn match_route_request(
     host: Option<&str>,
     rules: &[RoutePrefixRule],
 ) -> Option<RouteMatch> {
-    match_route(target, host, rules)
+    match_route(target, host, None, rules)
+}
+
+/// Matches a target path, optional host, and optional method against shared route-prefix rules.
+#[must_use]
+pub fn match_route_request_with_method(
+    target: &str,
+    host: Option<&str>,
+    method: Option<&str>,
+    rules: &[RoutePrefixRule],
+) -> Option<RouteMatch> {
+    match_route(target, host, method, rules)
+}
+
+/// Matches a request against shared route-prefix rules using all supported canonical criteria.
+#[must_use]
+pub fn match_route_request_with_context(
+    input: &RouteMatchInput,
+    rules: &[RoutePrefixRule],
+) -> Option<RouteMatch> {
+    let canonical_input = canonicalize_route_match_input(input).ok()?;
+    match_canonical_route(&canonical_input, rules)
 }
 
 /// Returns whether the request should be treated as a gRPC request.
@@ -578,6 +830,20 @@ pub fn is_grpc_content_type(value: &str) -> bool {
     normalized == "application/grpc"
         || normalized.starts_with("application/grpc+")
         || normalized.starts_with("application/grpc;")
+}
+
+#[must_use]
+pub fn extract_grpc_path_components(path: &str) -> Option<(String, String)> {
+    let trimmed = path.strip_prefix('/')?;
+    let (service, method) = trimmed.split_once('/')?;
+    if method.contains('/') {
+        return None;
+    }
+
+    Some((
+        normalize_grpc_service_match(service)?,
+        normalize_grpc_method_match(method)?,
+    ))
 }
 
 /// Enforces explicit HTTP/1.1 hardening rules for ambiguous framing and host handling.
@@ -690,29 +956,32 @@ pub fn canonicalize_request_target(
     })
 }
 
-fn match_route(target: &str, host: Option<&str>, rules: &[RoutePrefixRule]) -> Option<RouteMatch> {
-    let canonical_target = canonicalize_request_target(target).ok();
-    let path = canonical_target
-        .as_ref()
-        .map(|target| target.path.as_str())
-        .unwrap_or_else(|| target.split('?').next().unwrap_or(target));
-    let canonical_host = host
-        .and_then(|value| canonicalize_host(value).ok())
-        .or_else(|| canonical_target.as_ref().and_then(|target| target.authority.clone()));
+fn match_route(
+    target: &str,
+    host: Option<&str>,
+    method: Option<&str>,
+    rules: &[RoutePrefixRule],
+) -> Option<RouteMatch> {
+    match_route_request_with_context(
+        &RouteMatchInput {
+            target: target.to_string(),
+            host: host.map(String::from),
+            method: method.map(String::from),
+            headers: Vec::new(),
+            source_ip: None,
+        },
+        rules,
+    )
+}
+
+fn match_canonical_route(
+    input: &CanonicalRouteMatchInput,
+    rules: &[RoutePrefixRule],
+) -> Option<RouteMatch> {
     let mut best_match: Option<&RoutePrefixRule> = None;
-    for rule in rules.iter().filter(|rule| {
-        path.starts_with(&rule.prefix)
-            && (rule.hostnames.is_empty()
-                || canonical_host
-                    .as_deref()
-                    .is_some_and(|value| rule.hostnames.iter().any(|hostname| hostname == value)))
-    }) {
+    for rule in rules.iter().filter(|rule| route_rule_matches(rule, input)) {
         let should_replace = best_match
-            .map(|matched| {
-                let matched_specificity = (matched.prefix.len(), !matched.hostnames.is_empty());
-                let rule_specificity = (rule.prefix.len(), !rule.hostnames.is_empty());
-                rule_specificity > matched_specificity
-            })
+            .map(|matched| rule.specificity_key() > matched.specificity_key())
             .unwrap_or(true);
         if should_replace {
             best_match = Some(rule);
@@ -720,6 +989,78 @@ fn match_route(target: &str, host: Option<&str>, rules: &[RoutePrefixRule]) -> O
     }
 
     best_match.map(|rule| RouteMatch { label: rule.label.clone(), prefix: rule.prefix.clone() })
+}
+
+fn route_rule_matches(rule: &RoutePrefixRule, input: &CanonicalRouteMatchInput) -> bool {
+    input.path.starts_with(&rule.prefix)
+        && (rule.hostnames.is_empty()
+            || input
+                .authority
+                .as_deref()
+                .is_some_and(|value| rule.hostnames.iter().any(|hostname| hostname == value)))
+        && (rule.methods.is_empty()
+            || input
+                .method
+                .as_deref()
+                .is_some_and(|value| rule.methods.iter().any(|method| method == value)))
+        && rule.header_matches.iter().all(|matcher| header_match_satisfied(matcher, &input.headers))
+        && rule.query_matches.iter().all(|matcher| query_match_satisfied(matcher, &input.query_pairs))
+        && (rule.content_types.is_empty()
+            || input
+                .content_type
+                .as_deref()
+                .is_some_and(|value| {
+                    rule.content_types.iter().any(|content_type| {
+                        content_type == value
+                            || (content_type == "application/grpc" && is_grpc_content_type(value))
+                    })
+                }))
+        && (rule.grpc_services.is_empty()
+            || input
+                .grpc_service
+                .as_deref()
+                .is_some_and(|value| rule.grpc_services.iter().any(|service| service == value)))
+        && (rule.grpc_methods.is_empty()
+            || input
+                .grpc_method
+                .as_deref()
+                .is_some_and(|value| rule.grpc_methods.iter().any(|method| method == value)))
+        && (rule.source_cidrs.is_empty()
+            || input
+                .source_ip
+                .map(canonicalize_ip)
+                .is_some_and(|ip| rule.source_cidrs.iter().any(|cidr| cidr.contains(&ip))))
+}
+
+fn header_match_satisfied(matcher: &RouteHeaderMatch, headers: &[HttpHeader]) -> bool {
+    match matcher {
+        RouteHeaderMatch::Exact { name, value } => headers.iter().any(|header| {
+            header.name.eq_ignore_ascii_case(name) && header.value.trim() == value
+        }),
+        RouteHeaderMatch::Present { name } => {
+            headers.iter().any(|header| header.name.eq_ignore_ascii_case(name))
+        }
+        RouteHeaderMatch::Absent { name } => {
+            !headers.iter().any(|header| header.name.eq_ignore_ascii_case(name))
+        }
+    }
+}
+
+fn query_match_satisfied(matcher: &RouteQueryMatch, query_pairs: &[(String, String)]) -> bool {
+    match matcher {
+        RouteQueryMatch::Exact { name, value } => {
+            query_pairs.iter().any(|(query_name, query_value)| query_name == name && query_value == value)
+        }
+        RouteQueryMatch::Present { name } => query_pairs.iter().any(|(query_name, _)| query_name == name),
+        RouteQueryMatch::Absent { name } => !query_pairs.iter().any(|(query_name, _)| query_name == name),
+    }
+}
+
+fn extract_content_type_match(headers: &[HttpHeader]) -> Option<String> {
+    headers
+        .iter()
+        .find(|header| header.name.eq_ignore_ascii_case("content-type"))
+        .and_then(|header| normalize_content_type_match(&header.value))
 }
 
 fn split_path_and_query(path_and_query: &str) -> (&str, &str) {
@@ -730,6 +1071,26 @@ fn split_path_and_query(path_and_query: &str) -> (&str, &str) {
         Some((path, query)) => (if path.is_empty() { "/" } else { path }, query),
         None => (path_and_query, ""),
     }
+}
+
+fn is_http_token_char(character: char) -> bool {
+    matches!(
+        character,
+        '!' | '#'
+            | '$'
+            | '%'
+            | '&'
+            | '\''
+            | '*'
+            | '+'
+            | '-'
+            | '.'
+            | '^'
+            | '_'
+            | '`'
+            | '|'
+            | '~'
+    ) || character.is_ascii_alphanumeric()
 }
 
 fn canonicalize_query_pairs(query: &str) -> Result<Vec<(String, String)>, RequestTargetError> {
@@ -889,9 +1250,12 @@ fn default_reason(status: u16) -> &'static str {
 mod tests {
     use super::{
         canonicalize_host, canonicalize_request_target, encode_request_head, is_grpc_content_type,
-        is_grpc_request, match_route_prefix, match_route_request, normalize_request_headers,
-        validate_http1_request_hardening, BodyKind, Http1Limits, Http2Limits, HttpHeader,
-        ProtocolHardeningError, RequestTargetError, RoutePrefixRule, SupportedHttpVersion,
+        is_grpc_request, match_route_prefix, match_route_request, match_route_request_with_context,
+        match_route_request_with_method, normalize_content_type_match, normalize_http_header_name,
+        normalize_http_method, normalize_request_headers, validate_http1_request_hardening,
+        BodyKind, Http1Limits, Http2Limits, HttpHeader, ProtocolHardeningError,
+        RequestTargetError, RouteHeaderMatch, RouteMatchInput, RoutePrefixRule, RouteQueryMatch,
+        SupportedHttpVersion, canonicalize_query_match_name, canonicalize_query_match_value,
     };
 
     #[test]
@@ -913,6 +1277,19 @@ mod tests {
         let rejected = match_route_request("/api/v1/items?limit=1", Some("other.example"), &routes);
 
         assert_eq!(matched.map(|route| route.label), Some(String::from("api")));
+        assert_eq!(rejected, None);
+    }
+
+    #[test]
+    fn route_matching_can_filter_by_method() {
+        let routes = vec![RoutePrefixRule::new("writes", "/api")
+            .with_methods(vec![String::from("post")])];
+
+        let matched = match_route_request_with_method("/api/v1/items", None, Some("POST"), &routes);
+        let rejected =
+            match_route_request_with_method("/api/v1/items", None, Some("GET"), &routes);
+
+        assert_eq!(matched.map(|route| route.label), Some(String::from("writes")));
         assert_eq!(rejected, None);
     }
 
@@ -940,12 +1317,128 @@ mod tests {
     }
 
     #[test]
+    fn route_matching_prefers_method_specific_rule_for_equal_prefix() {
+        let routes = vec![
+            RoutePrefixRule::new("generic-api", "/api"),
+            RoutePrefixRule::new("writes", "/api").with_methods(vec![String::from("POST")]),
+        ];
+
+        let matched = match_route_request_with_method("/api/v1/items", None, Some("POST"), &routes);
+
+        assert_eq!(matched.map(|route| route.label), Some(String::from("writes")));
+    }
+
+    #[test]
+    fn normalize_http_method_rejects_invalid_tokens() {
+        assert_eq!(normalize_http_method("get"), Some(String::from("GET")));
+        assert_eq!(normalize_http_method(""), None);
+        assert_eq!(normalize_http_method("bad token"), None);
+    }
+
+    #[test]
+    fn normalize_http_header_name_rejects_invalid_tokens() {
+        assert_eq!(normalize_http_header_name("X-Test"), Some(String::from("x-test")));
+        assert_eq!(normalize_http_header_name("bad header"), None);
+    }
+
+    #[test]
+    fn canonicalize_query_match_components_validate_shape() {
+        assert_eq!(canonicalize_query_match_name("auth"), Ok(String::from("auth")));
+        assert_eq!(canonicalize_query_match_value("user%2Falpha"), Ok(String::from("user%2Falpha")));
+        assert!(canonicalize_query_match_name("").is_err());
+        assert!(canonicalize_query_match_name("a=b").is_err());
+    }
+
+    #[test]
+    fn normalize_content_type_match_extracts_media_type() {
+        assert_eq!(
+            normalize_content_type_match("Application/JSON; charset=utf-8"),
+            Some(String::from("application/json"))
+        );
+        assert_eq!(normalize_content_type_match("broken"), None);
+    }
+
+    #[test]
     fn route_matching_uses_absolute_form_authority_and_path() {
         let routes =
             vec![RoutePrefixRule::new("api", "/api")
                 .with_hostnames(vec![String::from("example.com")])];
 
         let matched = match_route_request("http://Example.com/api?q=1", None, &routes);
+
+        assert_eq!(matched.map(|route| route.label), Some(String::from("api")));
+    }
+
+    #[test]
+    fn route_matching_can_filter_by_headers_query_content_type_and_source() {
+        let route = RoutePrefixRule::new("api", "/api")
+            .with_header_matches(vec![RouteHeaderMatch::Exact {
+                name: String::from("x-tenant"),
+                value: String::from("beta"),
+            }])
+            .with_query_matches(vec![RouteQueryMatch::Exact {
+                name: String::from("auth"),
+                value: String::from("user"),
+            }])
+            .with_content_types(vec![String::from("application/json")])
+            .with_source_cidrs(vec!["198.51.100.0/24".parse().expect("cidr")]);
+
+        let matched = match_route_request_with_context(
+            &RouteMatchInput {
+                target: String::from("/api?auth=user"),
+                host: Some(String::from("example.com")),
+                method: Some(String::from("POST")),
+                headers: vec![
+                    HttpHeader { name: String::from("x-tenant"), value: String::from("beta") },
+                    HttpHeader {
+                        name: String::from("content-type"),
+                        value: String::from("application/json; charset=utf-8"),
+                    },
+                ],
+                source_ip: Some("198.51.100.7".parse().expect("ip")),
+            },
+            &[route],
+        );
+
+        assert_eq!(matched.map(|route| route.label), Some(String::from("api")));
+    }
+
+    #[test]
+    fn route_matching_rejects_missing_header_query_or_source_constraints() {
+        let route = RoutePrefixRule::new("api", "/api")
+            .with_header_matches(vec![RouteHeaderMatch::Present { name: String::from("x-tenant") }])
+            .with_query_matches(vec![RouteQueryMatch::Present { name: String::from("auth") }])
+            .with_source_cidrs(vec!["198.51.100.0/24".parse().expect("cidr")]);
+
+        let rejected = match_route_request_with_context(
+            &RouteMatchInput {
+                target: String::from("/api"),
+                host: None,
+                method: Some(String::from("GET")),
+                headers: Vec::new(),
+                source_ip: Some("203.0.113.7".parse().expect("ip")),
+            },
+            &[route],
+        );
+
+        assert_eq!(rejected, None);
+    }
+
+    #[test]
+    fn route_matching_accepts_ipv4_mapped_ipv6_for_ipv4_source_cidrs() {
+        let route = RoutePrefixRule::new("api", "/api")
+            .with_source_cidrs(vec!["198.51.100.0/24".parse().expect("cidr")]);
+
+        let matched = match_route_request_with_context(
+            &RouteMatchInput {
+                target: String::from("/api"),
+                host: None,
+                method: Some(String::from("GET")),
+                headers: Vec::new(),
+                source_ip: Some("::ffff:198.51.100.7".parse().expect("mapped ip")),
+            },
+            &[route],
+        );
 
         assert_eq!(matched.map(|route| route.label), Some(String::from("api")));
     }
@@ -1080,6 +1573,31 @@ mod tests {
 
         assert!(is_grpc_request("POST", SupportedHttpVersion::Http2, &headers));
         assert!(is_grpc_content_type("application/grpc; charset=utf-8"));
+    }
+
+    #[test]
+    fn grpc_route_matching_uses_service_and_method_filters() {
+        let route = RoutePrefixRule::new("grpc", "/")
+            .with_methods(vec![String::from("POST")])
+            .with_content_types(vec![String::from("application/grpc")])
+            .with_grpc_services(vec![String::from("grpc.payments.v1.Payments")])
+            .with_grpc_methods(vec![String::from("Capture")]);
+
+        let matched = match_route_request_with_context(
+            &RouteMatchInput {
+                target: String::from("/grpc.payments.v1.Payments/Capture"),
+                host: None,
+                method: Some(String::from("POST")),
+                headers: vec![HttpHeader {
+                    name: String::from("content-type"),
+                    value: String::from("application/grpc+proto"),
+                }],
+                source_ip: None,
+            },
+            &[route],
+        );
+
+        assert_eq!(matched.map(|value| value.label), Some(String::from("grpc")));
     }
 
     #[test]

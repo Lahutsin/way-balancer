@@ -218,6 +218,8 @@ The audit endpoint returns a bounded in-memory list of recent admin actions, inc
 
 This is the fastest way to understand whether a denied or failed admin action was caused by auth, permissions, rate limits, replay rejection, or a runtime apply failure.
 
+For snapshot publication workflows, the same `detail` field should also be treated as rollout context. When a newly published snapshot changes route destination weights, the publish audit entry now includes the previous published version plus a compact diff summary such as which route changed and how its destination weights moved.
+
 Reload audit entries publish machine-readable lifecycle codes such as `reload_started_in_place`, `reload_started_overlap_drain`, `reload_started_blocked_candidate`, `reload_applied_in_place`, `reload_applied_overlap_drain`, `reload_applied_overlap_drain_timeout`, `reload_failed_apply`, `reload_failed_rollback_preserved`, and `reload_failed_blocked_change`.
 
 ## Fleet Rollout Coordination

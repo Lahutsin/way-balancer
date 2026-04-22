@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use lb_net_core::canonicalize_ip;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -272,6 +273,7 @@ impl HandshakePermit {
 }
 
 fn normalize_source_key(ip: IpAddr, aggregation: SourceAggregation) -> String {
+    let ip = canonicalize_ip(ip);
     match (aggregation, ip) {
         (SourceAggregation::ExactIp, ip) => ip.to_string(),
         (SourceAggregation::Ipv4Subnet24, IpAddr::V4(ipv4)) => {
@@ -318,6 +320,17 @@ mod tests {
         assert_eq!(exact, "192.0.2.10");
         assert_eq!(subnet_v4, "192.0.2.0/24");
         assert_eq!(subnet_v6, "2001:db8:0:1::/64");
+    }
+
+    #[test]
+    fn source_normalization_flattens_ipv4_mapped_ipv6_for_ipv4_aggregation() {
+        let mapped = "::ffff:192.0.2.10".parse::<IpAddr>().expect("mapped ip");
+
+        let exact = normalize_source_key(mapped, SourceAggregation::ExactIp);
+        let subnet_v4 = normalize_source_key(mapped, SourceAggregation::Ipv4Subnet24);
+
+        assert_eq!(exact, "192.0.2.10");
+        assert_eq!(subnet_v4, "192.0.2.0/24");
     }
 
     #[test]

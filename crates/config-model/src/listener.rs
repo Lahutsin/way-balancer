@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{PolicyBindingConfig, WorkspaceConfigError, WorkspaceDefaultsConfig};
+use crate::{PolicyBindingConfig, UpgradePolicyConfig, WorkspaceConfigError, WorkspaceDefaultsConfig};
 
 /// Declarative listener resource.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -17,10 +17,16 @@ pub struct ListenerResourceConfig {
     pub class: ListenerClassConfig,
     /// Bound socket address.
     pub bind_address: SocketAddr,
+    /// Socket-family binding mode.
+    #[serde(default)]
+    pub bind_mode: ListenerBindModeConfig,
     /// Listener protocol mode.
     #[serde(default)]
     pub protocol: ListenerProtocolConfig,
-    /// Optional local TLS termination material for HTTPS listeners.
+    /// Optional Proxy Protocol handling mode for accepted connections.
+    #[serde(default)]
+    pub proxy_protocol: ProxyProtocolModeConfig,
+    /// Optional local TLS termination material for HTTPS and HTTP/3 listeners.
     #[serde(default)]
     pub tls_termination: Option<ListenerTlsTerminationConfig>,
     /// Explicit opt-in for unspecified bind addresses.
@@ -44,6 +50,9 @@ pub struct ListenerResourceConfig {
     /// Attached named policy references.
     #[serde(default)]
     pub policies: PolicyBindingConfig,
+    /// Explicit listener-wide HTTP upgrade allow-list.
+    #[serde(default, skip_serializing_if = "UpgradePolicyConfig::is_default")]
+    pub upgrade: UpgradePolicyConfig,
     /// Admin-plane hardening policy for privileged listeners.
     #[serde(default, skip_serializing_if = "AdminListenerPolicyConfig::is_default")]
     pub admin: AdminListenerPolicyConfig,
@@ -57,7 +66,9 @@ impl ListenerResourceConfig {
             name: name.into(),
             class,
             bind_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
+            bind_mode: ListenerBindModeConfig::SingleStack,
             protocol: ListenerProtocolConfig::Tcp,
+            proxy_protocol: ProxyProtocolModeConfig::Disabled,
             tls_termination: None,
             allow_unspecified_bind: false,
             max_connections: None,
@@ -66,6 +77,7 @@ impl ListenerResourceConfig {
             drain_timeout_ms: None,
             routes: Vec::new(),
             policies: PolicyBindingConfig::default(),
+            upgrade: UpgradePolicyConfig::default(),
             admin: AdminListenerPolicyConfig::default(),
         }
     }
@@ -79,6 +91,7 @@ impl ListenerResourceConfig {
             name: self.name.clone(),
             class: self.class.into(),
             bind_address: self.bind_address,
+            bind_mode: self.bind_mode.into(),
             max_connections: self.max_connections.unwrap_or(listener_defaults.max_connections),
             backlog: self.backlog.unwrap_or(listener_defaults.backlog),
             idle_timeout: Duration::from_millis(
@@ -89,6 +102,7 @@ impl ListenerResourceConfig {
             ),
             allow_unspecified_bind: self.allow_unspecified_bind
                 || listener_defaults.allow_unspecified_bind,
+            proxy_protocol: self.proxy_protocol.into(),
             tls_termination: self.tls_termination.as_ref().map(|tls_termination| {
                 lb_net_core::TlsListenerConfig {
                     cert_path: tls_termination.certificate_source.cert_path().to_owned(),
@@ -225,7 +239,7 @@ const fn default_admin_nonce_ttl_secs() -> u64 {
     120
 }
 
-/// Declarative local TLS termination for HTTPS listeners.
+/// Declarative local TLS termination for HTTPS and HTTP/3 listeners.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ListenerTlsTerminationConfig {
@@ -313,6 +327,8 @@ pub enum ListenerAlpnProtocolConfig {
     Http2,
     /// Advertise HTTP/1.1 via ALPN.
     Http11,
+    /// Advertise HTTP/3 via ALPN.
+    Http3,
 }
 
 impl ListenerAlpnProtocolConfig {
@@ -321,6 +337,7 @@ impl ListenerAlpnProtocolConfig {
         match self {
             Self::Http2 => b"h2",
             Self::Http11 => b"http/1.1",
+            Self::Http3 => b"h3",
         }
     }
 }
@@ -388,6 +405,29 @@ impl From<ListenerClassConfig> for lb_net_core::ListenerClass {
     }
 }
 
+/// Declarative listener bind mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ListenerBindModeConfig {
+    /// Bind a listener using the address family encoded in bind_address.
+    #[default]
+    SingleStack,
+    /// Request one IPv6 socket that may also admit IPv4 traffic where supported.
+    DualStack,
+    /// Request an IPv6-only socket explicitly.
+    Ipv6Only,
+}
+
+impl From<ListenerBindModeConfig> for lb_net_core::ListenerBindMode {
+    fn from(value: ListenerBindModeConfig) -> Self {
+        match value {
+            ListenerBindModeConfig::SingleStack => Self::SingleStack,
+            ListenerBindModeConfig::DualStack => Self::DualStack,
+            ListenerBindModeConfig::Ipv6Only => Self::Ipv6Only,
+        }
+    }
+}
+
 /// Declarative listener protocol mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -401,8 +441,33 @@ pub enum ListenerProtocolConfig {
     Https,
     /// HTTP/2 or gRPC termination and forwarding.
     Http2,
+    /// HTTP/3 over QUIC termination and forwarding.
+    Http3,
     /// Future protocol auto-detection.
     Auto,
+}
+
+/// Declarative Proxy Protocol handling mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ProxyProtocolModeConfig {
+    /// Do not expect a Proxy Protocol preface.
+    #[default]
+    Disabled,
+    /// Require and parse Proxy Protocol v1.
+    V1,
+    /// Require and parse Proxy Protocol v2.
+    V2,
+}
+
+impl From<ProxyProtocolModeConfig> for lb_net_core::ProxyProtocolMode {
+    fn from(value: ProxyProtocolModeConfig) -> Self {
+        match value {
+            ProxyProtocolModeConfig::Disabled => Self::Disabled,
+            ProxyProtocolModeConfig::V1 => Self::V1,
+            ProxyProtocolModeConfig::V2 => Self::V2,
+        }
+    }
 }
 
 pub(crate) fn compile_listeners(
@@ -428,12 +493,13 @@ mod tests {
 
     use super::{
         compile_listeners, AdminListenerPolicyConfig, ListenerAlpnProtocolConfig,
-        ListenerCertificateSourceConfig, ListenerClassConfig, ListenerResourceConfig,
+        ListenerBindModeConfig, ListenerCertificateSourceConfig, ListenerClassConfig, ListenerResourceConfig,
+        ProxyProtocolModeConfig,
         ListenerTlsMinimumVersionConfig, ListenerTlsSessionResumptionConfig,
         ListenerTlsSessionResumptionModeConfig, ListenerTlsSniCertificateConfig,
         ListenerTlsTerminationConfig,
     };
-    use crate::{WorkspaceConfigError, WorkspaceDefaultsConfig};
+    use crate::{UpgradePolicyConfig, WorkspaceConfigError, WorkspaceDefaultsConfig};
 
     #[test]
     fn compile_listeners_rejects_duplicate_names() {
@@ -456,7 +522,9 @@ mod tests {
             name: String::from("public"),
             class: ListenerClassConfig::Public,
             bind_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080),
+            bind_mode: ListenerBindModeConfig::SingleStack,
             protocol: super::ListenerProtocolConfig::Http1,
+            proxy_protocol: ProxyProtocolModeConfig::Disabled,
             tls_termination: None,
             allow_unspecified_bind: false,
             max_connections: None,
@@ -465,6 +533,7 @@ mod tests {
             drain_timeout_ms: None,
             routes: Vec::new(),
             policies: crate::PolicyBindingConfig::default(),
+            upgrade: UpgradePolicyConfig::default(),
             admin: AdminListenerPolicyConfig::default(),
         };
 
@@ -472,6 +541,7 @@ mod tests {
 
         assert_eq!(compiled[0].max_connections, 128);
         assert_eq!(compiled[0].backlog, 1024);
+        assert_eq!(compiled[0].proxy_protocol, lb_net_core::ProxyProtocolMode::Disabled);
         Ok(())
     }
 
@@ -481,7 +551,9 @@ mod tests {
             name: String::from("public-https"),
             class: ListenerClassConfig::Public,
             bind_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8443),
+            bind_mode: ListenerBindModeConfig::SingleStack,
             protocol: super::ListenerProtocolConfig::Https,
+            proxy_protocol: ProxyProtocolModeConfig::V2,
             tls_termination: Some(ListenerTlsTerminationConfig {
                 certificate_source: ListenerCertificateSourceConfig::Files {
                     cert_path: String::from("certs/server.pem"),
@@ -511,6 +583,7 @@ mod tests {
             drain_timeout_ms: None,
             routes: vec![String::from("api")],
             policies: crate::PolicyBindingConfig::default(),
+            upgrade: UpgradePolicyConfig::default(),
             admin: AdminListenerPolicyConfig::default(),
         };
 
@@ -524,6 +597,34 @@ mod tests {
             compiled[0].tls_termination.as_ref().map(|tls| tls.key_path.as_str()),
             Some("certs/server.key")
         );
+        assert_eq!(compiled[0].proxy_protocol, lb_net_core::ProxyProtocolMode::V2);
+        Ok(())
+    }
+
+    #[test]
+    fn listener_compile_preserves_bind_mode() -> Result<(), Box<dyn std::error::Error>> {
+        let listener = ListenerResourceConfig {
+            name: String::from("public-v6"),
+            class: ListenerClassConfig::Public,
+            bind_address: "[::1]:8080".parse()?,
+            bind_mode: ListenerBindModeConfig::Ipv6Only,
+            protocol: super::ListenerProtocolConfig::Http1,
+            proxy_protocol: ProxyProtocolModeConfig::Disabled,
+            tls_termination: None,
+            allow_unspecified_bind: false,
+            max_connections: None,
+            backlog: None,
+            idle_timeout_ms: None,
+            drain_timeout_ms: None,
+            routes: Vec::new(),
+            policies: crate::PolicyBindingConfig::default(),
+            upgrade: UpgradePolicyConfig::default(),
+            admin: AdminListenerPolicyConfig::default(),
+        };
+
+        let compiled = compile_listeners(&[listener], &WorkspaceDefaultsConfig::default())?;
+
+        assert_eq!(compiled[0].bind_mode, lb_net_core::ListenerBindMode::Ipv6Only);
         Ok(())
     }
 

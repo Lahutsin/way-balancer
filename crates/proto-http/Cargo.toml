@@ -8,6 +8,8 @@ publish.workspace = true
 
 [dependencies]
 httparse = "1.9"
+ipnet = "2.10"
+lb-net-core = { path = "../net-core" }
 tokio = { version = "1.37", features = ["io-util"] }
 
 [dev-dependencies]

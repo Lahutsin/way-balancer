@@ -45,9 +45,10 @@ pub use failure_management::{
     UpstreamFailureClass,
 };
 pub use http1_proxy::{
-    proxy_http1_connection, proxy_http1_connection_with_downstream_addr, Http1ConnectionMetrics,
+    proxy_http1_connection, proxy_http1_connection_with_downstream_addr,
+    proxy_http1_request_with_downstream_addr, Http1ConnectionMetrics,
     Http1ConnectionReport, Http1ProxyConfig, Http1ProxyError, Http1ResponseCacheConfig,
-    Http1RouteUpstream,
+    Http1RouteUpstream, Http1SingleRequestResponse, RouteDestinationPolicyRuntime,
 };
 pub use http2_proxy::{
     proxy_http2_connection, proxy_http2_connection_with_downstream_addr, Http2ConnectionMetrics,
@@ -93,13 +94,19 @@ pub use tcp_proxy::{
     proxy_tcp_stream, ConnectionContext, ConnectionEventKind, ConnectionMetadata,
     ProxySessionReport, TcpProxyConfig, TcpProxyError,
 };
-pub use telemetry::{HttpCacheRequestOutcome, HttpCacheRevalidationResult, RuntimeTelemetry};
-pub use trusted_client_ip::{TrustedClientIpError, TrustedClientIpPolicy};
+pub use telemetry::{
+    HttpCacheRequestOutcome, HttpCacheRevalidationResult, HttpUpgradeResult, RuntimeTelemetry,
+};
+pub use trusted_client_ip::{
+    TrustedClientIpError, TrustedClientIpHeaderSource, TrustedClientIpPolicy,
+    TrustedClientIpResolution,
+};
 pub use upstream_balancer::{
     ActiveProbeTarget, AffinityFallbackPolicy, AffinityPolicy, EndpointSelectionCandidate,
     LoadBalancingAlgorithm, LocalityRoutingPolicy, NoHealthyFallback, RouteBackendPool,
-    SelectedEndpoint, SelectedRouteBackend, SelectionContext, UpstreamBalancer,
-    UpstreamSelectionError, UpstreamSelectionMetrics, UpstreamSelectionPolicy,
+    RouteBackendPoolBuildError, SelectedEndpoint, SelectedRouteBackend, SelectionContext,
+    UpstreamBalancer, UpstreamSelectionError, UpstreamSelectionMetrics,
+    UpstreamSelectionPolicy, WeightedRouteDestination,
 };
 pub use upstream_health::{
     EndpointHealthPolicy, EndpointHealthSnapshot, EndpointHealthStatus, UpstreamHealthError,
@@ -109,12 +116,14 @@ pub use upstream_registry::{EndpointRegistry, EndpointRegistryError, EndpointReg
 
 use std::collections::VecDeque;
 use std::fmt;
+use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
+use socket2::{Domain, Protocol, Socket, Type};
 use tokio::io::AsyncReadExt;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::{watch, Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time;
@@ -172,6 +181,22 @@ impl Default for RuntimeMetadata {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Effective policy diagnostics for one concrete route destination.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct EffectiveRouteDestinationPolicy {
+    pub upstream_cluster: String,
+    pub retry_budget: Option<String>,
+    pub timeout_hierarchy: Option<String>,
+    pub circuit_breaker: Option<String>,
+    pub transform_policy: Option<String>,
+    pub traffic_mirror: Option<String>,
+    pub fault_injection: Option<String>,
+    pub local_rate_limits: Vec<String>,
+    pub local_concurrency_limits: Vec<String>,
+    pub effective_request_transform: Option<lb_config_model::RequestTransformConfig>,
+    pub effective_response_transform: Option<lb_config_model::ResponseTransformConfig>,
 }
 
 /// Deterministic lifecycle states for a running listener.
@@ -422,7 +447,7 @@ pub async fn start_listener_with_protection(
     config.validate().map_err(ListenerRuntimeError::InvalidConfig)?;
 
     let listener =
-        TcpListener::bind(config.bind_address).await.map_err(ListenerRuntimeError::Bind)?;
+        bind_tcp_listener(config.bind_address, config.bind_mode).map_err(ListenerRuntimeError::Bind)?;
     let local_addr = listener.local_addr().map_err(ListenerRuntimeError::Bind)?;
     let shared = Arc::new(ListenerShared::new(&config, local_addr));
     let protections = Arc::new(ListenerAbuseProtectionState::new(protection_policy));
@@ -442,6 +467,51 @@ pub async fn start_listener_with_protection(
         shutdown_tx,
         task: Arc::new(AsyncMutex::new(Some(task))),
     })
+}
+
+/// Binds a TCP listener using the configured address family and bind-mode semantics.
+pub fn bind_tcp_listener(
+    bind_address: SocketAddr,
+    bind_mode: lb_net_core::ListenerBindMode,
+) -> io::Result<TcpListener> {
+    let domain = match bind_address {
+        SocketAddr::V4(_) => Domain::IPV4,
+        SocketAddr::V6(_) => Domain::IPV6,
+    };
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+    socket.set_reuse_address(true)?;
+
+    if matches!(bind_address, SocketAddr::V6(_)) {
+        socket.set_only_v6(!matches!(bind_mode, lb_net_core::ListenerBindMode::DualStack))?;
+    }
+
+    socket.bind(&bind_address.into())?;
+    socket.listen(1024)?;
+    socket.set_nonblocking(true)?;
+
+    TcpListener::from_std(socket.into())
+}
+
+/// Binds a UDP socket using the configured address family and bind-mode semantics.
+pub fn bind_udp_socket(
+    bind_address: SocketAddr,
+    bind_mode: lb_net_core::ListenerBindMode,
+) -> io::Result<UdpSocket> {
+    let domain = match bind_address {
+        SocketAddr::V4(_) => Domain::IPV4,
+        SocketAddr::V6(_) => Domain::IPV6,
+    };
+    let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+    socket.set_reuse_address(true)?;
+
+    if matches!(bind_address, SocketAddr::V6(_)) {
+        socket.set_only_v6(!matches!(bind_mode, lb_net_core::ListenerBindMode::DualStack))?;
+    }
+
+    socket.bind(&bind_address.into())?;
+    socket.set_nonblocking(true)?;
+
+    UdpSocket::from_std(socket.into())
 }
 
 async fn run_listener(

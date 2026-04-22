@@ -1,0 +1,166 @@
+{
+  "name": "destination-policy-bindings",
+  "listeners": [
+    {
+      "name": "public-http",
+      "class": "public",
+      "bind_address": "127.0.0.1:8080",
+      "protocol": "http1",
+      "routes": ["api"],
+      "policies": {
+        "transform_policy": "listener-transform"
+      }
+    }
+  ],
+  "routes": [
+    {
+      "name": "api",
+      "match": {
+        "type": "path_prefix",
+        "prefix": "/api"
+      },
+      "destinations": [
+        {
+          "upstream_cluster": "payments-stable",
+          "weight": 90
+        },
+        {
+          "upstream_cluster": "payments-canary",
+          "weight": 10,
+          "policies": {
+            "local_rate_limits": ["payments-canary-rate"],
+            "local_concurrency_limits": ["payments-canary-concurrency"],
+            "retry_budget": "canary-retry",
+            "timeout_hierarchy": "canary-timeout",
+            "circuit_breaker": "canary-breaker",
+            "transform_policy": "canary-transform"
+          }
+        }
+      ],
+      "policies": {
+        "transform_policy": "route-transform"
+      }
+    }
+  ],
+  "upstream_clusters": [
+    {
+      "name": "payments-stable",
+      "endpoints": [
+        {
+          "id": "payments-stable-a",
+          "address": "127.0.0.1:9000",
+          "weight": 1
+        }
+      ]
+    },
+    {
+      "name": "payments-canary",
+      "endpoints": [
+        {
+          "id": "payments-canary-a",
+          "address": "127.0.0.1:9001",
+          "weight": 1
+        }
+      ]
+    }
+  ],
+  "policies": {
+    "local_rate_limits": [
+      {
+        "name": "payments-canary-rate",
+        "spec": {
+          "scope": {
+            "type": "route_destination",
+            "route": "api",
+            "upstream_cluster": "payments-canary"
+          },
+          "key_kind": "global",
+          "requests_per_window": 25,
+          "window_ms": 1000,
+          "max_tracked_keys": 64
+        }
+      }
+    ],
+    "local_concurrency_limits": [
+      {
+        "name": "payments-canary-concurrency",
+        "spec": {
+          "scope": {
+            "type": "route_destination",
+            "route": "api",
+            "upstream_cluster": "payments-canary"
+          },
+          "key_kind": "global",
+          "max_concurrent": 8,
+          "max_tracked_keys": 32
+        }
+      }
+    ],
+    "retry_budgets": [
+      {
+        "name": "canary-retry",
+        "spec": {
+          "min_retry_tokens": 3,
+          "retry_percent": 20,
+          "window_ms": 10000
+        }
+      }
+    ],
+    "timeout_hierarchies": [
+      {
+        "name": "canary-timeout",
+        "spec": {
+          "request_timeout_ms": 30000,
+          "attempt_timeout_ms": 10000,
+          "connect_timeout_ms": 1000,
+          "idle_timeout_ms": 5000
+        }
+      }
+    ],
+    "circuit_breakers": [
+      {
+        "name": "canary-breaker",
+        "spec": {
+          "open_failure_threshold": 5,
+          "open_duration_ms": 30000,
+          "half_open_success_threshold": 2
+        }
+      }
+    ],
+    "transforms": [
+      {
+        "name": "listener-transform",
+        "spec": {
+          "request": {
+            "header_mutations": [
+              { "type": "set", "name": "x-edge-tier", "value": "listener" }
+            ]
+          },
+          "response": {}
+        }
+      },
+      {
+        "name": "route-transform",
+        "spec": {
+          "request": {
+            "header_mutations": [
+              { "type": "set", "name": "x-edge-tier", "value": "route" }
+            ]
+          },
+          "response": {}
+        }
+      },
+      {
+        "name": "canary-transform",
+        "spec": {
+          "request": {
+            "header_mutations": [
+              { "type": "set", "name": "x-edge-tier", "value": "destination" }
+            ]
+          },
+          "response": {}
+        }
+      }
+    ]
+  }
+}

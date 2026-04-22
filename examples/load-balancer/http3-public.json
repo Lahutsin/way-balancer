@@ -1,0 +1,51 @@
+{
+  "api_version": "v1_alpha1",
+  "name": "http3-public",
+  "listeners": [
+    {
+      "name": "public-http3",
+      "class": "public",
+      "bind_address": "127.0.0.1:8443",
+      "protocol": "http3",
+      "routes": ["api"],
+      "tls_termination": {
+        "minimum_version": "tls13",
+        "alpn_protocols": ["http3"],
+        "certificate_source": {
+          "type": "files",
+          "cert_path": "certs/server.pem",
+          "key_path": "certs/server.key"
+        }
+      }
+    },
+    {
+      "name": "admin",
+      "class": "admin",
+      "bind_address": "127.0.0.1:9900",
+      "protocol": "http1"
+    }
+  ],
+  "routes": [
+    {
+      "name": "api",
+      "match": {
+        "type": "path_prefix",
+        "prefix": "/"
+      },
+      "upstream_cluster": "frontend"
+    }
+  ],
+  "upstream_clusters": [
+    {
+      "name": "frontend",
+      "endpoints": [
+        {
+          "id": "frontend-a",
+          "address": "127.0.0.1:9000",
+          "state": "ready",
+          "weight": 1
+        }
+      ]
+    }
+  ]
+}

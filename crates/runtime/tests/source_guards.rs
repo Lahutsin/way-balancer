@@ -1,7 +1,8 @@
 use std::io;
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
-use lb_net_core::{ListenerClass, ListenerConfig};
+use lb_net_core::{ListenerBindMode, ListenerClass, ListenerConfig};
 use lb_runtime::{
     start_listener_with_protection, HandshakeGuardPolicy, ListenerAbuseProtectionPolicy,
     ListenerAbuseProtectionSnapshot, ListenerRuntimeError, ListenerState, SourceAggregation,
@@ -105,6 +106,43 @@ async fn legitimate_traffic_passes_when_limits_allow_it() -> io::Result<()> {
     drop(first);
     drop(second);
     handle.shutdown().await.map_err(runtime_error_to_io)?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dual_stack_listener_groups_ipv4_clients_by_ipv4_subnet() -> io::Result<()> {
+    let mut config = ListenerConfig::foundation_local("public", ListenerClass::Public);
+    config.bind_address = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0);
+    config.bind_mode = ListenerBindMode::DualStack;
+    config.allow_unspecified_bind = true;
+    config.max_connections = 8;
+    config.idle_timeout = Duration::from_secs(30);
+    let handle = start_listener_with_protection(
+        config,
+        ListenerAbuseProtectionPolicy {
+            source_quota: Some(SourceQuotaPolicy::new(SourceAggregation::Ipv4Subnet24, 1, 8)),
+            handshake_guard: None,
+        },
+    )
+    .await
+    .map_err(runtime_error_to_io)?;
+
+    wait_for_state(&handle, ListenerState::Running).await?;
+
+    let port = handle.local_addr().port();
+    let first = TcpStream::connect(("127.0.0.1", port)).await?;
+    wait_for_rejection_metric(&handle, |snapshot| snapshot.tracked_sources == 1).await?;
+
+    let second = TcpStream::connect(("127.0.0.1", port)).await?;
+    wait_for_rejected_connections(&handle, 1).await?;
+
+    drop(second);
+    drop(first);
+    handle.shutdown().await.map_err(runtime_error_to_io)?;
+
+    let snapshot = handle.abuse_protection_snapshot();
+    assert_eq!(snapshot.source_quota_rejections, 1);
+    assert_eq!(snapshot.tracked_sources, 0);
     Ok(())
 }
 

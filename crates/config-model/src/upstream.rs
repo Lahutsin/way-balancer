@@ -196,6 +196,20 @@ pub enum WorkspaceConfigError {
     EmptyRoutePrefix(String),
     /// Route hostname filters must be syntactically valid.
     InvalidRouteHostname(String),
+    /// Route method filters must be syntactically valid.
+    InvalidRouteMethod(String),
+    /// Route header matchers are invalid.
+    InvalidRouteHeader(String),
+    /// Route query matchers are invalid.
+    InvalidRouteQuery(String),
+    /// Route content-type matchers are invalid.
+    InvalidRouteContentType(String),
+    /// Route gRPC service matchers are invalid.
+    InvalidRouteGrpcService(String),
+    /// Route gRPC method matchers are invalid.
+    InvalidRouteGrpcMethod(String),
+    /// Route source CIDR matchers are invalid.
+    InvalidRouteSourceCidr(String),
     /// Strong upstream model validation failed.
     InvalidUpstreamModel(lb_net_core::UpstreamModelError),
 }
@@ -222,6 +236,27 @@ impl fmt::Display for WorkspaceConfigError {
             Self::InvalidRouteHostname(route_name) => {
                 write!(formatter, "route {route_name} must declare only valid hostnames")
             }
+            Self::InvalidRouteMethod(route_name) => {
+                write!(formatter, "route {route_name} must declare only valid HTTP methods")
+            }
+            Self::InvalidRouteHeader(route_name) => {
+                write!(formatter, "route {route_name} must declare only valid header matchers")
+            }
+            Self::InvalidRouteQuery(route_name) => {
+                write!(formatter, "route {route_name} must declare only valid query matchers")
+            }
+            Self::InvalidRouteContentType(route_name) => {
+                write!(formatter, "route {route_name} must declare only valid content types")
+            }
+            Self::InvalidRouteGrpcService(route_name) => {
+                write!(formatter, "route {route_name} must declare only valid gRPC service matchers")
+            }
+            Self::InvalidRouteGrpcMethod(route_name) => {
+                write!(formatter, "route {route_name} must declare only valid gRPC method matchers")
+            }
+            Self::InvalidRouteSourceCidr(route_name) => {
+                write!(formatter, "route {route_name} must declare only valid source CIDRs")
+            }
             Self::InvalidUpstreamModel(error) => {
                 write!(formatter, "invalid upstream model: {error}")
             }
@@ -239,7 +274,14 @@ impl std::error::Error for WorkspaceConfigError {
             | Self::DuplicateRouteName(_)
             | Self::EmptyRouteName
             | Self::EmptyRoutePrefix(_)
-            | Self::InvalidRouteHostname(_) => None,
+            | Self::InvalidRouteHostname(_)
+            | Self::InvalidRouteMethod(_)
+            | Self::InvalidRouteHeader(_)
+            | Self::InvalidRouteQuery(_)
+            | Self::InvalidRouteContentType(_)
+            | Self::InvalidRouteGrpcService(_)
+            | Self::InvalidRouteGrpcMethod(_)
+            | Self::InvalidRouteSourceCidr(_) => None,
         }
     }
 }

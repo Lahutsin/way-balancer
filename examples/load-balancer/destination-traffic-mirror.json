@@ -1,0 +1,66 @@
+{
+  "api_version": "v1_alpha1",
+  "name": "destination-traffic-mirror",
+  "listeners": [
+    {
+      "name": "public-http",
+      "class": "public",
+      "bind_address": "127.0.0.1:8080",
+      "protocol": "http1",
+      "routes": ["payments"]
+    }
+  ],
+  "routes": [
+    {
+      "name": "payments",
+      "match": {
+        "type": "path_prefix",
+        "prefix": "/payments"
+      },
+      "destinations": [
+        {
+          "upstream_cluster": "payments-primary",
+          "weight": 100,
+          "policies": {
+            "traffic_mirror": "shadow-payments"
+          }
+        }
+      ]
+    }
+  ],
+  "upstream_clusters": [
+    {
+      "name": "payments-primary",
+      "endpoints": [
+        {
+          "id": "payments-primary-a",
+          "address": "127.0.0.1:9000",
+          "state": "ready",
+          "weight": 1
+        }
+      ]
+    },
+    {
+      "name": "payments-shadow",
+      "endpoints": [
+        {
+          "id": "payments-shadow-a",
+          "address": "127.0.0.1:9001",
+          "state": "ready",
+          "weight": 1
+        }
+      ]
+    }
+  ],
+  "policies": {
+    "traffic_mirrors": [
+      {
+        "name": "shadow-payments",
+        "spec": {
+          "percentage": 20,
+          "target_upstream_cluster": "payments-shadow"
+        }
+      }
+    ]
+  }
+}

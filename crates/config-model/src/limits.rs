@@ -8,6 +8,8 @@ pub enum LocalLimitScopeConfig {
     Listener { name: String },
     /// Route-level limit.
     Route { name: String },
+    /// Route-destination-level limit.
+    RouteDestination { route: String, upstream_cluster: String },
     /// Upstream-level limit.
     UpstreamCluster { name: String },
 }

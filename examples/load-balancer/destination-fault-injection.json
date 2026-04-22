@@ -1,0 +1,76 @@
+{
+  "api_version": "v1_alpha1",
+  "name": "destination-fault-injection",
+  "listeners": [
+    {
+      "name": "public-http",
+      "class": "public",
+      "bind_address": "127.0.0.1:8080",
+      "protocol": "http1",
+      "routes": ["payments"]
+    }
+  ],
+  "routes": [
+    {
+      "name": "payments",
+      "match": {
+        "type": "path_prefix",
+        "prefix": "/payments"
+      },
+      "destinations": [
+        {
+          "upstream_cluster": "payments-primary",
+          "weight": 90
+        },
+        {
+          "upstream_cluster": "payments-canary",
+          "weight": 10,
+          "policies": {
+            "fault_injection": "canary-chaos"
+          }
+        }
+      ]
+    }
+  ],
+  "upstream_clusters": [
+    {
+      "name": "payments-primary",
+      "endpoints": [
+        {
+          "id": "payments-primary-a",
+          "address": "127.0.0.1:9000",
+          "state": "ready",
+          "weight": 1
+        }
+      ]
+    },
+    {
+      "name": "payments-canary",
+      "endpoints": [
+        {
+          "id": "payments-canary-a",
+          "address": "127.0.0.1:9001",
+          "state": "ready",
+          "weight": 1
+        }
+      ]
+    }
+  ],
+  "policies": {
+    "fault_injections": [
+      {
+        "name": "canary-chaos",
+        "spec": {
+          "delay": {
+            "percentage": 10,
+            "fixed_delay_ms": 250
+          },
+          "abort": {
+            "percentage": 5,
+            "http_status": 503
+          }
+        }
+      }
+    ]
+  }
+}

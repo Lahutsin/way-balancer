@@ -14,6 +14,15 @@ use std::time::Duration;
 /// Returns the crate identifier for the shared networking layer.
 pub const CRATE_ID: &str = "lb-net-core";
 
+/// Canonicalizes IPv4-mapped IPv6 addresses back to plain IPv4.
+#[must_use]
+pub fn canonicalize_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(ipv4) => IpAddr::V4(ipv4),
+        IpAddr::V6(ipv6) => ipv6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(IpAddr::V6(ipv6)),
+    }
+}
+
 /// Shared network defaults used by future listeners and upstream sockets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NetworkDefaults {
@@ -36,6 +45,30 @@ pub enum ListenerClass {
     Public,
     /// Privileged listener for local admin or diagnostics traffic.
     Admin,
+}
+
+/// Proxy Protocol handling mode for accepted listener connections.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ProxyProtocolMode {
+    /// Do not expect a Proxy Protocol preface.
+    #[default]
+    Disabled,
+    /// Require and parse HAProxy Proxy Protocol v1.
+    V1,
+    /// Require and parse HAProxy Proxy Protocol v2.
+    V2,
+}
+
+/// Socket-family mode used when binding a listener.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ListenerBindMode {
+    /// Bind a single-stack listener using the concrete address family of bind_address.
+    #[default]
+    SingleStack,
+    /// Bind one IPv6 socket intended to also accept IPv4 traffic where supported.
+    DualStack,
+    /// Bind an IPv6-only socket explicitly.
+    Ipv6Only,
 }
 
 /// File-backed TLS material for listeners that terminate TLS locally.
@@ -70,6 +103,8 @@ pub struct ListenerConfig {
     pub class: ListenerClass,
     /// Socket address to bind.
     pub bind_address: SocketAddr,
+    /// Address-family behavior for the bound socket.
+    pub bind_mode: ListenerBindMode,
     /// Maximum number of admitted concurrent connections.
     pub max_connections: usize,
     /// Listener backlog placeholder.
@@ -80,6 +115,8 @@ pub struct ListenerConfig {
     pub drain_timeout: Duration,
     /// Whether unspecified addresses such as `0.0.0.0` are allowed.
     pub allow_unspecified_bind: bool,
+    /// Proxy Protocol handling mode for accepted downstream connections.
+    pub proxy_protocol: ProxyProtocolMode,
     /// Optional TLS termination material for HTTPS listeners.
     pub tls_termination: Option<TlsListenerConfig>,
 }
@@ -94,11 +131,13 @@ impl ListenerConfig {
             name: name.into(),
             class,
             bind_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            bind_mode: ListenerBindMode::SingleStack,
             max_connections: 128,
             backlog: defaults.backlog,
             idle_timeout: Duration::from_secs(defaults.idle_timeout_secs),
             drain_timeout: Duration::from_secs(5),
             allow_unspecified_bind: false,
+            proxy_protocol: ProxyProtocolMode::Disabled,
             tls_termination: None,
         }
     }
@@ -121,6 +160,25 @@ impl ListenerConfig {
             return Err(ListenerConfigError::UnspecifiedBindRequiresOptIn(self.bind_address));
         }
 
+        match self.bind_mode {
+            ListenerBindMode::SingleStack => {}
+            ListenerBindMode::DualStack => {
+                if !self.bind_address.is_ipv6() {
+                    return Err(ListenerConfigError::DualStackRequiresIpv6Bind(self.bind_address));
+                }
+                if !self.bind_address.ip().is_unspecified() {
+                    return Err(ListenerConfigError::DualStackRequiresIpv6Wildcard(
+                        self.bind_address,
+                    ));
+                }
+            }
+            ListenerBindMode::Ipv6Only => {
+                if !self.bind_address.is_ipv6() {
+                    return Err(ListenerConfigError::Ipv6OnlyRequiresIpv6Bind(self.bind_address));
+                }
+            }
+        }
+
         if let Some(tls_termination) = &self.tls_termination {
             tls_termination.validate()?;
         }
@@ -140,6 +198,12 @@ pub enum ListenerConfigError {
     ZeroBacklog,
     /// Unspecified bind addresses require explicit opt-in.
     UnspecifiedBindRequiresOptIn(SocketAddr),
+    /// Dual-stack listeners must bind an IPv6 socket.
+    DualStackRequiresIpv6Bind(SocketAddr),
+    /// Dual-stack listeners currently require the IPv6 wildcard address.
+    DualStackRequiresIpv6Wildcard(SocketAddr),
+    /// IPv6-only listeners must bind an IPv6 socket.
+    Ipv6OnlyRequiresIpv6Bind(SocketAddr),
     /// TLS termination requires a non-empty certificate path.
     EmptyTlsCertificatePath,
     /// TLS termination requires a non-empty private key path.
@@ -157,6 +221,18 @@ impl fmt::Display for ListenerConfigError {
             Self::UnspecifiedBindRequiresOptIn(address) => write!(
                 formatter,
                 "unspecified bind address {address} requires allow_unspecified_bind=true"
+            ),
+            Self::DualStackRequiresIpv6Bind(address) => write!(
+                formatter,
+                "dual_stack listener bind address {address} must use an IPv6 socket"
+            ),
+            Self::DualStackRequiresIpv6Wildcard(address) => write!(
+                formatter,
+                "dual_stack listener bind address {address} must use the IPv6 wildcard address [::]:port"
+            ),
+            Self::Ipv6OnlyRequiresIpv6Bind(address) => write!(
+                formatter,
+                "ipv6_only listener bind address {address} must use an IPv6 socket"
             ),
             Self::EmptyTlsCertificatePath => {
                 formatter.write_str("listener TLS certificate path must not be empty")
@@ -212,7 +288,17 @@ impl Default for ConnectionTimeouts {
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-    use super::{ListenerClass, ListenerConfig, ListenerConfigError, TlsListenerConfig};
+    use super::{
+        canonicalize_ip, ListenerBindMode, ListenerClass, ListenerConfig, ListenerConfigError,
+        ProxyProtocolMode, TlsListenerConfig,
+    };
+
+    #[test]
+    fn canonicalize_ip_flattens_ipv4_mapped_ipv6() {
+        let mapped = "::ffff:192.0.2.10".parse::<IpAddr>().expect("mapped ip");
+
+        assert_eq!(canonicalize_ip(mapped), IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)));
+    }
 
     #[test]
     fn foundation_local_uses_safe_defaults() {
@@ -220,6 +306,8 @@ mod tests {
 
         assert_eq!(config.bind_address.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
         assert!(!config.allow_unspecified_bind);
+        assert_eq!(config.proxy_protocol, ProxyProtocolMode::Disabled);
+        assert_eq!(config.bind_mode, ListenerBindMode::SingleStack);
         assert!(config.validate().is_ok());
     }
 
@@ -252,5 +340,37 @@ mod tests {
         });
 
         assert_eq!(config.validate(), Err(ListenerConfigError::EmptyTlsPrivateKeyPath));
+    }
+
+    #[test]
+    fn validate_rejects_dual_stack_on_ipv4_socket() {
+        let mut config = ListenerConfig::foundation_local("public", ListenerClass::Public);
+        config.bind_mode = ListenerBindMode::DualStack;
+
+        assert_eq!(
+            config.validate(),
+            Err(ListenerConfigError::DualStackRequiresIpv6Bind(config.bind_address))
+        );
+    }
+
+    #[test]
+    fn validate_rejects_dual_stack_on_specific_ipv6_socket() {
+        let mut config = ListenerConfig::foundation_local("public", ListenerClass::Public);
+        config.bind_address = "[::1]:8080".parse().expect("ipv6 loopback address");
+        config.bind_mode = ListenerBindMode::DualStack;
+
+        assert_eq!(
+            config.validate(),
+            Err(ListenerConfigError::DualStackRequiresIpv6Wildcard(config.bind_address))
+        );
+    }
+
+    #[test]
+    fn validate_accepts_ipv6_only_listener() {
+        let mut config = ListenerConfig::foundation_local("public", ListenerClass::Public);
+        config.bind_address = "[::1]:8080".parse().expect("ipv6 loopback address");
+        config.bind_mode = ListenerBindMode::Ipv6Only;
+
+        assert!(config.validate().is_ok());
     }
 }

@@ -5,11 +5,12 @@ use serde::{Deserialize, Serialize};
 use crate::{
     AdminAuthPolicyConfig, AdminAuthorizationScopeConfig, AffinityPolicyConfig,
     AnonymousSourceFilterConfig, ArtifactVerificationMode, CacheKeyPolicyConfig,
-    HostileEdgeProtectionPolicyConfig, HttpCachePolicyConfig, HttpCacheStorageConfig,
-    ListenerAlpnProtocolConfig, ListenerClassConfig, ListenerProtocolConfig,
-    LocalConcurrencyLimitPolicyConfig, LocalLimitScopeConfig, LocalRateLimitPolicyConfig,
-    NamedOverloadResponsePolicyConfig, OverloadResponsePolicyConfig, PolicyBindingConfig,
-    PolicyResourcesConfig, RouteConfig, RouteMatchConfig, TrustedClientIpConfig, WorkspaceConfig,
+    HeaderMutationConfig, HostileEdgeProtectionPolicyConfig, HttpCachePolicyConfig,
+    HttpCacheStorageConfig, ListenerAlpnProtocolConfig, ListenerBindModeConfig, ListenerClassConfig,
+    ListenerProtocolConfig, LocalConcurrencyLimitPolicyConfig, LocalLimitScopeConfig,
+    LocalRateLimitPolicyConfig, NamedOverloadResponsePolicyConfig, OverloadResponsePolicyConfig,
+    PathRewriteTransformConfig, PolicyBindingConfig, PolicyResourcesConfig, RouteConfig,
+    RouteMatchConfig, TransformPolicyConfig, TrustedClientIpConfig, WorkspaceConfig,
 };
 
 /// Stable validation error category.
@@ -189,6 +190,11 @@ pub(crate) fn validate_workspace_config(config: &WorkspaceConfig) -> ValidationR
             }),
             &mut report,
         );
+    let route_registry = config
+        .routes
+        .iter()
+        .map(|route| (route.name.clone(), route))
+        .collect::<BTreeMap<_, _>>();
     let upstream_names = collect_named_resources(
         config.upstream_clusters.iter().enumerate().map(|(index, cluster)| {
             (cluster.name.clone(), format!("upstream_clusters[{index}].name"), "upstream cluster")
@@ -196,10 +202,17 @@ pub(crate) fn validate_workspace_config(config: &WorkspaceConfig) -> ValidationR
         &mut report,
     );
 
-    let policy_registry = PolicyRegistry::new(&config.policies, &mut report);
+    let policy_registry = PolicyRegistry::new(&config.policies, &upstream_names, &mut report);
 
     for (index, listener) in config.listeners.iter().enumerate() {
-        validate_listener(listener, index, &route_names, &policy_registry, &mut report);
+        validate_listener(
+            listener,
+            index,
+            &route_names,
+            &route_registry,
+            &policy_registry,
+            &mut report,
+        );
     }
     for (index, route) in config.routes.iter().enumerate() {
         validate_route(route, index, &upstream_names, &policy_registry, &mut report);
@@ -367,6 +380,7 @@ fn validate_listener(
     listener: &crate::ListenerResourceConfig,
     index: usize,
     route_names: &BTreeSet<String>,
+    route_registry: &BTreeMap<String, &RouteConfig>,
     policy_registry: &PolicyRegistry,
     report: &mut ValidationReport,
 ) {
@@ -391,6 +405,34 @@ fn validate_listener(
         ));
     }
 
+    match listener.bind_mode {
+        ListenerBindModeConfig::SingleStack => {}
+        ListenerBindModeConfig::DualStack => {
+            if !listener.bind_address.is_ipv6() {
+                report.errors.push(ValidationError::schema(
+                    ValidationCode::InvalidListenerField,
+                    format!("{base_path}.bind_mode"),
+                    "dual_stack listeners must use an IPv6 bind_address",
+                ));
+            } else if !listener.bind_address.ip().is_unspecified() {
+                report.errors.push(ValidationError::schema(
+                    ValidationCode::InvalidListenerField,
+                    format!("{base_path}.bind_address"),
+                    "dual_stack listeners currently require the IPv6 wildcard bind address [::]:port",
+                ));
+            }
+        }
+        ListenerBindModeConfig::Ipv6Only => {
+            if !listener.bind_address.is_ipv6() {
+                report.errors.push(ValidationError::schema(
+                    ValidationCode::InvalidListenerField,
+                    format!("{base_path}.bind_mode"),
+                    "ipv6_only listeners must use an IPv6 bind_address",
+                ));
+            }
+        }
+    }
+
     if matches!(listener.protocol, ListenerProtocolConfig::Tcp) && !listener.routes.is_empty() {
         report.errors.push(ValidationError::semantic(
             ValidationCode::UnsupportedListenerRouting,
@@ -399,22 +441,73 @@ fn validate_listener(
         ));
     }
 
+    if !matches!(listener.proxy_protocol, crate::ProxyProtocolModeConfig::Disabled) {
+        if listener.class != ListenerClassConfig::Public {
+            report.errors.push(ValidationError::semantic(
+                ValidationCode::InvalidListenerField,
+                format!("{base_path}.proxy_protocol"),
+                "proxy protocol is supported only on public listeners",
+            ));
+        }
+        if listener.protocol == ListenerProtocolConfig::Http3 {
+            report.errors.push(ValidationError::semantic(
+                ValidationCode::InvalidListenerField,
+                format!("{base_path}.proxy_protocol"),
+                "proxy protocol is not supported on http3 listeners",
+            ));
+        }
+    }
+
+    if listener.protocol == ListenerProtocolConfig::Http3
+        && listener.class != ListenerClassConfig::Public
+    {
+        report.errors.push(ValidationError::semantic(
+            ValidationCode::InvalidListenerField,
+            format!("{base_path}.protocol"),
+            "http3 listeners are currently supported only on public listeners",
+        ));
+    }
+
+    validate_upgrade_policy(
+        &listener.upgrade,
+        &format!("{base_path}.upgrade"),
+        ValidationCode::InvalidListenerField,
+        "listener upgrade policy",
+        report,
+    );
+    if !listener.upgrade.is_default()
+        && (listener.class != ListenerClassConfig::Public
+            || !matches!(listener.protocol, ListenerProtocolConfig::Http1 | ListenerProtocolConfig::Https))
+    {
+        report.errors.push(ValidationError::semantic(
+            ValidationCode::InvalidListenerField,
+            format!("{base_path}.upgrade"),
+            "upgrade policy is supported only on public http1 or https listeners",
+        ));
+    }
+
     match (&listener.protocol, &listener.tls_termination) {
-        (ListenerProtocolConfig::Https, None) => {
+        (protocol @ (ListenerProtocolConfig::Https | ListenerProtocolConfig::Http3), None) => {
+            let protocol_name = listener_protocol_name(*protocol);
             report.errors.push(ValidationError::schema(
                 ValidationCode::InvalidListenerField,
                 format!("{base_path}.tls_termination"),
-                "https listeners must declare tls_termination certificate material",
+                format!(
+                    "{protocol_name} listeners must declare tls_termination certificate material"
+                ),
             ));
         }
-        (ListenerProtocolConfig::Https, Some(tls_termination)) => {
+        (protocol @ (ListenerProtocolConfig::Https | ListenerProtocolConfig::Http3), Some(tls_termination)) => {
+            let protocol_name = listener_protocol_name(*protocol);
             if tls_termination.certificate_source.cert_path().trim().is_empty()
                 || tls_termination.certificate_source.key_path().trim().is_empty()
             {
                 report.errors.push(ValidationError::schema(
                     ValidationCode::InvalidListenerField,
                     format!("{base_path}.tls_termination.certificate_source"),
-                    "https listeners must use non-empty cert_path and key_path values",
+                    format!(
+                        "{protocol_name} listeners must use non-empty cert_path and key_path values"
+                    ),
                 ));
             }
             if tls_termination
@@ -425,7 +518,9 @@ fn validate_listener(
                 report.errors.push(ValidationError::schema(
                     ValidationCode::InvalidListenerField,
                     format!("{base_path}.tls_termination.certificate_source.ocsp_path"),
-                    "https listeners must use a non-empty ocsp_path when OCSP stapling is configured",
+                    format!(
+                        "{protocol_name} listeners must use a non-empty ocsp_path when OCSP stapling is configured"
+                    ),
                 ));
             }
 
@@ -470,7 +565,7 @@ fn validate_listener(
                                     ValidationCode::InvalidListenerField,
                                     format!("{certificate_path}.server_names[{name_index}]"),
                                     format!(
-                                        "https listeners must not repeat SNI server name {normalized}"
+                                        "{protocol_name} listeners must not repeat SNI server name {normalized}"
                                     ),
                                 ));
                             }
@@ -495,7 +590,9 @@ fn validate_listener(
                         report.errors.push(ValidationError::schema(
                             ValidationCode::InvalidListenerField,
                             format!("{base_path}.tls_termination.session_resumption.session_cache_size"),
-                            "https listeners using stateful session resumption must use a non-zero session_cache_size",
+                            format!(
+                                "{protocol_name} listeners using stateful session resumption must use a non-zero session_cache_size"
+                            ),
                         ));
                     }
                 }
@@ -509,7 +606,9 @@ fn validate_listener(
                         report.errors.push(ValidationError::schema(
                             ValidationCode::InvalidListenerField,
                             format!("{base_path}.tls_termination.session_resumption.tls13_ticket_count"),
-                            "https listeners issuing TLS tickets must use a non-zero tls13_ticket_count",
+                            format!(
+                                "{protocol_name} listeners issuing TLS tickets must use a non-zero tls13_ticket_count"
+                            ),
                         ));
                     }
                 }
@@ -521,7 +620,20 @@ fn validate_listener(
                 report.errors.push(ValidationError::schema(
                     ValidationCode::InvalidListenerField,
                     format!("{base_path}.tls_termination.alpn_protocols"),
-                    "https listeners must advertise at least one ALPN protocol",
+                    format!("{protocol_name} listeners must advertise at least one ALPN protocol"),
+                ));
+            }
+
+            if *protocol == ListenerProtocolConfig::Http3
+                && !tls_termination
+                    .alpn_protocols
+                    .iter()
+                    .all(|alpn| *alpn == ListenerAlpnProtocolConfig::Http3)
+            {
+                report.errors.push(ValidationError::schema(
+                    ValidationCode::InvalidListenerField,
+                    format!("{base_path}.tls_termination.alpn_protocols"),
+                    "http3 listeners must advertise only the http3 ALPN protocol",
                 ));
             }
 
@@ -531,11 +643,15 @@ fn validate_listener(
                     let protocol_name = match alpn_protocol {
                         ListenerAlpnProtocolConfig::Http2 => "http2",
                         ListenerAlpnProtocolConfig::Http11 => "http11",
+                        ListenerAlpnProtocolConfig::Http3 => "http3",
                     };
                     report.errors.push(ValidationError::schema(
                         ValidationCode::InvalidListenerField,
                         format!("{base_path}.tls_termination.alpn_protocols[{alpn_index}]"),
-                        format!("https listeners must not repeat ALPN protocol {protocol_name}"),
+                        format!(
+                            "{} listeners must not repeat ALPN protocol {protocol_name}",
+                            listener_protocol_name(*protocol)
+                        ),
                     ));
                 }
             }
@@ -544,7 +660,7 @@ fn validate_listener(
             report.errors.push(ValidationError::semantic(
                 ValidationCode::InvalidListenerField,
                 format!("{base_path}.tls_termination"),
-                "tls_termination is currently supported only for https listeners",
+                "tls_termination is currently supported only for https and http3 listeners",
             ));
         }
         (_, None) => {}
@@ -577,6 +693,20 @@ fn validate_listener(
                 route_path,
                 format!("listener {} references unknown route {normalized}", listener.name),
             ));
+        } else if let Some(route) = route_registry.get(normalized) {
+            if !route.upgrade.is_default()
+                && (listener.class != ListenerClassConfig::Public
+                    || !matches!(listener.protocol, ListenerProtocolConfig::Http1 | ListenerProtocolConfig::Https))
+            {
+                report.errors.push(ValidationError::semantic(
+                    ValidationCode::InvalidListenerField,
+                    format!("{base_path}.routes[{route_index}]"),
+                    format!(
+                        "listener {} cannot attach route {} with upgrade policy unless the listener is public http1 or https",
+                        listener.name, route.name
+                    ),
+                ));
+            }
         }
     }
 
@@ -707,6 +837,17 @@ fn validate_admin_listener_policy(
     }
 }
 
+fn listener_protocol_name(protocol: ListenerProtocolConfig) -> &'static str {
+    match protocol {
+        ListenerProtocolConfig::Tcp => "tcp",
+        ListenerProtocolConfig::Http1 => "http1",
+        ListenerProtocolConfig::Https => "https",
+        ListenerProtocolConfig::Http2 => "http2",
+        ListenerProtocolConfig::Http3 => "http3",
+        ListenerProtocolConfig::Auto => "auto",
+    }
+}
+
 fn validate_admin_permissions(
     permissions: &[AdminAuthorizationScopeConfig],
     path: &str,
@@ -754,8 +895,26 @@ fn validate_route(
         ));
     }
 
+    validate_upgrade_policy(
+        &route.upgrade,
+        &format!("{base_path}.upgrade"),
+        ValidationCode::InvalidRouteMatch,
+        "route upgrade policy",
+        report,
+    );
+
     match &route.match_rule {
-        RouteMatchConfig::PathPrefix { prefix, hostnames } => {
+        RouteMatchConfig::PathPrefix {
+            prefix,
+            hostnames,
+            methods,
+            headers,
+            query_params,
+            content_types,
+            grpc_services,
+            grpc_methods,
+            source_cidrs,
+        } => {
             if prefix.trim().is_empty() {
                 report.errors.push(ValidationError::schema(
                     ValidationCode::InvalidRouteMatch,
@@ -775,22 +934,217 @@ fn validate_route(
                     ));
                 }
             }
+            for (method_index, method) in methods.iter().enumerate() {
+                if lb_proto_http::normalize_http_method(method).is_none() {
+                    report.errors.push(ValidationError::schema(
+                        ValidationCode::InvalidRouteMatch,
+                        format!("{base_path}.match.methods[{method_index}]"),
+                        format!("route {} declares invalid method filter {}", route.name, method),
+                    ));
+                }
+            }
+            for (header_index, header_match) in headers.iter().enumerate() {
+                match header_match {
+                    crate::RouteHeaderMatchConfig::Exact { name, value } => {
+                        if lb_proto_http::normalize_http_header_name(name).is_none() || value.trim().is_empty() {
+                            report.errors.push(ValidationError::schema(
+                                ValidationCode::InvalidRouteMatch,
+                                format!("{base_path}.match.headers[{header_index}]"),
+                                format!("route {} declares invalid header matcher", route.name),
+                            ));
+                        }
+                    }
+                    crate::RouteHeaderMatchConfig::Present { name }
+                    | crate::RouteHeaderMatchConfig::Absent { name } => {
+                        if lb_proto_http::normalize_http_header_name(name).is_none() {
+                            report.errors.push(ValidationError::schema(
+                                ValidationCode::InvalidRouteMatch,
+                                format!("{base_path}.match.headers[{header_index}]"),
+                                format!("route {} declares invalid header matcher", route.name),
+                            ));
+                        }
+                    }
+                }
+            }
+            for (query_index, query_match) in query_params.iter().enumerate() {
+                match query_match {
+                    crate::RouteQueryMatchConfig::Exact { name, value } => {
+                        if lb_proto_http::canonicalize_query_match_name(name).is_err()
+                            || lb_proto_http::canonicalize_query_match_value(value).is_err()
+                        {
+                            report.errors.push(ValidationError::schema(
+                                ValidationCode::InvalidRouteMatch,
+                                format!("{base_path}.match.query_params[{query_index}]"),
+                                format!("route {} declares invalid query matcher", route.name),
+                            ));
+                        }
+                    }
+                    crate::RouteQueryMatchConfig::Present { name }
+                    | crate::RouteQueryMatchConfig::Absent { name } => {
+                        if lb_proto_http::canonicalize_query_match_name(name).is_err() {
+                            report.errors.push(ValidationError::schema(
+                                ValidationCode::InvalidRouteMatch,
+                                format!("{base_path}.match.query_params[{query_index}]"),
+                                format!("route {} declares invalid query matcher", route.name),
+                            ));
+                        }
+                    }
+                }
+            }
+            for (content_type_index, content_type) in content_types.iter().enumerate() {
+                if lb_proto_http::normalize_content_type_match(content_type).is_none() {
+                    report.errors.push(ValidationError::schema(
+                        ValidationCode::InvalidRouteMatch,
+                        format!("{base_path}.match.content_types[{content_type_index}]"),
+                        format!("route {} declares invalid content-type filter {}", route.name, content_type),
+                    ));
+                }
+            }
+            for (grpc_service_index, grpc_service) in grpc_services.iter().enumerate() {
+                if lb_proto_http::normalize_grpc_service_match(grpc_service).is_none() {
+                    report.errors.push(ValidationError::schema(
+                        ValidationCode::InvalidRouteMatch,
+                        format!("{base_path}.match.grpc_services[{grpc_service_index}]"),
+                        format!("route {} declares invalid gRPC service matcher {}", route.name, grpc_service),
+                    ));
+                }
+            }
+            for (grpc_method_index, grpc_method) in grpc_methods.iter().enumerate() {
+                if lb_proto_http::normalize_grpc_method_match(grpc_method).is_none() {
+                    report.errors.push(ValidationError::schema(
+                        ValidationCode::InvalidRouteMatch,
+                        format!("{base_path}.match.grpc_methods[{grpc_method_index}]"),
+                        format!("route {} declares invalid gRPC method matcher {}", route.name, grpc_method),
+                    ));
+                }
+            }
+            if !(grpc_services.is_empty() && grpc_methods.is_empty()) {
+                let declares_grpc_content_type = content_types
+                    .iter()
+                    .any(|content_type| lb_proto_http::is_grpc_content_type(content_type));
+                if !declares_grpc_content_type {
+                    report.errors.push(ValidationError::schema(
+                        ValidationCode::InvalidRouteMatch,
+                        format!("{base_path}.match.content_types"),
+                        format!(
+                            "route {} must declare application/grpc content_types when gRPC service or method filters are present",
+                            route.name
+                        ),
+                    ));
+                }
+                if methods.iter().any(|method| !method.eq_ignore_ascii_case("POST")) {
+                    report.errors.push(ValidationError::schema(
+                        ValidationCode::InvalidRouteMatch,
+                        format!("{base_path}.match.methods"),
+                        format!(
+                            "route {} must use only POST when gRPC service or method filters are present",
+                            route.name
+                        ),
+                    ));
+                }
+            }
+            for (source_index, source_cidr) in source_cidrs.iter().enumerate() {
+                if source_cidr.parse::<ipnet::IpNet>().is_err() {
+                    report.errors.push(ValidationError::schema(
+                        ValidationCode::InvalidRouteMatch,
+                        format!("{base_path}.match.source_cidrs[{source_index}]"),
+                        format!("route {} declares invalid source CIDR {}", route.name, source_cidr),
+                    ));
+                }
+            }
         }
     }
 
-    let upstream_name = route.upstream_cluster.trim();
-    if upstream_name.is_empty() {
+    if route.upstream_cluster.is_some() && !route.destinations.is_empty() {
         report.errors.push(ValidationError::schema(
             ValidationCode::InvalidUpstreamReference,
-            format!("{base_path}.upstream_cluster"),
-            format!("route {} must reference a non-empty upstream cluster name", route.name),
+            format!("{base_path}.destinations"),
+            format!(
+                "route {} must declare either upstream_cluster or destinations, not both",
+                route.name
+            ),
         ));
-    } else if !upstream_names.contains(upstream_name) {
-        report.errors.push(ValidationError::semantic(
+    }
+
+    let destinations = route.normalized_destinations();
+    if destinations.is_empty() {
+        report.errors.push(ValidationError::schema(
             ValidationCode::InvalidUpstreamReference,
-            format!("{base_path}.upstream_cluster"),
-            format!("route {} references unknown upstream cluster {upstream_name}", route.name),
+            format!("{base_path}.destinations"),
+            format!("route {} must declare at least one upstream destination", route.name),
         ));
+    }
+
+    let mut seen_destinations = BTreeSet::new();
+    for (destination_index, destination) in destinations.iter().enumerate() {
+        let destination_base_path = if route.destinations.is_empty() {
+            format!("{base_path}.upstream_cluster")
+        } else {
+            format!("{base_path}.destinations[{destination_index}]")
+        };
+        let upstream_name = destination.upstream_cluster.trim();
+
+        if upstream_name.is_empty() {
+            let field_path = if route.destinations.is_empty() {
+                destination_base_path.clone()
+            } else {
+                format!("{destination_base_path}.upstream_cluster")
+            };
+            report.errors.push(ValidationError::schema(
+                ValidationCode::InvalidUpstreamReference,
+                field_path,
+                format!("route {} must reference a non-empty upstream cluster name", route.name),
+            ));
+            continue;
+        }
+        if destination.weight == 0 {
+            let field_path = if route.destinations.is_empty() {
+                destination_base_path.clone()
+            } else {
+                format!("{destination_base_path}.weight")
+            };
+            report.errors.push(ValidationError::schema(
+                ValidationCode::InvalidUpstreamReference,
+                field_path,
+                format!("route {} destination {upstream_name} must use a non-zero weight", route.name),
+            ));
+        }
+        if !seen_destinations.insert(upstream_name.to_string()) {
+            let field_path = if route.destinations.is_empty() {
+                destination_base_path.clone()
+            } else {
+                format!("{destination_base_path}.upstream_cluster")
+            };
+            report.errors.push(ValidationError::semantic(
+                ValidationCode::InvalidUpstreamReference,
+                field_path,
+                format!("route {} declares duplicate upstream destination {upstream_name}", route.name),
+            ));
+        } else if !upstream_names.contains(upstream_name) {
+            let field_path = if route.destinations.is_empty() {
+                destination_base_path.clone()
+            } else {
+                format!("{destination_base_path}.upstream_cluster")
+            };
+            report.errors.push(ValidationError::semantic(
+                ValidationCode::InvalidUpstreamReference,
+                field_path,
+                format!("route {} references unknown upstream cluster {upstream_name}", route.name),
+            ));
+        }
+
+        if !route.destinations.is_empty() {
+            validate_policy_binding(
+                &destination.policies,
+                &format!("{destination_base_path}.policies"),
+                PolicyBindingTarget::RouteDestination {
+                    route_name: &route.name,
+                    upstream_cluster: upstream_name,
+                },
+                policy_registry,
+                report,
+            );
+        }
     }
 
     validate_policy_binding(
@@ -800,6 +1154,34 @@ fn validate_route(
         policy_registry,
         report,
     );
+}
+
+fn validate_upgrade_policy(
+    policy: &crate::UpgradePolicyConfig,
+    path: &str,
+    code: ValidationCode,
+    subject: &str,
+    report: &mut ValidationReport,
+) {
+    let mut seen = BTreeSet::new();
+    for (index, protocol) in policy.protocols.iter().enumerate() {
+        if !seen.insert(*protocol) {
+            report.errors.push(ValidationError::schema(
+                code,
+                format!("{path}.protocols[{index}]"),
+                format!(
+                    "{subject} must not repeat upgrade protocol {}",
+                    upgrade_protocol_name(*protocol)
+                ),
+            ));
+        }
+    }
+}
+
+fn upgrade_protocol_name(protocol: crate::UpgradeProtocolConfig) -> &'static str {
+    match protocol {
+        crate::UpgradeProtocolConfig::Websocket => "websocket",
+    }
 }
 
 fn validate_upstream_cluster(
@@ -1016,6 +1398,87 @@ fn validate_policy_binding(
         &registry.http_caches,
         report,
     );
+    validate_single_policy_ref(
+        binding.transform_policy.as_deref(),
+        &format!("{base_path}.transform_policy"),
+        "transform policy",
+        &registry.transforms,
+        report,
+    );
+    validate_single_policy_ref(
+        binding.traffic_mirror.as_deref(),
+        &format!("{base_path}.traffic_mirror"),
+        "traffic mirroring policy",
+        &registry.traffic_mirrors,
+        report,
+    );
+    validate_single_policy_ref(
+        binding.fault_injection.as_deref(),
+        &format!("{base_path}.fault_injection"),
+        "fault injection policy",
+        &registry.fault_injections,
+        report,
+    );
+    if binding.transform_policy.is_some()
+        && matches!(target, PolicyBindingTarget::UpstreamCluster(_))
+    {
+        report.errors.push(ValidationError::semantic(
+            ValidationCode::InvalidPolicyScope,
+            format!("{base_path}.transform_policy"),
+            "transform policies may only be bound to listeners or routes",
+        ));
+    }
+    if binding.traffic_mirror.is_some()
+        && !matches!(target, PolicyBindingTarget::RouteDestination { .. })
+    {
+        report.errors.push(ValidationError::semantic(
+            ValidationCode::InvalidPolicyScope,
+            format!("{base_path}.traffic_mirror"),
+            "traffic mirroring policies may only be bound to route destinations",
+        ));
+    }
+    if let (
+        Some(policy_name),
+        PolicyBindingTarget::RouteDestination { upstream_cluster, .. },
+    ) = (binding.traffic_mirror.as_deref(), target)
+    {
+        if let Some(spec) = registry.traffic_mirror_specs.get(policy_name) {
+            if spec.target_upstream_cluster == upstream_cluster {
+                report.errors.push(ValidationError::semantic(
+                    ValidationCode::InvalidPolicyField,
+                    format!("{base_path}.traffic_mirror"),
+                    "traffic mirroring target_upstream_cluster must differ from the primary route destination upstream cluster",
+                ));
+            }
+        }
+    }
+    if binding.fault_injection.is_some()
+        && !matches!(target, PolicyBindingTarget::RouteDestination { .. })
+    {
+        report.errors.push(ValidationError::semantic(
+            ValidationCode::InvalidPolicyScope,
+            format!("{base_path}.fault_injection"),
+            "fault injection policies may only be bound to route destinations",
+        ));
+    }
+    if binding.overload_response.is_some()
+        && matches!(target, PolicyBindingTarget::RouteDestination { .. })
+    {
+        report.errors.push(ValidationError::semantic(
+            ValidationCode::InvalidPolicyScope,
+            format!("{base_path}.overload_response"),
+            "overload response policies may not be bound to route destinations",
+        ));
+    }
+    if binding.cache_policy.is_some()
+        && matches!(target, PolicyBindingTarget::RouteDestination { .. })
+    {
+        report.errors.push(ValidationError::semantic(
+            ValidationCode::InvalidPolicyScope,
+            format!("{base_path}.cache_policy"),
+            "http cache policies may not be bound to route destinations",
+        ));
+    }
 }
 
 fn validate_multi_policy_refs(
@@ -1120,6 +1583,20 @@ fn validate_scope_match(
             normalize_component(name) == normalize_component(target_name)
         }
         (
+            LocalLimitScopeConfig::RouteDestination {
+                route,
+                upstream_cluster,
+            },
+            PolicyBindingTarget::RouteDestination {
+                route_name,
+                upstream_cluster: target_upstream_cluster,
+            },
+        ) => {
+            normalize_component(route) == normalize_component(route_name)
+                && normalize_component(upstream_cluster)
+                    == normalize_component(target_upstream_cluster)
+        }
+        (
             LocalLimitScopeConfig::UpstreamCluster { name },
             PolicyBindingTarget::UpstreamCluster(target_name),
         ) => normalize_component(name) == normalize_component(target_name),
@@ -1144,6 +1621,10 @@ fn describe_scope(scope: &LocalLimitScopeConfig) -> String {
     match scope {
         LocalLimitScopeConfig::Listener { name } => format!("listener {name}"),
         LocalLimitScopeConfig::Route { name } => format!("route {name}"),
+        LocalLimitScopeConfig::RouteDestination {
+            route,
+            upstream_cluster,
+        } => format!("route destination {route}->{upstream_cluster}"),
         LocalLimitScopeConfig::UpstreamCluster { name } => format!("upstream cluster {name}"),
     }
 }
@@ -1183,12 +1664,20 @@ struct PolicyRegistry {
     circuit_breakers: BTreeSet<String>,
     overload_responses: BTreeSet<String>,
     http_caches: BTreeSet<String>,
+    transforms: BTreeSet<String>,
+    traffic_mirrors: BTreeSet<String>,
+    fault_injections: BTreeSet<String>,
+    traffic_mirror_specs: BTreeMap<String, crate::TrafficMirrorPolicyConfig>,
     rate_limit_scopes: BTreeMap<String, LocalLimitScopeConfig>,
     concurrency_limit_scopes: BTreeMap<String, LocalLimitScopeConfig>,
 }
 
 impl PolicyRegistry {
-    fn new(resources: &PolicyResourcesConfig, report: &mut ValidationReport) -> Self {
+    fn new(
+        resources: &PolicyResourcesConfig,
+        upstream_names: &BTreeSet<String>,
+        report: &mut ValidationReport,
+    ) -> Self {
         let mut registry = Self {
             local_rate_limits: BTreeSet::new(),
             local_concurrency_limits: BTreeSet::new(),
@@ -1198,6 +1687,10 @@ impl PolicyRegistry {
             circuit_breakers: BTreeSet::new(),
             overload_responses: BTreeSet::new(),
             http_caches: BTreeSet::new(),
+            transforms: BTreeSet::new(),
+            traffic_mirrors: BTreeSet::new(),
+            fault_injections: BTreeSet::new(),
+            traffic_mirror_specs: BTreeMap::new(),
             rate_limit_scopes: BTreeMap::new(),
             concurrency_limit_scopes: BTreeMap::new(),
         };
@@ -1210,9 +1703,131 @@ impl PolicyRegistry {
         validate_named_circuit_breakers(resources, &mut registry, report);
         validate_named_overload_responses(resources, &mut registry, report);
         validate_named_http_caches(resources, &mut registry, report);
+        validate_named_transforms(resources, &mut registry, report);
+        validate_named_traffic_mirrors(resources, upstream_names, &mut registry, report);
+        validate_named_fault_injections(resources, &mut registry, report);
 
         registry
     }
+}
+
+fn validate_named_traffic_mirrors(
+    resources: &PolicyResourcesConfig,
+    upstream_names: &BTreeSet<String>,
+    registry: &mut PolicyRegistry,
+    report: &mut ValidationReport,
+) {
+    for (index, policy) in resources.traffic_mirrors.iter().enumerate() {
+        let base_path = format!("policies.traffic_mirrors[{index}]");
+        register_policy_name(
+            &policy.name,
+            &format!("{base_path}.name"),
+            "traffic mirroring policy",
+            &mut registry.traffic_mirrors,
+            report,
+        );
+        if policy.spec.percentage == 0 {
+            report.errors.push(ValidationError::schema(
+                ValidationCode::InvalidPolicyField,
+                format!("{base_path}.spec.percentage"),
+                "traffic mirroring percentage must be between 1 and 100",
+            ));
+        }
+        if policy.spec.target_upstream_cluster.trim().is_empty() {
+            report.errors.push(ValidationError::schema(
+                ValidationCode::InvalidPolicyField,
+                format!("{base_path}.spec.target_upstream_cluster"),
+                "traffic mirroring target_upstream_cluster must not be empty",
+            ));
+        } else if !upstream_names.contains(policy.spec.target_upstream_cluster.trim()) {
+            report.errors.push(ValidationError::semantic(
+                ValidationCode::InvalidUpstreamReference,
+                format!("{base_path}.spec.target_upstream_cluster"),
+                format!(
+                    "traffic mirroring policy {} references unknown upstream cluster {}",
+                    policy.name, policy.spec.target_upstream_cluster
+                ),
+            ));
+        }
+        registry.traffic_mirror_specs.insert(policy.name.clone(), policy.spec.clone());
+    }
+}
+
+fn validate_named_transforms(
+    resources: &PolicyResourcesConfig,
+    registry: &mut PolicyRegistry,
+    report: &mut ValidationReport,
+) {
+    for (index, policy) in resources.transforms.iter().enumerate() {
+        let base_path = format!("policies.transforms[{index}]");
+        register_policy_name(
+            &policy.name,
+            &format!("{base_path}.name"),
+            "transform policy",
+            &mut registry.transforms,
+            report,
+        );
+        validate_transform_policy(&policy.spec, &base_path, report);
+    }
+}
+
+fn validate_transform_policy(
+    policy: &TransformPolicyConfig,
+    base_path: &str,
+    report: &mut ValidationReport,
+) {
+    let has_any_transform = policy.request.path_rewrite.is_some()
+        || policy.request.host_rewrite.is_some()
+        || !policy.request.header_mutations.is_empty()
+        || !policy.response.header_mutations.is_empty();
+    if !has_any_transform {
+        report.errors.push(ValidationError::schema(
+            ValidationCode::InvalidPolicyField,
+            format!("{base_path}.spec"),
+            "transform policy must declare at least one request or response transform",
+        ));
+    }
+
+    if let Some(path_rewrite) = &policy.request.path_rewrite {
+        match path_rewrite {
+            PathRewriteTransformConfig::ReplacePrefix { match_prefix, replacement } => {
+                if match_prefix.trim().is_empty()
+                    || !match_prefix.starts_with('/')
+                    || replacement.trim().is_empty()
+                    || !replacement.starts_with('/')
+                {
+                    report.errors.push(ValidationError::schema(
+                        ValidationCode::InvalidPolicyField,
+                        format!("{base_path}.spec.request.path_rewrite"),
+                        "path rewrite replace_prefix must use non-empty match_prefix and replacement values that start with '/'",
+                    ));
+                }
+            }
+        }
+    }
+
+    if let Some(host_rewrite) = &policy.request.host_rewrite {
+        if lb_proto_http::canonicalize_host(host_rewrite).is_err() {
+            report.errors.push(ValidationError::schema(
+                ValidationCode::InvalidPolicyField,
+                format!("{base_path}.spec.request.host_rewrite"),
+                "host rewrite must use a valid canonical host or authority value",
+            ));
+        }
+    }
+
+    validate_header_mutations(
+        &policy.request.header_mutations,
+        &format!("{base_path}.spec.request.header_mutations"),
+        HeaderMutationTarget::Request,
+        report,
+    );
+    validate_header_mutations(
+        &policy.response.header_mutations,
+        &format!("{base_path}.spec.response.header_mutations"),
+        HeaderMutationTarget::Response,
+        report,
+    );
 }
 
 fn validate_named_http_caches(
@@ -1231,6 +1846,150 @@ fn validate_named_http_caches(
         );
         validate_http_cache_policy(&policy.spec, &base_path, report);
     }
+}
+
+#[derive(Clone, Copy)]
+enum HeaderMutationTarget {
+    Request,
+    Response,
+}
+
+fn validate_header_mutations(
+    mutations: &[HeaderMutationConfig],
+    path: &str,
+    target: HeaderMutationTarget,
+    report: &mut ValidationReport,
+) {
+    for (index, mutation) in mutations.iter().enumerate() {
+        let (name, value) = match mutation {
+            HeaderMutationConfig::Set { name, value } => (name.as_str(), Some(value.as_str())),
+            HeaderMutationConfig::Remove { name } => (name.as_str(), None),
+        };
+        let name_path = format!("{path}[{index}].name");
+        let Some(normalized_name) = lb_proto_http::normalize_http_header_name(name) else {
+            report.errors.push(ValidationError::schema(
+                ValidationCode::InvalidPolicyField,
+                name_path,
+                "header mutation name must be a valid HTTP header name",
+            ));
+            continue;
+        };
+
+        let disallowed = match target {
+            HeaderMutationTarget::Request => is_disallowed_request_transform_header(&normalized_name),
+            HeaderMutationTarget::Response => {
+                is_disallowed_response_transform_header(&normalized_name)
+            }
+        };
+        if disallowed {
+            report.errors.push(ValidationError::schema(
+                ValidationCode::InvalidPolicyField,
+                format!("{path}[{index}]"),
+                format!(
+                    "header mutation for {normalized_name} is not allowed because it affects hop-by-hop or framing behavior"
+                ),
+            ));
+        }
+
+        if let Some(value) = value {
+            if value.trim().is_empty() || value.contains(['\r', '\n']) {
+                report.errors.push(ValidationError::schema(
+                    ValidationCode::InvalidPolicyField,
+                    format!("{path}[{index}].value"),
+                    "header mutation set values must be non-empty and must not contain CR or LF",
+                ));
+            }
+        }
+    }
+}
+
+fn validate_named_fault_injections(
+    resources: &PolicyResourcesConfig,
+    registry: &mut PolicyRegistry,
+    report: &mut ValidationReport,
+) {
+    for (index, policy) in resources.fault_injections.iter().enumerate() {
+        let base_path = format!("policies.fault_injections[{index}]");
+        register_policy_name(
+            &policy.name,
+            &format!("{base_path}.name"),
+            "fault injection policy",
+            &mut registry.fault_injections,
+            report,
+        );
+        if policy.spec.delay.is_none() && policy.spec.abort.is_none() {
+            report.errors.push(ValidationError::schema(
+                ValidationCode::InvalidPolicyField,
+                format!("{base_path}.spec"),
+                "fault injection policy must declare at least one of delay or abort",
+            ));
+        }
+        if let Some(delay) = &policy.spec.delay {
+            if delay.percentage == 0 {
+                report.errors.push(ValidationError::schema(
+                    ValidationCode::InvalidPolicyField,
+                    format!("{base_path}.spec.delay.percentage"),
+                    "fault injection delay percentage must be between 1 and 100",
+                ));
+            }
+            if delay.fixed_delay_ms == 0 {
+                report.errors.push(ValidationError::schema(
+                    ValidationCode::InvalidPolicyField,
+                    format!("{base_path}.spec.delay.fixed_delay_ms"),
+                    "fault injection fixed_delay_ms must be greater than zero",
+                ));
+            }
+        }
+        if let Some(abort) = &policy.spec.abort {
+            if abort.percentage == 0 {
+                report.errors.push(ValidationError::schema(
+                    ValidationCode::InvalidPolicyField,
+                    format!("{base_path}.spec.abort.percentage"),
+                    "fault injection abort percentage must be between 1 and 100",
+                ));
+            }
+            if !(400..=599).contains(&abort.http_status) {
+                report.errors.push(ValidationError::schema(
+                    ValidationCode::InvalidPolicyField,
+                    format!("{base_path}.spec.abort.http_status"),
+                    "fault injection abort http_status must be between 400 and 599",
+                ));
+            }
+        }
+    }
+}
+
+fn is_disallowed_request_transform_header(header: &str) -> bool {
+    matches!(
+        header,
+        "connection"
+            | "content-length"
+            | "host"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "proxy-connection"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+    )
+}
+
+fn is_disallowed_response_transform_header(header: &str) -> bool {
+    matches!(
+        header,
+        "connection"
+            | "content-length"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "proxy-connection"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+    )
 }
 
 fn validate_http_cache_policy(
@@ -1563,17 +2322,37 @@ fn validate_local_limit_scope(
     path: &str,
     report: &mut ValidationReport,
 ) {
-    let name = match scope {
+    match scope {
         LocalLimitScopeConfig::Listener { name }
         | LocalLimitScopeConfig::Route { name }
-        | LocalLimitScopeConfig::UpstreamCluster { name } => name,
-    };
-    if name.trim().is_empty() {
-        report.errors.push(ValidationError::schema(
-            ValidationCode::InvalidPolicyField,
-            path,
-            "local limit scope name must not be empty",
-        ));
+        | LocalLimitScopeConfig::UpstreamCluster { name } => {
+            if name.trim().is_empty() {
+                report.errors.push(ValidationError::schema(
+                    ValidationCode::InvalidPolicyField,
+                    path,
+                    "local limit scope name must not be empty",
+                ));
+            }
+        }
+        LocalLimitScopeConfig::RouteDestination {
+            route,
+            upstream_cluster,
+        } => {
+            if route.trim().is_empty() {
+                report.errors.push(ValidationError::schema(
+                    ValidationCode::InvalidPolicyField,
+                    format!("{path}.route"),
+                    "local limit route-destination scope route must not be empty",
+                ));
+            }
+            if upstream_cluster.trim().is_empty() {
+                report.errors.push(ValidationError::schema(
+                    ValidationCode::InvalidPolicyField,
+                    format!("{path}.upstream_cluster"),
+                    "local limit route-destination scope upstream_cluster must not be empty",
+                ));
+            }
+        }
     }
 }
 
@@ -1696,6 +2475,10 @@ fn normalize_component(value: &str) -> String {
 enum PolicyBindingTarget<'a> {
     Listener(&'a str),
     Route(&'a str),
+    RouteDestination {
+        route_name: &'a str,
+        upstream_cluster: &'a str,
+    },
     UpstreamCluster(&'a str),
 }
 
@@ -1704,13 +2487,20 @@ impl PolicyBindingTarget<'_> {
         match self {
             Self::Listener(_) => "listener",
             Self::Route(_) => "route",
+            Self::RouteDestination { .. } => "route destination",
             Self::UpstreamCluster(_) => "upstream cluster",
         }
     }
 
-    fn resource_name(&self) -> &str {
+    fn resource_name(&self) -> String {
         match self {
-            Self::Listener(name) | Self::Route(name) | Self::UpstreamCluster(name) => name,
+            Self::Listener(name) | Self::Route(name) | Self::UpstreamCluster(name) => {
+                (*name).to_string()
+            }
+            Self::RouteDestination {
+                route_name,
+                upstream_cluster,
+            } => format!("{route_name}->{upstream_cluster}"),
         }
     }
 
@@ -1721,7 +2511,7 @@ impl PolicyBindingTarget<'_> {
 
 #[cfg(test)]
 mod tests {
-    use std::net::SocketAddr;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     use super::{
         validate_workspace_config, ValidationCategory, ValidationCode, WorkspaceConfigValidator,
@@ -1730,14 +2520,20 @@ mod tests {
         AdminListenerPolicyConfig, AffinityFallbackConfig, AffinityPolicyConfig,
         AuthorizationCacheBehaviorConfig, CacheKeyPolicyConfig, CacheQueryKeyBehaviorConfig,
         HostileEdgeHandshakeGuardConfig, HostileEdgeProtectionPolicyConfig,
-        HostileEdgeSourceQuotaConfig, HttpCacheMethodConfig, HttpCachePolicyConfig,
-        HttpCacheStorageConfig, ListenerCertificateSourceConfig, ListenerClassConfig,
-        ListenerResourceConfig, ListenerTlsTerminationConfig, LocalConcurrencyLimitPolicyConfig,
-        LocalLimitKeyKindConfig, LocalLimitScopeConfig, LocalRateLimitPolicyConfig,
+        HeaderMutationConfig, HostileEdgeSourceQuotaConfig, HttpCacheMethodConfig,
+        HttpCachePolicyConfig, HttpCacheStorageConfig, ListenerCertificateSourceConfig,
+        ListenerBindModeConfig, ListenerClassConfig, ListenerResourceConfig, ListenerTlsTerminationConfig,
+        LocalConcurrencyLimitPolicyConfig, LocalLimitKeyKindConfig, LocalLimitScopeConfig,
+        LocalRateLimitPolicyConfig,
         NamedHostileEdgeProtectionPolicyConfig, NamedHttpCachePolicyConfig,
         NamedLocalConcurrencyLimitPolicyConfig, NamedLocalRateLimitPolicyConfig,
         NamedOverloadResponsePolicyConfig, NamedRetryBudgetPolicyConfig,
-        OverloadResponsePolicyConfig, PolicyBindingConfig, PolicyResourcesConfig, RouteConfig,
+        NamedFaultInjectionPolicyConfig,
+        NamedTrafficMirrorPolicyConfig,
+        NamedTransformPolicyConfig, OverloadResponsePolicyConfig, PathRewriteTransformConfig,
+        PolicyBindingConfig, PolicyResourcesConfig, RequestTransformConfig, ResponseTransformConfig,
+        RouteConfig, TrafficMirrorPolicyConfig, TransformPolicyConfig, UpgradePolicyConfig, UpgradeProtocolConfig,
+        FaultInjectionPolicyConfig, FaultInjectionDelayConfig, FaultInjectionAbortConfig,
         UpstreamClusterConfig, UpstreamEndpointConfig, UpstreamTrafficPolicyConfig,
         WorkspaceConfig,
     };
@@ -1752,7 +2548,9 @@ mod tests {
                 name: String::from("public"),
                 class: ListenerClassConfig::Public,
                 bind_address: public_listener_addr,
+                bind_mode: ListenerBindModeConfig::SingleStack,
                 protocol: crate::ListenerProtocolConfig::Http1,
+                proxy_protocol: crate::ProxyProtocolModeConfig::Disabled,
                 tls_termination: None,
                 allow_unspecified_bind: false,
                 max_connections: Some(1024),
@@ -1769,6 +2567,7 @@ mod tests {
                     cache_policy: Some(String::from("public-cache")),
                     ..PolicyBindingConfig::default()
                 },
+                upgrade: crate::UpgradePolicyConfig::default(),
                 admin: AdminListenerPolicyConfig::default(),
             }],
             routes: vec![RouteConfig {
@@ -1776,18 +2575,36 @@ mod tests {
                 match_rule: crate::RouteMatchConfig::PathPrefix {
                     prefix: String::from("/api"),
                     hostnames: Vec::new(),
+                    methods: Vec::new(),
+                    headers: Vec::new(),
+                    query_params: Vec::new(),
+                    content_types: Vec::new(),
+                    grpc_services: Vec::new(),
+                    grpc_methods: Vec::new(),
+                    source_cidrs: Vec::new(),
                 },
-                upstream_cluster: String::from("payments"),
+                upstream_cluster: Some(String::from("payments")),
+                destinations: Vec::new(),
                 policies: PolicyBindingConfig {
                     local_concurrency_limits: vec![String::from("api-concurrency")],
+                    transform_policy: Some(String::from("api-transform")),
                     ..PolicyBindingConfig::default()
                 },
+                upgrade: crate::UpgradePolicyConfig::default(),
             }],
             upstream_clusters: vec![UpstreamClusterConfig {
                 name: String::from("payments"),
                 endpoints: vec![UpstreamEndpointConfig::foundation(
                     "payments-a",
                     payments_endpoint_addr,
+                )],
+                traffic_policy: UpstreamTrafficPolicyConfig::default(),
+                policies: PolicyBindingConfig::default(),
+            }, UpstreamClusterConfig {
+                name: String::from("payments-shadow"),
+                endpoints: vec![UpstreamEndpointConfig::foundation(
+                    "payments-shadow-a",
+                    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9002),
                 )],
                 traffic_policy: UpstreamTrafficPolicyConfig::default(),
                 policies: PolicyBindingConfig::default(),
@@ -1879,6 +2696,47 @@ mod tests {
                         },
                     },
                 }],
+                transforms: vec![NamedTransformPolicyConfig {
+                    name: String::from("api-transform"),
+                    spec: TransformPolicyConfig {
+                        request: RequestTransformConfig {
+                            path_rewrite: Some(PathRewriteTransformConfig::ReplacePrefix {
+                                match_prefix: String::from("/api"),
+                                replacement: String::from("/v1/api"),
+                            }),
+                            host_rewrite: Some(String::from("backend.internal")),
+                            header_mutations: vec![HeaderMutationConfig::Set {
+                                name: String::from("x-route"),
+                                value: String::from("api"),
+                            }],
+                        },
+                        response: ResponseTransformConfig {
+                            header_mutations: vec![HeaderMutationConfig::Remove {
+                                name: String::from("server"),
+                            }],
+                        },
+                    },
+                }],
+                traffic_mirrors: vec![NamedTrafficMirrorPolicyConfig {
+                    name: String::from("shadow-payments"),
+                    spec: TrafficMirrorPolicyConfig {
+                        percentage: 20,
+                        target_upstream_cluster: String::from("payments-shadow"),
+                    },
+                }],
+                fault_injections: vec![NamedFaultInjectionPolicyConfig {
+                    name: String::from("canary-chaos"),
+                    spec: FaultInjectionPolicyConfig {
+                        delay: Some(FaultInjectionDelayConfig {
+                            percentage: 10,
+                            fixed_delay_ms: 250,
+                        }),
+                        abort: Some(FaultInjectionAbortConfig {
+                            percentage: 5,
+                            http_status: 503,
+                        }),
+                    },
+                }],
             },
             ..WorkspaceConfig::foundation()
         })
@@ -1931,7 +2789,7 @@ mod tests {
     fn validator_rejects_invalid_references() -> Result<(), Box<dyn std::error::Error>> {
         let mut config = valid_workspace()?;
         config.listeners[0].routes.push(String::from("missing-route"));
-        config.routes[0].upstream_cluster = String::from("missing-cluster");
+        config.routes[0].upstream_cluster = Some(String::from("missing-cluster"));
         config.listeners[0].policies.retry_budget = Some(String::from("missing-policy"));
 
         let report = validate_workspace_config(&config);
@@ -1945,11 +2803,309 @@ mod tests {
     }
 
     #[test]
+    fn validator_accepts_weighted_route_destinations() -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = valid_workspace()?;
+        config.routes[0].upstream_cluster = None;
+        config.routes[0].destinations = vec![
+            crate::RouteDestinationConfig {
+                upstream_cluster: String::from("payments"),
+                weight: 90,
+                policies: PolicyBindingConfig::default(),
+            },
+            crate::RouteDestinationConfig {
+                upstream_cluster: String::from("payments-canary"),
+                weight: 10,
+                policies: PolicyBindingConfig::default(),
+            },
+        ];
+        config.upstream_clusters.push(UpstreamClusterConfig {
+            name: String::from("payments-canary"),
+            endpoints: vec![UpstreamEndpointConfig::foundation(
+                "payments-canary-a",
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9001),
+            )],
+            traffic_policy: UpstreamTrafficPolicyConfig::default(),
+            policies: PolicyBindingConfig::default(),
+        });
+
+        let report = validate_workspace_config(&config);
+
+        assert!(report.is_empty(), "{}", report.operator_summary());
+        Ok(())
+    }
+
+    #[test]
+    fn validator_rejects_invalid_route_destinations() -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = valid_workspace()?;
+        config.routes[0].upstream_cluster = None;
+        config.routes[0].destinations = vec![
+            crate::RouteDestinationConfig {
+                upstream_cluster: String::from("payments"),
+                weight: 0,
+                policies: PolicyBindingConfig::default(),
+            },
+            crate::RouteDestinationConfig {
+                upstream_cluster: String::from("payments"),
+                weight: 1,
+                policies: PolicyBindingConfig::default(),
+            },
+        ];
+
+        let report = validate_workspace_config(&config);
+
+        assert!(report.errors.iter().any(|error| error.path == "routes[0].destinations[0].weight"));
+        assert!(report.errors.iter().any(|error| {
+            error.path == "routes[0].destinations[1].upstream_cluster"
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn validator_accepts_route_destination_policy_bindings(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = valid_workspace()?;
+        config.routes[0].upstream_cluster = None;
+        config.routes[0].destinations = vec![
+            crate::RouteDestinationConfig {
+                upstream_cluster: String::from("payments"),
+                weight: 90,
+                policies: PolicyBindingConfig::default(),
+            },
+            crate::RouteDestinationConfig {
+                upstream_cluster: String::from("payments-canary"),
+                weight: 10,
+                policies: PolicyBindingConfig {
+                    traffic_mirror: Some(String::from("shadow-payments")),
+                    fault_injection: Some(String::from("canary-chaos")),
+                    local_rate_limits: vec![String::from("payments-canary-rate")],
+                    local_concurrency_limits: vec![String::from("payments-canary-concurrency")],
+                    retry_budget: Some(String::from("standard-retry")),
+                    timeout_hierarchy: Some(String::from("standard-timeouts")),
+                    circuit_breaker: Some(String::from("standard-breaker")),
+                    transform_policy: Some(String::from("api-transform")),
+                    ..PolicyBindingConfig::default()
+                },
+            },
+        ];
+        config.upstream_clusters.push(UpstreamClusterConfig {
+            name: String::from("payments-canary"),
+            endpoints: vec![UpstreamEndpointConfig::foundation(
+                "payments-canary-a",
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9001),
+            )],
+            traffic_policy: UpstreamTrafficPolicyConfig::default(),
+            policies: PolicyBindingConfig::default(),
+        });
+        config
+            .policies
+            .local_rate_limits
+            .push(NamedLocalRateLimitPolicyConfig {
+                name: String::from("payments-canary-rate"),
+                spec: LocalRateLimitPolicyConfig {
+                    scope: LocalLimitScopeConfig::RouteDestination {
+                        route: String::from("api"),
+                        upstream_cluster: String::from("payments-canary"),
+                    },
+                    key_kind: LocalLimitKeyKindConfig::Global,
+                    requests_per_window: 25,
+                    window_ms: 1_000,
+                    max_tracked_keys: 64,
+                },
+            });
+        config.policies.local_concurrency_limits.push(
+            NamedLocalConcurrencyLimitPolicyConfig {
+                name: String::from("payments-canary-concurrency"),
+                spec: LocalConcurrencyLimitPolicyConfig {
+                    scope: LocalLimitScopeConfig::RouteDestination {
+                        route: String::from("api"),
+                        upstream_cluster: String::from("payments-canary"),
+                    },
+                    key_kind: LocalLimitKeyKindConfig::Global,
+                    max_concurrent: 8,
+                    max_tracked_keys: 32,
+                },
+            },
+        );
+
+        let report = validate_workspace_config(&config);
+
+        assert!(report.is_empty(), "{}", report.operator_summary());
+        Ok(())
+    }
+
+    #[test]
+    fn validator_rejects_invalid_traffic_mirror_policy_shapes(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = valid_workspace()?;
+        config.policies.traffic_mirrors[0].spec.percentage = 0;
+        config.policies.traffic_mirrors[0].spec.target_upstream_cluster = String::from("missing");
+
+        let report = validate_workspace_config(&config);
+
+        assert!(report.errors.iter().any(|error| {
+            error.path == "policies.traffic_mirrors[0].spec.percentage"
+        }));
+        assert!(report.errors.iter().any(|error| {
+            error.path == "policies.traffic_mirrors[0].spec.target_upstream_cluster"
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn validator_rejects_traffic_mirror_bound_on_route(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = valid_workspace()?;
+        config.routes[0].policies.traffic_mirror = Some(String::from("shadow-payments"));
+
+        let report = validate_workspace_config(&config);
+
+        assert!(report.errors.iter().any(|error| {
+            error.code == ValidationCode::InvalidPolicyScope
+                && error.path == "routes[0].policies.traffic_mirror"
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn validator_rejects_traffic_mirror_targeting_same_destination(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = valid_workspace()?;
+        config.routes[0].upstream_cluster = None;
+        config.routes[0].destinations = vec![crate::RouteDestinationConfig {
+            upstream_cluster: String::from("payments"),
+            weight: 1,
+            policies: PolicyBindingConfig {
+                traffic_mirror: Some(String::from("loop-payments")),
+                ..PolicyBindingConfig::default()
+            },
+        }];
+        config.policies.traffic_mirrors.push(NamedTrafficMirrorPolicyConfig {
+            name: String::from("loop-payments"),
+            spec: TrafficMirrorPolicyConfig {
+                percentage: 10,
+                target_upstream_cluster: String::from("payments"),
+            },
+        });
+
+        let report = validate_workspace_config(&config);
+
+        assert!(report.errors.iter().any(|error| {
+            error.code == ValidationCode::InvalidPolicyField
+                && error.path == "routes[0].destinations[0].policies.traffic_mirror"
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn validator_rejects_invalid_fault_injection_policy_shapes(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = valid_workspace()?;
+        config.policies.fault_injections[0].spec.delay = Some(FaultInjectionDelayConfig {
+            percentage: 0,
+            fixed_delay_ms: 0,
+        });
+        config.policies.fault_injections[0].spec.abort = Some(FaultInjectionAbortConfig {
+            percentage: 0,
+            http_status: 200,
+        });
+
+        let report = validate_workspace_config(&config);
+
+        assert!(report.errors.iter().any(|error| {
+            error.path == "policies.fault_injections[0].spec.delay.percentage"
+        }));
+        assert!(report.errors.iter().any(|error| {
+            error.path == "policies.fault_injections[0].spec.delay.fixed_delay_ms"
+        }));
+        assert!(report.errors.iter().any(|error| {
+            error.path == "policies.fault_injections[0].spec.abort.percentage"
+        }));
+        assert!(report.errors.iter().any(|error| {
+            error.path == "policies.fault_injections[0].spec.abort.http_status"
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn validator_rejects_fault_injection_bound_on_route(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = valid_workspace()?;
+        config.routes[0].policies.fault_injection = Some(String::from("canary-chaos"));
+
+        let report = validate_workspace_config(&config);
+
+        assert!(report.errors.iter().any(|error| {
+            error.code == ValidationCode::InvalidPolicyScope
+                && error.path == "routes[0].policies.fault_injection"
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn validator_rejects_invalid_route_destination_policy_bindings(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = valid_workspace()?;
+        config.routes[0].upstream_cluster = None;
+        config.routes[0].destinations = vec![crate::RouteDestinationConfig {
+            upstream_cluster: String::from("payments"),
+            weight: 1,
+            policies: PolicyBindingConfig {
+                local_rate_limits: vec![String::from("public-rate")],
+                local_concurrency_limits: vec![String::from("api-concurrency")],
+                overload_response: Some(String::from("public-overload")),
+                cache_policy: Some(String::from("public-cache")),
+                hostile_edge_protection: Some(String::from("edge-default")),
+                ..PolicyBindingConfig::default()
+            },
+        }];
+        config.policies.hostile_edge_protections.push(NamedHostileEdgeProtectionPolicyConfig {
+            name: String::from("edge-default"),
+            spec: HostileEdgeProtectionPolicyConfig {
+                source_quota: Some(HostileEdgeSourceQuotaConfig::default()),
+                handshake_guard: Some(HostileEdgeHandshakeGuardConfig::default()),
+            },
+        });
+
+        let report = validate_workspace_config(&config);
+
+        assert!(report.errors.iter().any(|error| {
+            error.code == ValidationCode::InvalidPolicyScope
+                && error.message.contains("local rate-limit policy public-rate scope listener public")
+        }));
+        assert!(report.errors.iter().any(|error| {
+            error.code == ValidationCode::InvalidPolicyScope
+                && error.message.contains(
+                    "local concurrency-limit policy api-concurrency scope route api"
+                )
+        }));
+        assert!(report.errors.iter().any(|error| {
+            error.code == ValidationCode::InvalidPolicyScope
+                && error.path == "routes[0].destinations[0].policies.overload_response"
+        }));
+        assert!(report.errors.iter().any(|error| {
+            error.code == ValidationCode::InvalidPolicyScope
+                && error.path == "routes[0].destinations[0].policies.cache_policy"
+        }));
+        assert!(report.errors.iter().any(|error| {
+            error.code == ValidationCode::InvalidPolicyScope
+                && error.path == "routes[0].destinations[0].policies.hostile_edge_protection"
+        }));
+        Ok(())
+    }
+
+    #[test]
     fn validator_rejects_invalid_route_hostname() -> Result<(), Box<dyn std::error::Error>> {
         let mut config = valid_workspace()?;
         config.routes[0].match_rule = crate::RouteMatchConfig::PathPrefix {
             prefix: String::from("/api"),
             hostnames: vec![String::from("bad/host")],
+            methods: Vec::new(),
+            headers: Vec::new(),
+            query_params: Vec::new(),
+            content_types: Vec::new(),
+            grpc_services: Vec::new(),
+            grpc_methods: Vec::new(),
+            source_cidrs: Vec::new(),
         };
 
         let report = validate_workspace_config(&config);
@@ -1957,6 +3113,124 @@ mod tests {
         assert_eq!(report.errors.len(), 1);
         assert_eq!(report.errors[0].code, ValidationCode::InvalidRouteMatch);
         assert_eq!(report.errors[0].path, "routes[0].match.hostnames[0]");
+        Ok(())
+    }
+
+    #[test]
+    fn validator_rejects_invalid_route_method() -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = valid_workspace()?;
+        config.routes[0].match_rule = crate::RouteMatchConfig::PathPrefix {
+            prefix: String::from("/api"),
+            hostnames: Vec::new(),
+            methods: vec![String::from("bad token")],
+            headers: Vec::new(),
+            query_params: Vec::new(),
+            content_types: Vec::new(),
+            grpc_services: Vec::new(),
+            grpc_methods: Vec::new(),
+            source_cidrs: Vec::new(),
+        };
+
+        let report = validate_workspace_config(&config);
+
+        assert_eq!(report.errors.len(), 1);
+        assert_eq!(report.errors[0].code, ValidationCode::InvalidRouteMatch);
+        assert_eq!(report.errors[0].path, "routes[0].match.methods[0]");
+        Ok(())
+    }
+
+    #[test]
+    fn validator_rejects_invalid_route_header_query_content_type_and_source(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = valid_workspace()?;
+        config.routes[0].match_rule = crate::RouteMatchConfig::PathPrefix {
+            prefix: String::from("/api"),
+            hostnames: Vec::new(),
+            methods: Vec::new(),
+            headers: vec![crate::RouteHeaderMatchConfig::Exact {
+                name: String::from("bad header"),
+                value: String::from("beta"),
+            }],
+            query_params: vec![crate::RouteQueryMatchConfig::Present {
+                name: String::from("a=b"),
+            }],
+            content_types: vec![String::from("broken")],
+            grpc_services: vec![String::from("bad/service")],
+            grpc_methods: vec![String::from("bad method")],
+            source_cidrs: vec![String::from("not-a-cidr")],
+        };
+
+        let report = validate_workspace_config(&config);
+
+        assert!(report.errors.iter().any(|error| error.path == "routes[0].match.headers[0]"));
+        assert!(report.errors.iter().any(|error| error.path == "routes[0].match.query_params[0]"));
+        assert!(report.errors.iter().any(|error| error.path == "routes[0].match.content_types[0]"));
+        assert!(report.errors.iter().any(|error| error.path == "routes[0].match.grpc_services[0]"));
+        assert!(report.errors.iter().any(|error| error.path == "routes[0].match.grpc_methods[0]"));
+        assert!(report.errors.iter().any(|error| error.path == "routes[0].match.source_cidrs[0]"));
+        Ok(())
+    }
+
+    #[test]
+    fn validator_rejects_grpc_matchers_without_grpc_content_type() -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = valid_workspace()?;
+        config.routes[0].match_rule = crate::RouteMatchConfig::PathPrefix {
+            prefix: String::from("/"),
+            hostnames: Vec::new(),
+            methods: vec![String::from("POST")],
+            headers: Vec::new(),
+            query_params: Vec::new(),
+            content_types: Vec::new(),
+            grpc_services: vec![String::from("grpc.payments.v1.Payments")],
+            grpc_methods: Vec::new(),
+            source_cidrs: Vec::new(),
+        };
+
+        let report = validate_workspace_config(&config);
+
+        assert!(report.errors.iter().any(|error| error.path == "routes[0].match.content_types"));
+        Ok(())
+    }
+
+    #[test]
+    fn validator_rejects_grpc_matchers_with_non_post_methods() -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = valid_workspace()?;
+        config.routes[0].match_rule = crate::RouteMatchConfig::PathPrefix {
+            prefix: String::from("/"),
+            hostnames: Vec::new(),
+            methods: vec![String::from("GET")],
+            headers: Vec::new(),
+            query_params: Vec::new(),
+            content_types: vec![String::from("application/grpc")],
+            grpc_services: Vec::new(),
+            grpc_methods: vec![String::from("Capture")],
+            source_cidrs: Vec::new(),
+        };
+
+        let report = validate_workspace_config(&config);
+
+        assert!(report.errors.iter().any(|error| error.path == "routes[0].match.methods"));
+        Ok(())
+    }
+
+    #[test]
+    fn validator_accepts_grpc_service_and_method_matchers() -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = valid_workspace()?;
+        config.routes[0].match_rule = crate::RouteMatchConfig::PathPrefix {
+            prefix: String::from("/"),
+            hostnames: Vec::new(),
+            methods: vec![String::from("POST")],
+            headers: Vec::new(),
+            query_params: Vec::new(),
+            content_types: vec![String::from("application/grpc")],
+            grpc_services: vec![String::from("grpc.payments.v1.Payments")],
+            grpc_methods: vec![String::from("Capture")],
+            source_cidrs: Vec::new(),
+        };
+
+        let report = validate_workspace_config(&config);
+
+        assert!(report.errors.is_empty());
         Ok(())
     }
 
@@ -2085,6 +3359,141 @@ mod tests {
     }
 
     #[test]
+    fn validator_rejects_invalid_transform_policy_shapes(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = valid_workspace()?;
+        config.policies.transforms[0].spec = TransformPolicyConfig::default();
+        config.policies.transforms.push(NamedTransformPolicyConfig {
+            name: String::from("broken-transform"),
+            spec: TransformPolicyConfig {
+                request: RequestTransformConfig {
+                    path_rewrite: Some(PathRewriteTransformConfig::ReplacePrefix {
+                        match_prefix: String::from("api"),
+                        replacement: String::from("v1"),
+                    }),
+                    host_rewrite: Some(String::from("bad host")),
+                    header_mutations: vec![HeaderMutationConfig::Set {
+                        name: String::from("connection"),
+                        value: String::from("close"),
+                    }],
+                },
+                response: ResponseTransformConfig {
+                    header_mutations: vec![HeaderMutationConfig::Set {
+                        name: String::from("content-length"),
+                        value: String::from("1"),
+                    }],
+                },
+            },
+        });
+        config.routes[0].policies.transform_policy = Some(String::from("broken-transform"));
+
+        let report = validate_workspace_config(&config);
+
+        assert!(report.errors.iter().any(|error| {
+            error.path == "policies.transforms[0].spec"
+                && error.code == ValidationCode::InvalidPolicyField
+        }));
+        assert!(report.errors.iter().any(|error| {
+            error.path == "policies.transforms[1].spec.request.path_rewrite"
+                && error.code == ValidationCode::InvalidPolicyField
+        }));
+        assert!(report.errors.iter().any(|error| {
+            error.path == "policies.transforms[1].spec.request.host_rewrite"
+                && error.code == ValidationCode::InvalidPolicyField
+        }));
+        assert!(report.errors.iter().any(|error| {
+            error.path == "policies.transforms[1].spec.request.header_mutations[0]"
+                && error.code == ValidationCode::InvalidPolicyField
+        }));
+        assert!(report.errors.iter().any(|error| {
+            error.path == "policies.transforms[1].spec.response.header_mutations[0]"
+                && error.code == ValidationCode::InvalidPolicyField
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn validator_rejects_transform_policy_bound_on_upstream_cluster(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = valid_workspace()?;
+        config.upstream_clusters[0].policies.transform_policy = Some(String::from("api-transform"));
+
+        let report = validate_workspace_config(&config);
+
+        assert!(report.errors.iter().any(|error| {
+            error.path == "upstream_clusters[0].policies.transform_policy"
+                && error.code == ValidationCode::InvalidPolicyScope
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn validator_rejects_upgrade_policy_on_unsupported_listener_surfaces(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = valid_workspace()?;
+        config.listeners[0].protocol = crate::ListenerProtocolConfig::Http2;
+        config.listeners[0].upgrade = UpgradePolicyConfig {
+            protocols: vec![UpgradeProtocolConfig::Websocket, UpgradeProtocolConfig::Websocket],
+        };
+        config.routes[0].upgrade = UpgradePolicyConfig {
+            protocols: vec![UpgradeProtocolConfig::Websocket],
+        };
+
+        let report = validate_workspace_config(&config);
+
+        assert!(report.errors.iter().any(|error| {
+            error.code == ValidationCode::InvalidListenerField
+                && error.path == "listeners[0].upgrade"
+                && error.message
+                    == "upgrade policy is supported only on public http1 or https listeners"
+        }));
+        assert!(report.errors.iter().any(|error| {
+            error.code == ValidationCode::InvalidListenerField
+                && error.path == "listeners[0].routes[0]"
+                && error.message.contains("cannot attach route api with upgrade policy")
+        }));
+        assert!(report.errors.iter().any(|error| {
+            error.code == ValidationCode::InvalidListenerField
+                && error.path == "listeners[0].upgrade.protocols[1]"
+                && error.message.contains("must not repeat upgrade protocol websocket")
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn validator_rejects_proxy_protocol_on_admin_listener(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = valid_workspace()?;
+        config.listeners.push(ListenerResourceConfig {
+            name: String::from("admin-proxy"),
+            class: ListenerClassConfig::Admin,
+            bind_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9090),
+            bind_mode: ListenerBindModeConfig::SingleStack,
+            protocol: crate::ListenerProtocolConfig::Http1,
+            proxy_protocol: crate::ProxyProtocolModeConfig::V1,
+            tls_termination: None,
+            allow_unspecified_bind: false,
+            max_connections: None,
+            backlog: None,
+            idle_timeout_ms: None,
+            drain_timeout_ms: None,
+            routes: Vec::new(),
+            policies: PolicyBindingConfig::default(),
+            upgrade: UpgradePolicyConfig::default(),
+            admin: AdminListenerPolicyConfig::default(),
+        });
+
+        let report = validate_workspace_config(&config);
+
+        assert!(report.errors.iter().any(|error| {
+            error.code == ValidationCode::InvalidListenerField
+                && error.path == "listeners[1].proxy_protocol"
+                && error.message == "proxy protocol is supported only on public listeners"
+        }));
+        Ok(())
+    }
+
+    #[test]
     fn validator_rejects_empty_hostile_edge_policy() -> Result<(), Box<dyn std::error::Error>> {
         let mut config = valid_workspace()?;
         config.listeners[0].policies.hostile_edge_protection = Some(String::from("edge-default"));
@@ -2129,7 +3538,7 @@ mod tests {
         let mut validator = WorkspaceConfigValidator::default();
         let mut config = valid_workspace()?;
         config.name = String::from(" ");
-        config.routes[0].upstream_cluster = String::from("missing");
+        config.routes[0].upstream_cluster = Some(String::from("missing"));
 
         let result = validator.validate(&config);
 
@@ -2154,6 +3563,42 @@ mod tests {
     }
 
     #[test]
+    fn validator_accepts_http3_listener_with_tls_and_h3_alpn(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = valid_workspace()?;
+        config.listeners[0].protocol = crate::ListenerProtocolConfig::Http3;
+        config.listeners[0].tls_termination = Some(ListenerTlsTerminationConfig {
+            certificate_source: ListenerCertificateSourceConfig::Files {
+                cert_path: String::from("certs/server.pem"),
+                key_path: String::from("certs/server.key"),
+                ocsp_path: None,
+            },
+            sni_certificates: Vec::new(),
+            session_resumption: crate::ListenerTlsSessionResumptionConfig::default(),
+            minimum_version: crate::ListenerTlsMinimumVersionConfig::Tls13,
+            alpn_protocols: vec![crate::ListenerAlpnProtocolConfig::Http3],
+        });
+
+        let report = validate_workspace_config(&config);
+
+        assert!(report.errors.is_empty(), "{report}");
+        Ok(())
+    }
+
+    #[test]
+    fn validator_rejects_http3_without_tls_material() -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = valid_workspace()?;
+        config.listeners[0].protocol = crate::ListenerProtocolConfig::Http3;
+
+        let report = validate_workspace_config(&config);
+
+        assert!(report
+            .to_string()
+            .contains("http3 listeners must declare tls_termination certificate material"));
+        Ok(())
+    }
+
+    #[test]
     fn validator_rejects_tls_termination_on_non_https_listener(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut config = valid_workspace()?;
@@ -2173,7 +3618,61 @@ mod tests {
 
         assert!(report
             .to_string()
-            .contains("tls_termination is currently supported only for https listeners"));
+            .contains("tls_termination is currently supported only for https and http3 listeners"));
+        Ok(())
+    }
+
+    #[test]
+    fn validator_rejects_http3_listener_without_h3_alpn(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = valid_workspace()?;
+        config.listeners[0].protocol = crate::ListenerProtocolConfig::Http3;
+        config.listeners[0].tls_termination = Some(ListenerTlsTerminationConfig {
+            certificate_source: ListenerCertificateSourceConfig::Files {
+                cert_path: String::from("certs/server.pem"),
+                key_path: String::from("certs/server.key"),
+                ocsp_path: None,
+            },
+            sni_certificates: Vec::new(),
+            session_resumption: crate::ListenerTlsSessionResumptionConfig::default(),
+            minimum_version: crate::ListenerTlsMinimumVersionConfig::Tls13,
+            alpn_protocols: vec![crate::ListenerAlpnProtocolConfig::Http2],
+        });
+
+        let report = validate_workspace_config(&config);
+
+        assert!(report
+            .to_string()
+            .contains("http3 listeners must advertise only the http3 ALPN protocol"));
+        Ok(())
+    }
+
+    #[test]
+    fn validator_rejects_admin_http3_listener() -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = valid_workspace()?;
+        let mut admin_listener =
+            ListenerResourceConfig::foundation("admin", ListenerClassConfig::Admin, 9900);
+        admin_listener.protocol = crate::ListenerProtocolConfig::Http3;
+        admin_listener.tls_termination = Some(ListenerTlsTerminationConfig {
+            certificate_source: ListenerCertificateSourceConfig::Files {
+                cert_path: String::from("certs/admin.pem"),
+                key_path: String::from("certs/admin.key"),
+                ocsp_path: None,
+            },
+            sni_certificates: Vec::new(),
+            session_resumption: crate::ListenerTlsSessionResumptionConfig::default(),
+            minimum_version: crate::ListenerTlsMinimumVersionConfig::Tls13,
+            alpn_protocols: vec![crate::ListenerAlpnProtocolConfig::Http3],
+        });
+        config.listeners.push(admin_listener);
+
+        let report = validate_workspace_config(&config);
+
+        assert!(report.errors.iter().any(|error| {
+            error.code == ValidationCode::InvalidListenerField
+                && error.path == "listeners[1].protocol"
+                && error.message == "http3 listeners are currently supported only on public listeners"
+        }));
         Ok(())
     }
 
@@ -2397,6 +3896,53 @@ mod tests {
                 && error.path == "listeners[1].protocol"
                 && error.message == "admin listeners exposed beyond loopback must use https"
         }));
+        Ok(())
+    }
+
+    #[test]
+    fn validator_rejects_dual_stack_listener_on_ipv4_bind(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = valid_workspace()?;
+        config.listeners[0].bind_mode = ListenerBindModeConfig::DualStack;
+
+        let report = validate_workspace_config(&config);
+
+        assert!(report.errors.iter().any(|error| {
+            error.code == ValidationCode::InvalidListenerField
+                && error.path == "listeners[0].bind_mode"
+                && error.message == "dual_stack listeners must use an IPv6 bind_address"
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn validator_rejects_dual_stack_listener_without_ipv6_wildcard(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = valid_workspace()?;
+        config.listeners[0].bind_address = "[::1]:8080".parse()?;
+        config.listeners[0].bind_mode = ListenerBindModeConfig::DualStack;
+
+        let report = validate_workspace_config(&config);
+
+        assert!(report.errors.iter().any(|error| {
+            error.code == ValidationCode::InvalidListenerField
+                && error.path == "listeners[0].bind_address"
+                && error.message
+                    == "dual_stack listeners currently require the IPv6 wildcard bind address [::]:port"
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn validator_accepts_ipv6_only_listener_bind_mode(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = valid_workspace()?;
+        config.listeners[0].bind_address = "[::1]:8080".parse()?;
+        config.listeners[0].bind_mode = ListenerBindModeConfig::Ipv6Only;
+
+        let report = validate_workspace_config(&config);
+
+        assert!(report.is_empty(), "{}", report.operator_summary());
         Ok(())
     }
 

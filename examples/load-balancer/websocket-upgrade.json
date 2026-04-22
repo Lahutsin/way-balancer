@@ -1,0 +1,63 @@
+{
+  "api_version": "v1_alpha1",
+  "name": "edge-websocket-upgrade",
+  "listeners": [
+    {
+      "name": "public-http",
+      "class": "public",
+      "bind_address": "127.0.0.1:8080",
+      "protocol": "http1",
+      "routes": ["chat-websocket", "api-http"],
+      "upgrade": {
+        "protocols": ["websocket"]
+      }
+    }
+  ],
+  "routes": [
+    {
+      "name": "chat-websocket",
+      "match": {
+        "type": "path_prefix",
+        "prefix": "/ws",
+        "hostnames": ["localhost:8080", "127.0.0.1:8080"]
+      },
+      "upstream_cluster": "chat-backend",
+      "upgrade": {
+        "protocols": ["websocket"]
+      }
+    },
+    {
+      "name": "api-http",
+      "match": {
+        "type": "path_prefix",
+        "prefix": "/api",
+        "hostnames": ["localhost:8080", "127.0.0.1:8080"]
+      },
+      "upstream_cluster": "api-backend"
+    }
+  ],
+  "upstream_clusters": [
+    {
+      "name": "chat-backend",
+      "endpoints": [
+        {
+          "id": "chat-a",
+          "address": "127.0.0.1:9100",
+          "state": "ready",
+          "weight": 1
+        }
+      ]
+    },
+    {
+      "name": "api-backend",
+      "endpoints": [
+        {
+          "id": "api-a",
+          "address": "127.0.0.1:9200",
+          "state": "ready",
+          "weight": 1
+        }
+      ]
+    }
+  ]
+}

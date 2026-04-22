@@ -3,6 +3,7 @@
 use std::future::poll_fn;
 use std::io;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::task::Poll;
 use std::time::Duration;
 
@@ -10,16 +11,24 @@ use bytes::{Buf, Bytes};
 use h2::{client, server, Reason};
 use http::{Request, Response, StatusCode};
 use ipnet::IpNet;
+use lb_config_model::{
+    FaultInjectionAbortConfig, FaultInjectionDelayConfig, FaultInjectionPolicyConfig,
+    HeaderMutationConfig, PathRewriteTransformConfig, RequestTransformConfig,
+    ResponseTransformConfig, TrafficMirrorPolicyConfig,
+};
 use lb_net_core::{
     EndpointMetadata, EndpointState, UpstreamCluster, UpstreamClusterName, UpstreamEndpoint,
     UpstreamEndpointId, UpstreamTarget,
 };
 use lb_runtime::{
     proxy_http2_connection, AffinityFallbackPolicy, AffinityPolicy, AnonymousSourceFilterPolicy,
-    EndpointHealthPolicy, Http2ConnectionReport, Http2ProxyConfig, Http2ProxyError,
-    Http2RouteUpstream, LoadBalancingAlgorithm, LocalityRoutingPolicy, NoHealthyFallback,
-    ProtocolAnomalyCategory, RouteBackendPool, RouteEnumerationProtectionPolicy, SourceAggregation,
-    TrustedClientIpPolicy, UpstreamSelectionPolicy,
+    CircuitBreakerPolicy, EndpointHealthPolicy, FailureManager, Http2ConnectionReport,
+    Http2ProxyConfig, Http2ProxyError, Http2RouteUpstream, LoadBalancingAlgorithm,
+    LocalLimitKeyKind, LocalLimitScope, LocalRateLimitConfig, LocalRateLimiter,
+    LocalityRoutingPolicy, NoHealthyFallback, ProtocolAnomalyCategory, RetryBudgetPolicy,
+    RouteBackendPool, RouteDestinationPolicyRuntime, RouteEnumerationProtectionPolicy,
+    SourceAggregation, TimeoutCategory, TimeoutHierarchy, TrustedClientIpPolicy,
+    UpstreamSelectionPolicy, WeightedRouteDestination,
 };
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
@@ -208,6 +217,594 @@ async fn repeated_http2_reconnects_stay_bounded_on_safe_requests(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn applies_request_transforms_before_http2_upstream_dispatch(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (upstream_addr, capture_rx) = spawn_request_capture_h2_upstream().await?;
+    let mut config = proxy_config(upstream_addr).with_request_transforms(
+        Some(RequestTransformConfig {
+            path_rewrite: None,
+            host_rewrite: None,
+            header_mutations: vec![HeaderMutationConfig::Set {
+                name: String::from("x-listener-env"),
+                value: String::from("demo"),
+            }],
+        }),
+        [(String::from("api"), RequestTransformConfig {
+            path_rewrite: Some(PathRewriteTransformConfig::ReplacePrefix {
+                match_prefix: String::from("/edge"),
+                replacement: String::from("/v1"),
+            }),
+            host_rewrite: Some(String::from("backend.internal")),
+            header_mutations: vec![
+                HeaderMutationConfig::Set {
+                    name: String::from("x-route"),
+                    value: String::from("api"),
+                },
+                HeaderMutationConfig::Remove {
+                    name: String::from("x-remove-me"),
+                },
+            ],
+        })],
+    );
+    config.routes = vec![lb_proto_http::RoutePrefixRule::new("api", "/edge")];
+    let (proxy_addr, report_rx) = spawn_one_shot_http2_proxy_listener(config).await?;
+
+    let mut client = connect_h2_client(proxy_addr).await?;
+    let request = Request::builder()
+        .method("GET")
+        .uri("/edge/orders?expand=true")
+        .header("x-remove-me", "true")
+        .body(())?;
+    let (response, _) = client.send_request(request, true)?;
+    let received = receive_h2_response(response).await?;
+    assert_eq!(received.0, StatusCode::OK);
+    drop(client);
+
+    let capture = time::timeout(Duration::from_secs(2), capture_rx).await??;
+    let expected_authority = format!("backend.internal:{}", upstream_addr.port());
+    assert_eq!(capture.path_and_query, "/v1/orders?expand=true");
+    assert_eq!(capture.authority.as_deref(), Some(expected_authority.as_str()));
+    assert!(capture.headers.iter().any(|(name, value)| name == "x-listener-env" && value == "demo"));
+    assert!(capture.headers.iter().any(|(name, value)| name == "x-route" && value == "api"));
+    assert!(!capture.headers.iter().any(|(name, _)| name == "x-remove-me"));
+
+    let report = receive_proxy_result(report_rx).await?;
+    assert_eq!(report.metrics.request_count, 1);
+    assert_eq!(report.metrics.response_status_counts.get(&200), Some(&1));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn enforces_destination_local_http2_transform_and_rate_limit(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (upstream_addr, capture_rx) = spawn_request_capture_h2_upstream().await?;
+    let pool = route_backend_pool(
+        "frontend-primary",
+        vec![("primary-a", upstream_addr, 1, None, None)],
+        EndpointHealthPolicy::default(),
+        UpstreamSelectionPolicy {
+            algorithm: LoadBalancingAlgorithm::RoundRobin,
+            locality: LocalityRoutingPolicy::Disabled,
+            no_healthy_fallback: NoHealthyFallback::Fail,
+            affinity: None,
+        },
+    )?;
+    let destination_rate_limiter = Arc::new(LocalRateLimiter::new(LocalRateLimitConfig {
+        scope: LocalLimitScope::RouteDestination {
+            route: String::from("api"),
+            upstream_cluster: String::from("frontend-primary"),
+        },
+        key_kind: LocalLimitKeyKind::Global,
+        requests_per_window: 1,
+        window: Duration::from_secs(60),
+        max_tracked_keys: 8,
+    })?);
+
+    let mut config = proxy_config(upstream_addr)
+        .with_route_backend_pools([(String::from("api"), pool)])
+        .with_route_destination_policies([(String::from("api"), std::collections::BTreeMap::from([(
+            String::from("frontend-primary"),
+            RouteDestinationPolicyRuntime {
+                request_transform: Some(RequestTransformConfig {
+                    path_rewrite: Some(PathRewriteTransformConfig::ReplacePrefix {
+                        match_prefix: String::from("/edge"),
+                        replacement: String::from("/dest"),
+                    }),
+                    host_rewrite: Some(String::from("frontend.internal")),
+                    header_mutations: vec![HeaderMutationConfig::Set {
+                        name: String::from("x-destination"),
+                        value: String::from("primary"),
+                    }],
+                }),
+                response_transform: Some(ResponseTransformConfig {
+                    header_mutations: vec![HeaderMutationConfig::Set {
+                        name: String::from("x-destination-response"),
+                        value: String::from("primary"),
+                    }],
+                }),
+                traffic_mirror: None,
+                fault_injection: None,
+                rate_limiters: vec![destination_rate_limiter],
+                concurrency_limiters: Vec::new(),
+                failure_manager: None,
+                enforce_retry_budget: false,
+                enforce_timeout_hierarchy: false,
+                enforce_circuit_breaker: false,
+            },
+        )]))]);
+    config.routes = vec![lb_proto_http::RoutePrefixRule::new("api", "/edge")];
+    let (proxy_addr, report_rx) = spawn_one_shot_http2_proxy_listener(config).await?;
+
+    let mut client = connect_h2_client(proxy_addr).await?;
+    let first = send_h2_request(&mut client, "/edge/orders", None).await?;
+    let first = first.await?;
+    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(
+        first.headers().get("x-destination-response").and_then(|value| value.to_str().ok()),
+        Some("primary")
+    );
+    let mut first_body = first.into_body();
+    while let Some(frame) = first_body.data().await {
+        let _ = frame?;
+    }
+
+    let second = send_h2_request(&mut client, "/edge/orders", None).await?;
+    let second = receive_h2_response(second).await?;
+    assert_eq!(second.0, StatusCode::TOO_MANY_REQUESTS);
+    drop(client);
+
+    let capture = time::timeout(Duration::from_secs(2), capture_rx).await??;
+    let expected_authority = format!("frontend.internal:{}", upstream_addr.port());
+    assert_eq!(capture.path_and_query, "/dest/orders");
+    assert_eq!(capture.authority.as_deref(), Some(expected_authority.as_str()));
+    assert!(capture.headers.iter().any(|(name, value)| name == "x-destination" && value == "primary"));
+
+    drop(report_rx);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mirrors_bodyless_http2_request_without_affecting_primary_response(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (primary_upstream_addr, primary_capture_rx) = spawn_request_capture_h2_upstream().await?;
+    let (shadow_upstream_addr, shadow_capture_rx) = spawn_request_capture_h2_upstream().await?;
+    let primary_pool = route_backend_pool(
+        "frontend-primary",
+        vec![("primary-a", primary_upstream_addr, 1, None, None)],
+        EndpointHealthPolicy::default(),
+        UpstreamSelectionPolicy {
+            algorithm: LoadBalancingAlgorithm::RoundRobin,
+            locality: LocalityRoutingPolicy::Disabled,
+            no_healthy_fallback: NoHealthyFallback::Fail,
+            affinity: None,
+        },
+    )?;
+    let shadow_pool = route_backend_pool(
+        "frontend-shadow",
+        vec![("shadow-a", shadow_upstream_addr, 1, None, None)],
+        EndpointHealthPolicy::default(),
+        UpstreamSelectionPolicy {
+            algorithm: LoadBalancingAlgorithm::RoundRobin,
+            locality: LocalityRoutingPolicy::Disabled,
+            no_healthy_fallback: NoHealthyFallback::Fail,
+            affinity: None,
+        },
+    )?;
+
+    let mut config = proxy_config(primary_upstream_addr)
+        .with_route_backend_pools([(String::from("api"), primary_pool)])
+        .with_mirror_backend_pools([(String::from("frontend-shadow"), shadow_pool)])
+        .with_route_destination_policies([(String::from("api"), std::collections::BTreeMap::from([(
+            String::from("frontend-primary"),
+            RouteDestinationPolicyRuntime {
+                request_transform: None,
+                response_transform: None,
+                traffic_mirror: Some(TrafficMirrorPolicyConfig {
+                    percentage: 100,
+                    target_upstream_cluster: String::from("frontend-shadow"),
+                }),
+                fault_injection: None,
+                rate_limiters: Vec::new(),
+                concurrency_limiters: Vec::new(),
+                failure_manager: None,
+                enforce_retry_budget: false,
+                enforce_timeout_hierarchy: false,
+                enforce_circuit_breaker: false,
+            },
+        )]))]);
+    config.routes = vec![lb_proto_http::RoutePrefixRule::new("api", "/api")];
+    let (proxy_addr, report_rx) = spawn_one_shot_http2_proxy_listener(config).await?;
+
+    let mut client = connect_h2_client(proxy_addr).await?;
+    let response = send_h2_request(&mut client, "/api/orders", None).await?;
+    let response = receive_h2_response(response).await?;
+    assert_eq!(response.0, StatusCode::OK);
+    drop(client);
+
+    let primary_capture = time::timeout(Duration::from_secs(2), primary_capture_rx).await??;
+    let shadow_capture = time::timeout(Duration::from_secs(2), shadow_capture_rx).await??;
+    assert_eq!(primary_capture.path_and_query, "/api/orders");
+    assert_eq!(shadow_capture.path_and_query, "/api/orders");
+
+    let report = receive_proxy_result(report_rx).await?;
+    assert_eq!(report.metrics.request_count, 1);
+    assert_eq!(report.metrics.mirror_dispatch_count, 1);
+    assert_eq!(report.metrics.mirror_skip_count, 0);
+    assert_eq!(report.metrics.mirror_dispatch_failure_count, 0);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delays_http2_request_before_primary_upstream_dispatch(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (upstream_addr, capture_rx) = spawn_request_capture_h2_upstream().await?;
+    let primary_pool = route_backend_pool(
+        "frontend-primary",
+        vec![("primary-a", upstream_addr, 1, None, None)],
+        EndpointHealthPolicy::default(),
+        UpstreamSelectionPolicy {
+            algorithm: LoadBalancingAlgorithm::RoundRobin,
+            locality: LocalityRoutingPolicy::Disabled,
+            no_healthy_fallback: NoHealthyFallback::Fail,
+            affinity: None,
+        },
+    )?;
+
+    let mut config = proxy_config(upstream_addr)
+        .with_route_backend_pools([(String::from("api"), primary_pool)])
+        .with_route_destination_policies([(String::from("api"), std::collections::BTreeMap::from([(
+            String::from("frontend-primary"),
+            RouteDestinationPolicyRuntime {
+                request_transform: None,
+                response_transform: None,
+                traffic_mirror: None,
+                fault_injection: Some(FaultInjectionPolicyConfig {
+                    delay: Some(FaultInjectionDelayConfig {
+                        percentage: 100,
+                        fixed_delay_ms: 60,
+                    }),
+                    abort: None,
+                }),
+                rate_limiters: Vec::new(),
+                concurrency_limiters: Vec::new(),
+                failure_manager: None,
+                enforce_retry_budget: false,
+                enforce_timeout_hierarchy: false,
+                enforce_circuit_breaker: false,
+            },
+        )]))]);
+    config.routes = vec![lb_proto_http::RoutePrefixRule::new("api", "/api")];
+    let (proxy_addr, report_rx) = spawn_one_shot_http2_proxy_listener(config).await?;
+
+    let mut client = connect_h2_client(proxy_addr).await?;
+    let started = time::Instant::now();
+    let response = send_h2_request(&mut client, "/api/orders", None).await?;
+    let response = receive_h2_response(response).await?;
+    let elapsed = started.elapsed();
+    assert_eq!(response.0, StatusCode::OK);
+    assert!(elapsed >= Duration::from_millis(40), "elapsed={elapsed:?}");
+    drop(client);
+
+    let capture = time::timeout(Duration::from_secs(2), capture_rx).await??;
+    assert_eq!(capture.path_and_query, "/api/orders");
+
+    let report = receive_proxy_result(report_rx).await?;
+    assert_eq!(report.metrics.request_count, 1);
+    assert_eq!(report.metrics.fault_injection_delay_count, 1);
+    assert_eq!(report.metrics.fault_injection_abort_count, 0);
+    assert_eq!(report.metrics.response_status_counts.get(&200), Some(&1));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn aborts_http2_request_locally_without_contacting_primary_upstream(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (upstream_addr, capture_rx) = spawn_request_capture_h2_upstream().await?;
+    let primary_pool = route_backend_pool(
+        "frontend-primary",
+        vec![("primary-a", upstream_addr, 1, None, None)],
+        EndpointHealthPolicy::default(),
+        UpstreamSelectionPolicy {
+            algorithm: LoadBalancingAlgorithm::RoundRobin,
+            locality: LocalityRoutingPolicy::Disabled,
+            no_healthy_fallback: NoHealthyFallback::Fail,
+            affinity: None,
+        },
+    )?;
+
+    let mut config = proxy_config(upstream_addr)
+        .with_route_backend_pools([(String::from("api"), primary_pool)])
+        .with_route_destination_policies([(String::from("api"), std::collections::BTreeMap::from([(
+            String::from("frontend-primary"),
+            RouteDestinationPolicyRuntime {
+                request_transform: None,
+                response_transform: None,
+                traffic_mirror: None,
+                fault_injection: Some(FaultInjectionPolicyConfig {
+                    delay: None,
+                    abort: Some(FaultInjectionAbortConfig {
+                        percentage: 100,
+                        http_status: 503,
+                    }),
+                }),
+                rate_limiters: Vec::new(),
+                concurrency_limiters: Vec::new(),
+                failure_manager: None,
+                enforce_retry_budget: false,
+                enforce_timeout_hierarchy: false,
+                enforce_circuit_breaker: false,
+            },
+        )]))]);
+    config.routes = vec![lb_proto_http::RoutePrefixRule::new("api", "/api")];
+    let (proxy_addr, report_rx) = spawn_one_shot_http2_proxy_listener(config).await?;
+
+    let mut client = connect_h2_client(proxy_addr).await?;
+    let response = send_h2_request(&mut client, "/api/orders", None).await?;
+    let response = receive_h2_response(response).await?;
+    assert_eq!(response.0, StatusCode::SERVICE_UNAVAILABLE);
+    drop(client);
+
+    assert!(time::timeout(Duration::from_millis(100), capture_rx).await.is_err());
+
+    let report = receive_proxy_result(report_rx).await?;
+    assert_eq!(report.metrics.request_count, 1);
+    assert_eq!(report.metrics.fault_injection_delay_count, 0);
+    assert_eq!(report.metrics.fault_injection_abort_count, 1);
+    assert_eq!(report.metrics.response_status_counts.get(&503), Some(&1));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn applies_response_transforms_before_http2_downstream_write(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let upstream_addr = spawn_transformable_h2_upstream().await?;
+    let mut config = proxy_config(upstream_addr).with_response_transforms(
+        Some(ResponseTransformConfig {
+            header_mutations: vec![HeaderMutationConfig::Set {
+                name: String::from("x-listener-response"),
+                value: String::from("demo"),
+            }],
+        }),
+        [(String::from("api"), ResponseTransformConfig {
+            header_mutations: vec![
+                HeaderMutationConfig::Set {
+                    name: String::from("x-route-response"),
+                    value: String::from("api"),
+                },
+                HeaderMutationConfig::Remove {
+                    name: String::from("x-remove-me"),
+                },
+            ],
+        })],
+    );
+    config.routes = vec![lb_proto_http::RoutePrefixRule::new("api", "/edge")];
+    let (proxy_addr, _report_rx) = spawn_one_shot_http2_proxy_listener(config).await?;
+
+    let mut client = connect_h2_client(proxy_addr).await?;
+    let response = send_h2_request(&mut client, "/edge/orders", None).await?;
+    let response = response.await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers().get("x-origin").and_then(|value| value.to_str().ok()), Some("true"));
+    assert_eq!(
+        response
+            .headers()
+            .get("x-listener-response")
+            .and_then(|value| value.to_str().ok()),
+        Some("demo")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-route-response")
+            .and_then(|value| value.to_str().ok()),
+        Some("api")
+    );
+    assert!(response.headers().get("x-remove-me").is_none());
+
+    let mut body = response.into_body();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = body.data().await {
+        let chunk = chunk?;
+        body.flow_control().release_capacity(chunk.len())?;
+        bytes.extend_from_slice(&chunk);
+    }
+    assert_eq!(String::from_utf8(bytes)?, "ok");
+    drop(client);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn destination_retry_budget_blocks_http2_stale_reuse_retry(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let upstream_addr = spawn_connection_indexed_h2_upstream(true).await?;
+    let pool = route_backend_pool(
+        "frontend-primary",
+        vec![("primary-a", upstream_addr, 1, None, None)],
+        EndpointHealthPolicy::default(),
+        UpstreamSelectionPolicy {
+            algorithm: LoadBalancingAlgorithm::RoundRobin,
+            locality: LocalityRoutingPolicy::Disabled,
+            no_healthy_fallback: NoHealthyFallback::Fail,
+            affinity: None,
+        },
+    )?;
+    let failure_manager = Arc::new(FailureManager::new(
+        RetryBudgetPolicy {
+            min_retry_tokens: 0,
+            retry_percent: 0,
+            window: Duration::from_secs(60),
+        },
+        TimeoutHierarchy {
+            request_timeout: Duration::from_secs(2),
+            attempt_timeout: Duration::from_secs(2),
+            connect_timeout: Duration::from_millis(250),
+            idle_timeout: Duration::from_secs(2),
+        },
+        CircuitBreakerPolicy::default(),
+    )?);
+
+    let mut config = proxy_config(upstream_addr)
+        .with_route_backend_pools([(String::from("api"), pool)])
+        .with_route_destination_policies([(String::from("api"), std::collections::BTreeMap::from([(
+            String::from("frontend-primary"),
+            RouteDestinationPolicyRuntime {
+                request_transform: None,
+                response_transform: None,
+                traffic_mirror: None,
+                fault_injection: None,
+                rate_limiters: Vec::new(),
+                concurrency_limiters: Vec::new(),
+                failure_manager: Some(failure_manager.clone()),
+                enforce_retry_budget: true,
+                enforce_timeout_hierarchy: false,
+                enforce_circuit_breaker: false,
+            },
+        )]))]);
+    config.routes = vec![lb_proto_http::RoutePrefixRule::new("api", "/")];
+
+    let (proxy_addr, report_rx) = spawn_one_shot_http2_proxy_listener(config).await?;
+    let mut client = connect_h2_client(proxy_addr).await?;
+
+    let first_response = send_h2_request(&mut client, "/first", None).await?;
+    let first_received = receive_h2_response(first_response).await?;
+    assert_eq!(first_received.0, StatusCode::OK);
+    assert_eq!(first_received.1, "conn-1");
+
+    let second_response = send_h2_request(&mut client, "/second", None).await?;
+    let second_received = receive_h2_response(second_response).await?;
+    assert_eq!(second_received.0, StatusCode::BAD_GATEWAY);
+    assert_eq!(second_received.1, "");
+    drop(client);
+
+    let report = receive_proxy_result(report_rx).await?;
+    assert_eq!(report.metrics.request_count, 2);
+    assert_eq!(report.metrics.response_status_counts.get(&200), Some(&1));
+    assert_eq!(report.metrics.response_status_counts.get(&502), Some(&1));
+
+    let metrics = failure_manager.metrics();
+    assert_eq!(metrics.retry_budget_exhausted_count, 1);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn destination_timeout_hierarchy_returns_gateway_timeout_for_http2(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let upstream_addr = spawn_basic_h2_upstream().await?;
+    let pool = route_backend_pool(
+        "frontend-primary",
+        vec![("primary-a", upstream_addr, 1, None, None)],
+        EndpointHealthPolicy::default(),
+        UpstreamSelectionPolicy {
+            algorithm: LoadBalancingAlgorithm::RoundRobin,
+            locality: LocalityRoutingPolicy::Disabled,
+            no_healthy_fallback: NoHealthyFallback::Fail,
+            affinity: None,
+        },
+    )?;
+    let failure_manager = Arc::new(FailureManager::new(
+        RetryBudgetPolicy::default(),
+        TimeoutHierarchy {
+            request_timeout: Duration::from_millis(50),
+            attempt_timeout: Duration::from_millis(50),
+            connect_timeout: Duration::from_millis(25),
+            idle_timeout: Duration::from_millis(50),
+        },
+        CircuitBreakerPolicy::default(),
+    )?);
+
+    let mut config = proxy_config(upstream_addr)
+        .with_route_backend_pools([(String::from("api"), pool)])
+        .with_route_destination_policies([(String::from("api"), std::collections::BTreeMap::from([(
+            String::from("frontend-primary"),
+            RouteDestinationPolicyRuntime {
+                request_transform: None,
+                response_transform: None,
+                traffic_mirror: None,
+                fault_injection: None,
+                rate_limiters: Vec::new(),
+                concurrency_limiters: Vec::new(),
+                failure_manager: Some(failure_manager.clone()),
+                enforce_retry_budget: false,
+                enforce_timeout_hierarchy: true,
+                enforce_circuit_breaker: false,
+            },
+        )]))]);
+    config.routes = vec![lb_proto_http::RoutePrefixRule::new("api", "/")];
+
+    let (proxy_addr, report_rx) = spawn_one_shot_http2_proxy_listener(config).await?;
+    let mut client = connect_h2_client(proxy_addr).await?;
+    let response = send_h2_request(&mut client, "/slow", None).await?;
+    let received = receive_h2_response(response).await?;
+    assert_eq!(received.0, StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(received.1, "");
+    drop(client);
+
+    let report = receive_proxy_result(report_rx).await?;
+    assert_eq!(report.metrics.request_count, 1);
+    assert_eq!(report.metrics.response_status_counts.get(&504), Some(&1));
+
+    let metrics = failure_manager.metrics();
+    assert_eq!(metrics.timeout_category_counts.get(&TimeoutCategory::Request), Some(&1));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn direct_http2_client_accepts_rewritten_absolute_uri_shape(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (upstream_addr, capture_rx) = spawn_request_capture_h2_upstream().await?;
+    let mut client = connect_h2_client(upstream_addr).await?;
+    let rewritten_uri = format!("http://backend.internal:{}/v1/orders?expand=true", upstream_addr.port());
+    let request = Request::builder().method("GET").uri(rewritten_uri).body(())?;
+
+    let (response, _) = client.send_request(request, true)?;
+    let received = receive_h2_response(response).await?;
+    assert_eq!(received.0, StatusCode::OK);
+
+    let capture = time::timeout(Duration::from_secs(2), capture_rx).await??;
+    let expected_authority = format!("backend.internal:{}", upstream_addr.port());
+    assert_eq!(capture.path_and_query, "/v1/orders?expand=true");
+    assert_eq!(capture.authority.as_deref(), Some(expected_authority.as_str()));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn direct_http2_client_accepts_path_only_uri_with_rewritten_host_header(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (upstream_addr, capture_rx) = spawn_request_capture_h2_upstream().await?;
+    let mut client = connect_h2_client(upstream_addr).await?;
+    let request = Request::builder()
+        .method("GET")
+        .uri("/v1/orders?expand=true")
+        .header("host", "backend.internal")
+        .body(())?;
+
+    let (response, _) = client.send_request(request, true)?;
+    let received = receive_h2_response(response).await?;
+    assert_eq!(received.0, StatusCode::OK);
+
+    let capture = time::timeout(Duration::from_secs(2), capture_rx).await??;
+    assert_eq!(capture.path_and_query, "/v1/orders?expand=true");
+    assert!(capture.headers.iter().any(|(name, value)| name == "host" && value == "backend.internal"));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn direct_http2_client_accepts_capture_upstream_baseline_request(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (upstream_addr, capture_rx) = spawn_request_capture_h2_upstream().await?;
+    let mut client = connect_h2_client(upstream_addr).await?;
+    let request = Request::builder().method("GET").uri("/v1/orders?expand=true").body(())?;
+
+    let (response, _) = client.send_request(request, true)?;
+    let received = receive_h2_response(response).await?;
+    assert_eq!(received.0, StatusCode::OK);
+
+    let capture = time::timeout(Duration::from_secs(2), capture_rx).await??;
+    assert_eq!(capture.path_and_query, "/v1/orders?expand=true");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rotates_http2_upstream_client_after_reuse_age_limit(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let upstream_addr = spawn_connection_indexed_h2_upstream(false).await?;
@@ -369,6 +966,84 @@ async fn unmatched_http2_host_filtered_routes_return_forbidden(
     let report = receive_proxy_result(report_rx).await?;
     assert_eq!(report.metrics.request_count, 1);
     assert_eq!(report.metrics.response_status_counts.get(&403), Some(&1));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn http2_routes_can_filter_by_method() -> Result<(), Box<dyn std::error::Error>> {
+    let upstream_addr = spawn_tagged_h2_upstream("writes-route").await?;
+    let mut config = proxy_config(upstream_addr)
+        .with_route_upstreams([Http2RouteUpstream {
+            route_label: String::from("writes"),
+            upstream: UpstreamTarget::new("writes-h2-upstream", upstream_addr),
+        }])
+        .rejecting_unmatched_routes();
+    config.routes = vec![lb_proto_http::RoutePrefixRule::new("writes", "/api")
+        .with_methods(vec![String::from("POST")])];
+    let (proxy_addr, report_rx) = spawn_one_shot_http2_proxy_listener(config).await?;
+
+    let mut client = connect_h2_client(proxy_addr).await?;
+    let response = send_h2_request_with_method(&mut client, "POST", "http://example.com/api", None).await?;
+    let received = receive_h2_response(response).await?;
+    assert_eq!(received.0, StatusCode::OK);
+    assert_eq!(received.1, "writes-route");
+    drop(client);
+
+    let report = receive_proxy_result(report_rx).await?;
+    assert_eq!(report.metrics.request_count, 1);
+    assert_eq!(report.metrics.response_status_counts.get(&200), Some(&1));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn http2_routes_can_filter_by_header_query_content_type_and_source(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let upstream_addr = spawn_tagged_h2_upstream("target-route").await?;
+    let mut config = proxy_config(upstream_addr)
+        .with_route_upstreams([Http2RouteUpstream {
+            route_label: String::from("target"),
+            upstream: UpstreamTarget::new("target-h2-upstream", upstream_addr),
+        }])
+        .with_trusted_client_ip(TrustedClientIpPolicy {
+            enabled: true,
+            trusted_proxy_cidrs: vec!["127.0.0.0/8".parse()?],
+        })
+        .rejecting_unmatched_routes();
+    config.routes = vec![lb_proto_http::RoutePrefixRule::new("target", "/api")
+        .with_methods(vec![String::from("POST")])
+        .with_header_matches(vec![lb_proto_http::RouteHeaderMatch::Exact {
+            name: String::from("x-tenant"),
+            value: String::from("beta"),
+        }])
+        .with_query_matches(vec![lb_proto_http::RouteQueryMatch::Exact {
+            name: String::from("auth"),
+            value: String::from("user"),
+        }])
+        .with_content_types(vec![String::from("application/json")])
+        .with_source_cidrs(vec!["198.51.100.0/24".parse()?])];
+    let (proxy_addr, report_rx) = spawn_one_shot_http2_proxy_listener(config).await?;
+
+    let mut client = connect_h2_client(proxy_addr).await?;
+    let response = send_h2_request_with_method_and_headers(
+        &mut client,
+        "POST",
+        "http://example.test/api?auth=user",
+        None,
+        &[
+            ("x-tenant", "beta"),
+            ("content-type", "application/json; charset=utf-8"),
+            ("x-forwarded-for", "198.51.100.7"),
+        ],
+    )
+    .await?;
+    let received = receive_h2_response(response).await?;
+    assert_eq!(received.0, StatusCode::OK);
+    assert_eq!(received.1, "target-route");
+    drop(client);
+
+    let report = receive_proxy_result(report_rx).await?;
+    assert_eq!(report.metrics.request_count, 1);
+    assert_eq!(report.metrics.response_status_counts.get(&200), Some(&1));
     Ok(())
 }
 
@@ -794,6 +1469,127 @@ async fn route_backend_pool_honors_http2_header_affinity() -> Result<(), Box<dyn
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn weighted_route_backend_pool_splits_http2_requests_across_route_destinations(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let stable_upstream = spawn_multi_tagged_h2_upstream("stable-h2-route", 9).await?;
+    let canary_upstream = spawn_multi_tagged_h2_upstream("canary-h2-route", 1).await?;
+    let stable_pool = route_backend_pool(
+        "stable",
+        vec![("stable-a", stable_upstream, 1, None, None)],
+        EndpointHealthPolicy::default(),
+        UpstreamSelectionPolicy::default(),
+    )?;
+    let canary_pool = route_backend_pool(
+        "canary",
+        vec![("canary-a", canary_upstream, 1, None, None)],
+        EndpointHealthPolicy::default(),
+        UpstreamSelectionPolicy::default(),
+    )?;
+    let weighted_pool = RouteBackendPool::from_weighted_destinations([
+        WeightedRouteDestination { weight: 90, pool: stable_pool },
+        WeightedRouteDestination { weight: 10, pool: canary_pool },
+    ])?;
+
+    let mut config = proxy_config(stable_upstream)
+        .with_route_backend_pools([(String::from("api"), weighted_pool)]);
+    config.routes = vec![lb_proto_http::RoutePrefixRule::new("api", "/api")];
+
+    let mut stable_count = 0;
+    let mut canary_count = 0;
+    for _ in 0..10 {
+        let (proxy_addr, report_rx) = spawn_one_shot_http2_proxy_listener(config.clone()).await?;
+        let mut client = connect_h2_client(proxy_addr).await?;
+        let response = send_h2_request(&mut client, "/api", None).await?;
+        let received = receive_h2_response(response).await?;
+        assert_eq!(received.0, StatusCode::OK);
+        match received.1.as_str() {
+            "stable-h2-route" => stable_count += 1,
+            "canary-h2-route" => canary_count += 1,
+            other => panic!("unexpected route destination body {other}"),
+        }
+        drop(client);
+        let report = receive_proxy_result(report_rx).await?;
+        assert_eq!(report.metrics.response_status_counts.get(&200), Some(&1));
+    }
+
+    assert_eq!(stable_count, 9);
+    assert_eq!(canary_count, 1);
+    let selection_metrics = config
+        .route_backend_pools
+        .get("api")
+        .expect("api weighted pool")
+        .selection_metrics();
+    assert_eq!(selection_metrics.weighted_route_selection_count, 10);
+    assert_eq!(selection_metrics.route_destination_fallback_count, 0);
+    assert_eq!(
+        selection_metrics.route_destination_selection_counts.get("stable"),
+        Some(&9)
+    );
+    assert_eq!(
+        selection_metrics.route_destination_selection_counts.get("canary"),
+        Some(&1)
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn weighted_route_backend_pool_reports_http2_destination_fallback_metrics(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let stable_upstream = spawn_tagged_h2_upstream("stable-h2-fallback-route").await?;
+    let canary_upstream = reserve_unused_addr().await?;
+    let stable_pool = route_backend_pool(
+        "stable",
+        vec![("stable-a", stable_upstream, 1, None, None)],
+        EndpointHealthPolicy::default(),
+        UpstreamSelectionPolicy::default(),
+    )?;
+    let canary_pool = route_backend_pool(
+        "canary",
+        vec![("canary-a", canary_upstream, 1, None, None)],
+        EndpointHealthPolicy {
+            degraded_failure_threshold: 1,
+            unhealthy_failure_threshold: 1,
+            ejection_failure_threshold: 1,
+            recovery_success_threshold: 1,
+            ejection_duration: Duration::from_secs(30),
+            warmup_duration: Duration::ZERO,
+        },
+        UpstreamSelectionPolicy::default(),
+    )?;
+    let canary_endpoint_id = canary_pool.active_probe_targets()?[0].endpoint_id.clone();
+    canary_pool.note_active_failure(&canary_endpoint_id)?;
+    let weighted_pool = RouteBackendPool::from_weighted_destinations([
+        WeightedRouteDestination { weight: 100, pool: canary_pool },
+        WeightedRouteDestination { weight: 1, pool: stable_pool },
+    ])?;
+
+    let mut config = proxy_config(stable_upstream)
+        .with_route_backend_pools([(String::from("api"), weighted_pool)]);
+    config.routes = vec![lb_proto_http::RoutePrefixRule::new("api", "/api")];
+
+    let (proxy_addr, report_rx) = spawn_one_shot_http2_proxy_listener(config).await?;
+    let mut client = connect_h2_client(proxy_addr).await?;
+    let response = send_h2_request(&mut client, "/api", None).await?;
+    let received = receive_h2_response(response).await?;
+    assert_eq!(received.0, StatusCode::OK);
+    assert_eq!(received.1, "stable-h2-fallback-route");
+    drop(client);
+
+    let report = receive_proxy_result(report_rx).await?;
+    assert_eq!(report.metrics.response_status_counts.get(&200), Some(&1));
+    let selection_metrics = report
+        .route_selection_metrics
+        .expect("route selection metrics should be present");
+    assert_eq!(selection_metrics.weighted_route_selection_count, 1);
+    assert_eq!(selection_metrics.route_destination_fallback_count, 1);
+    assert_eq!(
+        selection_metrics.route_destination_selection_counts.get("stable"),
+        Some(&1)
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn route_backend_pool_include_unhealthy_fallback_keeps_http2_backend_reachable(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let upstream_addr = spawn_tagged_h2_upstream("fallback-h2-route").await?;
@@ -869,6 +1665,15 @@ async fn route_backend_pool_include_unhealthy_fallback_keeps_http2_backend_reach
 
     let report = receive_proxy_result(report_rx).await?;
     assert_eq!(report.metrics.response_status_counts.get(&200), Some(&1));
+    let selection_metrics = report
+        .route_selection_metrics
+        .expect("route selection metrics should be present");
+    assert_eq!(selection_metrics.weighted_route_selection_count, 1);
+    assert_eq!(selection_metrics.route_destination_fallback_count, 1);
+    assert_eq!(
+        selection_metrics.route_destination_selection_counts.get("fallback"),
+        Some(&1)
+    );
     Ok(())
 }
 
@@ -1081,6 +1886,38 @@ async fn spawn_multi_tagged_h2_upstream(
     Ok(address)
 }
 
+async fn spawn_transformable_h2_upstream() -> io::Result<SocketAddr> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+
+    tokio::spawn(async move {
+        if let Ok((stream, _)) = listener.accept().await {
+            let mut connection = match server::handshake(stream).await {
+                Ok(connection) => connection,
+                Err(_) => return,
+            };
+
+            while let Some(result) = connection.accept().await {
+                let Ok((_request, mut respond)) = result else {
+                    break;
+                };
+                let response = Response::builder()
+                    .status(StatusCode::OK)
+                    .header("x-origin", "true")
+                    .header("x-remove-me", "yes")
+                    .body(());
+                if let Ok(response) = response {
+                    if let Ok(mut send) = respond.send_response(response, false) {
+                        let _ = send.send_data(Bytes::from_static(b"ok"), true);
+                    }
+                }
+            }
+        }
+    });
+
+    Ok(address)
+}
+
 async fn spawn_one_shot_http2_proxy_listener(
     config: Http2ProxyConfig,
 ) -> io::Result<(SocketAddr, oneshot::Receiver<Result<Http2ConnectionReport, Http2ProxyError>>)> {
@@ -1117,7 +1954,16 @@ async fn send_h2_request(
     path: &str,
     body: Option<Bytes>,
 ) -> Result<h2::client::ResponseFuture, h2::Error> {
-    send_h2_request_with_headers(client, path, body, &[]).await
+    send_h2_request_with_method(client, "GET", path, body).await
+}
+
+async fn send_h2_request_with_method(
+    client: &mut client::SendRequest<Bytes>,
+    method: &str,
+    path: &str,
+    body: Option<Bytes>,
+) -> Result<h2::client::ResponseFuture, h2::Error> {
+    send_h2_request_with_method_and_headers(client, method, path, body, &[]).await
 }
 
 async fn send_h2_request_with_headers(
@@ -1126,8 +1972,18 @@ async fn send_h2_request_with_headers(
     body: Option<Bytes>,
     headers: &[(&str, &str)],
 ) -> Result<h2::client::ResponseFuture, h2::Error> {
+    send_h2_request_with_method_and_headers(client, "GET", path, body, headers).await
+}
+
+async fn send_h2_request_with_method_and_headers(
+    client: &mut client::SendRequest<Bytes>,
+    method: &str,
+    path: &str,
+    body: Option<Bytes>,
+    headers: &[(&str, &str)],
+) -> Result<h2::client::ResponseFuture, h2::Error> {
     poll_fn(|cx| client.poll_ready(cx)).await?;
-    let mut builder = Request::builder().method("GET").uri(path);
+    let mut builder = Request::builder().method(method).uri(path);
     for (name, value) in headers {
         builder = builder.header(*name, *value);
     }
@@ -1193,6 +2049,62 @@ async fn receive_proxy_result(
 
 fn proxy_config(upstream_addr: SocketAddr) -> Http2ProxyConfig {
     Http2ProxyConfig::new(UpstreamTarget::new("http2-upstream", upstream_addr))
+}
+
+#[derive(Debug)]
+struct Http2RequestCapture {
+    path_and_query: String,
+    authority: Option<String>,
+    headers: Vec<(String, String)>,
+}
+
+async fn spawn_request_capture_h2_upstream(
+) -> io::Result<(SocketAddr, oneshot::Receiver<Http2RequestCapture>)> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let (capture_tx, capture_rx) = oneshot::channel();
+
+    tokio::spawn(async move {
+        if let Ok((socket, _)) = listener.accept().await {
+            let mut connection = match server::handshake(socket).await {
+                Ok(connection) => connection,
+                Err(_) => return,
+            };
+            let mut capture_tx = Some(capture_tx);
+            while let Some(result) = connection.accept().await {
+                let Ok((request, mut respond)) = result else {
+                    break;
+                };
+                let capture = Http2RequestCapture {
+                    path_and_query: request
+                        .uri()
+                        .path_and_query()
+                        .map(|value| value.as_str().to_string())
+                        .unwrap_or_else(|| String::from("/")),
+                    authority: request.uri().authority().map(|value| value.as_str().to_string()),
+                    headers: request
+                        .headers()
+                        .iter()
+                        .filter_map(|(name, value)| {
+                            value
+                                .to_str()
+                                .ok()
+                                .map(|value| (name.as_str().to_string(), value.to_string()))
+                        })
+                        .collect(),
+                };
+                let response = Response::builder().status(StatusCode::OK).body(()).expect("response");
+                if let Ok(mut send_stream) = respond.send_response(response, false) {
+                    let _ = send_stream.send_data(Bytes::from_static(b"ok"), true);
+                }
+                if let Some(capture_tx) = capture_tx.take() {
+                    let _ = capture_tx.send(capture);
+                }
+            }
+        }
+    });
+
+    Ok((address, capture_rx))
 }
 
 async fn reserve_unused_addr() -> io::Result<SocketAddr> {

@@ -1,0 +1,64 @@
+{
+  "api_version": "v1_alpha1",
+  "name": "edge-source-aware-routing",
+  "security": {
+    "trusted_client_ip": {
+      "enabled": true,
+      "trusted_proxy_cidrs": ["127.0.0.0/8"]
+    }
+  },
+  "listeners": [
+    {
+      "name": "public-http",
+      "class": "public",
+      "bind_address": "127.0.0.1:8080",
+      "protocol": "http1",
+      "routes": ["trusted-office-api", "fallback-api"]
+    }
+  ],
+  "routes": [
+    {
+      "name": "trusted-office-api",
+      "match": {
+        "type": "path_prefix",
+        "prefix": "/api",
+        "hostnames": ["example.test"],
+        "source_cidrs": ["198.51.100.0/24"]
+      },
+      "upstream_cluster": "office-api"
+    },
+    {
+      "name": "fallback-api",
+      "match": {
+        "type": "path_prefix",
+        "prefix": "/api",
+        "hostnames": ["example.test"]
+      },
+      "upstream_cluster": "default-api"
+    }
+  ],
+  "upstream_clusters": [
+    {
+      "name": "office-api",
+      "endpoints": [
+        {
+          "id": "office-api-a",
+          "address": "127.0.0.1:9000",
+          "state": "ready",
+          "weight": 1
+        }
+      ]
+    },
+    {
+      "name": "default-api",
+      "endpoints": [
+        {
+          "id": "default-api-a",
+          "address": "127.0.0.1:9001",
+          "state": "ready",
+          "weight": 1
+        }
+      ]
+    }
+  ]
+}

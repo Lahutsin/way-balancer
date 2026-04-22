@@ -18,6 +18,15 @@ This runbook summarizes the current edge and control-plane hardening posture for
 - Only the canonical framing header required for the detected body kind is preserved, such as `transfer-encoding: chunked` for chunked HTTP/1 request bodies.
 - User-supplied forwarding identity headers are replaced with runtime-derived values.
 
+## Proxy Protocol Boundary
+
+- Enable `listeners[].proxy_protocol` only on sockets that are actually fronted by a trusted L4 proxy or load balancer.
+- Treat `proxy_protocol: v1` and `proxy_protocol: v2` as fail-closed listener modes: a direct client that does not send the expected preface is rejected before HTTP parsing.
+- Proxy Protocol source identity and forwarded-header trust are separate controls. Proxy Protocol establishes the immediate downstream source address; `security.trusted_client_ip` still decides whether later `Forwarded` or `X-Forwarded-For` hops are trusted.
+- The effective precedence is: direct socket peer, then Proxy Protocol source if enabled, then a trusted `Forwarded` chain, and finally trusted `X-Forwarded-For` only when `Forwarded` is absent.
+- A spoofed forwarded chain is rejected even if the raw TCP peer is local, as long as the Proxy Protocol source itself is outside `trusted_proxy_cidrs`.
+- Do not enable Proxy Protocol on admin listeners.
+
 ## Cache Poisoning Boundaries
 
 - Cache lookup and storage fail closed on ambiguous host and authority shapes.
@@ -37,6 +46,7 @@ This runbook summarizes the current edge and control-plane hardening posture for
 
 - Public and admin listeners can now attach named `policies.hostile_edge_protections` resources through `listeners[].policies.hostile_edge_protection`.
 - `source_quota` applies fail-closed per-source admission fairness before a connection can consume steady-state listener capacity.
+- On public listeners with Proxy Protocol enabled, `source_quota` now keys off the proxy-resolved downstream source rather than the raw socket peer, so abuse controls stay meaningful behind trusted L4 frontends.
 - `handshake_guard` caps in-flight protected handshakes so slow or abusive connection setup cannot starve healthy clients.
 - Protected listeners expose a first-class `abuse_protection` block in `GET /status` with configured limits, current tracked-source and handshake pressure, cumulative rejection counters, and stable reason codes.
 - `GET /readyz` remains ready during normal enforcement, but reports not-ready when hostile-edge state is currently saturated enough to stop admitting new tracked sources or new protected handshakes.

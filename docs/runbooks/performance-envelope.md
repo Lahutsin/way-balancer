@@ -2,17 +2,26 @@
 
 ## Purpose
 
-This runbook defines the repeatable performance program used to track dataplane throughput, mixed-traffic latency, memory growth, TLS overhead, and control-plane timing boundaries over time.
+This runbook defines the repeatable performance program used to track dataplane throughput, mixed-traffic latency, memory growth, TLS overhead, first-phase HTTP/3 readiness checks, and control-plane timing boundaries over time.
 
 ## What Is Covered
 
 - HTTP/1 loopback proxy throughput through the runtime proxy path
 - HTTP/2 loopback stream throughput through the runtime proxy path
+- HTTP/3 first-phase readiness through the public QUIC listener and HTTP/1 bridge path
 - mixed HTTP/1 plus HTTP/2 latency with persistent loopback clients
 - TLS termination overhead for the HTTP/1 proxy path using `tokio-rustls`
 - resident-memory growth per idle accepted connection and per active HTTP/2 stream
 - named deployment profile artifacts that separate regression-only loopback runs from supported non-loopback release evidence
 - optional reload and failover timing evidence captured from stable operator surfaces and stored in the same artifact schema
+
+## HTTP/3 Measurement Boundary
+
+HTTP/3 is currently part of the supported public edge surface, but it is not yet part of the benchmarked throughput envelope in this runbook.
+
+- release candidates should still verify that the checked-in HTTP/3 serve test passes on the candidate build
+- until a dedicated QUIC benchmark lands, do not turn loopback HTTP/1 or HTTP/2 throughput numbers into implied HTTP/3 capacity claims
+- if a supported non-loopback profile depends on HTTP/3, attach separate operator evidence for handshake success, request routing, and certificate or ALPN correctness
 
 ## Reproducible Commands
 
@@ -150,6 +159,7 @@ Artifact-to-artifact comparison also applies explicit guardrails:
 - Loopback artifacts stay experimental and should be used for regression detection only.
 - A non-loopback artifact becomes supportable only when it uses a named supported profile, includes the required reload and failover timing evidence, and passes every threshold check in the artifact.
 - Release evidence should store the supported artifact under `artifacts/performance-envelope/` so GA review can inspect the exact profile assumptions and measured thresholds.
+- HTTP/3 release evidence should currently be attached as supplemental functional evidence, not substituted into the benchmark thresholds above.
 
 ## Validation Hooks
 

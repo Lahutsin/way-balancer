@@ -1,0 +1,38 @@
+{
+  "api_version": "v1_alpha1",
+  "name": "dual-stack-public",
+  "listeners": [
+    {
+      "name": "public-http",
+      "class": "public",
+      "bind_address": "[::]:8080",
+      "bind_mode": "dual_stack",
+      "allow_unspecified_bind": true,
+      "protocol": "http1",
+      "routes": ["api"]
+    }
+  ],
+  "routes": [
+    {
+      "name": "api",
+      "match": {
+        "type": "path_prefix",
+        "prefix": "/api"
+      },
+      "upstream_cluster": "payments"
+    }
+  ],
+  "upstream_clusters": [
+    {
+      "name": "payments",
+      "endpoints": [
+        {
+          "id": "payments-a",
+          "address": "127.0.0.1:9000",
+          "state": "ready",
+          "weight": 1
+        }
+      ]
+    }
+  ]
+}

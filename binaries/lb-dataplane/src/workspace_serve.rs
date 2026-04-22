@@ -16,16 +16,20 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use bytes::{Buf, Bytes};
+use h3::server::RequestStream;
+use h3_quinn::Connection as H3Connection;
 use ipnet::IpNet;
+use quinn::crypto::rustls::QuicServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::{ProducesTickets, ResolvesServerCert};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{oneshot, watch, Mutex, RwLock};
 use tokio::task::JoinSet;
 use tokio::time;
@@ -43,14 +47,25 @@ static TLS13_ONLY: [&rustls::SupportedProtocolVersion; 1] = [&rustls::version::T
 const ACTIVE_HEALTH_PROBE_INTERVAL: Duration = Duration::from_millis(500);
 const ACTIVE_HEALTH_PROBE_TIMEOUT: Duration = Duration::from_millis(150);
 const ROUTE_BACKEND_WARMUP_DURATION: Duration = Duration::from_secs(1);
+const PROXY_PROTOCOL_V1_MAX_LEN: usize = 108;
+const PROXY_PROTOCOL_V2_SIGNATURE: [u8; 12] = [
+    0x0d, 0x0a, 0x0d, 0x0a, 0x00, 0x0d, 0x0a, b'Q', b'U', b'I', b'T', 0x0a,
+];
 const ADMIN_AUDIT_DEFAULT_CAPACITY: usize = 64;
 const CONTROL_PLANE_JOURNAL_VERSION: u32 = 1;
 const RECOVERY_UNFINISHED_RELOAD_CODE: &str = "reload_recovered_unfinished";
 const TLS_STATUS_EXPIRY_WARNING_WINDOW: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 static NEXT_CONTROL_PLANE_JOURNAL_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+static RUSTLS_CRYPTO_PROVIDER_INSTALLED: OnceLock<()> = OnceLock::new();
 
 fn to_dyn_error(error: impl std::fmt::Display) -> DynError {
     Box::new(io::Error::other(error.to_string()))
+}
+
+fn ensure_rustls_crypto_provider() {
+    RUSTLS_CRYPTO_PROVIDER_INSTALLED.get_or_init(|| {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    });
 }
 
 #[derive(Debug)]
@@ -97,6 +112,7 @@ enum ManagedProxyConfig {
     Http1(lb_runtime::Http1ProxyConfig),
     Http2(lb_runtime::Http2ProxyConfig),
     Https(ManagedHttpsProxyConfig),
+    Http3(ManagedHttp3ProxyConfig),
 }
 
 #[derive(Debug, Clone)]
@@ -105,6 +121,12 @@ struct ManagedHttpsProxyConfig {
     http2: lb_runtime::Http2ProxyConfig,
     tls_server_config: Arc<rustls::ServerConfig>,
     tls_status: ListenerTlsStatus,
+}
+
+#[derive(Debug, Clone)]
+struct ManagedHttp3ProxyConfig {
+    http1: lb_runtime::Http1ProxyConfig,
+    quic_server_config: Arc<quinn::ServerConfig>,
 }
 
 #[derive(Debug, Clone)]
@@ -1077,7 +1099,9 @@ struct ManagedServeListener {
     name: String,
     class: lb_config_model::ListenerClassConfig,
     protocol: lb_config_model::ListenerProtocolConfig,
+    proxy_protocol: lb_config_model::ProxyProtocolModeConfig,
     configured_bind: SocketAddr,
+    bind_mode: lb_net_core::ListenerBindMode,
     local_addr: SocketAddr,
     drain_timeout: Duration,
     admission_limit: Arc<AtomicUsize>,
@@ -1101,7 +1125,9 @@ enum ListenerDrainOutcome {
 struct ListenerIdentity {
     class: lb_config_model::ListenerClassConfig,
     protocol: lb_config_model::ListenerProtocolConfig,
+    proxy_protocol: lb_config_model::ProxyProtocolModeConfig,
     configured_bind: SocketAddr,
+    bind_mode: lb_net_core::ListenerBindMode,
 }
 
 impl ListenerIdentity {
@@ -1109,7 +1135,9 @@ impl ListenerIdentity {
         Self {
             class: spec.class(),
             protocol: spec.protocol(),
+            proxy_protocol: spec.proxy_protocol(),
             configured_bind: spec.bind_address(),
+            bind_mode: spec.bind_mode(),
         }
     }
 
@@ -1117,7 +1145,9 @@ impl ListenerIdentity {
         Self {
             class: listener.class,
             protocol: listener.protocol,
+            proxy_protocol: listener.proxy_protocol,
             configured_bind: listener.configured_bind,
+            bind_mode: listener.bind_mode,
         }
     }
 }
@@ -1262,7 +1292,9 @@ struct RetiredManagedListener {
 struct CurrentListenerIdentity {
     class: lb_config_model::ListenerClassConfig,
     protocol: lb_config_model::ListenerProtocolConfig,
+    proxy_protocol: lb_config_model::ProxyProtocolModeConfig,
     configured_bind: SocketAddr,
+    bind_mode: lb_net_core::ListenerBindMode,
     local_addr: SocketAddr,
 }
 
@@ -1270,7 +1302,9 @@ impl CurrentListenerIdentity {
     fn matches_spec(&self, spec: &CompiledServeListener) -> bool {
         self.class == spec.class()
             && self.protocol == spec.protocol()
+            && self.proxy_protocol == spec.proxy_protocol()
             && self.configured_bind == spec.bind_address()
+            && self.bind_mode == spec.bind_mode()
     }
 
     fn needs_replacement(&self, spec: &CompiledServeListener) -> bool {
@@ -1298,7 +1332,9 @@ impl ManagedListenerSlot {
         CurrentListenerIdentity {
             class: self.active.class,
             protocol: self.active.protocol,
+            proxy_protocol: self.active.proxy_protocol,
             configured_bind: self.active.configured_bind,
+            bind_mode: self.active.bind_mode,
             local_addr: self.active.local_addr,
         }
     }
@@ -1306,7 +1342,9 @@ impl ManagedListenerSlot {
     fn can_update_in_place(&self, spec: &CompiledServeListener) -> bool {
         self.active.class == spec.class()
             && self.active.protocol == spec.protocol()
+            && self.active.proxy_protocol == spec.proxy_protocol()
             && self.active.configured_bind == spec.bind_address()
+            && self.active.bind_mode == spec.bind_mode()
     }
 
     async fn apply_update(&mut self, spec: &CompiledServeListener) -> Result<(), DynError> {
@@ -1353,7 +1391,9 @@ enum CompiledServeListener {
     Public {
         class: lb_config_model::ListenerClassConfig,
         protocol: lb_config_model::ListenerProtocolConfig,
+        proxy_protocol: lb_config_model::ProxyProtocolModeConfig,
         bind_address: SocketAddr,
+        bind_mode: lb_net_core::ListenerBindMode,
         max_connections: usize,
         drain_timeout: Duration,
         overload_policy: Option<CompiledListenerOverloadPolicy>,
@@ -1362,7 +1402,9 @@ enum CompiledServeListener {
     },
     Admin {
         protocol: lb_config_model::ListenerProtocolConfig,
+        proxy_protocol: lb_config_model::ProxyProtocolModeConfig,
         bind_address: SocketAddr,
+        bind_mode: lb_net_core::ListenerBindMode,
         max_connections: usize,
         drain_timeout: Duration,
         overload_policy: Option<CompiledListenerOverloadPolicy>,
@@ -1387,9 +1429,22 @@ impl CompiledServeListener {
         }
     }
 
+    fn proxy_protocol(&self) -> lb_config_model::ProxyProtocolModeConfig {
+        match self {
+            Self::Public { proxy_protocol, .. } => *proxy_protocol,
+            Self::Admin { proxy_protocol, .. } => *proxy_protocol,
+        }
+    }
+
     fn bind_address(&self) -> SocketAddr {
         match self {
             Self::Public { bind_address, .. } | Self::Admin { bind_address, .. } => *bind_address,
+        }
+    }
+
+    fn bind_mode(&self) -> lb_net_core::ListenerBindMode {
+        match self {
+            Self::Public { bind_mode, .. } | Self::Admin { bind_mode, .. } => *bind_mode,
         }
     }
 
@@ -1606,6 +1661,14 @@ impl WorkspaceServeState {
             detail,
         }) {
             eprintln!("overload telemetry emission failed: {error}");
+        }
+    }
+
+    fn record_http3_request(&self, listener_name: &str, result: &str, reason: &str) {
+        if let Err(error) =
+            self.telemetry.record_http3_request(&http3_scope(listener_name), result, reason)
+        {
+            eprintln!("http3 telemetry emission failed: {error}");
         }
     }
 
@@ -2222,6 +2285,7 @@ struct ListenerIdentityStatus {
     class: lb_config_model::ListenerClassConfig,
     protocol: lb_config_model::ListenerProtocolConfig,
     configured_bind: SocketAddr,
+    bind_mode: lb_net_core::ListenerBindMode,
 }
 
 impl From<ListenerIdentity> for ListenerIdentityStatus {
@@ -2230,6 +2294,7 @@ impl From<ListenerIdentity> for ListenerIdentityStatus {
             class: identity.class,
             protocol: identity.protocol,
             configured_bind: identity.configured_bind,
+            bind_mode: identity.bind_mode,
         }
     }
 }
@@ -2241,12 +2306,14 @@ impl ListenerIdentityStatus {
                 "{{",
                 "\"class\":\"{}\",",
                 "\"protocol\":\"{}\",",
-                "\"configured_bind\":\"{}\"",
+                "\"configured_bind\":\"{}\",",
+                "\"bind_mode\":\"{}\"",
                 "}}"
             ),
             listener_class_name(self.class),
             listener_protocol_name(self.protocol),
             self.configured_bind,
+            listener_bind_mode_name(self.bind_mode),
         )
     }
 }
@@ -2784,7 +2851,10 @@ impl ServeSupervisor {
             self.shared.state.reload_requests.fetch_add(1, Ordering::SeqCst);
             let started_at = Instant::now();
 
-            let compiled = compile_workspace_runtime(&self.shared.config_path)?;
+            let compiled = compile_workspace_runtime_with_telemetry(
+                &self.shared.config_path,
+                Some(&self.shared.state.telemetry),
+            )?;
             let desired_snapshot =
                 DurableSnapshotIdentity::from_snapshot(&compiled.source_label, &compiled.snapshot);
             let current_identities = {
@@ -2849,7 +2919,10 @@ impl ServeSupervisor {
                 .collect::<BTreeMap<_, _>>();
             (inner.active_snapshot.clone(), current_identities)
         };
-        let candidate = compile_workspace_runtime(&self.shared.config_path)?;
+        let candidate = compile_workspace_runtime_with_telemetry(
+            &self.shared.config_path,
+            Some(&self.shared.state.telemetry),
+        )?;
 
         Ok(build_config_validation_preview(
             &self.shared.config_path,
@@ -2913,7 +2986,10 @@ impl ServeSupervisor {
                 .map(|(name, listener)| (name.clone(), listener.current_identity()))
                 .collect::<BTreeMap<_, _>>()
         };
-        let candidate = compile_workspace_runtime(&self.shared.config_path)?;
+        let candidate = compile_workspace_runtime_with_telemetry(
+            &self.shared.config_path,
+            Some(&self.shared.state.telemetry),
+        )?;
         Ok(ReloadAuditPlan::from_candidate(&current_identities, &candidate.listeners))
     }
 
@@ -3114,7 +3190,9 @@ impl ServeSupervisor {
             let tls = if let Some(shared_proxy) = shared_proxy {
                 match shared_proxy.read().await.clone() {
                     ManagedProxyConfig::Https(proxy) => Some(proxy.tls_status),
-                    ManagedProxyConfig::Http1(_) | ManagedProxyConfig::Http2(_) => None,
+                    ManagedProxyConfig::Http1(_)
+                    | ManagedProxyConfig::Http2(_)
+                    | ManagedProxyConfig::Http3(_) => None,
                 }
             } else {
                 admin_tls_status
@@ -3193,8 +3271,6 @@ async fn start_managed_listener(
     state: Arc<WorkspaceServeState>,
     supervisor: ServeSupervisor,
 ) -> Result<ManagedServeListener, DynError> {
-    let listener = TcpListener::bind(spec.bind_address()).await?;
-    let local_addr = listener.local_addr()?;
     let drain_timeout = spec.drain_timeout();
     let admission_limit = Arc::new(AtomicUsize::new(spec.max_connections()));
     let overload_runtime =
@@ -3205,14 +3281,67 @@ async fn start_managed_listener(
     )));
     let counters = Arc::new(ListenerRuntimeCounters::new());
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-
     match spec {
-        CompiledServeListener::Public { class, protocol, bind_address, proxy, .. } => {
+        CompiledServeListener::Public {
+            class,
+            protocol,
+            proxy_protocol,
+            bind_address,
+            bind_mode,
+            proxy,
+            ..
+        } => {
+            if let ManagedProxyConfig::Http3(proxy) = proxy.clone() {
+                let socket = lb_runtime::bind_udp_socket(bind_address, bind_mode)?;
+                let local_addr = socket.local_addr()?;
+                let (ready_tx, ready_rx) = oneshot::channel();
+                let shared_proxy = Arc::new(RwLock::new(ManagedProxyConfig::Http3(proxy)));
+                let task = tokio::spawn(run_public_http3_listener_loop(
+                    socket,
+                    name.clone(),
+                    shared_proxy.read().await.clone(),
+                    Arc::clone(&admission_limit),
+                    Arc::clone(&overload_runtime),
+                    Arc::clone(&abuse_protection),
+                    Arc::clone(&counters),
+                    Arc::clone(&state),
+                    shutdown_rx,
+                    drain_timeout,
+                    ready_tx,
+                ));
+                return await_managed_listener_ready(
+                    ManagedServeListener {
+                        name,
+                        class,
+                        protocol,
+                        proxy_protocol,
+                        configured_bind: bind_address,
+                        bind_mode,
+                        local_addr,
+                        drain_timeout,
+                        admission_limit,
+                        overload_runtime,
+                        abuse_policy,
+                        abuse_protection,
+                        counters,
+                        kind: ManagedListenerKind::Public { shared_proxy },
+                        shutdown_tx,
+                        task,
+                        probe_task: None,
+                    },
+                    ready_rx,
+                )
+                .await;
+            }
+
+            let listener = lb_runtime::bind_tcp_listener(bind_address, bind_mode)?;
+            let local_addr = listener.local_addr()?;
             let (ready_tx, ready_rx) = oneshot::channel();
             let shared_proxy = Arc::new(RwLock::new(proxy));
             let task = tokio::spawn(run_public_listener_loop(
                 listener,
                 name.clone(),
+                proxy_protocol,
                 Arc::clone(&shared_proxy),
                 Arc::clone(&admission_limit),
                 Arc::clone(&overload_runtime),
@@ -3232,7 +3361,9 @@ async fn start_managed_listener(
                     name,
                     class,
                     protocol,
+                    proxy_protocol,
                     configured_bind: bind_address,
+                    bind_mode,
                     local_addr,
                     drain_timeout,
                     admission_limit,
@@ -3249,7 +3380,17 @@ async fn start_managed_listener(
             )
             .await
         }
-        CompiledServeListener::Admin { protocol, bind_address, admin_policy, tls, .. } => {
+        CompiledServeListener::Admin {
+            protocol,
+            proxy_protocol,
+            bind_address,
+            bind_mode,
+            admin_policy,
+            tls,
+            ..
+        } => {
+            let listener = lb_runtime::bind_tcp_listener(bind_address, bind_mode)?;
+            let local_addr = listener.local_addr()?;
             let (ready_tx, ready_rx) = oneshot::channel();
             let admin_runtime = AdminRuntimeHandles {
                 shared_policy: Arc::new(RwLock::new(admin_policy)),
@@ -3277,7 +3418,9 @@ async fn start_managed_listener(
                     name,
                     class: lb_config_model::ListenerClassConfig::Admin,
                     protocol,
+                    proxy_protocol,
                     configured_bind: bind_address,
+                    bind_mode,
                     local_addr,
                     drain_timeout,
                     admission_limit,
@@ -3297,6 +3440,169 @@ async fn start_managed_listener(
             )
             .await
         }
+    }
+}
+
+fn proxy_preface_timeout(proxy: &ManagedProxyConfig) -> Duration {
+    match proxy {
+        ManagedProxyConfig::Http1(config) => config.timeouts.preface_timeout,
+        ManagedProxyConfig::Http2(config) => config.timeouts.preface_timeout,
+        ManagedProxyConfig::Https(config) => config.http1.timeouts.preface_timeout,
+        ManagedProxyConfig::Http3(_) => Duration::from_secs(5),
+    }
+}
+
+async fn resolve_downstream_addr_from_proxy_protocol(
+    stream: &mut TcpStream,
+    peer_addr: SocketAddr,
+    mode: lb_config_model::ProxyProtocolModeConfig,
+    timeout: Duration,
+) -> io::Result<SocketAddr> {
+    let source_addr = match mode {
+        lb_config_model::ProxyProtocolModeConfig::Disabled => None,
+        lb_config_model::ProxyProtocolModeConfig::V1 => {
+            time::timeout(timeout, read_proxy_protocol_v1(stream))
+                .await
+                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "proxy protocol v1 timeout"))??
+        }
+        lb_config_model::ProxyProtocolModeConfig::V2 => {
+            time::timeout(timeout, read_proxy_protocol_v2(stream))
+                .await
+                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "proxy protocol v2 timeout"))??
+        }
+    };
+    Ok(source_addr.unwrap_or(peer_addr))
+}
+
+async fn read_proxy_protocol_v1(stream: &mut TcpStream) -> io::Result<Option<SocketAddr>> {
+    let mut line = Vec::with_capacity(PROXY_PROTOCOL_V1_MAX_LEN);
+    loop {
+        if line.len() >= PROXY_PROTOCOL_V1_MAX_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "proxy protocol v1 header too long",
+            ));
+        }
+        let byte = stream.read_u8().await?;
+        line.push(byte);
+        if line.len() >= 2 && line[line.len() - 2..] == *b"\r\n" {
+            break;
+        }
+    }
+    parse_proxy_protocol_v1_line(&line)
+}
+
+async fn read_proxy_protocol_v2(stream: &mut TcpStream) -> io::Result<Option<SocketAddr>> {
+    let mut header = [0_u8; 16];
+    stream.read_exact(&mut header).await?;
+    let payload_len = parse_proxy_protocol_v2_header(&header)?;
+    let mut payload = vec![0_u8; payload_len];
+    stream.read_exact(&mut payload).await?;
+    parse_proxy_protocol_v2_payload(&header, &payload)
+}
+
+fn parse_proxy_protocol_v1_line(line: &[u8]) -> io::Result<Option<SocketAddr>> {
+    let line = std::str::from_utf8(line)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "proxy protocol v1 utf8"))?;
+    let line = line
+        .strip_suffix("\r\n")
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "proxy protocol v1 newline"))?;
+    let parts = line.split_whitespace().collect::<Vec<_>>();
+    if parts.len() < 2 || parts[0] != "PROXY" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "proxy protocol v1 preface",
+        ));
+    }
+    match parts[1] {
+        "UNKNOWN" => Ok(None),
+        "TCP4" | "TCP6" => {
+            if parts.len() != 6 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "proxy protocol v1 address fields",
+                ));
+            }
+            let source_ip: IpAddr = parts[2]
+                .parse()
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "proxy protocol v1 source ip"))?;
+            let _destination_ip: IpAddr = parts[3].parse().map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "proxy protocol v1 destination ip")
+            })?;
+            let source_port: u16 = parts[4].parse().map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "proxy protocol v1 source port")
+            })?;
+            let _destination_port: u16 = parts[5].parse().map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "proxy protocol v1 destination port")
+            })?;
+            Ok(Some(SocketAddr::new(source_ip, source_port)))
+        }
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "proxy protocol v1 transport",
+        )),
+    }
+}
+
+fn parse_proxy_protocol_v2_header(header: &[u8; 16]) -> io::Result<usize> {
+    if header[..12] != PROXY_PROTOCOL_V2_SIGNATURE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "proxy protocol v2 signature",
+        ));
+    }
+    if header[12] >> 4 != 0x2 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "proxy protocol v2 version",
+        ));
+    }
+    Ok(u16::from_be_bytes([header[14], header[15]]) as usize)
+}
+
+fn parse_proxy_protocol_v2_payload(
+    header: &[u8; 16],
+    payload: &[u8],
+) -> io::Result<Option<SocketAddr>> {
+    let command = header[12] & 0x0f;
+    if command == 0x00 {
+        return Ok(None);
+    }
+    if command != 0x01 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "proxy protocol v2 command",
+        ));
+    }
+    match header[13] {
+        0x11 => {
+            if payload.len() < 12 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "proxy protocol v2 ipv4 payload",
+                ));
+            }
+            let source_ip = IpAddr::from([payload[0], payload[1], payload[2], payload[3]]);
+            let source_port = u16::from_be_bytes([payload[8], payload[9]]);
+            Ok(Some(SocketAddr::new(source_ip, source_port)))
+        }
+        0x21 => {
+            if payload.len() < 36 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "proxy protocol v2 ipv6 payload",
+                ));
+            }
+            let mut source = [0_u8; 16];
+            source.copy_from_slice(&payload[..16]);
+            let source_port = u16::from_be_bytes([payload[32], payload[33]]);
+            Ok(Some(SocketAddr::new(IpAddr::from(source), source_port)))
+        }
+        0x00 => Ok(None),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "proxy protocol v2 transport",
+        )),
     }
 }
 
@@ -3370,9 +3676,15 @@ async fn run_active_health_probe_loop(
 }
 
 fn collect_active_probe_pools(proxy: &ManagedProxyConfig) -> Vec<lb_runtime::RouteBackendPool> {
-    let mut pools_by_cluster = BTreeMap::<String, lb_runtime::RouteBackendPool>::new();
+    let mut pools_by_scope = BTreeMap::<String, lb_runtime::RouteBackendPool>::new();
     let mut insert_pool = |pool: &lb_runtime::RouteBackendPool| {
-        pools_by_cluster.entry(pool.cluster_name().to_string()).or_insert_with(|| pool.clone());
+        let key = pool
+            .cluster_names()
+            .into_iter()
+            .map(|cluster_name| cluster_name.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        pools_by_scope.entry(key).or_insert_with(|| pool.clone());
     };
 
     match proxy {
@@ -3394,14 +3706,270 @@ fn collect_active_probe_pools(proxy: &ManagedProxyConfig) -> Vec<lb_runtime::Rou
                 insert_pool(pool);
             }
         }
+        ManagedProxyConfig::Http3(_) => {}
     }
 
-    pools_by_cluster.into_values().collect()
+    pools_by_scope.into_values().collect()
+}
+
+async fn run_public_http3_listener_loop(
+    socket: UdpSocket,
+    listener_name: String,
+    proxy: ManagedProxyConfig,
+    admission_limit: Arc<AtomicUsize>,
+    overload_runtime: Arc<StdMutex<Option<ListenerOverloadRuntime>>>,
+    abuse_protection: Arc<RwLock<lb_runtime::ListenerAbuseProtectionState>>,
+    counters: Arc<ListenerRuntimeCounters>,
+    state: Arc<WorkspaceServeState>,
+    mut shutdown_rx: watch::Receiver<bool>,
+    drain_timeout: Duration,
+    ready_tx: oneshot::Sender<()>,
+) -> io::Result<ListenerDrainOutcome> {
+    let ManagedProxyConfig::Http3(proxy) = proxy else {
+        return Err(io::Error::other("http3 listener requires http3 proxy config"));
+    };
+    let runtime = quinn::TokioRuntime;
+    let endpoint = quinn::Endpoint::new(
+        quinn::EndpointConfig::default(),
+        Some((*proxy.quic_server_config).clone()),
+        socket.into_std()?,
+        Arc::new(runtime),
+    )
+    .map_err(io::Error::other)?;
+
+    *counters.state.write().await = String::from("running");
+    let _ = ready_tx.send(());
+    let mut tasks = JoinSet::new();
+
+    loop {
+        tokio::select! {
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() || *shutdown_rx.borrow() {
+                    break;
+                }
+            }
+            incoming = endpoint.accept() => {
+                let Some(incoming) = incoming else {
+                    break;
+                };
+                counters.accepted_connections.fetch_add(1, Ordering::SeqCst);
+                if !try_acquire_listener_slot(&counters, &admission_limit) {
+                    counters.shed_connections.fetch_add(1, Ordering::SeqCst);
+                    state.record_overload_event(
+                        &listener_name,
+                        lb_observability::OverloadEventKind::RequestShed,
+                        format!(
+                            "listener shed http3 connection at capacity {}",
+                            admission_limit.load(Ordering::SeqCst)
+                        ),
+                    );
+                    state.sync_listener_overload_snapshot(
+                        &listener_name,
+                        &counters,
+                        admission_limit.load(Ordering::SeqCst),
+                        &overload_runtime,
+                        true,
+                    );
+                    continue;
+                }
+                state.sync_listener_overload_snapshot(
+                    &listener_name,
+                    &counters,
+                    admission_limit.load(Ordering::SeqCst),
+                    &overload_runtime,
+                    false,
+                );
+
+                let counters = Arc::clone(&counters);
+                let state = Arc::clone(&state);
+                let abuse_protection = Arc::clone(&abuse_protection);
+                let overload_runtime = Arc::clone(&overload_runtime);
+                let admission_limit = Arc::clone(&admission_limit);
+                let listener_name = listener_name.clone();
+                let proxy = proxy.clone();
+
+                tasks.spawn(async move {
+                    let result = handle_http3_connecting(
+                        incoming,
+                        &listener_name,
+                        proxy,
+                        &state,
+                        Arc::clone(&abuse_protection),
+                    )
+                    .await;
+                    if let Ok(request_count) = result {
+                        state.proxied_connections.fetch_add(1, Ordering::SeqCst);
+                        state.proxied_requests.fetch_add(request_count, Ordering::SeqCst);
+                    }
+                    counters.active_connections.fetch_sub(1, Ordering::SeqCst);
+                    counters.completed_connections.fetch_add(1, Ordering::SeqCst);
+                    state.sync_listener_overload_snapshot(
+                        &listener_name,
+                        &counters,
+                        admission_limit.load(Ordering::SeqCst),
+                        &overload_runtime,
+                        false,
+                    );
+                    state.sync_listener_abuse_snapshot(&listener_name, &abuse_protection).await;
+                });
+            }
+        }
+    }
+
+    endpoint.close(0u32.into(), b"server shutdown");
+    *counters.state.write().await = String::from("draining");
+    let drain_outcome =
+        if time::timeout(drain_timeout, async { while tasks.join_next().await.is_some() {} })
+            .await
+            .is_ok()
+        {
+            *counters.state.write().await = String::from("stopped");
+            ListenerDrainOutcome::Completed
+        } else {
+            *counters.state.write().await = String::from("drain_timeout_expired");
+            ListenerDrainOutcome::TimedOut
+        };
+    Ok(drain_outcome)
+}
+
+async fn handle_http3_connecting(
+    connecting: quinn::Incoming,
+    listener_name: &str,
+    proxy: ManagedHttp3ProxyConfig,
+    state: &WorkspaceServeState,
+    abuse_protection: Arc<RwLock<lb_runtime::ListenerAbuseProtectionState>>,
+) -> io::Result<u64> {
+    let connecting = connecting.accept().map_err(io::Error::other)?;
+    let connection = connecting.await.map_err(io::Error::other)?;
+    let remote_addr = connection.remote_address();
+    let _source_lease = {
+        let protection = abuse_protection.read().await;
+        protection.try_acquire_source(remote_addr).map_err(|reason| io::Error::other(reason.detail()))?
+    };
+    let mut h3_conn = h3::server::builder()
+        .build(H3Connection::new(connection))
+        .await
+        .map_err(io::Error::other)?;
+    let mut request_count = 0_u64;
+
+    while let Some(resolver) = h3_conn.accept().await.map_err(io::Error::other)? {
+        let (request, mut stream) = resolver.resolve_request().await.map_err(io::Error::other)?;
+        request_count += 1;
+        handle_http3_request(listener_name, state, &proxy, remote_addr, request, &mut stream)
+            .await?;
+    }
+
+    Ok(request_count)
+}
+
+async fn handle_http3_request(
+    listener_name: &str,
+    state: &WorkspaceServeState,
+    proxy: &ManagedHttp3ProxyConfig,
+    downstream_addr: SocketAddr,
+    request: http1::Request<()>,
+    stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+) -> io::Result<()> {
+    let mut headers = request
+        .headers()
+        .iter()
+        .filter_map(|(name, value)| {
+            value.to_str().ok().map(|value| lb_proto_http::HttpHeader {
+                name: name.as_str().to_ascii_lowercase(),
+                value: value.to_string(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let target = request
+        .uri()
+        .path_and_query()
+        .map(|value| value.as_str())
+        .unwrap_or("/")
+        .to_string();
+    let route_input = lb_proto_http::RouteMatchInput {
+        target: target.clone(),
+        host: request.uri().authority().map(|authority| authority.as_str().to_string()),
+        method: Some(request.method().as_str().to_string()),
+        headers: headers.clone(),
+        source_ip: Some(downstream_addr.ip()),
+    };
+    let route = lb_proto_http::match_route_request_with_context(&route_input, &proxy.http1.routes);
+
+    let mut request_body = Vec::new();
+    while let Some(mut chunk) = stream.recv_data().await.map_err(io::Error::other)? {
+        let chunk_bytes = chunk.copy_to_bytes(chunk.remaining());
+        request_body.extend_from_slice(&chunk_bytes);
+    }
+    if !request_body.is_empty() {
+        headers.retain(|header| !header.name.eq_ignore_ascii_case("content-length"));
+        headers.push(lb_proto_http::HttpHeader {
+            name: String::from("content-length"),
+            value: request_body.len().to_string(),
+        });
+    }
+
+    let response = lb_runtime::proxy_http1_request_with_downstream_addr(
+        &proxy.http1,
+        downstream_addr,
+        lb_proto_http::Http1RequestHead {
+            method: request.method().as_str().to_string(),
+            target,
+            version: lb_proto_http::SupportedHttpVersion::Http1,
+            headers,
+            body_kind: if request_body.is_empty() {
+                lb_proto_http::BodyKind::None
+            } else {
+                lb_proto_http::BodyKind::ContentLength(request_body.len() as u64)
+            },
+            keep_alive: false,
+            route,
+        },
+        &request_body,
+    )
+    .await
+    .map_err(|error| {
+        state.record_http3_request(listener_name, "failed", "bridge_failed");
+        io::Error::other(error)
+    })?;
+
+    let status_reason = match response.head.status / 100 {
+        2 => "2xx",
+        3 => "3xx",
+        4 => "4xx",
+        5 => "5xx",
+        _ => "other",
+    };
+
+    let mut response_builder = http1::Response::builder().status(response.head.status);
+    for header in &response.head.headers {
+        response_builder = response_builder.header(&header.name, &header.value);
+    }
+    let response_head = response_builder.body(()).map_err(|error| {
+        state.record_http3_request(listener_name, "failed", "response_build_failed");
+        io::Error::other(error)
+    })?;
+    stream.send_response(response_head).await.map_err(|error| {
+        state.record_http3_request(listener_name, "failed", "response_head_write_failed");
+        io::Error::other(error)
+    })?;
+    if !response.body.is_empty() {
+        stream.send_data(Bytes::from(response.body)).await.map_err(|error| {
+            state.record_http3_request(listener_name, "failed", "response_body_write_failed");
+            io::Error::other(error)
+        })?;
+    }
+    stream.finish().await.map_err(|error| {
+        state.record_http3_request(listener_name, "failed", "response_finish_failed");
+        io::Error::other(error)
+    })?;
+    state.record_http3_request(listener_name, "served", status_reason);
+    Ok(())
 }
 
 async fn run_public_listener_loop(
     listener: TcpListener,
     listener_name: String,
+    proxy_protocol: lb_config_model::ProxyProtocolModeConfig,
     shared_proxy: Arc<RwLock<ManagedProxyConfig>>,
     admission_limit: Arc<AtomicUsize>,
     overload_runtime: Arc<StdMutex<Option<ListenerOverloadRuntime>>>,
@@ -3425,14 +3993,25 @@ async fn run_public_listener_loop(
             }
             accepted = listener.accept() => {
                 let (mut stream, peer_addr) = accepted?;
+                let proxy = shared_proxy.read().await.clone();
+                let downstream_addr = match resolve_downstream_addr_from_proxy_protocol(
+                    &mut stream,
+                    peer_addr,
+                    proxy_protocol,
+                    proxy_preface_timeout(&proxy),
+                )
+                .await
+                {
+                    Ok(downstream_addr) => downstream_addr,
+                    Err(_) => continue,
+                };
                 let source_lease = {
                     let protection = abuse_protection.read().await;
-                    match protection.try_acquire_source(peer_addr) {
+                    match protection.try_acquire_source(downstream_addr) {
                         Ok(source_lease) => source_lease,
                         Err(reason) => {
                             state.record_listener_abuse_rejection(&listener_name, reason);
                             state.sync_listener_abuse_snapshot(&listener_name, &abuse_protection).await;
-                            let proxy = shared_proxy.read().await.clone();
                             if matches!(&proxy, ManagedProxyConfig::Http1(_)) {
                                 let _ = write_abuse_rejection_response(&mut stream, reason).await;
                             }
@@ -3440,7 +4019,6 @@ async fn run_public_listener_loop(
                         }
                     }
                 };
-                let proxy = shared_proxy.read().await.clone();
                 let mut handshake_permit = {
                     let protection = abuse_protection.read().await;
                     match protection.try_acquire_handshake() {
@@ -3503,16 +4081,32 @@ async fn run_public_listener_loop(
                 tasks.spawn(async move {
                     let _source_lease = source_lease;
                     let result: io::Result<u64> = match proxy {
-                        ManagedProxyConfig::Http1(config) => lb_runtime::proxy_http1_connection(stream, &config)
+                        ManagedProxyConfig::Http1(config) => {
+                            lb_runtime::proxy_http1_connection_with_downstream_addr(
+                                stream,
+                                downstream_addr,
+                                &config,
+                            )
                             .await
                             .map(|report| report.metrics.request_count)
-                            .map_err(|error| io::Error::other(error.to_string())),
-                        ManagedProxyConfig::Http2(config) => lb_runtime::proxy_http2_connection(stream, &config)
+                            .map_err(|error| io::Error::other(error.to_string()))
+                        }
+                        ManagedProxyConfig::Http2(config) => {
+                            lb_runtime::proxy_http2_connection_with_downstream_addr(
+                                stream,
+                                downstream_addr,
+                                &config,
+                            )
                             .await
                             .map(|report| report.metrics.request_count)
-                            .map_err(|error| io::Error::other(error.to_string())),
+                            .map_err(|error| io::Error::other(error.to_string()))
+                        }
                         ManagedProxyConfig::Https(config) => {
-                            proxy_https_connection(stream, peer_addr, config, handshake_permit).await
+                            proxy_https_connection(stream, downstream_addr, config, handshake_permit)
+                                .await
+                        }
+                        ManagedProxyConfig::Http3(_) => {
+                            Err(io::Error::other("http3 proxy config cannot run on tcp listener loop"))
                         }
                     };
                     if let Ok(request_count) = result {
@@ -5341,7 +5935,15 @@ fn summarize_snapshot_changes(changes: &[lb_config_model::SnapshotResourceChange
         .join(", ")
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn compile_workspace_runtime(config_path: &str) -> Result<CompiledWorkspaceRuntime, DynError> {
+    compile_workspace_runtime_with_telemetry(config_path, None)
+}
+
+fn compile_workspace_runtime_with_telemetry(
+    config_path: &str,
+    telemetry: Option<&Arc<lb_runtime::RuntimeTelemetry>>,
+) -> Result<CompiledWorkspaceRuntime, DynError> {
     let config = crate::load_workspace_config(config_path).map_err(to_dyn_error)?;
     let snapshot = config.compile_snapshot().map_err(to_dyn_error)?;
     let compiled_listeners = config.compile_listeners()?;
@@ -5386,7 +5988,9 @@ fn compile_workspace_runtime(config_path: &str) -> Result<CompiledWorkspaceRunti
             ) => CompiledServeListener::Public {
                 class: listener.class,
                 protocol: listener.protocol,
+                proxy_protocol: listener.proxy_protocol,
                 bind_address: compiled_listener.bind_address,
+                bind_mode: compiled_listener.bind_mode,
                 max_connections: compiled_listener.max_connections,
                 drain_timeout: compiled_listener.drain_timeout,
                 overload_policy: compile_listener_overload_policy(&config, listener)?,
@@ -5400,6 +6004,7 @@ fn compile_workspace_runtime(config_path: &str) -> Result<CompiledWorkspaceRunti
                     http_cache_scope.as_ref().map(|(scope_runtime, policy)| {
                         (policy.clone(), Arc::clone(&scope_runtime.store))
                     }),
+                    telemetry,
                 )?),
             },
             (
@@ -5408,7 +6013,9 @@ fn compile_workspace_runtime(config_path: &str) -> Result<CompiledWorkspaceRunti
             ) => CompiledServeListener::Public {
                 class: listener.class,
                 protocol: listener.protocol,
+                proxy_protocol: listener.proxy_protocol,
                 bind_address: compiled_listener.bind_address,
+                bind_mode: compiled_listener.bind_mode,
                 max_connections: compiled_listener.max_connections,
                 drain_timeout: compiled_listener.drain_timeout,
                 overload_policy: compile_listener_overload_policy(&config, listener)?,
@@ -5427,7 +6034,9 @@ fn compile_workspace_runtime(config_path: &str) -> Result<CompiledWorkspaceRunti
             ) => CompiledServeListener::Public {
                 class: listener.class,
                 protocol: listener.protocol,
+                proxy_protocol: listener.proxy_protocol,
                 bind_address: compiled_listener.bind_address,
+                bind_mode: compiled_listener.bind_mode,
                 max_connections: compiled_listener.max_connections,
                 drain_timeout: compiled_listener.drain_timeout,
                 overload_policy: compile_listener_overload_policy(&config, listener)?,
@@ -5442,6 +6051,28 @@ fn compile_workspace_runtime(config_path: &str) -> Result<CompiledWorkspaceRunti
                     http_cache_scope.as_ref().map(|(scope_runtime, policy)| {
                         (policy.clone(), Arc::clone(&scope_runtime.store))
                     }),
+                    telemetry,
+                )?),
+            },
+            (
+                lb_config_model::ListenerClassConfig::Public,
+                lb_config_model::ListenerProtocolConfig::Http3,
+            ) => CompiledServeListener::Public {
+                class: listener.class,
+                protocol: listener.protocol,
+                proxy_protocol: listener.proxy_protocol,
+                bind_address: compiled_listener.bind_address,
+                bind_mode: compiled_listener.bind_mode,
+                max_connections: compiled_listener.max_connections,
+                drain_timeout: compiled_listener.drain_timeout,
+                overload_policy: compile_listener_overload_policy(&config, listener)?,
+                abuse_protection_policy: compile_listener_abuse_protection_policy(
+                    &config, listener,
+                )?,
+                proxy: ManagedProxyConfig::Http3(compile_http3_proxy_config(
+                    &config,
+                    listener,
+                    &compiled_routes,
                 )?),
             },
             (lb_config_model::ListenerClassConfig::Public, protocol) => {
@@ -5456,7 +6087,9 @@ fn compile_workspace_runtime(config_path: &str) -> Result<CompiledWorkspaceRunti
                 lb_config_model::ListenerProtocolConfig::Http1,
             ) => CompiledServeListener::Admin {
                 protocol: listener.protocol,
+                proxy_protocol: listener.proxy_protocol,
                 bind_address: compiled_listener.bind_address,
+                bind_mode: compiled_listener.bind_mode,
                 max_connections: compiled_listener.max_connections,
                 drain_timeout: compiled_listener.drain_timeout,
                 overload_policy: compile_listener_overload_policy(&config, listener)?,
@@ -5471,7 +6104,9 @@ fn compile_workspace_runtime(config_path: &str) -> Result<CompiledWorkspaceRunti
                 lb_config_model::ListenerProtocolConfig::Https,
             ) => CompiledServeListener::Admin {
                 protocol: listener.protocol,
+                proxy_protocol: listener.proxy_protocol,
                 bind_address: compiled_listener.bind_address,
+                bind_mode: compiled_listener.bind_mode,
                 max_connections: compiled_listener.max_connections,
                 drain_timeout: compiled_listener.drain_timeout,
                 overload_policy: compile_listener_overload_policy(&config, listener)?,
@@ -5640,6 +6275,630 @@ fn resolve_listener_http_cache_policy(
     Ok(Some((policy.name.clone(), policy.spec.clone())))
 }
 
+fn resolve_listener_request_transforms(
+    config: &lb_config_model::WorkspaceConfig,
+    listener: &lb_config_model::ListenerResourceConfig,
+) -> Result<
+    (
+        Option<lb_config_model::RequestTransformConfig>,
+        Vec<(String, lb_config_model::RequestTransformConfig)>,
+    ),
+    DynError,
+> {
+    let listener_request_transform = listener
+        .policies
+        .transform_policy
+        .as_deref()
+        .map(|policy_name| resolve_named_request_transform(config, policy_name, &listener.name))
+        .transpose()?;
+
+    let route_request_transforms = listener
+        .routes
+        .iter()
+        .filter_map(|route_name| {
+            config
+                .routes
+                .iter()
+                .find(|route| route.name == *route_name)
+                .and_then(|route| {
+                    route.policies.transform_policy.as_deref().map(|policy_name| {
+                        (route.name.clone(), policy_name.to_string())
+                    })
+                })
+        })
+        .map(|(route_name, policy_name)| {
+            resolve_named_request_transform(config, &policy_name, &route_name)
+                .map(|transform| (route_name, transform))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok((listener_request_transform, route_request_transforms))
+}
+
+fn resolve_named_request_transform(
+    config: &lb_config_model::WorkspaceConfig,
+    policy_name: &str,
+    referrer_name: &str,
+) -> Result<lb_config_model::RequestTransformConfig, DynError> {
+    config
+        .policies
+        .transforms
+        .iter()
+        .find(|policy| policy.name == policy_name)
+        .map(|policy| policy.spec.request.clone())
+        .ok_or_else(|| {
+            to_dyn_error(format!(
+                "resource {} references unknown transform policy {}",
+                referrer_name, policy_name
+            ))
+        })
+}
+
+fn resolve_listener_response_transforms(
+    config: &lb_config_model::WorkspaceConfig,
+    listener: &lb_config_model::ListenerResourceConfig,
+) -> Result<
+    (
+        Option<lb_config_model::ResponseTransformConfig>,
+        Vec<(String, lb_config_model::ResponseTransformConfig)>,
+    ),
+    DynError,
+> {
+    let listener_response_transform = listener
+        .policies
+        .transform_policy
+        .as_deref()
+        .map(|policy_name| resolve_named_response_transform(config, policy_name, &listener.name))
+        .transpose()?;
+
+    let route_response_transforms = listener
+        .routes
+        .iter()
+        .filter_map(|route_name| {
+            config
+                .routes
+                .iter()
+                .find(|route| route.name == *route_name)
+                .and_then(|route| {
+                    route.policies.transform_policy.as_deref().map(|policy_name| {
+                        (route.name.clone(), policy_name.to_string())
+                    })
+                })
+        })
+        .map(|(route_name, policy_name)| {
+            resolve_named_response_transform(config, &policy_name, &route_name)
+                .map(|transform| (route_name, transform))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok((listener_response_transform, route_response_transforms))
+}
+
+fn resolve_named_response_transform(
+    config: &lb_config_model::WorkspaceConfig,
+    policy_name: &str,
+    referrer_name: &str,
+) -> Result<lb_config_model::ResponseTransformConfig, DynError> {
+    config
+        .policies
+        .transforms
+        .iter()
+        .find(|policy| policy.name == policy_name)
+        .map(|policy| policy.spec.response.clone())
+        .ok_or_else(|| {
+            to_dyn_error(format!(
+                "resource {} references unknown transform policy {}",
+                referrer_name, policy_name
+            ))
+        })
+}
+
+fn compile_route_destination_policy_runtime(
+    config: &lb_config_model::WorkspaceConfig,
+    route_backend_policy_diagnostics: &BTreeMap<String, Vec<lb_runtime::EffectiveRouteDestinationPolicy>>,
+) -> Result<BTreeMap<String, BTreeMap<String, lb_runtime::RouteDestinationPolicyRuntime>>, DynError>
+{
+    let mut shared_rate_limiters = BTreeMap::<String, Arc<lb_runtime::LocalRateLimiter>>::new();
+    let mut shared_concurrency_limiters =
+        BTreeMap::<String, Arc<lb_runtime::LocalConcurrencyLimiter>>::new();
+    let mut shared_failure_managers = BTreeMap::<String, Arc<lb_runtime::FailureManager>>::new();
+
+    route_backend_policy_diagnostics
+        .iter()
+        .map(|(route_name, diagnostics)| {
+            let destination_runtime = diagnostics
+                .iter()
+                .map(|diagnostic| {
+                    let rate_limiters = diagnostic
+                        .local_rate_limits
+                        .iter()
+                        .map(|policy_name| {
+                            resolve_named_local_rate_limiter(
+                                config,
+                                &mut shared_rate_limiters,
+                                policy_name,
+                            )
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let concurrency_limiters = diagnostic
+                        .local_concurrency_limits
+                        .iter()
+                        .map(|policy_name| {
+                            resolve_named_local_concurrency_limiter(
+                                config,
+                                &mut shared_concurrency_limiters,
+                                policy_name,
+                            )
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let failure_manager = resolve_destination_failure_manager(
+                        config,
+                        &mut shared_failure_managers,
+                        diagnostic,
+                    )?;
+
+                    Ok((
+                        diagnostic.upstream_cluster.clone(),
+                        lb_runtime::RouteDestinationPolicyRuntime {
+                            request_transform: diagnostic.effective_request_transform.clone(),
+                            response_transform: diagnostic.effective_response_transform.clone(),
+                            traffic_mirror: diagnostic.traffic_mirror.as_ref().map(|policy_name| {
+                                config
+                                    .policies
+                                    .traffic_mirrors
+                                    .iter()
+                                    .find(|policy| policy.name == *policy_name)
+                                    .expect("validated traffic mirroring policy reference")
+                                    .spec
+                                    .clone()
+                            }),
+                                    fault_injection: diagnostic.fault_injection.as_ref().map(|policy_name| {
+                                    config
+                                        .policies
+                                        .fault_injections
+                                        .iter()
+                                        .find(|policy| policy.name == *policy_name)
+                                        .expect("validated fault injection policy reference")
+                                        .spec
+                                        .clone()
+                                    }),
+                            rate_limiters,
+                            concurrency_limiters,
+                            failure_manager,
+                            enforce_retry_budget: diagnostic.retry_budget.is_some(),
+                            enforce_timeout_hierarchy: diagnostic.timeout_hierarchy.is_some(),
+                            enforce_circuit_breaker: diagnostic.circuit_breaker.is_some(),
+                        },
+                    ))
+                })
+                .collect::<Result<BTreeMap<_, _>, DynError>>()?;
+            Ok((route_name.clone(), destination_runtime))
+        })
+        .collect()
+}
+
+fn resolve_named_local_rate_limiter(
+    config: &lb_config_model::WorkspaceConfig,
+    cache: &mut BTreeMap<String, Arc<lb_runtime::LocalRateLimiter>>,
+    policy_name: &str,
+) -> Result<Arc<lb_runtime::LocalRateLimiter>, DynError> {
+    if let Some(limiter) = cache.get(policy_name) {
+        return Ok(Arc::clone(limiter));
+    }
+
+    let policy = config
+        .policies
+        .local_rate_limits
+        .iter()
+        .find(|policy| policy.name == policy_name)
+        .ok_or_else(|| to_dyn_error(format!("unknown local rate-limit policy {policy_name}")))?;
+    let limiter = Arc::new(
+        lb_runtime::LocalRateLimiter::new(lb_runtime::LocalRateLimitConfig {
+            scope: compile_local_limit_scope(&policy.spec.scope),
+            key_kind: compile_local_limit_key_kind(policy.spec.key_kind),
+            requests_per_window: policy.spec.requests_per_window,
+            window: Duration::from_millis(policy.spec.window_ms),
+            max_tracked_keys: policy.spec.max_tracked_keys,
+        })
+        .map_err(to_dyn_error)?,
+    );
+    cache.insert(policy_name.to_string(), Arc::clone(&limiter));
+    Ok(limiter)
+}
+
+fn resolve_destination_failure_manager(
+    config: &lb_config_model::WorkspaceConfig,
+    cache: &mut BTreeMap<String, Arc<lb_runtime::FailureManager>>,
+    diagnostic: &lb_runtime::EffectiveRouteDestinationPolicy,
+) -> Result<Option<Arc<lb_runtime::FailureManager>>, DynError> {
+    if diagnostic.retry_budget.is_none()
+        && diagnostic.timeout_hierarchy.is_none()
+        && diagnostic.circuit_breaker.is_none()
+    {
+        return Ok(None);
+    }
+
+    let key = format!(
+        "retry={:?}|timeout={:?}|breaker={:?}",
+        diagnostic.retry_budget, diagnostic.timeout_hierarchy, diagnostic.circuit_breaker
+    );
+    if let Some(manager) = cache.get(&key) {
+        return Ok(Some(Arc::clone(manager)));
+    }
+
+    let retry_budget = diagnostic
+        .retry_budget
+        .as_deref()
+        .map(|policy_name| resolve_named_retry_budget_policy(config, policy_name))
+        .transpose()?
+        .unwrap_or_else(default_retry_budget_policy);
+    let timeout_hierarchy = diagnostic
+        .timeout_hierarchy
+        .as_deref()
+        .map(|policy_name| resolve_named_timeout_hierarchy(config, policy_name))
+        .transpose()?
+        .unwrap_or_else(default_timeout_hierarchy);
+    let circuit_breaker = diagnostic
+        .circuit_breaker
+        .as_deref()
+        .map(|policy_name| resolve_named_circuit_breaker_policy(config, policy_name))
+        .transpose()?
+        .unwrap_or_else(default_circuit_breaker_policy);
+
+    let manager = Arc::new(
+        lb_runtime::FailureManager::new(retry_budget, timeout_hierarchy, circuit_breaker)
+            .map_err(to_dyn_error)?,
+    );
+    cache.insert(key, Arc::clone(&manager));
+    Ok(Some(manager))
+}
+
+fn resolve_named_retry_budget_policy(
+    config: &lb_config_model::WorkspaceConfig,
+    policy_name: &str,
+) -> Result<lb_runtime::RetryBudgetPolicy, DynError> {
+    let policy = config
+        .policies
+        .retry_budgets
+        .iter()
+        .find(|policy| policy.name == policy_name)
+        .ok_or_else(|| to_dyn_error(format!("unknown retry-budget policy {policy_name}")))?;
+    Ok(lb_runtime::RetryBudgetPolicy {
+        min_retry_tokens: policy.spec.min_retry_tokens,
+        retry_percent: policy.spec.retry_percent,
+        window: Duration::from_millis(policy.spec.window_ms),
+    })
+}
+
+fn resolve_named_timeout_hierarchy(
+    config: &lb_config_model::WorkspaceConfig,
+    policy_name: &str,
+) -> Result<lb_runtime::TimeoutHierarchy, DynError> {
+    let policy = config
+        .policies
+        .timeout_hierarchies
+        .iter()
+        .find(|policy| policy.name == policy_name)
+        .ok_or_else(|| to_dyn_error(format!("unknown timeout hierarchy policy {policy_name}")))?;
+    Ok(lb_runtime::TimeoutHierarchy {
+        request_timeout: Duration::from_millis(policy.spec.request_timeout_ms),
+        attempt_timeout: Duration::from_millis(policy.spec.attempt_timeout_ms),
+        connect_timeout: Duration::from_millis(policy.spec.connect_timeout_ms),
+        idle_timeout: Duration::from_millis(policy.spec.idle_timeout_ms),
+    })
+}
+
+fn resolve_named_circuit_breaker_policy(
+    config: &lb_config_model::WorkspaceConfig,
+    policy_name: &str,
+) -> Result<lb_runtime::CircuitBreakerPolicy, DynError> {
+    let policy = config
+        .policies
+        .circuit_breakers
+        .iter()
+        .find(|policy| policy.name == policy_name)
+        .ok_or_else(|| to_dyn_error(format!("unknown circuit-breaker policy {policy_name}")))?;
+    Ok(lb_runtime::CircuitBreakerPolicy {
+        open_failure_threshold: policy.spec.open_failure_threshold,
+        open_duration: Duration::from_millis(policy.spec.open_duration_ms),
+        half_open_success_threshold: policy.spec.half_open_success_threshold,
+    })
+}
+
+fn default_retry_budget_policy() -> lb_runtime::RetryBudgetPolicy {
+    lb_runtime::RetryBudgetPolicy::default()
+}
+
+fn default_timeout_hierarchy() -> lb_runtime::TimeoutHierarchy {
+    let defaults = lb_net_core::ConnectionTimeouts::default();
+    let attempt_timeout = defaults.idle_timeout.max(defaults.connect_timeout);
+    lb_runtime::TimeoutHierarchy {
+        request_timeout: attempt_timeout,
+        attempt_timeout,
+        connect_timeout: defaults.connect_timeout,
+        idle_timeout: defaults.idle_timeout.min(attempt_timeout),
+    }
+}
+
+fn default_circuit_breaker_policy() -> lb_runtime::CircuitBreakerPolicy {
+    lb_runtime::CircuitBreakerPolicy::default()
+}
+
+fn resolve_named_local_concurrency_limiter(
+    config: &lb_config_model::WorkspaceConfig,
+    cache: &mut BTreeMap<String, Arc<lb_runtime::LocalConcurrencyLimiter>>,
+    policy_name: &str,
+) -> Result<Arc<lb_runtime::LocalConcurrencyLimiter>, DynError> {
+    if let Some(limiter) = cache.get(policy_name) {
+        return Ok(Arc::clone(limiter));
+    }
+
+    let policy = config
+        .policies
+        .local_concurrency_limits
+        .iter()
+        .find(|policy| policy.name == policy_name)
+        .ok_or_else(|| {
+            to_dyn_error(format!("unknown local concurrency-limit policy {policy_name}"))
+        })?;
+    let limiter = Arc::new(
+        lb_runtime::LocalConcurrencyLimiter::new(lb_runtime::LocalConcurrencyLimitConfig {
+            scope: compile_local_limit_scope(&policy.spec.scope),
+            key_kind: compile_local_limit_key_kind(policy.spec.key_kind),
+            max_concurrent: policy.spec.max_concurrent,
+            max_tracked_keys: policy.spec.max_tracked_keys,
+        })
+        .map_err(to_dyn_error)?,
+    );
+    cache.insert(policy_name.to_string(), Arc::clone(&limiter));
+    Ok(limiter)
+}
+
+fn compile_local_limit_scope(
+    scope: &lb_config_model::LocalLimitScopeConfig,
+) -> lb_runtime::LocalLimitScope {
+    match scope {
+        lb_config_model::LocalLimitScopeConfig::Listener { name } => {
+            lb_runtime::LocalLimitScope::Listener { name: name.clone() }
+        }
+        lb_config_model::LocalLimitScopeConfig::Route { name } => {
+            lb_runtime::LocalLimitScope::Route { name: name.clone() }
+        }
+        lb_config_model::LocalLimitScopeConfig::RouteDestination {
+            route,
+            upstream_cluster,
+        } => lb_runtime::LocalLimitScope::RouteDestination {
+            route: route.clone(),
+            upstream_cluster: upstream_cluster.clone(),
+        },
+        lb_config_model::LocalLimitScopeConfig::UpstreamCluster { name } => {
+            lb_runtime::LocalLimitScope::UpstreamCluster { name: name.clone() }
+        }
+    }
+}
+
+fn compile_local_limit_key_kind(
+    key_kind: lb_config_model::LocalLimitKeyKindConfig,
+) -> lb_runtime::LocalLimitKeyKind {
+    match key_kind {
+        lb_config_model::LocalLimitKeyKindConfig::Global => lb_runtime::LocalLimitKeyKind::Global,
+        lb_config_model::LocalLimitKeyKindConfig::SourceIp => {
+            lb_runtime::LocalLimitKeyKind::SourceIp
+        }
+        lb_config_model::LocalLimitKeyKindConfig::RouteName => {
+            lb_runtime::LocalLimitKeyKind::RouteName
+        }
+        lb_config_model::LocalLimitKeyKindConfig::UpstreamCluster => {
+            lb_runtime::LocalLimitKeyKind::UpstreamCluster
+        }
+    }
+}
+
+fn merge_request_transform_layers(
+    listener: Option<&lb_config_model::RequestTransformConfig>,
+    route: Option<&lb_config_model::RequestTransformConfig>,
+    destination: Option<&lb_config_model::RequestTransformConfig>,
+) -> Option<lb_config_model::RequestTransformConfig> {
+    let mut merged = listener.cloned().unwrap_or_default();
+    let mut has_any = listener.is_some();
+
+    for layer in [route, destination].into_iter().flatten() {
+        has_any = true;
+        if layer.path_rewrite.is_some() {
+            merged.path_rewrite = layer.path_rewrite.clone();
+        }
+        if layer.host_rewrite.is_some() {
+            merged.host_rewrite = layer.host_rewrite.clone();
+        }
+        merged.header_mutations.extend(layer.header_mutations.clone());
+    }
+
+    has_any.then_some(merged)
+}
+
+fn merge_response_transform_layers(
+    listener: Option<&lb_config_model::ResponseTransformConfig>,
+    route: Option<&lb_config_model::ResponseTransformConfig>,
+    destination: Option<&lb_config_model::ResponseTransformConfig>,
+) -> Option<lb_config_model::ResponseTransformConfig> {
+    let mut merged = listener.cloned().unwrap_or_default();
+    let mut has_any = listener.is_some();
+
+    for layer in [route, destination].into_iter().flatten() {
+        has_any = true;
+        merged.header_mutations.extend(layer.header_mutations.clone());
+    }
+
+    has_any.then_some(merged)
+}
+
+fn pick_effective_policy_name(
+    listener: Option<&String>,
+    route: Option<&String>,
+    destination: Option<&String>,
+) -> Option<String> {
+    destination
+        .cloned()
+        .or_else(|| route.cloned())
+        .or_else(|| listener.cloned())
+}
+
+fn merge_effective_policy_refs(
+    listener: &[String],
+    route: &[String],
+    destination: &[String],
+) -> Vec<String> {
+    listener
+        .iter()
+        .chain(route.iter())
+        .chain(destination.iter())
+        .cloned()
+        .collect()
+}
+
+fn resolve_effective_route_backend_policy_diagnostics(
+    config: &lb_config_model::WorkspaceConfig,
+    listener: &lb_config_model::ListenerResourceConfig,
+) -> Result<BTreeMap<String, Vec<lb_runtime::EffectiveRouteDestinationPolicy>>, DynError> {
+    let listener_transform_name = listener.policies.transform_policy.as_deref();
+    let listener_request_transform = listener_transform_name
+        .map(|policy_name| resolve_named_request_transform(config, policy_name, &listener.name))
+        .transpose()?;
+    let listener_response_transform = listener_transform_name
+        .map(|policy_name| resolve_named_response_transform(config, policy_name, &listener.name))
+        .transpose()?;
+
+    listener
+        .routes
+        .iter()
+        .map(|route_name| {
+            let route = config
+                .routes
+                .iter()
+                .find(|route| route.name == *route_name)
+                .ok_or_else(|| {
+                    to_dyn_error(format!(
+                        "listener {} references unknown route {}",
+                        listener.name, route_name
+                    ))
+                })?;
+
+            let route_transform_name = route.policies.transform_policy.as_deref();
+            let route_request_transform = route_transform_name
+                .map(|policy_name| resolve_named_request_transform(config, policy_name, &route.name))
+                .transpose()?;
+            let route_response_transform = route_transform_name
+                .map(|policy_name| resolve_named_response_transform(config, policy_name, &route.name))
+                .transpose()?;
+
+            let diagnostics = route
+                .normalized_destinations()
+                .into_iter()
+                .map(|destination| {
+                    let destination_transform_name = destination.policies.transform_policy.as_deref();
+                    let destination_request_transform = destination_transform_name
+                        .map(|policy_name| {
+                            resolve_named_request_transform(
+                                config,
+                                policy_name,
+                                &format!("{}->{}", route.name, destination.upstream_cluster),
+                            )
+                        })
+                        .transpose()?;
+                    let destination_response_transform = destination_transform_name
+                        .map(|policy_name| {
+                            resolve_named_response_transform(
+                                config,
+                                policy_name,
+                                &format!("{}->{}", route.name, destination.upstream_cluster),
+                            )
+                        })
+                        .transpose()?;
+
+                    Ok(lb_runtime::EffectiveRouteDestinationPolicy {
+                        upstream_cluster: destination.upstream_cluster.clone(),
+                        retry_budget: pick_effective_policy_name(
+                            listener.policies.retry_budget.as_ref(),
+                            route.policies.retry_budget.as_ref(),
+                            destination.policies.retry_budget.as_ref(),
+                        ),
+                        timeout_hierarchy: pick_effective_policy_name(
+                            listener.policies.timeout_hierarchy.as_ref(),
+                            route.policies.timeout_hierarchy.as_ref(),
+                            destination.policies.timeout_hierarchy.as_ref(),
+                        ),
+                        circuit_breaker: pick_effective_policy_name(
+                            listener.policies.circuit_breaker.as_ref(),
+                            route.policies.circuit_breaker.as_ref(),
+                            destination.policies.circuit_breaker.as_ref(),
+                        ),
+                        transform_policy: pick_effective_policy_name(
+                            listener.policies.transform_policy.as_ref(),
+                            route.policies.transform_policy.as_ref(),
+                            destination.policies.transform_policy.as_ref(),
+                        ),
+                        traffic_mirror: pick_effective_policy_name(
+                            listener.policies.traffic_mirror.as_ref(),
+                            route.policies.traffic_mirror.as_ref(),
+                            destination.policies.traffic_mirror.as_ref(),
+                        ),
+                        fault_injection: pick_effective_policy_name(
+                            listener.policies.fault_injection.as_ref(),
+                            route.policies.fault_injection.as_ref(),
+                            destination.policies.fault_injection.as_ref(),
+                        ),
+                        local_rate_limits: merge_effective_policy_refs(
+                            &listener.policies.local_rate_limits,
+                            &route.policies.local_rate_limits,
+                            &destination.policies.local_rate_limits,
+                        ),
+                        local_concurrency_limits: merge_effective_policy_refs(
+                            &listener.policies.local_concurrency_limits,
+                            &route.policies.local_concurrency_limits,
+                            &destination.policies.local_concurrency_limits,
+                        ),
+                        effective_request_transform: merge_request_transform_layers(
+                            listener_request_transform.as_ref(),
+                            route_request_transform.as_ref(),
+                            destination_request_transform.as_ref(),
+                        ),
+                        effective_response_transform: merge_response_transform_layers(
+                            listener_response_transform.as_ref(),
+                            route_response_transform.as_ref(),
+                            destination_response_transform.as_ref(),
+                        ),
+                    })
+                })
+                .collect::<Result<Vec<_>, DynError>>()?;
+
+            Ok((route.name.clone(), diagnostics))
+        })
+        .collect()
+}
+
+fn resolve_listener_upgrade_policies(
+    config: &lb_config_model::WorkspaceConfig,
+    listener: &lb_config_model::ListenerResourceConfig,
+) -> (
+    Vec<lb_config_model::UpgradeProtocolConfig>,
+    Vec<(String, Vec<lb_config_model::UpgradeProtocolConfig>)>,
+) {
+    let route_upgrade_protocols = listener
+        .routes
+        .iter()
+        .filter_map(|route_name| {
+            config
+                .routes
+                .iter()
+                .find(|route| route.name == *route_name)
+                .filter(|route| !route.upgrade.protocols.is_empty())
+                .map(|route| (route.name.clone(), route.upgrade.protocols.clone()))
+        })
+        .collect::<Vec<_>>();
+
+    (listener.upgrade.protocols.clone(), route_upgrade_protocols)
+}
+
 fn build_http_cache_store(
     policy: &lb_config_model::HttpCachePolicyConfig,
 ) -> Result<Arc<lb_runtime::HttpCacheStore>, DynError> {
@@ -5666,16 +6925,37 @@ fn compile_http1_proxy_config(
         lb_config_model::HttpCachePolicyConfig,
         Arc<lb_runtime::HttpCacheStore>,
     )>,
+    upgrade_telemetry: Option<&Arc<lb_runtime::RuntimeTelemetry>>,
 ) -> Result<lb_runtime::Http1ProxyConfig, DynError> {
     let (route_rules, route_upstreams, route_backend_pools, primary_upstream) =
         compile_http1_route_backends(config, listener, compiled_routes)?;
+    let mirror_backend_pools = compile_mirror_backend_pools(config)?;
+    let (listener_request_transform, route_request_transforms) =
+        resolve_listener_request_transforms(config, listener)?;
+    let (listener_response_transform, route_response_transforms) =
+        resolve_listener_response_transforms(config, listener)?;
+    let route_backend_policy_diagnostics =
+        resolve_effective_route_backend_policy_diagnostics(config, listener)?;
+    let route_destination_policies =
+        compile_route_destination_policy_runtime(config, &route_backend_policy_diagnostics)?;
+    let (listener_upgrade_protocols, route_upgrade_protocols) =
+        resolve_listener_upgrade_policies(config, listener);
     let mut proxy = lb_runtime::Http1ProxyConfig::new(primary_upstream);
     proxy.routes = route_rules;
     proxy = proxy
         .with_route_upstreams(route_upstreams)
         .with_route_backend_pools(route_backend_pools)
+        .with_mirror_backend_pools(mirror_backend_pools)
+        .with_request_transforms(listener_request_transform, route_request_transforms)
+        .with_response_transforms(listener_response_transform, route_response_transforms)
+        .with_route_destination_policies(route_destination_policies)
+        .with_route_backend_policy_diagnostics(route_backend_policy_diagnostics)
+        .with_upgrade_policies(listener_upgrade_protocols, route_upgrade_protocols)
         .with_route_enumeration_protection(default_route_enumeration_policy())
         .rejecting_unmatched_routes();
+    if let Some(telemetry) = upgrade_telemetry {
+        proxy = proxy.with_upgrade_telemetry(listener.name.clone(), Arc::clone(telemetry));
+    }
     if let Some(policy) =
         compile_trusted_client_ip(&config.security.trusted_client_ip).map_err(to_dyn_error)?
     {
@@ -5699,12 +6979,26 @@ fn compile_http2_proxy_config(
 ) -> Result<lb_runtime::Http2ProxyConfig, DynError> {
     let (route_rules, route_upstreams, route_backend_pools, primary_upstream) =
         compile_http2_route_backends(config, listener, compiled_routes)?;
+    let mirror_backend_pools = compile_mirror_backend_pools(config)?;
+    let (listener_request_transform, route_request_transforms) =
+        resolve_listener_request_transforms(config, listener)?;
+    let (listener_response_transform, route_response_transforms) =
+        resolve_listener_response_transforms(config, listener)?;
+    let route_backend_policy_diagnostics =
+        resolve_effective_route_backend_policy_diagnostics(config, listener)?;
+    let route_destination_policies =
+        compile_route_destination_policy_runtime(config, &route_backend_policy_diagnostics)?;
     let mut proxy = lb_runtime::Http2ProxyConfig::new(primary_upstream);
     proxy.routes = route_rules;
     proxy.limits = config.defaults.http.http2_limits();
     proxy = proxy
         .with_route_upstreams(route_upstreams)
         .with_route_backend_pools(route_backend_pools)
+        .with_mirror_backend_pools(mirror_backend_pools)
+        .with_request_transforms(listener_request_transform, route_request_transforms)
+        .with_response_transforms(listener_response_transform, route_response_transforms)
+        .with_route_destination_policies(route_destination_policies)
+        .with_route_backend_policy_diagnostics(route_backend_policy_diagnostics)
         .with_route_enumeration_protection(default_route_enumeration_policy())
         .rejecting_unmatched_routes();
     if let Some(policy) =
@@ -5729,6 +7023,7 @@ fn compile_https_proxy_config(
         lb_config_model::HttpCachePolicyConfig,
         Arc<lb_runtime::HttpCacheStore>,
     )>,
+    upgrade_telemetry: Option<&Arc<lb_runtime::RuntimeTelemetry>>,
 ) -> Result<ManagedHttpsProxyConfig, DynError> {
     let _compiled_tls_termination =
         compiled_listener.tls_termination.as_ref().ok_or_else(|| {
@@ -5740,6 +7035,17 @@ fn compile_https_proxy_config(
 
     let (route_rules, route_upstreams, route_backend_pools, primary_upstream) =
         compile_http1_route_backends(config, listener, compiled_routes)?;
+    let mirror_backend_pools = compile_mirror_backend_pools(config)?;
+    let (listener_request_transform, route_request_transforms) =
+        resolve_listener_request_transforms(config, listener)?;
+    let (listener_response_transform, route_response_transforms) =
+        resolve_listener_response_transforms(config, listener)?;
+    let route_backend_policy_diagnostics =
+        resolve_effective_route_backend_policy_diagnostics(config, listener)?;
+    let route_destination_policies =
+        compile_route_destination_policy_runtime(config, &route_backend_policy_diagnostics)?;
+    let (listener_upgrade_protocols, route_upgrade_protocols) =
+        resolve_listener_upgrade_policies(config, listener);
     let route_upstreams_http2 = route_upstreams
         .iter()
         .map(|upstream| lb_runtime::Http2RouteUpstream {
@@ -5753,8 +7059,23 @@ fn compile_https_proxy_config(
     http1 = http1
         .with_route_upstreams(route_upstreams)
         .with_route_backend_pools(route_backend_pools.clone())
+        .with_mirror_backend_pools(mirror_backend_pools.clone())
+        .with_request_transforms(
+            listener_request_transform.clone(),
+            route_request_transforms.clone(),
+        )
+        .with_response_transforms(
+            listener_response_transform.clone(),
+            route_response_transforms.clone(),
+        )
+        .with_route_destination_policies(route_destination_policies.clone())
+        .with_route_backend_policy_diagnostics(route_backend_policy_diagnostics.clone())
+        .with_upgrade_policies(listener_upgrade_protocols, route_upgrade_protocols)
         .with_route_enumeration_protection(default_route_enumeration_policy())
         .rejecting_unmatched_routes();
+    if let Some(telemetry) = upgrade_telemetry {
+        http1 = http1.with_upgrade_telemetry(listener.name.clone(), Arc::clone(telemetry));
+    }
     if let Some(policy) =
         compile_trusted_client_ip(&config.security.trusted_client_ip).map_err(to_dyn_error)?
     {
@@ -5775,6 +7096,11 @@ fn compile_https_proxy_config(
     http2 = http2
         .with_route_upstreams(route_upstreams_http2)
         .with_route_backend_pools(route_backend_pools)
+        .with_mirror_backend_pools(mirror_backend_pools)
+        .with_request_transforms(listener_request_transform, route_request_transforms)
+        .with_response_transforms(listener_response_transform, route_response_transforms)
+        .with_route_destination_policies(route_destination_policies)
+        .with_route_backend_policy_diagnostics(route_backend_policy_diagnostics)
         .with_route_enumeration_protection(default_route_enumeration_policy())
         .rejecting_unmatched_routes();
     if let Some(policy) =
@@ -5796,9 +7122,40 @@ fn compile_https_proxy_config(
     })
 }
 
+fn compile_http3_proxy_config(
+    config: &lb_config_model::WorkspaceConfig,
+    listener: &lb_config_model::ListenerResourceConfig,
+    compiled_routes: &[lb_proto_http::RoutePrefixRule],
+) -> Result<ManagedHttp3ProxyConfig, DynError> {
+    let tls_termination = listener.tls_termination.as_ref().ok_or_else(|| {
+        to_dyn_error(format!("listener {} is missing tls_termination", listener.name))
+    })?;
+    let http1 = compile_http1_proxy_config(config, listener, compiled_routes, None, None)?;
+    let tls_server_config = Arc::new(build_tls_server_config(tls_termination)?);
+    let quic_server_config = Arc::new(build_quic_server_config(Arc::clone(&tls_server_config))?);
+    let _ = config;
+
+    Ok(ManagedHttp3ProxyConfig {
+        http1,
+        quic_server_config,
+    })
+}
+
+fn build_quic_server_config(
+    tls_server_config: Arc<rustls::ServerConfig>,
+) -> Result<quinn::ServerConfig, DynError> {
+    let crypto = QuicServerConfig::try_from((*tls_server_config).clone()).map_err(to_dyn_error)?;
+    let mut config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
+    let mut transport = quinn::TransportConfig::default();
+    transport.max_concurrent_uni_streams(32_u8.into());
+    config.transport_config(Arc::new(transport));
+    Ok(config)
+}
+
 fn build_tls_server_config(
     tls_termination: &lb_config_model::ListenerTlsTerminationConfig,
 ) -> Result<rustls::ServerConfig, DynError> {
+    ensure_rustls_crypto_provider();
     let cert_resolver = build_tls_cert_resolver(tls_termination)?;
     let mut config = rustls::ServerConfig::builder_with_protocol_versions(
         protocol_versions_for_minimum(tls_termination.minimum_version),
@@ -6012,6 +7369,7 @@ fn tls_alpn_protocol_name(protocol: lb_config_model::ListenerAlpnProtocolConfig)
     match protocol {
         lb_config_model::ListenerAlpnProtocolConfig::Http2 => "http2",
         lb_config_model::ListenerAlpnProtocolConfig::Http11 => "http11",
+        lb_config_model::ListenerAlpnProtocolConfig::Http3 => "http3",
     }
 }
 
@@ -6087,41 +7445,55 @@ fn compile_http1_route_backends(
             .iter()
             .find(|compiled| compiled.label == *route_name)
             .ok_or_else(|| format!("compiled route {route_name} is missing"))?;
-        let cluster = config
-            .upstream_clusters
-            .iter()
-            .find(|cluster| cluster.name == route.upstream_cluster)
-            .ok_or_else(|| {
-                format!(
-                    "route {} references unknown upstream cluster {}",
-                    route.name, route.upstream_cluster
+        route_rules.push(compiled_route.clone());
+        let mut route_destinations = Vec::new();
+        for destination in route.normalized_destinations() {
+            let cluster = config
+                .upstream_clusters
+                .iter()
+                .find(|cluster| cluster.name == destination.upstream_cluster)
+                .ok_or_else(|| {
+                    format!(
+                        "route {} references unknown upstream cluster {}",
+                        route.name, destination.upstream_cluster
+                    )
+                })?;
+            if cluster.endpoints.is_empty() {
+                return Err(format!(
+                    "upstream cluster {} must declare at least one endpoint",
+                    cluster.name
                 )
-            })?;
-        if cluster.endpoints.is_empty() {
-            return Err(format!(
-                "upstream cluster {} must declare at least one endpoint",
-                cluster.name
-            )
-            .into());
+                .into());
+            }
+
+            route_upstreams.extend(cluster.endpoints.iter().map(|endpoint| {
+                lb_runtime::Http1RouteUpstream {
+                    route_label: route.name.clone(),
+                    upstream: lb_net_core::UpstreamTarget::new(
+                        format!("{}:{}", cluster.name, endpoint.id),
+                        endpoint.address,
+                    ),
+                }
+            }));
+            let pool = match pools_by_cluster.get(&cluster.name) {
+                Some(pool) => pool.clone(),
+                None => {
+                    let pool = compile_route_backend_pool(cluster)?;
+                    pools_by_cluster.insert(cluster.name.clone(), pool.clone());
+                    pool
+                }
+            };
+            route_destinations.push(lb_runtime::WeightedRouteDestination {
+                weight: destination.weight,
+                pool,
+            });
         }
 
-        route_rules.push(compiled_route.clone());
-        route_upstreams.extend(cluster.endpoints.iter().map(|endpoint| {
-            lb_runtime::Http1RouteUpstream {
-                route_label: route.name.clone(),
-                upstream: lb_net_core::UpstreamTarget::new(
-                    format!("{}:{}", cluster.name, endpoint.id),
-                    endpoint.address,
-                ),
-            }
-        }));
-        let route_backend_pool = match pools_by_cluster.get(&cluster.name) {
-            Some(pool) => pool.clone(),
-            None => {
-                let pool = compile_route_backend_pool(cluster)?;
-                pools_by_cluster.insert(cluster.name.clone(), pool.clone());
-                pool
-            }
+        let route_backend_pool = if route_destinations.len() == 1 {
+            route_destinations.remove(0).pool
+        } else {
+            lb_runtime::RouteBackendPool::from_weighted_destinations(route_destinations)
+                .map_err(to_dyn_error)?
         };
         route_backend_pools.push((route.name.clone(), route_backend_pool));
     }
@@ -6160,41 +7532,55 @@ fn compile_http2_route_backends(
             .iter()
             .find(|compiled| compiled.label == *route_name)
             .ok_or_else(|| format!("compiled route {route_name} is missing"))?;
-        let cluster = config
-            .upstream_clusters
-            .iter()
-            .find(|cluster| cluster.name == route.upstream_cluster)
-            .ok_or_else(|| {
-                format!(
-                    "route {} references unknown upstream cluster {}",
-                    route.name, route.upstream_cluster
+        route_rules.push(compiled_route.clone());
+        let mut route_destinations = Vec::new();
+        for destination in route.normalized_destinations() {
+            let cluster = config
+                .upstream_clusters
+                .iter()
+                .find(|cluster| cluster.name == destination.upstream_cluster)
+                .ok_or_else(|| {
+                    format!(
+                        "route {} references unknown upstream cluster {}",
+                        route.name, destination.upstream_cluster
+                    )
+                })?;
+            if cluster.endpoints.is_empty() {
+                return Err(format!(
+                    "upstream cluster {} must declare at least one endpoint",
+                    cluster.name
                 )
-            })?;
-        if cluster.endpoints.is_empty() {
-            return Err(format!(
-                "upstream cluster {} must declare at least one endpoint",
-                cluster.name
-            )
-            .into());
+                .into());
+            }
+
+            route_upstreams.extend(cluster.endpoints.iter().map(|endpoint| {
+                lb_runtime::Http2RouteUpstream {
+                    route_label: route.name.clone(),
+                    upstream: lb_net_core::UpstreamTarget::new(
+                        format!("{}:{}", cluster.name, endpoint.id),
+                        endpoint.address,
+                    ),
+                }
+            }));
+            let pool = match pools_by_cluster.get(&cluster.name) {
+                Some(pool) => pool.clone(),
+                None => {
+                    let pool = compile_route_backend_pool(cluster)?;
+                    pools_by_cluster.insert(cluster.name.clone(), pool.clone());
+                    pool
+                }
+            };
+            route_destinations.push(lb_runtime::WeightedRouteDestination {
+                weight: destination.weight,
+                pool,
+            });
         }
 
-        route_rules.push(compiled_route.clone());
-        route_upstreams.extend(cluster.endpoints.iter().map(|endpoint| {
-            lb_runtime::Http2RouteUpstream {
-                route_label: route.name.clone(),
-                upstream: lb_net_core::UpstreamTarget::new(
-                    format!("{}:{}", cluster.name, endpoint.id),
-                    endpoint.address,
-                ),
-            }
-        }));
-        let route_backend_pool = match pools_by_cluster.get(&cluster.name) {
-            Some(pool) => pool.clone(),
-            None => {
-                let pool = compile_route_backend_pool(cluster)?;
-                pools_by_cluster.insert(cluster.name.clone(), pool.clone());
-                pool
-            }
+        let route_backend_pool = if route_destinations.len() == 1 {
+            route_destinations.remove(0).pool
+        } else {
+            lb_runtime::RouteBackendPool::from_weighted_destinations(route_destinations)
+                .map_err(to_dyn_error)?
         };
         route_backend_pools.push((route.name.clone(), route_backend_pool));
     }
@@ -6308,6 +7694,16 @@ fn compile_route_backend_pool(
     .map_err(to_dyn_error)
 }
 
+fn compile_mirror_backend_pools(
+    config: &lb_config_model::WorkspaceConfig,
+) -> Result<Vec<(String, lb_runtime::RouteBackendPool)>, DynError> {
+    config
+        .upstream_clusters
+        .iter()
+        .map(|cluster| Ok((cluster.name.clone(), compile_route_backend_pool(cluster)?)))
+        .collect()
+}
+
 fn default_route_enumeration_policy() -> lb_runtime::RouteEnumerationProtectionPolicy {
     lb_runtime::RouteEnumerationProtectionPolicy {
         source_aggregation: lb_runtime::SourceAggregation::ExactIp,
@@ -6333,7 +7729,16 @@ fn listener_protocol_name(protocol: lb_config_model::ListenerProtocolConfig) -> 
         lb_config_model::ListenerProtocolConfig::Http1 => "http1",
         lb_config_model::ListenerProtocolConfig::Https => "https",
         lb_config_model::ListenerProtocolConfig::Http2 => "http2",
+        lb_config_model::ListenerProtocolConfig::Http3 => "http3",
         lb_config_model::ListenerProtocolConfig::Auto => "auto",
+    }
+}
+
+fn listener_bind_mode_name(bind_mode: lb_net_core::ListenerBindMode) -> &'static str {
+    match bind_mode {
+        lb_net_core::ListenerBindMode::SingleStack => "single_stack",
+        lb_net_core::ListenerBindMode::DualStack => "dual_stack",
+        lb_net_core::ListenerBindMode::Ipv6Only => "ipv6_only",
     }
 }
 
@@ -6356,6 +7761,10 @@ fn overload_state_name(state: lb_runtime::OverloadState) -> &'static str {
 
 fn overload_scope(listener_name: &str) -> String {
     format!("workspace_listener_{}", listener_name)
+}
+
+fn http3_scope(listener_name: &str) -> String {
+    format!("workspace_http3_{}", listener_name)
 }
 
 const fn overload_state_index(state: lb_runtime::OverloadState) -> usize {
@@ -6471,29 +7880,34 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    use bytes::Bytes;
-    use h2::{client, server};
+    use bytes::{Buf, Bytes};
+    use h3::client as h3_client;
+    use h2::{client as h2_client, server};
     use http::{Request, Response, StatusCode};
+    use quinn::crypto::rustls::QuicClientConfig;
     use rcgen::generate_simple_self_signed;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::oneshot;
     use tokio::time;
     use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName};
-    use tokio_rustls::rustls::{ClientConfig, RootCertStore};
+    use tokio_rustls::rustls::{ClientConfig as RustlsClientConfig, RootCertStore};
     use tokio_rustls::TlsConnector;
 
     use super::{
-        build_tls_server_config, compile_route_backend_pool, compile_workspace_runtime,
-        control_plane_journal_path, evaluate_workspace_readiness, reload_health_name,
-        sign_admin_request, to_dyn_error, unix_time_ms, write_control_plane_journal_atomic,
-        AdminAuditEvent, CompiledServeListener, ControlPlaneJournalEnvelope,
-        ControlPlaneJournalPayload, ControlPlaneRecoveryInfo, DurableSnapshotIdentity, DynError,
-        JournalInFlightOperation, ListenerAbuseProtectionStatus, ListenerDrainOutcome,
-        ListenerIdentity, ListenerIdentityStatus, ListenerLifecycleEntry, ListenerLifecycleModel,
+        build_tls_server_config, collect_blocked_listener_replacements,
+        collect_supported_listener_replacements, compile_route_backend_pool,
+        compile_workspace_runtime, control_plane_journal_path, evaluate_workspace_readiness,
+        ensure_rustls_crypto_provider, reload_health_name, sign_admin_request, to_dyn_error,
+        unix_time_ms,
+        write_control_plane_journal_atomic, AdminAuditEvent, CompiledServeListener,
+        ControlPlaneJournalEnvelope, ControlPlaneJournalPayload, ControlPlaneRecoveryInfo,
+        CurrentListenerIdentity, DurableSnapshotIdentity, DynError, JournalInFlightOperation,
+        ListenerAbuseProtectionStatus, ListenerDrainOutcome, ListenerIdentity,
+        ListenerIdentityStatus, ListenerLifecycleEntry, ListenerLifecycleModel,
         ListenerLifecycleState, ListenerReplacementStatus, ListenerStatus, ManagedProxyConfig,
-        RecoveredListenerStatus, RecoveryReconciliationSummary, ReloadHealthState, ServeSupervisor,
-        ACTIVE_HEALTH_PROBE_INTERVAL, CONTROL_PLANE_JOURNAL_VERSION,
+        RecoveredListenerStatus, RecoveryReconciliationSummary, ReloadHealthState,
+        ServeSupervisor, ACTIVE_HEALTH_PROBE_INTERVAL, CONTROL_PLANE_JOURNAL_VERSION,
         RECOVERY_UNFINISHED_RELOAD_CODE, ROUTE_BACKEND_WARMUP_DURATION,
     };
 
@@ -6510,12 +7924,16 @@ mod tests {
         let active = ListenerIdentity {
             class: lb_config_model::ListenerClassConfig::Public,
             protocol: lb_config_model::ListenerProtocolConfig::Http1,
+            proxy_protocol: lb_config_model::ProxyProtocolModeConfig::Disabled,
             configured_bind: "127.0.0.1:8080".parse()?,
+            bind_mode: lb_net_core::ListenerBindMode::SingleStack,
         };
         let replacement = ListenerIdentity {
             class: lb_config_model::ListenerClassConfig::Public,
             protocol: lb_config_model::ListenerProtocolConfig::Http2,
+            proxy_protocol: lb_config_model::ProxyProtocolModeConfig::V1,
             configured_bind: "127.0.0.1:8080".parse()?,
+            bind_mode: lb_net_core::ListenerBindMode::SingleStack,
         };
         let mut lifecycle = ListenerLifecycleModel::new_active(active);
 
@@ -6555,6 +7973,41 @@ mod tests {
             ]
         );
         Ok(())
+    }
+
+    #[test]
+    fn proxy_protocol_v1_parser_extracts_source_address() -> Result<(), DynError> {
+        let parsed = super::parse_proxy_protocol_v1_line(
+            b"PROXY TCP4 198.51.100.7 203.0.113.10 45678 8080\r\n",
+        )?;
+
+        assert_eq!(parsed, Some("198.51.100.7:45678".parse()?));
+        Ok(())
+    }
+
+    #[test]
+    fn proxy_protocol_v2_parser_extracts_source_address() -> Result<(), DynError> {
+        let mut header = [0_u8; 16];
+        header[..12].copy_from_slice(&super::PROXY_PROTOCOL_V2_SIGNATURE);
+        header[12] = 0x21;
+        header[13] = 0x11;
+        header[14..16].copy_from_slice(&(12_u16).to_be_bytes());
+        let payload = [198, 51, 100, 7, 203, 0, 113, 10, 31, 144, 35, 130];
+
+        let parsed = super::parse_proxy_protocol_v2_payload(&header, &payload)?;
+
+        assert_eq!(parsed, Some("198.51.100.7:8080".parse()?));
+        Ok(())
+    }
+
+    #[test]
+    fn proxy_protocol_v2_parser_rejects_bad_signature() {
+        let header = [0_u8; 16];
+
+        let error =
+            super::parse_proxy_protocol_v2_header(&header).expect_err("bad signature must fail");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
@@ -6769,12 +8222,16 @@ mod tests {
         let active = ListenerIdentity {
             class: lb_config_model::ListenerClassConfig::Public,
             protocol: lb_config_model::ListenerProtocolConfig::Http1,
+            proxy_protocol: lb_config_model::ProxyProtocolModeConfig::Disabled,
             configured_bind: "127.0.0.1:8080".parse()?,
+            bind_mode: lb_net_core::ListenerBindMode::SingleStack,
         };
         let attempted = ListenerIdentity {
             class: lb_config_model::ListenerClassConfig::Public,
             protocol: lb_config_model::ListenerProtocolConfig::Https,
+            proxy_protocol: lb_config_model::ProxyProtocolModeConfig::V1,
             configured_bind: "127.0.0.1:8443".parse()?,
+            bind_mode: lb_net_core::ListenerBindMode::SingleStack,
         };
         let mut lifecycle = ListenerLifecycleModel::new_active(active);
 
@@ -6804,6 +8261,102 @@ mod tests {
         let compiled = compile_workspace_runtime(path.to_str().ok_or("utf8 path")?)?;
 
         assert_eq!(compiled.listeners.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn compile_workspace_runtime_accepts_http3_public_listener(
+    ) -> Result<(), DynError> {
+        let (cert_path, key_path, _cert_der) = write_temp_tls_identity()?;
+        let path = write_temp_config(
+            "http3-runtime",
+            &workspace_config_json_with_http3_tls(
+                "127.0.0.1:0",
+                "127.0.0.1:0",
+                "127.0.0.1:19080",
+                &cert_path,
+                &key_path,
+            ),
+        )?;
+
+        let compiled = compile_workspace_runtime(path.to_str().ok_or("utf8 path")?)?;
+
+        assert_eq!(compiled.listeners.len(), 2);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn supervisor_serves_http3_public_listener() -> Result<(), DynError> {
+        std::env::set_var("LB_CTL_ADMIN_SECRET", "admin-secret");
+        let upstream_addr = spawn_tagged_http1_upstream("upstream-a").await?;
+        let (cert_path, key_path, cert_der) = write_temp_tls_identity()?;
+        let path = write_temp_config(
+            "http3-supervisor",
+            &workspace_config_json_with_http3_tls(
+                "127.0.0.1:0",
+                "127.0.0.1:0",
+                &upstream_addr.to_string(),
+                &cert_path,
+                &key_path,
+            ),
+        )?;
+        let supervisor = ServeSupervisor::start(
+            path.to_str().ok_or("utf8 path")?.to_string(),
+            Arc::new(String::from("admin-secret")),
+        )
+        .await?;
+
+        let public_addr = supervisor
+            .listener_statuses()
+            .await
+            .into_iter()
+            .find(|status| status.class == lb_config_model::ListenerClassConfig::Public)
+            .ok_or("missing public listener")?
+            .local_addr;
+
+        let (status, body) = send_http3_request(public_addr, &cert_der, "localhost", "/").await?;
+        assert_eq!(status, 200);
+    assert!(body.contains("upstream-a"));
+
+        supervisor.shutdown().await?;
+        Ok(())
+    }
+
+    #[test]
+    fn bind_mode_change_on_same_listener_bind_requires_rebind() -> Result<(), DynError> {
+        let path = write_temp_config(
+            "bind-mode-rebind-required",
+            &workspace_config_json_with_bind_mode(
+                "[::]:8080",
+                "127.0.0.1:0",
+                "http1",
+                "127.0.0.1:19080",
+                "dual_stack",
+                true,
+            ),
+        )?;
+        let compiled = compile_workspace_runtime(path.to_str().ok_or("utf8 path")?)?;
+
+        let current_identities = std::iter::once((
+            String::from("public"),
+            CurrentListenerIdentity {
+                class: lb_config_model::ListenerClassConfig::Public,
+                protocol: lb_config_model::ListenerProtocolConfig::Http1,
+                proxy_protocol: lb_config_model::ProxyProtocolModeConfig::Disabled,
+                configured_bind: "[::]:8080".parse()?,
+                bind_mode: lb_net_core::ListenerBindMode::SingleStack,
+                local_addr: "[::]:8080".parse()?,
+            },
+        ))
+        .collect::<std::collections::BTreeMap<_, _>>();
+
+        let supported =
+            collect_supported_listener_replacements(&current_identities, &compiled.listeners);
+        let blocked =
+            collect_blocked_listener_replacements(&current_identities, &compiled.listeners);
+
+        assert!(supported.is_empty());
+        assert_eq!(blocked, vec![String::from("public")]);
         Ok(())
     }
 
@@ -6897,6 +8450,7 @@ mod tests {
                     class,
                     protocol: lb_config_model::ListenerProtocolConfig::Http1,
                     configured_bind,
+                    bind_mode: lb_net_core::ListenerBindMode::SingleStack,
                 },
                 draining: Vec::new(),
                 retired_recent: Vec::new(),
@@ -7289,6 +8843,886 @@ mod tests {
     }
 
     #[test]
+    fn compile_workspace_runtime_attaches_request_transforms_to_http1_public_proxy(
+    ) -> Result<(), DynError> {
+        let path = write_temp_config(
+            "workspace-request-transforms-http1.json",
+            r#"{
+    "api_version": "v1_alpha1",
+    "name": "workspace-runtime",
+    "listeners": [
+        {
+            "name": "public",
+            "class": "public",
+            "bind_address": "127.0.0.1:28080",
+            "protocol": "http1",
+            "routes": ["web"],
+            "policies": { "transform_policy": "listener-transform" }
+        },
+        {
+            "name": "admin",
+            "class": "admin",
+            "bind_address": "127.0.0.1:29900",
+            "protocol": "http1"
+        }
+    ],
+    "routes": [
+        {
+            "name": "web",
+            "match": { "type": "path_prefix", "prefix": "/edge" },
+            "upstream_cluster": "frontend",
+            "policies": { "transform_policy": "route-transform" }
+        }
+    ],
+    "upstream_clusters": [
+        {
+            "name": "frontend",
+            "endpoints": [
+                {
+                    "id": "frontend-a",
+                    "address": "127.0.0.1:18081",
+                    "state": "ready",
+                    "zone": null,
+                    "locality": null,
+                    "weight": 1
+                }
+            ]
+        }
+    ],
+    "policies": {
+        "transforms": [
+            {
+                "name": "listener-transform",
+                "spec": {
+                    "request": {
+                        "header_mutations": [{ "type": "set", "name": "x-listener", "value": "edge" }]
+                    },
+                    "response": {}
+                }
+            },
+            {
+                "name": "route-transform",
+                "spec": {
+                    "request": {
+                        "path_rewrite": {
+                            "type": "replace_prefix",
+                            "match_prefix": "/edge",
+                            "replacement": "/v1"
+                        },
+                        "host_rewrite": "backend.internal"
+                    },
+                    "response": {}
+                }
+            }
+        ]
+    }
+}"#,
+        )?;
+
+        let compiled = compile_workspace_runtime(path.to_str().ok_or("utf8 path")?)?;
+        let CompiledServeListener::Public { proxy: ManagedProxyConfig::Http1(config), .. } =
+            compiled.listeners.get("public").ok_or("missing public listener")?
+        else {
+            return Err("expected public HTTP/1 listener".into());
+        };
+
+        assert_eq!(
+            config
+                .listener_request_transform
+                .as_ref()
+                .map(|transform| transform.header_mutations.len()),
+            Some(1)
+        );
+        assert_eq!(
+            config
+                .route_request_transforms
+                .get("web")
+                .and_then(|transform| transform.host_rewrite.as_deref()),
+            Some("backend.internal")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn compile_workspace_runtime_attaches_request_transforms_to_http2_public_proxy(
+    ) -> Result<(), DynError> {
+        let path = write_temp_config(
+            "workspace-request-transforms-http2.json",
+            r#"{
+    "api_version": "v1_alpha1",
+    "name": "workspace-runtime",
+    "listeners": [
+        {
+            "name": "public",
+            "class": "public",
+            "bind_address": "127.0.0.1:28081",
+            "protocol": "http2",
+            "routes": ["web"],
+            "policies": { "transform_policy": "listener-transform" }
+        },
+        {
+            "name": "admin",
+            "class": "admin",
+            "bind_address": "127.0.0.1:29901",
+            "protocol": "http1"
+        }
+    ],
+    "routes": [
+        {
+            "name": "web",
+            "match": { "type": "path_prefix", "prefix": "/edge" },
+            "upstream_cluster": "frontend",
+            "policies": { "transform_policy": "route-transform" }
+        }
+    ],
+    "upstream_clusters": [
+        {
+            "name": "frontend",
+            "endpoints": [
+                {
+                    "id": "frontend-a",
+                    "address": "127.0.0.1:18082",
+                    "state": "ready",
+                    "zone": null,
+                    "locality": null,
+                    "weight": 1
+                }
+            ]
+        }
+    ],
+    "policies": {
+        "transforms": [
+            {
+                "name": "listener-transform",
+                "spec": {
+                    "request": {
+                        "header_mutations": [{ "type": "set", "name": "x-listener", "value": "edge" }]
+                    },
+                    "response": {}
+                }
+            },
+            {
+                "name": "route-transform",
+                "spec": {
+                    "request": {
+                        "path_rewrite": {
+                            "type": "replace_prefix",
+                            "match_prefix": "/edge",
+                            "replacement": "/v1"
+                        },
+                        "host_rewrite": "backend.internal"
+                    },
+                    "response": {}
+                }
+            }
+        ]
+    }
+}"#,
+        )?;
+
+        let compiled = compile_workspace_runtime(path.to_str().ok_or("utf8 path")?)?;
+        let CompiledServeListener::Public { proxy: ManagedProxyConfig::Http2(config), .. } =
+            compiled.listeners.get("public").ok_or("missing public listener")?
+        else {
+            return Err("expected public HTTP/2 listener".into());
+        };
+
+        assert_eq!(
+            config
+                .listener_request_transform
+                .as_ref()
+                .map(|transform| transform.header_mutations.len()),
+            Some(1)
+        );
+        assert_eq!(
+            config
+                .route_request_transforms
+                .get("web")
+                .and_then(|transform| transform.host_rewrite.as_deref()),
+            Some("backend.internal")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn compile_workspace_runtime_attaches_response_transforms_to_http1_public_proxy(
+    ) -> Result<(), DynError> {
+        let path = write_temp_config(
+            "workspace-response-transforms-http1.json",
+            r#"{
+    "api_version": "v1_alpha1",
+    "name": "workspace-runtime",
+    "listeners": [
+        {
+            "name": "public",
+            "class": "public",
+            "bind_address": "127.0.0.1:28082",
+            "protocol": "http1",
+            "routes": ["web"],
+            "policies": { "transform_policy": "listener-transform" }
+        },
+        {
+            "name": "admin",
+            "class": "admin",
+            "bind_address": "127.0.0.1:29902",
+            "protocol": "http1"
+        }
+    ],
+    "routes": [
+        {
+            "name": "web",
+            "match": { "type": "path_prefix", "prefix": "/edge" },
+            "upstream_cluster": "frontend",
+            "policies": { "transform_policy": "route-transform" }
+        }
+    ],
+    "upstream_clusters": [
+        {
+            "name": "frontend",
+            "endpoints": [
+                {
+                    "id": "frontend-a",
+                    "address": "127.0.0.1:18083",
+                    "state": "ready",
+                    "zone": null,
+                    "locality": null,
+                    "weight": 1
+                }
+            ]
+        }
+    ],
+    "policies": {
+        "transforms": [
+            {
+                "name": "listener-transform",
+                "spec": {
+                    "request": {},
+                    "response": {
+                        "header_mutations": [{ "type": "set", "name": "x-listener-response", "value": "edge" }]
+                    }
+                }
+            },
+            {
+                "name": "route-transform",
+                "spec": {
+                    "request": {},
+                    "response": {
+                        "header_mutations": [{ "type": "remove", "name": "x-remove-me" }]
+                    }
+                }
+            }
+        ]
+    }
+}"#,
+        )?;
+
+        let compiled = compile_workspace_runtime(path.to_str().ok_or("utf8 path")?)?;
+        let CompiledServeListener::Public { proxy: ManagedProxyConfig::Http1(config), .. } =
+            compiled.listeners.get("public").ok_or("missing public listener")?
+        else {
+            return Err("expected public HTTP/1 listener".into());
+        };
+
+        assert_eq!(
+            config
+                .listener_response_transform
+                .as_ref()
+                .map(|transform| transform.header_mutations.len()),
+            Some(1)
+        );
+        assert_eq!(
+            config
+                .route_response_transforms
+                .get("web")
+                .map(|transform| transform.header_mutations.len()),
+            Some(1)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn compile_workspace_runtime_attaches_response_transforms_to_http2_public_proxy(
+    ) -> Result<(), DynError> {
+        let path = write_temp_config(
+            "workspace-response-transforms-http2.json",
+            r#"{
+    "api_version": "v1_alpha1",
+    "name": "workspace-runtime",
+    "listeners": [
+        {
+            "name": "public",
+            "class": "public",
+            "bind_address": "127.0.0.1:28083",
+            "protocol": "http2",
+            "routes": ["web"],
+            "policies": { "transform_policy": "listener-transform" }
+        },
+        {
+            "name": "admin",
+            "class": "admin",
+            "bind_address": "127.0.0.1:29903",
+            "protocol": "http1"
+        }
+    ],
+    "routes": [
+        {
+            "name": "web",
+            "match": { "type": "path_prefix", "prefix": "/edge" },
+            "upstream_cluster": "frontend",
+            "policies": { "transform_policy": "route-transform" }
+        }
+    ],
+    "upstream_clusters": [
+        {
+            "name": "frontend",
+            "endpoints": [
+                {
+                    "id": "frontend-a",
+                    "address": "127.0.0.1:18084",
+                    "state": "ready",
+                    "zone": null,
+                    "locality": null,
+                    "weight": 1
+                }
+            ]
+        }
+    ],
+    "policies": {
+        "transforms": [
+            {
+                "name": "listener-transform",
+                "spec": {
+                    "request": {},
+                    "response": {
+                        "header_mutations": [{ "type": "set", "name": "x-listener-response", "value": "edge" }]
+                    }
+                }
+            },
+            {
+                "name": "route-transform",
+                "spec": {
+                    "request": {},
+                    "response": {
+                        "header_mutations": [{ "type": "remove", "name": "x-remove-me" }]
+                    }
+                }
+            }
+        ]
+    }
+}"#,
+        )?;
+
+        let compiled = compile_workspace_runtime(path.to_str().ok_or("utf8 path")?)?;
+        let CompiledServeListener::Public { proxy: ManagedProxyConfig::Http2(config), .. } =
+            compiled.listeners.get("public").ok_or("missing public listener")?
+        else {
+            return Err("expected public HTTP/2 listener".into());
+        };
+
+        assert_eq!(
+            config
+                .listener_response_transform
+                .as_ref()
+                .map(|transform| transform.header_mutations.len()),
+            Some(1)
+        );
+        assert_eq!(
+            config
+                .route_response_transforms
+                .get("web")
+                .map(|transform| transform.header_mutations.len()),
+            Some(1)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn compile_workspace_runtime_exposes_effective_backend_policy_diagnostics_for_http1(
+    ) -> Result<(), DynError> {
+        let path = write_temp_config(
+            "workspace-effective-backend-policies-http1.json",
+            r#"{
+    "api_version": "v1_alpha1",
+    "name": "workspace-runtime",
+    "listeners": [
+        {
+            "name": "public",
+            "class": "public",
+            "bind_address": "127.0.0.1:28110",
+            "protocol": "http1",
+            "routes": ["web"],
+            "policies": {
+                "transform_policy": "listener-transform",
+                "retry_budget": "listener-retry",
+                "local_rate_limits": ["listener-rate"]
+            }
+        },
+        {
+            "name": "admin",
+            "class": "admin",
+            "bind_address": "127.0.0.1:29910",
+            "protocol": "http1"
+        }
+    ],
+    "routes": [
+        {
+            "name": "web",
+            "match": { "type": "path_prefix", "prefix": "/edge" },
+            "destinations": [
+                {
+                    "upstream_cluster": "frontend-stable",
+                    "weight": 90
+                },
+                {
+                    "upstream_cluster": "frontend-canary",
+                    "weight": 10,
+                    "policies": {
+                        "transform_policy": "destination-transform",
+                        "retry_budget": "destination-retry",
+                        "circuit_breaker": "destination-breaker",
+                        "local_rate_limits": ["destination-rate"],
+                        "local_concurrency_limits": ["destination-concurrency"]
+                    }
+                }
+            ],
+            "policies": {
+                "transform_policy": "route-transform",
+                "timeout_hierarchy": "route-timeout",
+                "local_rate_limits": ["route-rate"],
+                "local_concurrency_limits": ["route-concurrency"]
+            }
+        }
+    ],
+    "upstream_clusters": [
+        {
+            "name": "frontend-stable",
+            "endpoints": [
+                {
+                    "id": "frontend-stable-a",
+                    "address": "127.0.0.1:18110",
+                    "state": "ready",
+                    "zone": null,
+                    "locality": null,
+                    "weight": 1
+                }
+            ]
+        },
+        {
+            "name": "frontend-canary",
+            "endpoints": [
+                {
+                    "id": "frontend-canary-a",
+                    "address": "127.0.0.1:18111",
+                    "state": "ready",
+                    "zone": null,
+                    "locality": null,
+                    "weight": 1
+                }
+            ]
+        }
+    ],
+    "policies": {
+        "local_rate_limits": [
+            {
+                "name": "listener-rate",
+                "spec": {
+                    "scope": { "type": "listener", "name": "public" },
+                    "key_kind": "source_ip",
+                    "requests_per_window": 100,
+                    "window_ms": 1000,
+                    "max_tracked_keys": 1024
+                }
+            },
+            {
+                "name": "route-rate",
+                "spec": {
+                    "scope": { "type": "route", "name": "web" },
+                    "key_kind": "route_name",
+                    "requests_per_window": 50,
+                    "window_ms": 1000,
+                    "max_tracked_keys": 256
+                }
+            },
+            {
+                "name": "destination-rate",
+                "spec": {
+                    "scope": {
+                        "type": "route_destination",
+                        "route": "web",
+                        "upstream_cluster": "frontend-canary"
+                    },
+                    "key_kind": "global",
+                    "requests_per_window": 10,
+                    "window_ms": 1000,
+                    "max_tracked_keys": 64
+                }
+            }
+        ],
+        "local_concurrency_limits": [
+            {
+                "name": "route-concurrency",
+                "spec": {
+                    "scope": { "type": "route", "name": "web" },
+                    "key_kind": "route_name",
+                    "max_concurrent": 64,
+                    "max_tracked_keys": 256
+                }
+            },
+            {
+                "name": "destination-concurrency",
+                "spec": {
+                    "scope": {
+                        "type": "route_destination",
+                        "route": "web",
+                        "upstream_cluster": "frontend-canary"
+                    },
+                    "key_kind": "global",
+                    "max_concurrent": 8,
+                    "max_tracked_keys": 64
+                }
+            }
+        ],
+        "retry_budgets": [
+            {
+                "name": "listener-retry",
+                "spec": {
+                    "min_retry_tokens": 3,
+                    "retry_percent": 20,
+                    "window_ms": 10000
+                }
+            },
+            {
+                "name": "destination-retry",
+                "spec": {
+                    "min_retry_tokens": 2,
+                    "retry_percent": 5,
+                    "window_ms": 5000
+                }
+            }
+        ],
+        "timeout_hierarchies": [
+            {
+                "name": "route-timeout",
+                "spec": {
+                    "request_timeout_ms": 30000,
+                    "attempt_timeout_ms": 10000,
+                    "connect_timeout_ms": 1000,
+                    "idle_timeout_ms": 5000
+                }
+            }
+        ],
+        "circuit_breakers": [
+            {
+                "name": "destination-breaker",
+                "spec": {
+                    "open_failure_threshold": 5,
+                    "open_duration_ms": 30000,
+                    "half_open_success_threshold": 2
+                }
+            }
+        ],
+        "transforms": [
+            {
+                "name": "listener-transform",
+                "spec": {
+                    "request": {
+                        "header_mutations": [{ "type": "set", "name": "x-listener", "value": "edge" }]
+                    },
+                    "response": {
+                        "header_mutations": [{ "type": "set", "name": "x-listener-response", "value": "edge" }]
+                    }
+                }
+            },
+            {
+                "name": "route-transform",
+                "spec": {
+                    "request": {
+                        "path_rewrite": {
+                            "type": "replace_prefix",
+                            "match_prefix": "/edge",
+                            "replacement": "/v1"
+                        },
+                        "header_mutations": [{ "type": "set", "name": "x-route", "value": "api" }]
+                    },
+                    "response": {
+                        "header_mutations": [{ "type": "set", "name": "x-route-response", "value": "api" }]
+                    }
+                }
+            },
+            {
+                "name": "destination-transform",
+                "spec": {
+                    "request": {
+                        "host_rewrite": "canary.internal",
+                        "header_mutations": [{ "type": "set", "name": "x-destination", "value": "canary" }]
+                    },
+                    "response": {
+                        "header_mutations": [{ "type": "set", "name": "x-destination-response", "value": "canary" }]
+                    }
+                }
+            }
+        ]
+    }
+}"#,
+        )?;
+
+        let compiled = compile_workspace_runtime(path.to_str().ok_or("utf8 path")?)?;
+        let CompiledServeListener::Public { proxy: ManagedProxyConfig::Http1(config), .. } =
+            compiled.listeners.get("public").ok_or("missing public listener")?
+        else {
+            return Err("expected public HTTP/1 listener".into());
+        };
+
+        let diagnostics = config
+            .route_backend_policy_diagnostics
+            .get("web")
+            .ok_or("missing web backend diagnostics")?;
+        let stable = diagnostics
+            .iter()
+            .find(|entry| entry.upstream_cluster == "frontend-stable")
+            .ok_or("missing stable diagnostics")?;
+        let canary = diagnostics
+            .iter()
+            .find(|entry| entry.upstream_cluster == "frontend-canary")
+            .ok_or("missing canary diagnostics")?;
+
+        assert_eq!(stable.retry_budget.as_deref(), Some("listener-retry"));
+        assert_eq!(stable.timeout_hierarchy.as_deref(), Some("route-timeout"));
+        assert_eq!(stable.transform_policy.as_deref(), Some("route-transform"));
+        assert_eq!(stable.local_rate_limits, vec!["listener-rate", "route-rate"]);
+        assert_eq!(
+            stable
+                .effective_request_transform
+                .as_ref()
+                .and_then(|transform| transform.path_rewrite.as_ref())
+                .is_some(),
+            true
+        );
+        assert_eq!(
+            stable
+                .effective_request_transform
+                .as_ref()
+                .map(|transform| transform.header_mutations.len()),
+            Some(2)
+        );
+
+        assert_eq!(canary.retry_budget.as_deref(), Some("destination-retry"));
+        assert_eq!(canary.timeout_hierarchy.as_deref(), Some("route-timeout"));
+        assert_eq!(canary.circuit_breaker.as_deref(), Some("destination-breaker"));
+        assert_eq!(canary.transform_policy.as_deref(), Some("destination-transform"));
+        assert_eq!(
+            canary.local_rate_limits,
+            vec!["listener-rate", "route-rate", "destination-rate"]
+        );
+        assert_eq!(
+            canary.local_concurrency_limits,
+            vec!["route-concurrency", "destination-concurrency"]
+        );
+        assert_eq!(
+            canary
+                .effective_request_transform
+                .as_ref()
+                .and_then(|transform| transform.host_rewrite.as_deref()),
+            Some("canary.internal")
+        );
+        assert_eq!(
+            canary
+                .effective_request_transform
+                .as_ref()
+                .map(|transform| transform.header_mutations.len()),
+            Some(3)
+        );
+        assert_eq!(
+            canary
+                .effective_response_transform
+                .as_ref()
+                .map(|transform| transform.header_mutations.len()),
+            Some(3)
+        );
+
+        let canary_runtime = config
+            .route_destination_policies
+            .get("web")
+            .and_then(|policies| policies.get("frontend-canary"))
+            .ok_or("missing canary destination runtime")?;
+        assert_eq!(
+            canary_runtime
+                .request_transform
+                .as_ref()
+                .and_then(|transform| transform.host_rewrite.as_deref()),
+            Some("canary.internal")
+        );
+        assert_eq!(canary_runtime.rate_limiters.len(), 3);
+        assert_eq!(canary_runtime.concurrency_limiters.len(), 2);
+        assert!(canary_runtime.failure_manager.is_some());
+        assert!(canary_runtime.enforce_retry_budget);
+        Ok(())
+    }
+
+    #[test]
+    fn compile_workspace_runtime_exposes_effective_backend_policy_diagnostics_for_http2(
+    ) -> Result<(), DynError> {
+        let path = write_temp_config(
+            "workspace-effective-backend-policies-http2.json",
+            r#"{
+    "api_version": "v1_alpha1",
+    "name": "workspace-runtime",
+    "listeners": [
+        {
+            "name": "public",
+            "class": "public",
+            "bind_address": "127.0.0.1:28111",
+            "protocol": "http2",
+            "routes": ["web"],
+            "policies": {
+                "transform_policy": "listener-transform",
+                "retry_budget": "listener-retry"
+            }
+        },
+        {
+            "name": "admin",
+            "class": "admin",
+            "bind_address": "127.0.0.1:29911",
+            "protocol": "http1"
+        }
+    ],
+    "routes": [
+        {
+            "name": "web",
+            "match": { "type": "path_prefix", "prefix": "/edge" },
+            "destinations": [
+                {
+                    "upstream_cluster": "frontend-canary",
+                    "weight": 10,
+                    "policies": {
+                        "transform_policy": "destination-transform",
+                        "retry_budget": "destination-retry"
+                    }
+                }
+            ],
+            "policies": {
+                "transform_policy": "route-transform"
+            }
+        }
+    ],
+    "upstream_clusters": [
+        {
+            "name": "frontend-canary",
+            "endpoints": [
+                {
+                    "id": "frontend-canary-a",
+                    "address": "127.0.0.1:18112",
+                    "state": "ready",
+                    "zone": null,
+                    "locality": null,
+                    "weight": 1
+                }
+            ]
+        }
+    ],
+    "policies": {
+        "retry_budgets": [
+            {
+                "name": "listener-retry",
+                "spec": {
+                    "min_retry_tokens": 3,
+                    "retry_percent": 20,
+                    "window_ms": 10000
+                }
+            },
+            {
+                "name": "destination-retry",
+                "spec": {
+                    "min_retry_tokens": 2,
+                    "retry_percent": 5,
+                    "window_ms": 5000
+                }
+            }
+        ],
+        "transforms": [
+            {
+                "name": "listener-transform",
+                "spec": {
+                    "request": {
+                        "header_mutations": [{ "type": "set", "name": "x-listener", "value": "edge" }]
+                    },
+                    "response": {}
+                }
+            },
+            {
+                "name": "route-transform",
+                "spec": {
+                    "request": {
+                        "path_rewrite": {
+                            "type": "replace_prefix",
+                            "match_prefix": "/edge",
+                            "replacement": "/v2"
+                        }
+                    },
+                    "response": {}
+                }
+            },
+            {
+                "name": "destination-transform",
+                "spec": {
+                    "request": {
+                        "host_rewrite": "canary.internal"
+                    },
+                    "response": {}
+                }
+            }
+        ]
+    }
+}"#,
+        )?;
+
+        let compiled = compile_workspace_runtime(path.to_str().ok_or("utf8 path")?)?;
+        let CompiledServeListener::Public { proxy: ManagedProxyConfig::Http2(config), .. } =
+            compiled.listeners.get("public").ok_or("missing public listener")?
+        else {
+            return Err("expected public HTTP/2 listener".into());
+        };
+
+        let canary = config
+            .route_backend_policy_diagnostics
+            .get("web")
+            .and_then(|entries| entries.first())
+            .ok_or("missing canary diagnostics")?;
+        assert_eq!(canary.retry_budget.as_deref(), Some("destination-retry"));
+        assert_eq!(canary.transform_policy.as_deref(), Some("destination-transform"));
+        assert_eq!(
+            canary
+                .effective_request_transform
+                .as_ref()
+                .and_then(|transform| transform.host_rewrite.as_deref()),
+            Some("canary.internal")
+        );
+        assert_eq!(
+            canary
+                .effective_request_transform
+                .as_ref()
+                .and_then(|transform| transform.path_rewrite.as_ref())
+                .is_some(),
+            true
+        );
+        let canary_runtime = config
+            .route_destination_policies
+            .get("web")
+            .and_then(|policies| policies.get("frontend-canary"))
+            .ok_or("missing canary destination runtime")?;
+        assert_eq!(
+            canary_runtime
+                .request_transform
+                .as_ref()
+                .and_then(|transform| transform.host_rewrite.as_deref()),
+            Some("canary.internal")
+        );
+        assert!(canary_runtime.failure_manager.is_some());
+        assert!(canary_runtime.enforce_retry_budget);
+        Ok(())
+    }
+
+    #[test]
     fn tls_server_config_disables_session_resumption_when_requested() -> Result<(), DynError> {
         let (cert_path, key_path, _cert_der) = write_temp_tls_identity()?;
         let tls_termination = lb_config_model::ListenerTlsTerminationConfig {
@@ -7394,6 +9828,186 @@ mod tests {
         let received = receive_h2_response(response).await?;
         assert_eq!(received.0, StatusCode::OK);
         assert_eq!(received.1, "http2-ok");
+
+        supervisor.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn supervisor_public_http1_listener_accepts_proxy_protocol_v1_preface(
+    ) -> Result<(), DynError> {
+        std::env::set_var("LB_CTL_ADMIN_SECRET", "admin-secret");
+        let (upstream_addr, capture_rx) = spawn_capture_http1_upstream().await?;
+        let path = write_temp_config(
+            "proxy-protocol-v1-http1",
+            &workspace_config_json_with_proxy_protocol(
+                "127.0.0.1:0",
+                "127.0.0.1:0",
+                "http1",
+                &upstream_addr.to_string(),
+                "v1",
+            ),
+        )?;
+        let supervisor = ServeSupervisor::start(
+            path.to_str().ok_or("utf8 path")?.to_string(),
+            Arc::new(String::from("admin-secret")),
+        )
+        .await?;
+
+        let public_addr = supervisor
+            .listener_statuses()
+            .await
+            .into_iter()
+            .find(|status| status.class == lb_config_model::ListenerClassConfig::Public)
+            .ok_or("missing public listener")?
+            .local_addr;
+
+        let response = send_prefixed_http1_request(
+            public_addr,
+            b"PROXY TCP4 198.51.100.7 203.0.113.10 45678 8080\r\n",
+            "/",
+        )
+        .await?;
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+
+        let capture = time::timeout(Duration::from_secs(2), capture_rx).await??;
+        assert!(capture.to_ascii_lowercase().contains("x-forwarded-for: 198.51.100.7\r\n"));
+
+        supervisor.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn supervisor_public_http1_listener_trusts_forwarded_chain_from_proxy_protocol_source(
+    ) -> Result<(), DynError> {
+        std::env::set_var("LB_CTL_ADMIN_SECRET", "admin-secret");
+        let (upstream_addr, capture_rx) = spawn_capture_http1_upstream().await?;
+        let path = write_temp_config(
+            "proxy-protocol-trusted-client-ip",
+            &workspace_config_json_with_proxy_protocol_and_trusted_client_ip(
+                "127.0.0.1:0",
+                "127.0.0.1:0",
+                "http1",
+                &upstream_addr.to_string(),
+                "v1",
+                &["203.0.113.0/24"],
+            ),
+        )?;
+        let supervisor = ServeSupervisor::start(
+            path.to_str().ok_or("utf8 path")?.to_string(),
+            Arc::new(String::from("admin-secret")),
+        )
+        .await?;
+
+        let public_addr = supervisor
+            .listener_statuses()
+            .await
+            .into_iter()
+            .find(|status| status.class == lb_config_model::ListenerClassConfig::Public)
+            .ok_or("missing public listener")?
+            .local_addr;
+
+        let response = send_prefixed_http1_request_with_headers(
+            public_addr,
+            b"PROXY TCP4 203.0.113.10 192.0.2.20 45678 8080\r\n",
+            "/",
+            &[
+                ("Forwarded", "for=198.51.100.9"),
+                ("X-Forwarded-For", "198.51.100.7"),
+            ],
+        )
+        .await?;
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+
+        let capture = time::timeout(Duration::from_secs(2), capture_rx).await??;
+        let capture = capture.to_ascii_lowercase();
+        assert!(capture.contains("x-forwarded-for: 198.51.100.9\r\n"));
+        assert!(!capture.contains("x-forwarded-for: 198.51.100.7\r\n"));
+
+        supervisor.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn supervisor_public_http1_listener_rejects_forwarded_chain_from_untrusted_proxy_protocol_source(
+    ) -> Result<(), DynError> {
+        std::env::set_var("LB_CTL_ADMIN_SECRET", "admin-secret");
+        let (upstream_addr, counter) = spawn_counting_http1_upstream().await?;
+        let path = write_temp_config(
+            "proxy-protocol-untrusted-client-ip",
+            &workspace_config_json_with_proxy_protocol_and_trusted_client_ip(
+                "127.0.0.1:0",
+                "127.0.0.1:0",
+                "http1",
+                &upstream_addr.to_string(),
+                "v1",
+                &["203.0.113.0/24"],
+            ),
+        )?;
+        let supervisor = ServeSupervisor::start(
+            path.to_str().ok_or("utf8 path")?.to_string(),
+            Arc::new(String::from("admin-secret")),
+        )
+        .await?;
+
+        let public_addr = supervisor
+            .listener_statuses()
+            .await
+            .into_iter()
+            .find(|status| status.class == lb_config_model::ListenerClassConfig::Public)
+            .ok_or("missing public listener")?
+            .local_addr;
+
+        let response = send_prefixed_http1_request_with_headers(
+            public_addr,
+            b"PROXY TCP4 198.18.0.10 192.0.2.20 45678 8080\r\n",
+            "/",
+            &[("X-Forwarded-For", "198.51.100.7")],
+        )
+        .await?;
+        assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+
+        supervisor.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn supervisor_public_http1_listener_rejects_proxy_protocol_preface_when_disabled(
+    ) -> Result<(), DynError> {
+        std::env::set_var("LB_CTL_ADMIN_SECRET", "admin-secret");
+        let (upstream_addr, counter) = spawn_counting_http1_upstream().await?;
+        let path = write_temp_config(
+            "proxy-protocol-disabled-http1",
+            &workspace_config_json(
+                "127.0.0.1:0",
+                "127.0.0.1:0",
+                "http1",
+                &upstream_addr.to_string(),
+            ),
+        )?;
+        let supervisor = ServeSupervisor::start(
+            path.to_str().ok_or("utf8 path")?.to_string(),
+            Arc::new(String::from("admin-secret")),
+        )
+        .await?;
+
+        let public_addr = supervisor
+            .listener_statuses()
+            .await
+            .into_iter()
+            .find(|status| status.class == lb_config_model::ListenerClassConfig::Public)
+            .ok_or("missing public listener")?
+            .local_addr;
+
+        let response = send_prefixed_http1_request(
+            public_addr,
+            b"PROXY TCP4 198.51.100.7 203.0.113.10 45678 8080\r\n",
+            "/",
+        )
+        .await?;
+        assert!(!response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
 
         supervisor.shutdown().await?;
         Ok(())
@@ -7769,6 +10383,7 @@ mod tests {
         );
         assert!(json_u64_field(&final_json, "reload_last_success_duration_ms")? >= 1);
         assert!(json_u64_field(&final_json, "reload_last_failure_duration_ms")? >= 1);
+
         assert!(json_u64_field(&final_json, "reload_max_duration_ms")? >= 1);
 
         supervisor.shutdown().await?;
@@ -9027,11 +11642,11 @@ mod tests {
             time::sleep(Duration::from_millis(25)).await;
         };
         assert!(live_status.contains(&format!(
-            "\"desired\":{{\"class\":\"public\",\"protocol\":\"http1\",\"configured_bind\":\"{}\"}}",
+            "\"desired\":{{\"class\":\"public\",\"protocol\":\"http1\",\"configured_bind\":\"{}\",\"bind_mode\":\"single_stack\"}}",
             replacement_public_bind
         )));
         assert!(live_status.contains(&format!(
-            "\"draining\":[{{\"class\":\"public\",\"protocol\":\"http1\",\"configured_bind\":\"{}\"}}]",
+            "\"draining\":[{{\"class\":\"public\",\"protocol\":\"http1\",\"configured_bind\":\"{}\",\"bind_mode\":\"single_stack\"}}]",
             initial_public_bind
         )));
 
@@ -9070,7 +11685,7 @@ mod tests {
                 >= json_u64_field(&final_status_json, "reload_last_duration_ms")?
         );
         assert!(final_status.contains(&format!(
-            "\"retired_recent\":[{{\"class\":\"public\",\"protocol\":\"http1\",\"configured_bind\":\"{}\"}}]",
+            "\"retired_recent\":[{{\"class\":\"public\",\"protocol\":\"http1\",\"configured_bind\":\"{}\",\"bind_mode\":\"single_stack\"}}]",
             initial_public_bind
         )));
 
@@ -9145,7 +11760,7 @@ mod tests {
             time::sleep(Duration::from_millis(25)).await;
         };
         assert!(live_status.contains(&format!(
-            "\"desired\":{{\"class\":\"public\",\"protocol\":\"http1\",\"configured_bind\":\"{}\"}}",
+            "\"desired\":{{\"class\":\"public\",\"protocol\":\"http1\",\"configured_bind\":\"{}\",\"bind_mode\":\"single_stack\"}}",
             replacement_public_bind_one
         )));
 
@@ -9165,7 +11780,7 @@ mod tests {
 
         let queued_status = send_admin_status(admin_addr).await?;
         assert!(queued_status.contains(&format!(
-            "\"desired\":{{\"class\":\"public\",\"protocol\":\"http1\",\"configured_bind\":\"{}\"}}",
+            "\"desired\":{{\"class\":\"public\",\"protocol\":\"http1\",\"configured_bind\":\"{}\",\"bind_mode\":\"single_stack\"}}",
             replacement_public_bind_one
         )));
 
@@ -9908,6 +12523,74 @@ mod tests {
         assert!(status.contains("\"handshake_guard\":{\"max_inflight\":16,\"timeout_ms\":5000}"));
         assert!(status.contains("\"source_quota_rejections\":1"));
         assert!(status.contains("\"reason_codes\":[\"source_quota_exceeded\"]"));
+
+        let _ = release_tx.send(());
+        let mut first_response = Vec::new();
+        first.read_to_end(&mut first_response).await?;
+
+        supervisor.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn supervisor_hostile_edge_source_quota_uses_proxy_protocol_client_ip(
+    ) -> Result<(), DynError> {
+        std::env::set_var("LB_CTL_ADMIN_SECRET", "admin-secret");
+        let (upstream_addr, accepted_rx, release_tx, request_count) =
+            spawn_block_first_then_count_http1_upstream().await?;
+        let path = write_temp_config(
+            "hostile-edge-source-quota-proxy-protocol",
+            &workspace_config_json_with_hostile_edge_policy_and_proxy_protocol(
+                "127.0.0.1:0",
+                "127.0.0.1:0",
+                "http1",
+                &upstream_addr.to_string(),
+                "edge-default",
+                "v1",
+                1,
+                64,
+                16,
+            ),
+        )?;
+        let supervisor = ServeSupervisor::start(
+            path.to_str().ok_or("utf8 path")?.to_string(),
+            Arc::new(String::from("admin-secret")),
+        )
+        .await?;
+
+        let statuses = supervisor.listener_statuses().await;
+        let public_addr = statuses
+            .iter()
+            .find(|status| status.class == lb_config_model::ListenerClassConfig::Public)
+            .ok_or("missing public listener")?
+            .local_addr;
+        let admin_addr = statuses
+            .iter()
+            .find(|status| status.class == lb_config_model::ListenerClassConfig::Admin)
+            .ok_or("missing admin listener")?
+            .local_addr;
+
+        let mut first = start_prefixed_http1_request(
+            public_addr,
+            b"PROXY TCP4 198.51.100.7 203.0.113.10 45678 8080\r\n",
+            "/",
+        )
+        .await?;
+        accepted_rx.await.map_err(to_dyn_error)?;
+
+        let second = send_prefixed_http1_request(
+            public_addr,
+            b"PROXY TCP4 198.51.100.8 203.0.113.10 45679 8080\r\n",
+            "/",
+        )
+        .await?;
+        assert!(second.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
+
+        let status = send_admin_status(admin_addr).await?;
+        assert!(status.contains("\"abuse_protection\":{\"state\":\"enforcing\""));
+        assert!(status.contains("\"source_quota\":{\"aggregation\":\"exact_ip\",\"max_active_per_source\":1,\"max_tracked_sources\":64}"));
+        assert!(status.contains("\"source_quota_rejections\":0"));
 
         let _ = release_tx.send(());
         let mut first_response = Vec::new();
@@ -10720,6 +13403,179 @@ mod tests {
         )
     }
 
+    fn workspace_config_json_with_bind_mode(
+        public_addr: &str,
+        admin_addr: &str,
+        public_protocol: &str,
+        upstream_addr: &str,
+        public_bind_mode: &str,
+        allow_unspecified_bind: bool,
+    ) -> String {
+        format!(
+            r#"{{
+    "api_version": "v1_alpha1",
+    "name": "workspace-runtime",
+    "listeners": [
+        {{
+            "name": "public",
+            "class": "public",
+            "bind_address": "{public_addr}",
+            "bind_mode": "{public_bind_mode}",
+            "allow_unspecified_bind": {allow_unspecified_bind},
+            "protocol": "{public_protocol}",
+            "routes": ["web"]
+        }},
+        {{
+            "name": "admin",
+            "class": "admin",
+            "bind_address": "{admin_addr}",
+            "protocol": "http1"
+        }}
+    ],
+    "routes": [
+        {{
+            "name": "web",
+            "match": {{ "type": "path_prefix", "prefix": "/" }},
+            "upstream_cluster": "frontend"
+        }}
+    ],
+    "upstream_clusters": [
+        {{
+            "name": "frontend",
+            "endpoints": [
+                {{
+                    "id": "frontend-a",
+                    "address": "{upstream_addr}",
+                    "state": "ready",
+                    "zone": null,
+                    "locality": null,
+                    "weight": 1
+                }}
+            ]
+        }}
+    ]
+}}"#
+        )
+    }
+
+    fn workspace_config_json_with_proxy_protocol(
+        public_addr: &str,
+        admin_addr: &str,
+        public_protocol: &str,
+        upstream_addr: &str,
+        proxy_protocol: &str,
+    ) -> String {
+        format!(
+            r#"{{
+    "api_version": "v1_alpha1",
+    "name": "workspace-runtime",
+    "listeners": [
+        {{
+            "name": "public",
+            "class": "public",
+            "bind_address": "{public_addr}",
+            "protocol": "{public_protocol}",
+            "proxy_protocol": "{proxy_protocol}",
+            "routes": ["web"]
+        }},
+        {{
+            "name": "admin",
+            "class": "admin",
+            "bind_address": "{admin_addr}",
+            "protocol": "http1"
+        }}
+    ],
+    "routes": [
+        {{
+            "name": "web",
+            "match": {{ "type": "path_prefix", "prefix": "/" }},
+            "upstream_cluster": "frontend"
+        }}
+    ],
+    "upstream_clusters": [
+        {{
+            "name": "frontend",
+            "endpoints": [
+                {{
+                    "id": "frontend-a",
+                    "address": "{upstream_addr}",
+                    "state": "ready",
+                    "zone": null,
+                    "locality": null,
+                    "weight": 1
+                }}
+            ]
+        }}
+    ]
+}}"#
+        )
+    }
+
+    fn workspace_config_json_with_proxy_protocol_and_trusted_client_ip(
+        public_addr: &str,
+        admin_addr: &str,
+        public_protocol: &str,
+        upstream_addr: &str,
+        proxy_protocol: &str,
+        trusted_proxy_cidrs: &[&str],
+    ) -> String {
+        let trusted_proxy_cidrs = trusted_proxy_cidrs
+            .iter()
+            .map(|cidr| format!("\"{cidr}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            r#"{{
+    "api_version": "v1_alpha1",
+    "name": "workspace-runtime",
+    "listeners": [
+        {{
+            "name": "public",
+            "class": "public",
+            "bind_address": "{public_addr}",
+            "protocol": "{public_protocol}",
+            "proxy_protocol": "{proxy_protocol}",
+            "routes": ["web"]
+        }},
+        {{
+            "name": "admin",
+            "class": "admin",
+            "bind_address": "{admin_addr}",
+            "protocol": "http1"
+        }}
+    ],
+    "routes": [
+        {{
+            "name": "web",
+            "match": {{ "type": "path_prefix", "prefix": "/" }},
+            "upstream_cluster": "frontend"
+        }}
+    ],
+    "upstream_clusters": [
+        {{
+            "name": "frontend",
+            "endpoints": [
+                {{
+                    "id": "frontend-a",
+                    "address": "{upstream_addr}",
+                    "state": "ready",
+                    "zone": null,
+                    "locality": null,
+                    "weight": 1
+                }}
+            ]
+        }}
+    ],
+    "security": {{
+        "trusted_client_ip": {{
+            "enabled": true,
+            "trusted_proxy_cidrs": [{trusted_proxy_cidrs}]
+        }}
+    }}
+}}"#
+        )
+    }
+
     fn workspace_config_json_with_drain_timeout(
         public_addr: &str,
         admin_addr: &str,
@@ -11234,6 +14090,84 @@ mod tests {
         )
     }
 
+    fn workspace_config_json_with_hostile_edge_policy_and_proxy_protocol(
+        public_addr: &str,
+        admin_addr: &str,
+        public_protocol: &str,
+        upstream_addr: &str,
+        policy_name: &str,
+        proxy_protocol: &str,
+        max_active_per_source: usize,
+        max_tracked_sources: usize,
+        max_inflight_handshakes: usize,
+    ) -> String {
+        format!(
+            r#"{{
+    "api_version": "v1_alpha1",
+    "name": "workspace-runtime",
+    "listeners": [
+        {{
+            "name": "public",
+            "class": "public",
+            "bind_address": "{public_addr}",
+            "protocol": "{public_protocol}",
+            "proxy_protocol": "{proxy_protocol}",
+            "routes": ["web"],
+            "policies": {{
+                "hostile_edge_protection": "{policy_name}"
+            }}
+        }},
+        {{
+            "name": "admin",
+            "class": "admin",
+            "bind_address": "{admin_addr}",
+            "protocol": "http1"
+        }}
+    ],
+    "routes": [
+        {{
+            "name": "web",
+            "match": {{ "type": "path_prefix", "prefix": "/" }},
+            "upstream_cluster": "frontend"
+        }}
+    ],
+    "upstream_clusters": [
+        {{
+            "name": "frontend",
+            "endpoints": [
+                {{
+                    "id": "frontend-a",
+                    "address": "{upstream_addr}",
+                    "state": "ready",
+                    "zone": null,
+                    "locality": null,
+                    "weight": 1
+                }}
+            ]
+        }}
+    ],
+    "policies": {{
+        "hostile_edge_protections": [
+            {{
+                "name": "{policy_name}",
+                "spec": {{
+                    "source_quota": {{
+                        "aggregation": "exact_ip",
+                        "max_active_per_source": {max_active_per_source},
+                        "max_tracked_sources": {max_tracked_sources}
+                    }},
+                    "handshake_guard": {{
+                        "max_inflight": {max_inflight_handshakes},
+                        "timeout_ms": 5000
+                    }}
+                }}
+            }}
+        ]
+    }}
+}}"#,
+        )
+    }
+
     fn workspace_config_json_with_tls(
         public_addr: &str,
         admin_addr: &str,
@@ -11252,6 +14186,67 @@ mod tests {
             minimum_version,
             alpn_protocols,
             &[],
+        )
+    }
+
+    fn workspace_config_json_with_http3_tls(
+        public_addr: &str,
+        admin_addr: &str,
+        upstream_addr: &str,
+        cert_path: &str,
+        key_path: &str,
+    ) -> String {
+        format!(
+            r#"{{
+    "api_version": "v1_alpha1",
+    "name": "workspace-runtime",
+    "listeners": [
+        {{
+            "name": "public",
+            "class": "public",
+            "bind_address": "{public_addr}",
+            "protocol": "http3",
+            "routes": ["web"],
+            "tls_termination": {{
+                "minimum_version": "tls13",
+                "alpn_protocols": ["http3"],
+                "certificate_source": {{
+                    "type": "files",
+                    "cert_path": "{cert_path}",
+                    "key_path": "{key_path}"
+                }}
+            }}
+        }},
+        {{
+            "name": "admin",
+            "class": "admin",
+            "bind_address": "{admin_addr}",
+            "protocol": "http1"
+        }}
+    ],
+    "routes": [
+        {{
+            "name": "web",
+            "match": {{ "type": "path_prefix", "prefix": "/" }},
+            "upstream_cluster": "frontend"
+        }}
+    ],
+    "upstream_clusters": [
+        {{
+            "name": "frontend",
+            "endpoints": [
+                {{
+                    "id": "frontend-a",
+                    "address": "{upstream_addr}",
+                    "state": "ready",
+                    "zone": null,
+                    "locality": null,
+                    "weight": 1
+                }}
+            ]
+        }}
+    ]
+}}"#,
         )
     }
 
@@ -11428,6 +14423,25 @@ mod tests {
         Ok((address, counter))
     }
 
+    async fn spawn_capture_http1_upstream() -> io::Result<(SocketAddr, oneshot::Receiver<String>)> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let (capture_tx, capture_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buffer = [0_u8; 4096];
+            let bytes_read = stream.read(&mut buffer).await.unwrap_or(0);
+            let request = String::from_utf8_lossy(&buffer[..bytes_read]).into_owned();
+            let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+            let _ = stream.write_all(response).await;
+            let _ = stream.shutdown().await;
+            let _ = capture_tx.send(request);
+        });
+        Ok((address, capture_rx))
+    }
+
     async fn spawn_blocked_http1_upstream(
         body: &'static str,
     ) -> io::Result<(SocketAddr, oneshot::Receiver<()>, oneshot::Sender<()>)> {
@@ -11451,6 +14465,55 @@ mod tests {
             let _ = stream.shutdown().await;
         });
         Ok((address, accepted_rx, release_tx))
+    }
+
+    async fn spawn_block_first_then_count_http1_upstream(
+    ) -> io::Result<(SocketAddr, oneshot::Receiver<()>, oneshot::Sender<()>, Arc<AtomicU64>)> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let (accepted_tx, accepted_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let counter = Arc::new(AtomicU64::new(0));
+        let counter_for_task = Arc::clone(&counter);
+
+        tokio::spawn(async move {
+            let Ok((mut first_stream, _)) = listener.accept().await else {
+                return;
+            };
+            let first_counter = Arc::clone(&counter_for_task);
+            tokio::spawn(async move {
+                let mut buffer = [0_u8; 2048];
+                let _ = first_stream.read(&mut buffer).await;
+                let count = first_counter.fetch_add(1, Ordering::SeqCst) + 1;
+                let _ = accepted_tx.send(());
+                let _ = release_rx.await;
+                let body = format!("count:{count}");
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = first_stream.write_all(response.as_bytes()).await;
+                let _ = first_stream.shutdown().await;
+            });
+
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let counter = Arc::clone(&counter_for_task);
+                tokio::spawn(async move {
+                    let mut buffer = [0_u8; 2048];
+                    let _ = stream.read(&mut buffer).await;
+                    let count = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                    let body = format!("count:{count}");
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+
+        Ok((address, accepted_rx, release_tx, counter))
     }
 
     async fn spawn_tagged_h2_upstream(body: &'static str) -> io::Result<SocketAddr> {
@@ -11481,9 +14544,9 @@ mod tests {
 
     async fn connect_h2_client(
         address: SocketAddr,
-    ) -> Result<client::SendRequest<Bytes>, DynError> {
+    ) -> Result<h2_client::SendRequest<Bytes>, DynError> {
         let stream = TcpStream::connect(address).await?;
-        let (client, connection) = client::handshake(stream).await.map_err(to_dyn_error)?;
+        let (client, connection) = h2_client::handshake(stream).await.map_err(to_dyn_error)?;
         tokio::spawn(async move {
             let _ = connection.await;
         });
@@ -11491,7 +14554,7 @@ mod tests {
     }
 
     async fn send_h2_request(
-        client: &mut client::SendRequest<Bytes>,
+        client: &mut h2_client::SendRequest<Bytes>,
         path: &str,
     ) -> Result<h2::client::ResponseFuture, h2::Error> {
         let request = Request::builder()
@@ -11526,6 +14589,77 @@ mod tests {
             Err(error) => return Err(to_dyn_error(error)),
         }
         String::from_utf8(response).map_err(to_dyn_error)
+    }
+
+    async fn send_prefixed_http1_request(
+        address: SocketAddr,
+        prefix: &[u8],
+        target: &str,
+    ) -> Result<String, DynError> {
+        let mut stream = TcpStream::connect(address).await?;
+        stream.write_all(prefix).await?;
+        stream
+            .write_all(
+                format!(
+                    "GET {target} HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await?;
+        let mut response = Vec::new();
+        match stream.read_to_end(&mut response).await {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::ConnectionReset => {}
+            Err(error) => return Err(to_dyn_error(error)),
+        }
+        String::from_utf8(response).map_err(to_dyn_error)
+    }
+
+    async fn send_prefixed_http1_request_with_headers(
+        address: SocketAddr,
+        prefix: &[u8],
+        target: &str,
+        headers: &[(&str, &str)],
+    ) -> Result<String, DynError> {
+        let mut stream = TcpStream::connect(address).await?;
+        stream.write_all(prefix).await?;
+        let extra_headers = headers
+            .iter()
+            .map(|(name, value)| format!("{name}: {value}\r\n"))
+            .collect::<String>();
+        stream
+            .write_all(
+                format!(
+                    "GET {target} HTTP/1.1\r\nHost: example.test\r\n{extra_headers}Connection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await?;
+        let mut response = Vec::new();
+        match stream.read_to_end(&mut response).await {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::ConnectionReset => {}
+            Err(error) => return Err(to_dyn_error(error)),
+        }
+        String::from_utf8(response).map_err(to_dyn_error)
+    }
+
+    async fn start_prefixed_http1_request(
+        address: SocketAddr,
+        prefix: &[u8],
+        target: &str,
+    ) -> Result<TcpStream, DynError> {
+        let mut stream = TcpStream::connect(address).await?;
+        stream.write_all(prefix).await?;
+        stream
+            .write_all(
+                format!(
+                    "GET {target} HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await?;
+        Ok(stream)
     }
 
     async fn start_http1_request(address: SocketAddr, target: &str) -> Result<TcpStream, DynError> {
@@ -11859,7 +14993,7 @@ mod tests {
         for cert_der in cert_ders {
             root_store.add(CertificateDer::from(cert_der.clone())).map_err(to_dyn_error)?;
         }
-        let mut client_config = ClientConfig::builder_with_protocol_versions(protocol_versions)
+        let mut client_config = RustlsClientConfig::builder_with_protocol_versions(protocol_versions)
             .with_root_certificates(root_store)
             .with_no_client_auth();
         client_config.alpn_protocols =
@@ -11883,5 +15017,64 @@ mod tests {
             Err(error) => return Err(to_dyn_error(error)),
         }
         String::from_utf8(response).map_err(to_dyn_error)
+    }
+
+    async fn send_http3_request(
+        address: SocketAddr,
+        cert_der: &[u8],
+        server_name: &str,
+        target: &str,
+    ) -> Result<(u16, String), DynError> {
+        ensure_rustls_crypto_provider();
+        let mut root_store = RootCertStore::empty();
+        root_store.add(CertificateDer::from(cert_der.to_vec())).map_err(to_dyn_error)?;
+        let mut tls_config = RustlsClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        tls_config.alpn_protocols = vec![b"h3".to_vec()];
+        let quic_config = QuicClientConfig::try_from(Arc::new(tls_config)).map_err(to_dyn_error)?;
+        let client_config = quinn::ClientConfig::new(Arc::new(quic_config));
+        let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse()?)?;
+        endpoint.set_default_client_config(client_config);
+
+        let connection = endpoint
+            .connect(address, server_name)
+            .map_err(|error| to_dyn_error(format!("http3 connect setup failed: {error}")))?
+            .await
+            .map_err(|error| to_dyn_error(format!("http3 connect failed: {error}")))?;
+        let (_driver, mut send_request) = h3_client::new(h3_quinn::Connection::new(connection))
+            .await
+            .map_err(|error| to_dyn_error(format!("http3 client handshake failed: {error}")))?;
+
+        let request = http1::Request::builder()
+            .method("GET")
+            .uri(format!("https://{server_name}{target}"))
+            .body(())
+            .map_err(to_dyn_error)?;
+        let mut request_stream = send_request
+            .send_request(request)
+            .await
+            .map_err(|error| to_dyn_error(format!("http3 send request failed: {error}")))?;
+        request_stream
+            .finish()
+            .await
+            .map_err(|error| to_dyn_error(format!("http3 request finish failed: {error}")))?;
+        let response = request_stream
+            .recv_response()
+            .await
+            .map_err(|error| to_dyn_error(format!("http3 recv response failed: {error}")))?;
+        let status = response.status().as_u16();
+        let mut body = Vec::new();
+        while let Some(mut chunk) = request_stream
+            .recv_data()
+            .await
+            .map_err(|error| to_dyn_error(format!("http3 recv body failed: {error}")))?
+        {
+            let chunk_bytes = chunk.copy_to_bytes(chunk.remaining());
+            body.extend_from_slice(&chunk_bytes);
+        }
+
+        endpoint.close(0u32.into(), b"done");
+        Ok((status, String::from_utf8(body).map_err(to_dyn_error)?))
     }
 }

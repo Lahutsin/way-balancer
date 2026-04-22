@@ -263,6 +263,9 @@ pub enum TelemetryEventCode {
     RuntimeListenerDraining,
     RuntimeListenerStopped,
     RuntimeListenerAcceptError,
+    RuntimeHttpUpgradeAccepted,
+    RuntimeHttpUpgradeRejected,
+    RuntimeHttpUpgradeFailed,
     HealthEndpointDegraded,
     HealthEndpointUnhealthy,
     HealthEndpointEjected,
@@ -300,6 +303,9 @@ impl TelemetryEventCode {
             Self::RuntimeListenerDraining => "runtime.listener.draining",
             Self::RuntimeListenerStopped => "runtime.listener.stopped",
             Self::RuntimeListenerAcceptError => "runtime.listener.accept_error",
+            Self::RuntimeHttpUpgradeAccepted => "runtime.http_upgrade.accepted",
+            Self::RuntimeHttpUpgradeRejected => "runtime.http_upgrade.rejected",
+            Self::RuntimeHttpUpgradeFailed => "runtime.http_upgrade.failed",
             Self::HealthEndpointDegraded => "health.endpoint.degraded",
             Self::HealthEndpointUnhealthy => "health.endpoint.unhealthy",
             Self::HealthEndpointEjected => "health.endpoint.ejected",
@@ -336,7 +342,10 @@ impl TelemetryEventCode {
             | Self::RuntimeListenerShutdownRequested
             | Self::RuntimeListenerDraining
             | Self::RuntimeListenerStopped
-            | Self::RuntimeListenerAcceptError => TelemetryEventCategory::Runtime,
+            | Self::RuntimeListenerAcceptError
+            | Self::RuntimeHttpUpgradeAccepted
+            | Self::RuntimeHttpUpgradeRejected
+            | Self::RuntimeHttpUpgradeFailed => TelemetryEventCategory::Runtime,
             Self::HealthEndpointDegraded
             | Self::HealthEndpointUnhealthy
             | Self::HealthEndpointEjected
@@ -367,8 +376,11 @@ impl TelemetryEventCode {
     #[must_use]
     pub const fn severity(self) -> TelemetrySeverity {
         match self {
-            Self::RuntimeListenerAcceptError => TelemetrySeverity::Error,
+            Self::RuntimeListenerAcceptError | Self::RuntimeHttpUpgradeFailed => {
+                TelemetrySeverity::Error
+            }
             Self::RuntimeListenerRejected
+            | Self::RuntimeHttpUpgradeRejected
             | Self::HealthEndpointUnhealthy
             | Self::HealthEndpointEjected
             | Self::FailureBreakerOpened
@@ -383,6 +395,7 @@ impl TelemetryEventCode {
             | Self::RuntimeListenerShutdownRequested
             | Self::RuntimeListenerDraining
             | Self::RuntimeListenerStopped
+            | Self::RuntimeHttpUpgradeAccepted
             | Self::HealthEndpointDegraded
             | Self::HealthWarmupStarted
             | Self::HealthWarmupCompleted
@@ -411,6 +424,9 @@ impl TelemetryEventCode {
             Self::RuntimeListenerDraining,
             Self::RuntimeListenerStopped,
             Self::RuntimeListenerAcceptError,
+            Self::RuntimeHttpUpgradeAccepted,
+            Self::RuntimeHttpUpgradeRejected,
+            Self::RuntimeHttpUpgradeFailed,
             Self::HealthEndpointDegraded,
             Self::HealthEndpointUnhealthy,
             Self::HealthEndpointEjected,
@@ -1003,6 +1019,9 @@ mod tests {
                 "runtime.listener.draining",
                 "runtime.listener.stopped",
                 "runtime.listener.accept_error",
+                "runtime.http_upgrade.accepted",
+                "runtime.http_upgrade.rejected",
+                "runtime.http_upgrade.failed",
                 "health.endpoint.degraded",
                 "health.endpoint.unhealthy",
                 "health.endpoint.ejected",

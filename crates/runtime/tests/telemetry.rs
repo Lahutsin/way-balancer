@@ -6,8 +6,9 @@ use lb_observability::TraceHookPhase;
 use lb_observability::{FailureManagementEventKind, OverloadEvent, OverloadEventKind};
 use lb_runtime::{
     AbuseRejectionReason, HttpCacheRequestOutcome, HttpCacheRevalidationResult,
-    HttpCacheStoreMetrics, ListenerAbuseProtectionSnapshot, ListenerEvent, ListenerEventKind,
-    ListenerSnapshot, ListenerState, OverloadSnapshot, OverloadState, RuntimeTelemetry,
+    HttpCacheStoreMetrics, HttpUpgradeResult, ListenerAbuseProtectionSnapshot, ListenerEvent,
+    ListenerEventKind, ListenerSnapshot, ListenerState, OverloadSnapshot, OverloadState,
+    RuntimeTelemetry,
 };
 
 #[test]
@@ -103,6 +104,26 @@ fn runtime_telemetry_emits_structured_logs_and_metrics() -> Result<(), Box<dyn s
     telemetry.record_http_cache_purge("public-http", "purged", 3)?;
     telemetry.record_http_cache_invalidation_delivery("public-http", "http_peer", "success", 2)?;
     telemetry.record_http_cache_invalidation_delivery("public-http", "http_peer", "failed", 1)?;
+    telemetry.record_http_upgrade(
+        "public-http",
+        HttpUpgradeResult::Accepted,
+        "websocket",
+        "websocket tunnel accepted",
+    )?;
+    telemetry.record_http_upgrade(
+        "public-http",
+        HttpUpgradeResult::Rejected,
+        "policy_denied",
+        "route upgrade policy denied websocket",
+    )?;
+    telemetry.record_http_upgrade(
+        "public-http",
+        HttpUpgradeResult::Failed,
+        "upstream_refused",
+        "upstream refused websocket upgrade",
+    )?;
+    telemetry.record_http3_request("public-http3", "served", "2xx")?;
+    telemetry.record_http3_request("public-http3", "failed", "bridge_failed")?;
     telemetry.record_request_latency(
         "http1/request",
         TraceHookPhase::ResponseCompleted,
@@ -167,6 +188,21 @@ fn runtime_telemetry_emits_structured_logs_and_metrics() -> Result<(), Box<dyn s
         "runtime_http_cache_invalidation_peer_deliveries_total{scope=\"public-http\",result=\"failed\",reason=\"http_peer\"} 1"
     ));
     assert!(metrics.contains(
+        "runtime_http_upgrades_total{scope=\"public-http\",result=\"accepted\",reason=\"websocket\"} 1"
+    ));
+    assert!(metrics.contains(
+        "runtime_http_upgrades_total{scope=\"public-http\",result=\"rejected\",reason=\"policy_denied\"} 1"
+    ));
+    assert!(metrics.contains(
+        "runtime_http_upgrades_total{scope=\"public-http\",result=\"failed\",reason=\"upstream_refused\"} 1"
+    ));
+    assert!(metrics.contains(
+        "runtime_http3_requests_total{scope=\"public-http3\",result=\"served\",reason=\"2xx\"} 1"
+    ));
+    assert!(metrics.contains(
+        "runtime_http3_requests_total{scope=\"public-http3\",result=\"failed\",reason=\"bridge_failed\"} 1"
+    ));
+    assert!(metrics.contains(
         "runtime_request_latency_samples_total{scope=\"http1_request\",bucket=\"le_10ms\",phase=\"response_completed\"} 1"
     ));
     assert!(metrics.contains(
@@ -174,12 +210,15 @@ fn runtime_telemetry_emits_structured_logs_and_metrics() -> Result<(), Box<dyn s
     ));
 
     let snapshot = telemetry.snapshot();
-    assert_eq!(snapshot.events.len(), 9);
+    assert_eq!(snapshot.events.len(), 12);
     assert!(snapshot.logs.iter().any(|record| record.code.as_str() == "runtime.listener.started"));
     assert!(snapshot.logs.iter().any(|record| record.code.as_str() == "runtime.listener.rejected"));
     assert!(snapshot.logs.iter().any(|record| record.code.as_str() == "failure.breaker.opened"));
     assert!(snapshot.logs.iter().any(|record| record.code.as_str() == "overload.request.shed"));
     assert!(snapshot.logs.iter().any(|record| record.code.as_str() == "cache.hit"));
     assert!(snapshot.logs.iter().any(|record| record.code.as_str() == "cache.revalidated"));
+    assert!(snapshot.events.iter().any(|event| event.code.as_str() == "runtime.http_upgrade.accepted"));
+    assert!(snapshot.events.iter().any(|event| event.code.as_str() == "runtime.http_upgrade.rejected"));
+    assert!(snapshot.events.iter().any(|event| event.code.as_str() == "runtime.http_upgrade.failed"));
     Ok(())
 }

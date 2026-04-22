@@ -430,7 +430,9 @@ pub fn translate_gateway_api(
                 name: listener_name,
                 class: options.listener_class,
                 bind_address: SocketAddr::new(options.bind_ip, listener.port),
+                bind_mode: lb_config_model::ListenerBindModeConfig::SingleStack,
                 protocol: options.listener_protocol,
+                proxy_protocol: lb_config_model::ProxyProtocolModeConfig::Disabled,
                 tls_termination: None,
                 allow_unspecified_bind: false,
                 max_connections: None,
@@ -439,6 +441,7 @@ pub fn translate_gateway_api(
                 drain_timeout_ms: None,
                 routes: Vec::new(),
                 policies: PolicyBindingConfig::default(),
+                upgrade: lb_config_model::UpgradePolicyConfig::default(),
                 admin: lb_config_model::AdminListenerPolicyConfig::default(),
             });
         }
@@ -796,7 +799,14 @@ mod tests {
         assert_eq!(config.listeners[0].name, "edge.public.web");
         assert_eq!(config.listeners[0].routes, vec![String::from("edge.payments.r0.m0")]);
         assert_eq!(config.routes.len(), 1);
-        assert_eq!(config.routes[0].upstream_cluster, "edge.payments.8080");
+        assert_eq!(
+            config.routes[0].normalized_destinations(),
+            vec![lb_config_model::RouteDestinationConfig {
+                upstream_cluster: String::from("edge.payments.8080"),
+                weight: 1,
+                policies: lb_config_model::PolicyBindingConfig::default(),
+            }]
+        );
         assert_eq!(config.upstream_clusters.len(), 1);
         assert_eq!(config.upstream_clusters[0].endpoints.len(), 2);
         config.validate()?;

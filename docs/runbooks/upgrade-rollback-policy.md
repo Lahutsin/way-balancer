@@ -11,11 +11,12 @@
 
 1. Build and validate the candidate with `./scripts/quality.sh`.
 2. Publish the candidate snapshot with digest verification and trusted attestation.
-3. Roll out the candidate through `RolloutCoordinator`.
-4. Confirm dataplane activation succeeded and the active digest matches the published digest.
-5. For config-driven listener changes, inspect `GET /status` until each affected listener reports `replacement.state = stable` and no unexpected `draining` entries remain.
-6. Record the upgrade outcome in release evidence.
-7. For active-active fleets, use `FleetRolloutCoordinator` and do not declare success until the fleet convergence report is `converged`.
+3. If the candidate changes route destination weights, inspect the publication diff or publish audit detail and confirm the expected route-level shift before broader rollout.
+4. Roll out the candidate through `RolloutCoordinator`.
+5. Confirm dataplane activation succeeded and the active digest matches the published digest.
+6. For config-driven listener changes, inspect `GET /status` until each affected listener reports `replacement.state = stable` and no unexpected `draining` entries remain.
+7. Record the upgrade outcome in release evidence.
+8. For active-active fleets, use `FleetRolloutCoordinator` and do not declare success until the fleet convergence report is `converged`.
 
 ## Rollback Flow
 
@@ -27,6 +28,8 @@
 6. For active-active fleets, prefer a whole-fleet rollback to a shared known-good version instead of leaving a mixed-version steady state in place.
 
 For admin-driven config rollback, also confirm `GET /status` reports the expected `last_reload_outcome_code` and that `GET /audit` records matching reload lifecycle `code` values. That keeps rollback verification machine-readable.
+
+For snapshot-driven route canaries or blue-green shifts, also compare the candidate publication diff against the prior published version before rollback or forward rollout. That avoids treating a digest-only change as sufficient review when the real operational question is the route destination weight shift.
 
 If the instance recently recovered from crash and `GET /status` still reports `control_plane_journal.recovery.state = needs_operator_action`, do not treat rollback or rollout as fully closed until a clean follow-up reload moves that recovery state to `resolved`.
 

@@ -3,11 +3,14 @@
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ipnet::IpNet;
 use lb_config_model::{
-    AuthorizationCacheBehaviorConfig, CacheKeyPolicyConfig, HttpCachePolicyConfig,
+    AuthorizationCacheBehaviorConfig, CacheKeyPolicyConfig, HeaderMutationConfig,
+    FaultInjectionAbortConfig, FaultInjectionDelayConfig, FaultInjectionPolicyConfig,
+    HttpCachePolicyConfig, PathRewriteTransformConfig, RequestTransformConfig,
+    ResponseTransformConfig, TrafficMirrorPolicyConfig, UpgradeProtocolConfig,
 };
 use lb_net_core::{
     EndpointMetadata, EndpointState, UpstreamCluster, UpstreamClusterName, UpstreamEndpoint,
@@ -15,12 +18,15 @@ use lb_net_core::{
 };
 use lb_runtime::{
     build_http_cache_key_material, proxy_http1_connection, AffinityFallbackPolicy, AffinityPolicy,
-    AnonymousSourceFilterPolicy, EndpointHealthPolicy, Http1ConnectionReport, Http1ProxyConfig,
-    Http1ProxyError, Http1ResponseCacheConfig, Http1RouteUpstream, HttpCacheRequest,
-    HttpCacheStore, HttpCacheStoreConfig, HttpCacheStoreError, LoadBalancingAlgorithm,
-    LocalityRoutingPolicy, NoHealthyFallback, ProtocolAnomalyCategory, RouteBackendPool,
-    RouteEnumerationProtectionPolicy, SourceAggregation, TrustedClientIpPolicy,
-    UpstreamSelectionPolicy,
+    AnonymousSourceFilterPolicy, CircuitBreakerPolicy, EndpointHealthPolicy, FailureManager,
+    Http1ConnectionReport, Http1ProxyConfig, Http1ProxyError, Http1ResponseCacheConfig,
+    Http1RouteUpstream, HttpCacheRequest, HttpCacheStore, HttpCacheStoreConfig,
+    HttpCacheStoreError, LoadBalancingAlgorithm, LocalLimitKeyKind, LocalLimitScope,
+    LocalRateLimitConfig, LocalRateLimiter, LocalityRoutingPolicy, NoHealthyFallback,
+    ProtocolAnomalyCategory, RetryBudgetPolicy, RouteBackendPool,
+    RouteDestinationPolicyRuntime, RouteEnumerationProtectionPolicy, RuntimeTelemetry,
+    SourceAggregation, TimeoutHierarchy, TrustedClientIpPolicy, UpstreamSelectionPolicy,
+    WeightedRouteDestination,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -31,6 +37,12 @@ use tokio::time;
 struct RequestCapture {
     head: String,
     body: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct UpgradeCapture {
+    head: String,
+    tunnel_payload: Vec<u8>,
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -176,6 +188,805 @@ async fn rotates_http1_upstream_connection_after_reuse_age_limit(
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn applies_request_transforms_before_http1_upstream_dispatch(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (upstream_addr, capture_rx) = spawn_single_capture_upstream().await?;
+    let mut config = proxy_config(upstream_addr).with_request_transforms(
+        Some(RequestTransformConfig {
+            path_rewrite: None,
+            host_rewrite: None,
+            header_mutations: vec![HeaderMutationConfig::Set {
+                name: String::from("x-listener-env"),
+                value: String::from("demo"),
+            }],
+        }),
+        [(String::from("api"), RequestTransformConfig {
+            path_rewrite: Some(PathRewriteTransformConfig::ReplacePrefix {
+                match_prefix: String::from("/edge"),
+                replacement: String::from("/v1"),
+            }),
+            host_rewrite: Some(String::from("backend.internal")),
+            header_mutations: vec![
+                HeaderMutationConfig::Set {
+                    name: String::from("x-route"),
+                    value: String::from("api"),
+                },
+                HeaderMutationConfig::Remove {
+                    name: String::from("x-remove-me"),
+                },
+            ],
+        })],
+    );
+    config.routes = vec![lb_proto_http::RoutePrefixRule::new("api", "/edge")];
+    let (proxy_addr, report_rx) = spawn_one_shot_http1_proxy_listener(config).await?;
+
+    let mut client = TcpStream::connect(proxy_addr).await?;
+    client
+        .write_all(
+            b"GET /edge/orders?expand=true HTTP/1.1\r\nHost: edge.example\r\nX-Remove-Me: true\r\nConnection: close\r\n\r\n",
+        )
+        .await?;
+    let response = read_http_response(&mut client).await?;
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+
+    let capture = receive_capture(capture_rx).await?;
+    assert!(capture.head.contains("GET /v1/orders?expand=true HTTP/1.1\r\n"));
+    assert!(capture.head.contains("host: backend.internal\r\n"));
+    assert!(capture.head.contains("x-listener-env: demo\r\n"));
+    assert!(capture.head.contains("x-route: api\r\n"));
+    assert!(!capture.head.contains("x-remove-me:"));
+
+    let report = receive_proxy_result(report_rx).await?;
+    assert_eq!(report.metrics.request_count, 1);
+    assert_eq!(report.metrics.response_status_counts.get(&200), Some(&1));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn enforces_destination_local_http1_transform_and_rate_limit(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (upstream_addr, capture_rx) = spawn_keep_alive_single_capture_upstream().await?;
+    let pool = route_backend_pool(
+        "frontend-primary",
+        vec![("primary-a", upstream_addr, 1, None, None)],
+        EndpointHealthPolicy::default(),
+        UpstreamSelectionPolicy {
+            algorithm: LoadBalancingAlgorithm::RoundRobin,
+            locality: LocalityRoutingPolicy::Disabled,
+            no_healthy_fallback: NoHealthyFallback::Fail,
+            affinity: None,
+        },
+    )?;
+    let destination_rate_limiter = Arc::new(LocalRateLimiter::new(LocalRateLimitConfig {
+        scope: LocalLimitScope::RouteDestination {
+            route: String::from("api"),
+            upstream_cluster: String::from("frontend-primary"),
+        },
+        key_kind: LocalLimitKeyKind::Global,
+        requests_per_window: 1,
+        window: Duration::from_secs(60),
+        max_tracked_keys: 8,
+    })?);
+
+    let mut config = proxy_config(upstream_addr)
+        .with_route_backend_pools([(String::from("api"), pool)])
+        .with_route_destination_policies([(String::from("api"), std::collections::BTreeMap::from([(
+            String::from("frontend-primary"),
+            RouteDestinationPolicyRuntime {
+                request_transform: Some(RequestTransformConfig {
+                    path_rewrite: Some(PathRewriteTransformConfig::ReplacePrefix {
+                        match_prefix: String::from("/edge"),
+                        replacement: String::from("/dest"),
+                    }),
+                    host_rewrite: Some(String::from("frontend.internal")),
+                    header_mutations: vec![HeaderMutationConfig::Set {
+                        name: String::from("x-destination"),
+                        value: String::from("primary"),
+                    }],
+                }),
+                response_transform: Some(ResponseTransformConfig {
+                    header_mutations: vec![HeaderMutationConfig::Set {
+                        name: String::from("x-destination-response"),
+                        value: String::from("primary"),
+                    }],
+                }),
+                traffic_mirror: None,
+                fault_injection: None,
+                rate_limiters: vec![destination_rate_limiter],
+                concurrency_limiters: Vec::new(),
+                failure_manager: None,
+                enforce_retry_budget: false,
+                enforce_timeout_hierarchy: false,
+                enforce_circuit_breaker: false,
+            },
+        )]))]);
+    config.routes = vec![lb_proto_http::RoutePrefixRule::new("api", "/edge")];
+    let (proxy_addr, report_rx) = spawn_one_shot_http1_proxy_listener(config).await?;
+
+    let mut client = TcpStream::connect(proxy_addr).await?;
+    client
+        .write_all(
+            b"GET /edge/orders HTTP/1.1\r\nHost: edge.example\r\nConnection: keep-alive\r\n\r\n",
+        )
+        .await?;
+    let first_response = read_http_response(&mut client).await?;
+    assert!(first_response.starts_with("HTTP/1.1 200 OK\r\n"));
+    assert!(first_response.contains("x-destination-response: primary\r\n"));
+
+    client
+        .write_all(
+            b"GET /edge/orders HTTP/1.1\r\nHost: edge.example\r\nConnection: close\r\n\r\n",
+        )
+        .await?;
+    let second_response = read_http_response(&mut client).await?;
+    assert!(second_response.starts_with("HTTP/1.1 429"));
+    drop(client);
+
+    let capture = receive_capture(capture_rx).await?;
+    assert!(capture.head.contains("GET /dest/orders HTTP/1.1\r\n"));
+    assert!(capture.head.contains("host: frontend.internal\r\n"));
+    assert!(capture.head.contains("x-destination: primary\r\n"));
+
+    let report = receive_proxy_result(report_rx).await?;
+    assert_eq!(report.metrics.request_count, 2);
+    assert_eq!(report.metrics.response_status_counts.get(&200), Some(&1));
+    assert_eq!(report.metrics.response_status_counts.get(&429), Some(&1));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mirrors_bodyless_http1_request_without_affecting_primary_response(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (primary_upstream_addr, primary_capture_rx) = spawn_single_capture_upstream().await?;
+    let (shadow_upstream_addr, shadow_capture_rx) = spawn_single_capture_upstream().await?;
+    let primary_pool = route_backend_pool(
+        "frontend-primary",
+        vec![("primary-a", primary_upstream_addr, 1, None, None)],
+        EndpointHealthPolicy::default(),
+        UpstreamSelectionPolicy {
+            algorithm: LoadBalancingAlgorithm::RoundRobin,
+            locality: LocalityRoutingPolicy::Disabled,
+            no_healthy_fallback: NoHealthyFallback::Fail,
+            affinity: None,
+        },
+    )?;
+    let shadow_pool = route_backend_pool(
+        "frontend-shadow",
+        vec![("shadow-a", shadow_upstream_addr, 1, None, None)],
+        EndpointHealthPolicy::default(),
+        UpstreamSelectionPolicy {
+            algorithm: LoadBalancingAlgorithm::RoundRobin,
+            locality: LocalityRoutingPolicy::Disabled,
+            no_healthy_fallback: NoHealthyFallback::Fail,
+            affinity: None,
+        },
+    )?;
+
+    let mut config = proxy_config(primary_upstream_addr)
+        .with_route_backend_pools([(String::from("api"), primary_pool)])
+        .with_mirror_backend_pools([(String::from("frontend-shadow"), shadow_pool)])
+        .with_route_destination_policies([(String::from("api"), std::collections::BTreeMap::from([(
+            String::from("frontend-primary"),
+            RouteDestinationPolicyRuntime {
+                request_transform: None,
+                response_transform: None,
+                traffic_mirror: Some(TrafficMirrorPolicyConfig {
+                    percentage: 100,
+                    target_upstream_cluster: String::from("frontend-shadow"),
+                }),
+                fault_injection: None,
+                rate_limiters: Vec::new(),
+                concurrency_limiters: Vec::new(),
+                failure_manager: None,
+                enforce_retry_budget: false,
+                enforce_timeout_hierarchy: false,
+                enforce_circuit_breaker: false,
+            },
+        )]))]);
+    config.routes = vec![lb_proto_http::RoutePrefixRule::new("api", "/api")];
+
+    let (proxy_addr, report_rx) = spawn_one_shot_http1_proxy_listener(config).await?;
+    let mut client = TcpStream::connect(proxy_addr).await?;
+    client
+        .write_all(b"GET /api/orders HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n")
+        .await?;
+    let response = read_http_response(&mut client).await?;
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+    drop(client);
+
+    let primary_capture = receive_capture(primary_capture_rx).await?;
+    let shadow_capture = receive_capture(shadow_capture_rx).await?;
+    assert!(primary_capture.head.contains("GET /api/orders HTTP/1.1\r\n"));
+    assert!(shadow_capture.head.contains("GET /api/orders HTTP/1.1\r\n"));
+
+    let report = receive_proxy_result(report_rx).await?;
+    assert_eq!(report.metrics.request_count, 1);
+    assert_eq!(report.metrics.mirror_dispatch_count, 1);
+    assert_eq!(report.metrics.mirror_skip_count, 0);
+    assert_eq!(report.metrics.mirror_dispatch_failure_count, 0);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delays_http1_request_before_primary_upstream_dispatch(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (upstream_addr, capture_rx) = spawn_single_capture_upstream().await?;
+    let primary_pool = route_backend_pool(
+        "frontend-primary",
+        vec![("primary-a", upstream_addr, 1, None, None)],
+        EndpointHealthPolicy::default(),
+        UpstreamSelectionPolicy {
+            algorithm: LoadBalancingAlgorithm::RoundRobin,
+            locality: LocalityRoutingPolicy::Disabled,
+            no_healthy_fallback: NoHealthyFallback::Fail,
+            affinity: None,
+        },
+    )?;
+
+    let mut config = proxy_config(upstream_addr)
+        .with_route_backend_pools([(String::from("api"), primary_pool)])
+        .with_route_destination_policies([(String::from("api"), std::collections::BTreeMap::from([(
+            String::from("frontend-primary"),
+            RouteDestinationPolicyRuntime {
+                request_transform: None,
+                response_transform: None,
+                traffic_mirror: None,
+                fault_injection: Some(FaultInjectionPolicyConfig {
+                    delay: Some(FaultInjectionDelayConfig {
+                        percentage: 100,
+                        fixed_delay_ms: 60,
+                    }),
+                    abort: None,
+                }),
+                rate_limiters: Vec::new(),
+                concurrency_limiters: Vec::new(),
+                failure_manager: None,
+                enforce_retry_budget: false,
+                enforce_timeout_hierarchy: false,
+                enforce_circuit_breaker: false,
+            },
+        )]))]);
+    config.routes = vec![lb_proto_http::RoutePrefixRule::new("api", "/api")];
+
+    let (proxy_addr, report_rx) = spawn_one_shot_http1_proxy_listener(config).await?;
+    let mut client = TcpStream::connect(proxy_addr).await?;
+    let started = time::Instant::now();
+    client
+        .write_all(b"GET /api/orders HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n")
+        .await?;
+    let response = read_http_response(&mut client).await?;
+    let elapsed = started.elapsed();
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+    assert!(elapsed >= Duration::from_millis(40), "elapsed={elapsed:?}");
+    drop(client);
+
+    let capture = receive_capture(capture_rx).await?;
+    assert!(capture.head.contains("GET /api/orders HTTP/1.1\r\n"));
+
+    let report = receive_proxy_result(report_rx).await?;
+    assert_eq!(report.metrics.request_count, 1);
+    assert_eq!(report.metrics.fault_injection_delay_count, 1);
+    assert_eq!(report.metrics.fault_injection_abort_count, 0);
+    assert_eq!(report.metrics.response_status_counts.get(&200), Some(&1));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn aborts_http1_request_locally_without_contacting_primary_upstream(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (upstream_addr, capture_rx) = spawn_single_capture_upstream().await?;
+    let primary_pool = route_backend_pool(
+        "frontend-primary",
+        vec![("primary-a", upstream_addr, 1, None, None)],
+        EndpointHealthPolicy::default(),
+        UpstreamSelectionPolicy {
+            algorithm: LoadBalancingAlgorithm::RoundRobin,
+            locality: LocalityRoutingPolicy::Disabled,
+            no_healthy_fallback: NoHealthyFallback::Fail,
+            affinity: None,
+        },
+    )?;
+
+    let mut config = proxy_config(upstream_addr)
+        .with_route_backend_pools([(String::from("api"), primary_pool)])
+        .with_route_destination_policies([(String::from("api"), std::collections::BTreeMap::from([(
+            String::from("frontend-primary"),
+            RouteDestinationPolicyRuntime {
+                request_transform: None,
+                response_transform: None,
+                traffic_mirror: None,
+                fault_injection: Some(FaultInjectionPolicyConfig {
+                    delay: None,
+                    abort: Some(FaultInjectionAbortConfig {
+                        percentage: 100,
+                        http_status: 503,
+                    }),
+                }),
+                rate_limiters: Vec::new(),
+                concurrency_limiters: Vec::new(),
+                failure_manager: None,
+                enforce_retry_budget: false,
+                enforce_timeout_hierarchy: false,
+                enforce_circuit_breaker: false,
+            },
+        )]))]);
+    config.routes = vec![lb_proto_http::RoutePrefixRule::new("api", "/api")];
+
+    let (proxy_addr, report_rx) = spawn_one_shot_http1_proxy_listener(config).await?;
+    let mut client = TcpStream::connect(proxy_addr).await?;
+    client
+        .write_all(b"GET /api/orders HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n")
+        .await?;
+    let response = read_http_response(&mut client).await?;
+    assert!(response.starts_with("HTTP/1.1 503"));
+    drop(client);
+
+    assert!(time::timeout(Duration::from_millis(100), capture_rx).await.is_err());
+
+    let report = receive_proxy_result(report_rx).await?;
+    assert_eq!(report.metrics.request_count, 1);
+    assert_eq!(report.metrics.fault_injection_delay_count, 0);
+    assert_eq!(report.metrics.fault_injection_abort_count, 1);
+    assert_eq!(report.metrics.response_status_counts.get(&503), Some(&1));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxies_allowed_websocket_upgrade_and_relays_tunnel_bytes(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (upstream_addr, capture_rx) = spawn_websocket_upgrade_upstream().await?;
+    let telemetry = Arc::new(RuntimeTelemetry::new()?);
+    let mut config = proxy_config(upstream_addr).with_upgrade_policies(
+        Vec::<UpgradeProtocolConfig>::new(),
+        [(String::from("ws"), vec![UpgradeProtocolConfig::Websocket])],
+    );
+    config = config.with_upgrade_telemetry("public-http", Arc::clone(&telemetry));
+    config.routes = vec![lb_proto_http::RoutePrefixRule::new("ws", "/ws")];
+    let (proxy_addr, report_rx) = spawn_one_shot_http1_proxy_listener(config).await?;
+
+    let mut client = TcpStream::connect(proxy_addr).await?;
+    client
+        .write_all(
+            b"GET /ws/chat HTTP/1.1\r\nHost: example.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: test-key\r\nSec-WebSocket-Version: 13\r\n\r\n",
+        )
+        .await?;
+
+    let response_head = read_http_head(&mut client).await?;
+    assert!(response_head.starts_with("HTTP/1.1 101 Switching Protocols\r\n"));
+    assert!(response_head.to_ascii_lowercase().contains("connection: upgrade\r\n"));
+    assert!(response_head.to_ascii_lowercase().contains("upgrade: websocket\r\n"));
+
+    client.write_all(b"ping").await?;
+    let mut tunnel_reply = [0_u8; 4];
+    client.read_exact(&mut tunnel_reply).await?;
+    assert_eq!(&tunnel_reply, b"pong");
+    drop(client);
+
+    let capture = receive_upgrade_capture(capture_rx).await?;
+    assert!(capture.head.contains("GET /ws/chat HTTP/1.1\r\n"));
+    assert!(capture.head.to_ascii_lowercase().contains("connection: upgrade\r\n"));
+    assert!(capture.head.to_ascii_lowercase().contains("upgrade: websocket\r\n"));
+    assert_eq!(capture.tunnel_payload, b"ping");
+
+    let report = receive_proxy_result(report_rx).await?;
+    assert_eq!(report.metrics.request_count, 1);
+    assert_eq!(report.metrics.response_status_counts.get(&101), Some(&1));
+    let metrics = telemetry.export_metrics();
+    assert!(metrics.contains(
+        "runtime_http_upgrades_total{scope=\"public-http\",result=\"accepted\",reason=\"websocket\"} 1"
+    ));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rejects_websocket_upgrade_when_route_policy_does_not_allow_it(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let upstream_addr = reserve_unused_addr().await?;
+    let telemetry = Arc::new(RuntimeTelemetry::new()?);
+    let mut config = proxy_config(upstream_addr).with_upgrade_telemetry(
+        "public-http",
+        Arc::clone(&telemetry),
+    );
+    config.timeouts.connect_timeout = Duration::from_millis(50);
+    config.routes = vec![lb_proto_http::RoutePrefixRule::new("ws", "/ws")];
+    let (proxy_addr, report_rx) = spawn_one_shot_http1_proxy_listener(config).await?;
+
+    let mut client = TcpStream::connect(proxy_addr).await?;
+    client
+        .write_all(
+            b"GET /ws/chat HTTP/1.1\r\nHost: example.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: test-key\r\nSec-WebSocket-Version: 13\r\n\r\n",
+        )
+        .await?;
+
+    let response = read_http_response(&mut client).await?;
+    assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+    assert!(response.ends_with("upgrade not allowed for the selected route\n"));
+
+    let report = receive_proxy_result(report_rx).await?;
+    assert_eq!(report.metrics.request_count, 1);
+    assert_eq!(report.metrics.response_status_counts.get(&400), Some(&1));
+    let metrics = telemetry.export_metrics();
+    assert!(metrics.contains(
+        "runtime_http_upgrades_total{scope=\"public-http\",result=\"rejected\",reason=\"policy_denied\"} 1"
+    ));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rejects_malformed_websocket_upgrade_without_upgrade_header(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let upstream_addr = reserve_unused_addr().await?;
+    let mut config = proxy_config(upstream_addr).with_upgrade_policies(
+        vec![UpgradeProtocolConfig::Websocket],
+        Vec::<(String, Vec<UpgradeProtocolConfig>)>::new(),
+    );
+    config.timeouts.connect_timeout = Duration::from_millis(50);
+    let (proxy_addr, report_rx) = spawn_one_shot_http1_proxy_listener(config).await?;
+
+    let mut client = TcpStream::connect(proxy_addr).await?;
+    client
+        .write_all(
+            b"GET /ws/chat HTTP/1.1\r\nHost: example.test\r\nConnection: Upgrade\r\nSec-WebSocket-Key: test-key\r\nSec-WebSocket-Version: 13\r\n\r\n",
+        )
+        .await?;
+
+    let response = read_http_response(&mut client).await?;
+    assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+    assert!(response.ends_with("malformed upgrade request: missing Upgrade header\n"));
+
+    let report = receive_proxy_result(report_rx).await?;
+    assert_eq!(report.metrics.response_status_counts.get(&400), Some(&1));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rejects_unsupported_http1_upgrade_protocol(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let upstream_addr = reserve_unused_addr().await?;
+    let mut config = proxy_config(upstream_addr).with_upgrade_policies(
+        vec![UpgradeProtocolConfig::Websocket],
+        Vec::<(String, Vec<UpgradeProtocolConfig>)>::new(),
+    );
+    config.timeouts.connect_timeout = Duration::from_millis(50);
+    let (proxy_addr, report_rx) = spawn_one_shot_http1_proxy_listener(config).await?;
+
+    let mut client = TcpStream::connect(proxy_addr).await?;
+    client
+        .write_all(
+            b"GET /ws/chat HTTP/1.1\r\nHost: example.test\r\nConnection: Upgrade\r\nUpgrade: h2c\r\n\r\n",
+        )
+        .await?;
+
+    let response = read_http_response(&mut client).await?;
+    assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+    assert!(response.ends_with("unsupported upgrade protocol\n"));
+
+    let report = receive_proxy_result(report_rx).await?;
+    assert_eq!(report.metrics.response_status_counts.get(&400), Some(&1));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rejects_websocket_upgrade_when_request_includes_body(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let upstream_addr = reserve_unused_addr().await?;
+    let telemetry = Arc::new(RuntimeTelemetry::new()?);
+    let mut config = proxy_config(upstream_addr)
+        .with_upgrade_policies(
+            vec![UpgradeProtocolConfig::Websocket],
+            Vec::<(String, Vec<UpgradeProtocolConfig>)>::new(),
+        )
+        .with_upgrade_telemetry("public-http", Arc::clone(&telemetry));
+    config.timeouts.connect_timeout = Duration::from_millis(50);
+    let (proxy_addr, report_rx) = spawn_one_shot_http1_proxy_listener(config).await?;
+
+    let mut client = TcpStream::connect(proxy_addr).await?;
+    client
+        .write_all(
+            b"GET /ws/chat HTTP/1.1\r\nHost: example.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nContent-Length: 4\r\n\r\nping",
+        )
+        .await?;
+
+    let response = read_http_response(&mut client).await?;
+    assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+    assert!(response.ends_with("websocket upgrade requests must not include a body\n"));
+
+    let report = receive_proxy_result(report_rx).await?;
+    assert_eq!(report.metrics.response_status_counts.get(&400), Some(&1));
+    let metrics = telemetry.export_metrics();
+    assert!(metrics.contains(
+        "runtime_http_upgrades_total{scope=\"public-http\",result=\"rejected\",reason=\"body_not_allowed\"} 1"
+    ));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relays_upstream_upgrade_refusal_and_records_failed_upgrade(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (upstream_addr, capture_rx) = spawn_upgrade_refusal_upstream().await?;
+    let telemetry = Arc::new(RuntimeTelemetry::new()?);
+    let mut config = proxy_config(upstream_addr)
+        .with_upgrade_policies(
+            Vec::<UpgradeProtocolConfig>::new(),
+            [(String::from("ws"), vec![UpgradeProtocolConfig::Websocket])],
+        )
+        .with_upgrade_telemetry("public-http", Arc::clone(&telemetry));
+    config.routes = vec![lb_proto_http::RoutePrefixRule::new("ws", "/ws")];
+    let (proxy_addr, report_rx) = spawn_one_shot_http1_proxy_listener(config).await?;
+
+    let mut client = TcpStream::connect(proxy_addr).await?;
+    client
+        .write_all(
+            b"GET /ws/chat HTTP/1.1\r\nHost: example.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: test-key\r\nSec-WebSocket-Version: 13\r\n\r\n",
+        )
+        .await?;
+
+    let response = read_http_response(&mut client).await?;
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+    assert!(response.ends_with("nope"));
+    drop(client);
+
+    let capture = receive_capture(capture_rx).await?;
+    assert!(capture.head.contains("GET /ws/chat HTTP/1.1\r\n"));
+
+    let report = receive_proxy_result(report_rx).await?;
+    assert_eq!(report.metrics.request_count, 1);
+    assert_eq!(report.metrics.response_status_counts.get(&200), Some(&1));
+    let metrics = telemetry.export_metrics();
+    assert!(metrics.contains(
+        "runtime_http_upgrades_total{scope=\"public-http\",result=\"failed\",reason=\"upstream_refused\"} 1"
+    ));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn destination_circuit_breaker_rejects_http1_request_after_connect_failure(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let upstream_addr = reserve_unused_addr().await?;
+    let pool = route_backend_pool(
+        "frontend-primary",
+        vec![("primary-a", upstream_addr, 1, None, None)],
+        EndpointHealthPolicy::default(),
+        UpstreamSelectionPolicy {
+            algorithm: LoadBalancingAlgorithm::RoundRobin,
+            locality: LocalityRoutingPolicy::Disabled,
+            no_healthy_fallback: NoHealthyFallback::Fail,
+            affinity: None,
+        },
+    )?;
+    let failure_manager = Arc::new(FailureManager::new(
+        RetryBudgetPolicy::default(),
+        TimeoutHierarchy {
+            request_timeout: Duration::from_secs(2),
+            attempt_timeout: Duration::from_secs(2),
+            connect_timeout: Duration::from_millis(100),
+            idle_timeout: Duration::from_secs(2),
+        },
+        CircuitBreakerPolicy {
+            open_failure_threshold: 1,
+            open_duration: Duration::from_secs(60),
+            half_open_success_threshold: 1,
+        },
+    )?);
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO);
+    failure_manager.record_failure(now, lb_runtime::UpstreamFailureClass::Connect);
+
+    let mut config = proxy_config(upstream_addr)
+        .with_route_backend_pools([(String::from("api"), pool)])
+        .with_route_destination_policies([(String::from("api"), std::collections::BTreeMap::from([(
+            String::from("frontend-primary"),
+            RouteDestinationPolicyRuntime {
+                request_transform: None,
+                response_transform: None,
+                traffic_mirror: None,
+                fault_injection: None,
+                rate_limiters: Vec::new(),
+                concurrency_limiters: Vec::new(),
+                failure_manager: Some(failure_manager.clone()),
+                enforce_retry_budget: false,
+                enforce_timeout_hierarchy: false,
+                enforce_circuit_breaker: true,
+            },
+        )]))]);
+    config.routes = vec![lb_proto_http::RoutePrefixRule::new("api", "/")];
+
+    let (proxy_addr, report_rx) = spawn_one_shot_http1_proxy_listener(config).await?;
+
+    let mut client = TcpStream::connect(proxy_addr).await?;
+    client
+        .write_all(b"GET /blocked HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n")
+        .await?;
+    let response = read_http_response(&mut client).await?;
+    assert!(response.starts_with("HTTP/1.1 503"));
+    drop(client);
+
+    let report = receive_proxy_result(report_rx).await?;
+    assert_eq!(report.metrics.request_count, 1);
+    assert_eq!(report.metrics.response_status_counts.get(&503), Some(&1));
+
+    let metrics = failure_manager.metrics();
+    assert_eq!(metrics.breaker_open_rejection_count, 1);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rejects_malformed_101_upgrade_response_and_records_failed_upgrade(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let upstream_addr = spawn_malformed_websocket_upgrade_upstream().await?;
+    let telemetry = Arc::new(RuntimeTelemetry::new()?);
+    let mut config = proxy_config(upstream_addr)
+        .with_upgrade_policies(
+            Vec::<UpgradeProtocolConfig>::new(),
+            [(String::from("ws"), vec![UpgradeProtocolConfig::Websocket])],
+        )
+        .with_upgrade_telemetry("public-http", Arc::clone(&telemetry));
+    config.routes = vec![lb_proto_http::RoutePrefixRule::new("ws", "/ws")];
+    let (proxy_addr, report_rx) = spawn_one_shot_http1_proxy_listener(config).await?;
+
+    let mut client = TcpStream::connect(proxy_addr).await?;
+    client
+        .write_all(
+            b"GET /ws/chat HTTP/1.1\r\nHost: example.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: test-key\r\nSec-WebSocket-Version: 13\r\n\r\n",
+        )
+        .await?;
+
+    match receive_proxy_result(report_rx).await {
+        Err(Http1ProxyError::ParseResponse(lb_proto_http::Http1ParseError::Invalid(message))) => {
+            assert_eq!(message, "invalid upgrade response headers");
+        }
+        other => panic!("unexpected proxy result: {other:?}"),
+    }
+    let metrics = telemetry.export_metrics();
+    assert!(metrics.contains(
+        "runtime_http_upgrades_total{scope=\"public-http\",result=\"failed\",reason=\"malformed_101\"} 1"
+    ));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn times_out_idle_upgraded_tunnel_and_records_failed_upgrade(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let upstream_addr = spawn_idle_websocket_upgrade_upstream().await?;
+    let telemetry = Arc::new(RuntimeTelemetry::new()?);
+    let mut config = proxy_config(upstream_addr)
+        .with_upgrade_policies(
+            Vec::<UpgradeProtocolConfig>::new(),
+            [(String::from("ws"), vec![UpgradeProtocolConfig::Websocket])],
+        )
+        .with_upgrade_telemetry("public-http", Arc::clone(&telemetry));
+    config.routes = vec![lb_proto_http::RoutePrefixRule::new("ws", "/ws")];
+    config.timeouts.idle_timeout = Duration::from_millis(100);
+    let (proxy_addr, report_rx) = spawn_one_shot_http1_proxy_listener(config).await?;
+
+    let mut client = TcpStream::connect(proxy_addr).await?;
+    client
+        .write_all(
+            b"GET /ws/chat HTTP/1.1\r\nHost: example.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: test-key\r\nSec-WebSocket-Version: 13\r\n\r\n",
+        )
+        .await?;
+
+    let response_head = read_http_head(&mut client).await?;
+    assert!(response_head.starts_with("HTTP/1.1 101 Switching Protocols\r\n"));
+
+    match receive_proxy_result(report_rx).await {
+        Err(Http1ProxyError::IdleTimeout("upgrade tunnel")) => {}
+        other => panic!("unexpected proxy result: {other:?}"),
+    }
+    let metrics = telemetry.export_metrics();
+    assert!(metrics.contains(
+        "runtime_http_upgrades_total{scope=\"public-http\",result=\"accepted\",reason=\"websocket\"} 1"
+    ));
+    assert!(metrics.contains(
+        "runtime_http_upgrades_total{scope=\"public-http\",result=\"failed\",reason=\"tunnel_idle_timeout\"} 1"
+    ));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn applies_response_transforms_to_live_and_cached_http1_responses(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let shared_store = Arc::new(HttpCacheStore::new(HttpCacheStoreConfig {
+        max_entries: 16,
+        max_bytes: 64 * 1024,
+        max_object_bytes: 16 * 1024,
+    })?);
+    let policy = HttpCachePolicyConfig {
+        cache_key: CacheKeyPolicyConfig {
+            include_host: true,
+            include_method: true,
+            ..CacheKeyPolicyConfig::default()
+        },
+        ..HttpCachePolicyConfig::default()
+    };
+
+    let (upstream_addr, capture_rx) = spawn_transformable_cacheable_upstream().await?;
+    let mut first_config = proxy_config(upstream_addr)
+        .with_response_cache(Http1ResponseCacheConfig::new(policy.clone(), Arc::clone(&shared_store)))
+        .with_response_transforms(
+            Some(ResponseTransformConfig {
+                header_mutations: vec![HeaderMutationConfig::Set {
+                    name: String::from("x-listener-response"),
+                    value: String::from("demo"),
+                }],
+            }),
+            [(String::from("api"), ResponseTransformConfig {
+                header_mutations: vec![
+                    HeaderMutationConfig::Set {
+                        name: String::from("x-route-response"),
+                        value: String::from("api"),
+                    },
+                    HeaderMutationConfig::Remove {
+                        name: String::from("x-remove-me"),
+                    },
+                ],
+            })],
+        );
+    first_config.routes = vec![lb_proto_http::RoutePrefixRule::new("api", "/cacheable")];
+    let (first_proxy_addr, first_report_rx) =
+        spawn_one_shot_http1_proxy_listener(first_config).await?;
+
+    let mut first_client = TcpStream::connect(first_proxy_addr).await?;
+    first_client
+        .write_all(b"GET /cacheable HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n")
+        .await?;
+    let first_response = read_http_response(&mut first_client).await?;
+    assert!(first_response.ends_with("cached"));
+    assert!(first_response.contains("x-origin: true\r\n"));
+    assert!(first_response.contains("x-listener-response: demo\r\n"));
+    assert!(first_response.contains("x-route-response: api\r\n"));
+    assert!(!first_response.contains("x-remove-me:"));
+    drop(first_client);
+
+    let first_report = receive_proxy_result(first_report_rx).await?;
+    assert_eq!(first_report.metrics.cache_miss_count, 1);
+    assert_eq!(first_report.metrics.cache_fill_count, 1);
+    assert_eq!(receive_capture_list(capture_rx).await?.len(), 1);
+
+    let unused_upstream = reserve_unused_addr().await?;
+    let mut second_config = proxy_config(unused_upstream)
+        .with_response_cache(Http1ResponseCacheConfig::new(policy, Arc::clone(&shared_store)))
+        .with_response_transforms(
+            Some(ResponseTransformConfig {
+                header_mutations: vec![HeaderMutationConfig::Set {
+                    name: String::from("x-listener-response"),
+                    value: String::from("demo"),
+                }],
+            }),
+            [(String::from("api"), ResponseTransformConfig {
+                header_mutations: vec![
+                    HeaderMutationConfig::Set {
+                        name: String::from("x-route-response"),
+                        value: String::from("api"),
+                    },
+                    HeaderMutationConfig::Remove {
+                        name: String::from("x-remove-me"),
+                    },
+                ],
+            })],
+        );
+    second_config.routes = vec![lb_proto_http::RoutePrefixRule::new("api", "/cacheable")];
+    let (second_proxy_addr, second_report_rx) =
+        spawn_one_shot_http1_proxy_listener(second_config).await?;
+
+    let mut second_client = TcpStream::connect(second_proxy_addr).await?;
+    second_client
+        .write_all(b"GET /cacheable HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n")
+        .await?;
+    let second_response = read_http_response(&mut second_client).await?;
+    assert!(second_response.ends_with("cached"));
+    assert!(second_response.contains("x-origin: true\r\n"));
+    assert!(second_response.contains("x-listener-response: demo\r\n"));
+    assert!(second_response.contains("x-route-response: api\r\n"));
+    assert!(!second_response.contains("x-remove-me:"));
+    drop(second_client);
+
+    let second_report = receive_proxy_result(second_report_rx).await?;
+    assert_eq!(second_report.metrics.cache_hit_count, 1);
+    assert_eq!(second_report.metrics.cache_miss_count, 0);
+    Ok(())
+}
+
 async fn spawn_not_modified_revalidation_upstream(
 ) -> io::Result<(SocketAddr, oneshot::Receiver<Vec<RequestCapture>>)> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -222,6 +1033,52 @@ async fn spawn_short_ttl_not_modified_revalidation_upstream(
     });
 
     Ok((address, captures_rx))
+}
+
+async fn spawn_single_capture_upstream(
+) -> io::Result<(SocketAddr, oneshot::Receiver<RequestCapture>)> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let (capture_tx, capture_rx) = oneshot::channel();
+
+    tokio::spawn(async move {
+        if let Ok((mut stream, _)) = listener.accept().await {
+            if let Ok(capture) = read_http_request_capture(&mut stream).await {
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nok",
+                    )
+                    .await;
+                let _ = capture_tx.send(capture);
+            }
+        }
+    });
+
+    Ok((address, capture_rx))
+}
+
+async fn spawn_keep_alive_single_capture_upstream(
+) -> io::Result<(SocketAddr, oneshot::Receiver<RequestCapture>)> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let (capture_tx, capture_rx) = oneshot::channel();
+
+    tokio::spawn(async move {
+        if let Ok((mut stream, _)) = listener.accept().await {
+            if let Ok(capture) = read_http_request_capture(&mut stream).await {
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 2\r\n\r\nok",
+                    )
+                    .await;
+                let _ = capture_tx.send(capture);
+                let mut buffer = [0_u8; 128];
+                let _ = stream.read(&mut buffer).await;
+            }
+        }
+    });
+
+    Ok((address, capture_rx))
 }
 
 async fn spawn_revalidation_replacement_upstream(
@@ -392,6 +1249,79 @@ async fn unmatched_host_filtered_routes_return_local_forbidden(
     let report = receive_proxy_result(report_rx).await?;
     assert_eq!(report.metrics.request_count, 1);
     assert_eq!(report.metrics.response_status_counts.get(&403), Some(&1));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http1_routes_can_filter_by_method() -> Result<(), Box<dyn std::error::Error>> {
+    let (api_upstream_addr, api_capture_rx) = spawn_tagged_upstream("api-route").await?;
+    let mut config = proxy_config(api_upstream_addr)
+        .with_route_upstreams([Http1RouteUpstream {
+            route_label: String::from("writes"),
+            upstream: UpstreamTarget::new("writes-upstream", api_upstream_addr),
+        }])
+        .rejecting_unmatched_routes();
+    config.routes = vec![lb_proto_http::RoutePrefixRule::new("writes", "/api")
+        .with_methods(vec![String::from("POST")])];
+    let (proxy_addr, report_rx) = spawn_one_shot_http1_proxy_listener(config).await?;
+
+    let mut client = TcpStream::connect(proxy_addr).await?;
+    client
+        .write_all(b"POST /api HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
+        .await?;
+    let response = read_http_response(&mut client).await?;
+    assert!(response.ends_with("api-route"));
+    drop(client);
+
+    let capture = receive_capture(api_capture_rx).await?;
+    assert!(capture.head.contains("POST /api HTTP/1.1\r\n"));
+
+    let report = receive_proxy_result(report_rx).await?;
+    assert_eq!(report.metrics.request_count, 1);
+    assert_eq!(report.metrics.response_status_counts.get(&200), Some(&1));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http1_routes_can_filter_by_header_query_content_type_and_source(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (api_upstream_addr, api_capture_rx) = spawn_tagged_upstream("api-route").await?;
+    let mut config = proxy_config(api_upstream_addr)
+        .with_route_upstreams([Http1RouteUpstream {
+            route_label: String::from("target"),
+            upstream: UpstreamTarget::new("target-upstream", api_upstream_addr),
+        }])
+        .with_trusted_client_ip(TrustedClientIpPolicy {
+            enabled: true,
+            trusted_proxy_cidrs: vec!["127.0.0.0/8".parse()?],
+        })
+        .rejecting_unmatched_routes();
+    config.routes = vec![lb_proto_http::RoutePrefixRule::new("target", "/api")
+        .with_methods(vec![String::from("POST")])
+        .with_header_matches(vec![lb_proto_http::RouteHeaderMatch::Exact {
+            name: String::from("x-tenant"),
+            value: String::from("beta"),
+        }])
+        .with_query_matches(vec![lb_proto_http::RouteQueryMatch::Exact {
+            name: String::from("auth"),
+            value: String::from("user"),
+        }])
+        .with_content_types(vec![String::from("application/json")])
+        .with_source_cidrs(vec!["198.51.100.0/24".parse()?])];
+    let (proxy_addr, report_rx) = spawn_one_shot_http1_proxy_listener(config).await?;
+
+    let mut client = TcpStream::connect(proxy_addr).await?;
+    client.write_all(b"POST /api?auth=user HTTP/1.1\r\nHost: example.test\r\nContent-Type: application/json; charset=utf-8\r\nX-Tenant: beta\r\nX-Forwarded-For: 198.51.100.7\r\nConnection: close\r\nContent-Length: 0\r\n\r\n").await?;
+    let response = read_http_response(&mut client).await?;
+    assert!(response.ends_with("api-route"));
+    drop(client);
+
+    let capture = receive_capture(api_capture_rx).await?;
+    assert!(capture.head.contains("POST /api?auth=user HTTP/1.1\r\n"));
+
+    let report = receive_proxy_result(report_rx).await?;
+    assert_eq!(report.metrics.request_count, 1);
+    assert_eq!(report.metrics.response_status_counts.get(&200), Some(&1));
     Ok(())
 }
 
@@ -617,6 +1547,127 @@ async fn route_backend_pool_honors_http1_cookie_affinity() -> Result<(), Box<dyn
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn weighted_route_backend_pool_splits_http1_requests_across_route_destinations(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (stable_upstream, stable_capture_rx) = spawn_multi_tagged_upstream("stable-route", 9).await?;
+    let (canary_upstream, canary_capture_rx) = spawn_multi_tagged_upstream("canary-route", 1).await?;
+    let stable_pool = route_backend_pool(
+        "stable",
+        vec![("stable-a", stable_upstream, 1, None, None)],
+        EndpointHealthPolicy::default(),
+        UpstreamSelectionPolicy::default(),
+    )?;
+    let canary_pool = route_backend_pool(
+        "canary",
+        vec![("canary-a", canary_upstream, 1, None, None)],
+        EndpointHealthPolicy::default(),
+        UpstreamSelectionPolicy::default(),
+    )?;
+    let weighted_pool = RouteBackendPool::from_weighted_destinations([
+        WeightedRouteDestination { weight: 90, pool: stable_pool },
+        WeightedRouteDestination { weight: 10, pool: canary_pool },
+    ])?;
+
+    let mut config = proxy_config(stable_upstream)
+        .with_route_backend_pools([(String::from("api"), weighted_pool)]);
+    config.routes = vec![lb_proto_http::RoutePrefixRule::new("api", "/api")];
+
+    for _ in 0..10 {
+        let (proxy_addr, report_rx) = spawn_one_shot_http1_proxy_listener(config.clone()).await?;
+        let mut client = TcpStream::connect(proxy_addr).await?;
+        client
+            .write_all(b"GET /api HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n")
+            .await?;
+        let response = read_http_response(&mut client).await?;
+        assert!(response.ends_with("stable-route") || response.ends_with("canary-route"));
+        let report = receive_proxy_result(report_rx).await?;
+        assert_eq!(report.metrics.response_status_counts.get(&200), Some(&1));
+    }
+
+    let selection_metrics = config
+        .route_backend_pools
+        .get("api")
+        .expect("api weighted pool")
+        .selection_metrics();
+    assert_eq!(selection_metrics.weighted_route_selection_count, 10);
+    assert_eq!(selection_metrics.route_destination_fallback_count, 0);
+    assert_eq!(
+        selection_metrics.route_destination_selection_counts.get("stable"),
+        Some(&9)
+    );
+    assert_eq!(
+        selection_metrics.route_destination_selection_counts.get("canary"),
+        Some(&1)
+    );
+
+    let stable_captures = receive_capture_list(stable_capture_rx).await?;
+    let canary_captures = receive_capture_list(canary_capture_rx).await?;
+    assert_eq!(stable_captures.len(), 9);
+    assert_eq!(canary_captures.len(), 1);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn weighted_route_backend_pool_reports_http1_destination_fallback_metrics(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (stable_upstream, stable_capture_rx) =
+        spawn_tagged_upstream("stable-fallback-route").await?;
+    let canary_upstream = reserve_unused_addr().await?;
+    let stable_pool = route_backend_pool(
+        "stable",
+        vec![("stable-a", stable_upstream, 1, None, None)],
+        EndpointHealthPolicy::default(),
+        UpstreamSelectionPolicy::default(),
+    )?;
+    let canary_pool = route_backend_pool(
+        "canary",
+        vec![("canary-a", canary_upstream, 1, None, None)],
+        EndpointHealthPolicy {
+            degraded_failure_threshold: 1,
+            unhealthy_failure_threshold: 1,
+            ejection_failure_threshold: 1,
+            recovery_success_threshold: 1,
+            ejection_duration: Duration::from_secs(30),
+            warmup_duration: Duration::ZERO,
+        },
+        UpstreamSelectionPolicy::default(),
+    )?;
+    let canary_endpoint_id = canary_pool.active_probe_targets()?[0].endpoint_id.clone();
+    canary_pool.note_active_failure(&canary_endpoint_id)?;
+    let weighted_pool = RouteBackendPool::from_weighted_destinations([
+        WeightedRouteDestination { weight: 100, pool: canary_pool },
+        WeightedRouteDestination { weight: 1, pool: stable_pool },
+    ])?;
+
+    let mut config = proxy_config(stable_upstream)
+        .with_route_backend_pools([(String::from("api"), weighted_pool)]);
+    config.routes = vec![lb_proto_http::RoutePrefixRule::new("api", "/api")];
+
+    let (proxy_addr, report_rx) = spawn_one_shot_http1_proxy_listener(config).await?;
+    let mut client = TcpStream::connect(proxy_addr).await?;
+    client
+        .write_all(b"GET /api HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n")
+        .await?;
+    let response = read_http_response(&mut client).await?;
+    assert!(response.ends_with("stable-fallback-route"));
+
+    let report = receive_proxy_result(report_rx).await?;
+    assert_eq!(report.metrics.response_status_counts.get(&200), Some(&1));
+    let selection_metrics = report
+        .route_selection_metrics
+        .expect("route selection metrics should be present");
+    assert_eq!(selection_metrics.weighted_route_selection_count, 1);
+    assert_eq!(selection_metrics.route_destination_fallback_count, 1);
+    assert_eq!(
+        selection_metrics.route_destination_selection_counts.get("stable"),
+        Some(&1)
+    );
+    let capture = receive_capture(stable_capture_rx).await?;
+    assert!(capture.head.contains("GET /api HTTP/1.1\r\n"));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn route_backend_pool_include_unhealthy_fallback_keeps_http1_backend_reachable(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (upstream_addr, capture_rx) = spawn_tagged_upstream("fallback-route").await?;
@@ -776,6 +1827,7 @@ async fn trusted_proxy_uses_forwarded_client_ip_for_filters(
     assert!(response.ends_with("anonymous source blocked\n"));
 
     let report = receive_proxy_result(report_rx).await?;
+    assert_eq!(report.metrics.request_count, 1);
     assert_eq!(report.metrics.response_status_counts.get(&403), Some(&1));
     Ok(())
 }
@@ -1798,6 +2850,30 @@ async fn spawn_revalidation_seed_upstream(
     Ok((address, captures_rx))
 }
 
+async fn spawn_transformable_cacheable_upstream(
+) -> io::Result<(SocketAddr, oneshot::Receiver<Vec<RequestCapture>>)> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let (captures_tx, captures_rx) = oneshot::channel();
+
+    tokio::spawn(async move {
+        let mut captures = Vec::new();
+        if let Ok((mut stream, _)) = listener.accept().await {
+            if let Ok(capture) = read_http_request_capture(&mut stream).await {
+                captures.push(capture);
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\nCache-Control: max-age=5\r\nX-Origin: true\r\nX-Remove-Me: yes\r\n\r\ncached",
+                    )
+                    .await;
+            }
+        }
+        let _ = captures_tx.send(captures);
+    });
+
+    Ok((address, captures_rx))
+}
+
 async fn spawn_no_store_upstream(
 ) -> io::Result<(SocketAddr, oneshot::Receiver<Vec<RequestCapture>>)> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -1941,6 +3017,102 @@ async fn spawn_private_cache_control_upstream(
     Ok((address, captures_rx))
 }
 
+async fn spawn_websocket_upgrade_upstream(
+) -> io::Result<(SocketAddr, oneshot::Receiver<UpgradeCapture>)> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let (capture_tx, capture_rx) = oneshot::channel();
+
+    tokio::spawn(async move {
+        if let Ok((mut stream, _)) = listener.accept().await {
+            let head = match read_http_head(&mut stream).await {
+                Ok(head) => head,
+                Err(_) => return,
+            };
+            if stream
+                .write_all(
+                    b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: test-accept\r\n\r\n",
+                )
+                .await
+                .is_err()
+            {
+                return;
+            }
+            let mut tunnel_payload = vec![0_u8; 4];
+            if stream.read_exact(&mut tunnel_payload).await.is_err() {
+                return;
+            }
+            if stream.write_all(b"pong").await.is_err() {
+                return;
+            }
+            let _ = capture_tx.send(UpgradeCapture { head, tunnel_payload });
+        }
+    });
+
+    Ok((address, capture_rx))
+}
+
+async fn spawn_upgrade_refusal_upstream(
+) -> io::Result<(SocketAddr, oneshot::Receiver<RequestCapture>)> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let (capture_tx, capture_rx) = oneshot::channel();
+
+    tokio::spawn(async move {
+        if let Ok((mut stream, _)) = listener.accept().await {
+            if let Ok(capture) = read_http_request_capture(&mut stream).await {
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nnope",
+                    )
+                    .await;
+                let _ = capture_tx.send(capture);
+            }
+        }
+    });
+
+    Ok((address, capture_rx))
+}
+
+async fn spawn_malformed_websocket_upgrade_upstream() -> io::Result<SocketAddr> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+
+    tokio::spawn(async move {
+        if let Ok((mut stream, _)) = listener.accept().await {
+            if read_http_head(&mut stream).await.is_ok() {
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 101 Switching Protocols\r\nConnection: close\r\n\r\n",
+                    )
+                    .await;
+            }
+        }
+    });
+
+    Ok(address)
+}
+
+async fn spawn_idle_websocket_upgrade_upstream() -> io::Result<SocketAddr> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+
+    tokio::spawn(async move {
+        if let Ok((mut stream, _)) = listener.accept().await {
+            if read_http_head(&mut stream).await.is_ok() {
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: test-accept\r\n\r\n",
+                    )
+                    .await;
+                time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+    });
+
+    Ok(address)
+}
+
 async fn spawn_idle_upstream() -> io::Result<SocketAddr> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
@@ -2001,6 +3173,13 @@ async fn read_http_response(stream: &mut TcpStream) -> io::Result<String> {
     let body_text = String::from_utf8(body)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "response body utf8"))?;
     Ok(format!("{head}{body_text}"))
+}
+
+async fn read_http_head(stream: &mut TcpStream) -> io::Result<String> {
+    let mut buffer = Vec::new();
+    let head_end = read_until_sequence(stream, &mut buffer, b"\r\n\r\n").await?;
+    String::from_utf8(buffer[..head_end].to_vec())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "http head utf8"))
 }
 
 async fn read_until_sequence(
@@ -2078,6 +3257,13 @@ async fn receive_capture_list(
 ) -> Result<Vec<RequestCapture>, Box<dyn std::error::Error>> {
     let captures = time::timeout(Duration::from_secs(2), capture_rx).await??;
     Ok(captures)
+}
+
+async fn receive_upgrade_capture(
+    capture_rx: oneshot::Receiver<UpgradeCapture>,
+) -> Result<UpgradeCapture, Box<dyn std::error::Error>> {
+    let capture = time::timeout(Duration::from_secs(2), capture_rx).await??;
+    Ok(capture)
 }
 
 fn proxy_config(upstream_addr: SocketAddr) -> Http1ProxyConfig {

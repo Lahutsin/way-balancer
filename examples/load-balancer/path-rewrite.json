@@ -1,0 +1,86 @@
+{
+  "api_version": "v1_alpha1",
+  "name": "edge-path-rewrite",
+  "listeners": [
+    {
+      "name": "public-http",
+      "class": "public",
+      "bind_address": "127.0.0.1:8080",
+      "protocol": "http1",
+      "routes": ["api"],
+      "policies": {
+        "transform_policy": "listener-default-transform"
+      }
+    }
+  ],
+  "routes": [
+    {
+      "name": "api",
+      "match": {
+        "type": "path_prefix",
+        "prefix": "/edge",
+        "hostnames": ["example.localhost", "127.0.0.1:8080"]
+      },
+      "upstream_cluster": "api-backend",
+      "policies": {
+        "transform_policy": "api-transform"
+      }
+    }
+  ],
+  "upstream_clusters": [
+    {
+      "name": "api-backend",
+      "endpoints": [
+        {
+          "id": "api-backend-a",
+          "address": "127.0.0.1:9000",
+          "state": "ready",
+          "zone": null,
+          "locality": null,
+          "weight": 1
+        }
+      ]
+    }
+  ],
+  "policies": {
+    "transforms": [
+      {
+        "name": "listener-default-transform",
+        "spec": {
+          "request": {
+            "header_mutations": [
+              { "type": "set", "name": "x-forwarded-env", "value": "demo" }
+            ]
+          },
+          "response": {
+            "header_mutations": [
+              { "type": "remove", "name": "server" }
+            ]
+          }
+        }
+      },
+      {
+        "name": "api-transform",
+        "spec": {
+          "request": {
+            "path_rewrite": {
+              "type": "replace_prefix",
+              "match_prefix": "/edge",
+              "replacement": "/v1"
+            },
+            "host_rewrite": "backend.internal",
+            "header_mutations": [
+              { "type": "set", "name": "x-route", "value": "api" },
+              { "type": "remove", "name": "x-remove-me" }
+            ]
+          },
+          "response": {
+            "header_mutations": [
+              { "type": "set", "name": "x-served-by", "value": "way-balancer" }
+            ]
+          }
+        }
+      }
+    ]
+  }
+}
