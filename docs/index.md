@@ -15,6 +15,55 @@ way-balancer is a production-oriented Rust load balancer with explicit `0.1.x` r
 - where to find runbooks for security, TLS, cache, DR, upgrade, and release evidence
 - where to find the explicit support-boundary guidance for supported and unsupported deployment shapes
 
+## System Overview
+
+The diagram below is the canonical high-level scheme for the current control-plane and dataplane layout.
+
+```mermaid
+flowchart LR
+  user[Clients] --> public[Public listeners\nHTTP HTTPS HTTP3 gRPC TCP]
+  operator[Operators and CI] --> admin[Admin listeners\nhealthz status validate audit reload\ncache purge cache invalidate]
+  operator --> ctl[lb-ctl]
+  k8s[Kubernetes Gateway API] --> k8s_integration[crates/k8s-integration]
+
+  subgraph ControlPlane[Control plane]
+    ctl --> admin_api[crates/admin-api]
+    k8s_integration --> config_model[crates/config-model]
+    admin_api --> config_model
+    admin_api --> fleet[Fleet rollout coordination\nbounded eventual convergence]
+    config_model --> snapshot[Validated config snapshot\ncompile digest diff]
+    config_model --> safety[Config safety preview\nvalidate warnings apply strategy]
+  end
+
+  subgraph DataPlane[Dataplane]
+    dataplane[lb-dataplane] --> runtime[crates/runtime]
+    public --> dataplane
+    admin --> dataplane
+    snapshot --> runtime
+    safety --> runtime
+    runtime --> routing[Route matching and\nlistener lifecycle]
+    runtime --> selection[Upstream selection\nhealth locality affinity]
+    runtime --> cache[HTTP cache\nrevalidate purge invalidate]
+    runtime --> protection[Overload limits breakers\nsource and protocol protection]
+    selection --> upstreams[Upstream clusters and services]
+    cache --> peers[Peer invalidation\nretry-aware fan-out delivery]
+    fleet --> dataplane
+  end
+
+  proto_http[crates/proto-http]
+  proto_tls[crates/proto-tls]
+  observability[crates/observability]
+  security_cfg[Workspace security posture\nartifact integrity and source filters]
+
+  proto_http --> runtime
+  proto_tls --> runtime
+  proto_tls --> admin_api
+  config_model --> security_cfg
+  security_cfg --> runtime
+  runtime --> observability
+  admin_api --> observability
+```
+
 ## Start Here
 
 <div class="grid cards" markdown>
