@@ -28,14 +28,14 @@ Use this document together with the compatibility matrix, stability contract, an
 
 ### Kubernetes Gateway Translation And Controller Packaging
 
-- Supported for Gateway API translation and single-replica controller deployment.
-- The checked-in controller packaging remains intentionally single-replica until leader election exists.
-- Do not treat the current controller chart or deployment example as an HA operator contract.
+- Supported for Gateway API translation and the checked-in lease-based HA controller packaging.
+- The checked-in controller chart and raw deployment example assume at least two replicas with Kubernetes `Lease`-based leader election fencing write-bearing reconcile work to one active controller.
+- Treat the controller packaging as an HA operator contract only within the documented lease-based topology and rollback procedures.
 
 ## Unsupported Or Deferred Topologies
 
 - Mixed release-line runtime, admin API, or Kubernetes integration fleets in production evidence.
-- Controller deployments scaled above one replica before leader election lands.
+- Controller deployments that disable leader election while scaling above one replica.
 - Hidden distributed consensus or two-phase commit embedded in dataplane runtime behavior.
 - Automatic partition healing that claims fleet or cache convergence without per-node evidence.
 - Internet-wide capacity claims or generic non-loopback performance claims without a supported performance artifact.

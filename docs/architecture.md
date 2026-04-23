@@ -86,6 +86,8 @@ The runtime is not one feature. It combines several operational planes that now 
 - bounded HTTP cache with revalidation and invalidation
 - overload management, breaker signals, and source or protocol protection
 
+Topology changes in upstream health are fail-closed by design. If cluster membership and tracked health records diverge during insertion, removal, or reload churn, the runtime now treats that as an explicit inconsistent state instead of silently dropping the affected endpoint from selection.
+
 ## Request Classification And Routing
 
 Route selection is split across two layers on purpose:

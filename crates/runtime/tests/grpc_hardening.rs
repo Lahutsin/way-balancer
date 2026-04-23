@@ -119,6 +119,7 @@ async fn grpc_unary_retry_budget_retries_unavailable_trailers(
                 request_transform: None,
                 response_transform: None,
                 traffic_mirror: None,
+                fault_injection: None,
                 rate_limiters: Vec::new(),
                 concurrency_limiters: Vec::new(),
                 failure_manager: Some(failure_manager.clone()),

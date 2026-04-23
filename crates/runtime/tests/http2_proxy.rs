@@ -1668,12 +1668,11 @@ async fn route_backend_pool_include_unhealthy_fallback_keeps_http2_backend_reach
     let selection_metrics = report
         .route_selection_metrics
         .expect("route selection metrics should be present");
-    assert_eq!(selection_metrics.weighted_route_selection_count, 1);
-    assert_eq!(selection_metrics.route_destination_fallback_count, 1);
-    assert_eq!(
-        selection_metrics.route_destination_selection_counts.get("fallback"),
-        Some(&1)
-    );
+    assert_eq!(selection_metrics.round_robin_selection_count, 1);
+    assert_eq!(selection_metrics.unhealthy_fallback_selection_count, 1);
+    assert_eq!(selection_metrics.weighted_route_selection_count, 0);
+    assert_eq!(selection_metrics.route_destination_fallback_count, 0);
+    assert!(selection_metrics.route_destination_selection_counts.is_empty());
     Ok(())
 }
 

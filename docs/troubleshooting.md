@@ -178,6 +178,8 @@ Common causes:
 - content-type matcher is checking the media type only, but the request sends a different media type than expected
 - route-level source CIDRs are matching against the raw peer address because trusted forwarding was not configured
 
+If the request became unavailable immediately after a config or topology change, do not assume the runtime quietly rebalanced away a missing endpoint. The health registry now fails closed when cluster topology and tracked endpoint health diverge, so treat sudden `route backend unavailable` or `no eligible endpoints` outcomes after reload churn as a signal to inspect reload status and reconcile the intended endpoint set rather than retry blindly.
+
 ### Effective Client IP Looks Wrong
 
 If source-based routing or blocking behaves incorrectly:

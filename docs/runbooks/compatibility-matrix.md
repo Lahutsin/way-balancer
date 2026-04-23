@@ -24,7 +24,7 @@
 | Single-node dataplane with local admin plane | Supported | Default operational topology for `0.1.x`. |
 | Active-active dataplane fleet with shared control plane | Supported | Uses `FleetRolloutCoordinator` and `bounded_eventual` convergence only. |
 | HTTP cache peer fan-out across multiple nodes | Supported with degraded partial-convergence semantics | Local purge correctness is primary; peer failure remains operator-visible and does not imply hidden consensus. |
-| Kubernetes controller deployment | Supported as single replica | Do not scale above one replica until leader election exists. |
+| Kubernetes controller deployment | Supported with lease-based HA packaging | The checked-in chart and raw manifest default to two replicas with Kubernetes `Lease` leader election; do not scale above one replica if leader election is disabled. |
 | Mixed release-line production fleet | Unsupported | GA evidence for `0.1.x` assumes one supported release line across targeted components. |
 
 ## Skew Policy

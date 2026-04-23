@@ -717,8 +717,15 @@ where
             return note(&destination.pool, endpoint_id);
         }
     }
+    let cluster = destinations
+        .first()
+        .map(|destination| destination.pool.cluster_name().clone())
+        .unwrap_or_else(|| {
+            lb_net_core::UpstreamClusterName::new("weighted-destinations")
+                .unwrap_or_else(|_| unreachable!("static fallback cluster name is valid"))
+        });
     Err(UpstreamHealthError::EndpointNotTracked {
-        cluster: destinations[0].pool.cluster_name().clone(),
+        cluster,
         endpoint_id: endpoint_id.clone(),
     })
 }
@@ -858,6 +865,24 @@ mod tests {
 
         let selected = pool.select_backend(0)?;
         assert_eq!(selected.upstream().address.port(), 9000);
+        Ok(())
+    }
+
+    #[test]
+    fn empty_weighted_destination_error_path_does_not_panic(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let endpoint_id = lb_net_core::UpstreamEndpointId::new("missing")?;
+        let result = super::note_endpoint_across_weighted_destinations(
+            &[],
+            &endpoint_id,
+            |_pool, _endpoint_id| unreachable!("empty destinations should not invoke callback"),
+        );
+
+        assert!(matches!(
+            result,
+            Err(crate::UpstreamHealthError::EndpointNotTracked { cluster, endpoint_id: id })
+                if cluster.as_str() == "weighted-destinations" && id == endpoint_id
+        ));
         Ok(())
     }
 }

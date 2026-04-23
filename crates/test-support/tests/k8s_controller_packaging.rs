@@ -24,7 +24,9 @@ fn controller_packaging_examples_and_runbook_stay_in_sync() -> Result<(), Box<dy
         "kind: ClusterRole",
         "kind: ClusterRoleBinding",
         "kind: Deployment",
-        "replicas: 1",
+        "kind: Role",
+        "kind: RoleBinding",
+        "replicas: 2",
         "gatewayclasses",
         "gateways",
         "httproutes",
@@ -43,8 +45,8 @@ fn controller_packaging_examples_and_runbook_stay_in_sync() -> Result<(), Box<dy
     for expected in [
         "docker build --build-arg APP_BIN=lb-k8s-controller",
         "kubectl apply -f examples/kubernetes/lb-k8s-controller/deployment.yaml",
-        "single replica",
-        "leader election",
+        "two warm replicas with Kubernetes lease-based leader election",
+        "kubectl get lease lb-k8s-controller -n way-balancer-system -o yaml",
         "kubectl rollout undo",
     ] {
         assert!(example_readme.contains(expected), "missing example README snippet: {expected}");
@@ -52,8 +54,8 @@ fn controller_packaging_examples_and_runbook_stay_in_sync() -> Result<(), Box<dy
 
     let runbook = read_repo_file("docs/runbooks/kubernetes-controller-operations.md")?;
     for expected in [
-        "single controller replica only",
-        "leader election is not implemented",
+        "deploy at least two controller replicas for warm failover",
+        "Kubernetes `Lease` objects in `coordination.k8s.io` fence write-bearing reconcile work",
         "kubectl rollout status",
         "kubectl rollout undo deployment/lb-k8s-controller -n way-balancer-system",
         "GatewayClass",

@@ -940,6 +940,8 @@ mod tests {
                 headers: Vec::new(),
                 query_params: Vec::new(),
                 content_types: Vec::new(),
+                grpc_services: Vec::new(),
+                grpc_methods: Vec::new(),
                 source_cidrs: Vec::new(),
             },
             upstream_cluster: None,

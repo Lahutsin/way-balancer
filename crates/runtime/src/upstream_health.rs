@@ -110,6 +110,11 @@ pub struct UpstreamHealthMetrics {
 pub enum UpstreamHealthError {
     /// Underlying registry operation failed.
     Registry(EndpointRegistryError),
+    /// Registry topology and health records diverged unexpectedly.
+    InconsistentState {
+        cluster: lb_net_core::UpstreamClusterName,
+        endpoint_id: lb_net_core::UpstreamEndpointId,
+    },
     /// Health state was requested for an untracked endpoint.
     EndpointNotTracked {
         cluster: lb_net_core::UpstreamClusterName,
@@ -121,6 +126,10 @@ impl fmt::Display for UpstreamHealthError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Registry(error) => write!(formatter, "upstream health registry error: {error}"),
+            Self::InconsistentState { cluster, endpoint_id } => write!(
+                formatter,
+                "endpoint {endpoint_id} in cluster {cluster} is missing health state"
+            ),
             Self::EndpointNotTracked { cluster, endpoint_id } => {
                 write!(formatter, "endpoint {endpoint_id} in cluster {cluster} is not tracked")
             }
@@ -132,6 +141,7 @@ impl std::error::Error for UpstreamHealthError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Registry(error) => Some(error),
+            Self::InconsistentState { .. } => None,
             Self::EndpointNotTracked { .. } => None,
         }
     }
@@ -264,6 +274,7 @@ impl MetricsState {
 pub struct UpstreamHealthRegistry {
     registry: EndpointRegistry,
     policy: EndpointHealthPolicy,
+    topology: RwLock<()>,
     records: RwLock<BTreeMap<EndpointKey, EndpointHealthRecord>>,
     events: Mutex<VecDeque<lb_observability::UpstreamHealthEvent>>,
     metrics: MetricsState,
@@ -276,6 +287,7 @@ impl UpstreamHealthRegistry {
         Self {
             registry: EndpointRegistry::new(),
             policy,
+            topology: RwLock::new(()),
             records: RwLock::new(BTreeMap::new()),
             events: Mutex::new(VecDeque::with_capacity(MAX_HEALTH_EVENTS)),
             metrics: MetricsState::default(),
@@ -287,6 +299,7 @@ impl UpstreamHealthRegistry {
         &self,
         cluster: lb_net_core::UpstreamCluster,
     ) -> Result<(), UpstreamHealthError> {
+        let _topology = self.topology.write().unwrap_or_else(|poisoned| poisoned.into_inner());
         let cluster_name = cluster.name().clone();
         let endpoints = cluster.endpoints().to_vec();
         self.registry.insert_cluster(cluster)?;
@@ -314,6 +327,7 @@ impl UpstreamHealthRegistry {
         &self,
         cluster_name: &lb_net_core::UpstreamClusterName,
     ) -> Option<lb_net_core::UpstreamCluster> {
+        let _topology = self.topology.write().unwrap_or_else(|poisoned| poisoned.into_inner());
         let removed = self.registry.remove_cluster(cluster_name);
         if removed.is_some() {
             let mut records = self.records.write().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -328,6 +342,7 @@ impl UpstreamHealthRegistry {
         cluster_name: &lb_net_core::UpstreamClusterName,
         endpoint: lb_net_core::UpstreamEndpoint,
     ) -> Result<(), UpstreamHealthError> {
+        let _topology = self.topology.write().unwrap_or_else(|poisoned| poisoned.into_inner());
         let endpoint_id = endpoint.id().clone();
         let record = EndpointHealthRecord::new(&endpoint, &self.policy);
         self.registry.insert_endpoint(cluster_name, endpoint)?;
@@ -353,6 +368,7 @@ impl UpstreamHealthRegistry {
         cluster_name: &lb_net_core::UpstreamClusterName,
         endpoint_id: &lb_net_core::UpstreamEndpointId,
     ) -> Result<lb_net_core::UpstreamEndpoint, UpstreamHealthError> {
+        let _topology = self.topology.write().unwrap_or_else(|poisoned| poisoned.into_inner());
         let endpoint = self.registry.remove_endpoint(cluster_name, endpoint_id)?;
         let mut records = self.records.write().unwrap_or_else(|poisoned| poisoned.into_inner());
         let _ = records.remove(&EndpointKey {
@@ -468,6 +484,7 @@ impl UpstreamHealthRegistry {
         &self,
         cluster_name: &lb_net_core::UpstreamClusterName,
     ) -> Result<lb_net_core::UpstreamClusterState, UpstreamHealthError> {
+        let _topology = self.topology.read().unwrap_or_else(|poisoned| poisoned.into_inner());
         let cluster = self.registry.cluster(cluster_name).ok_or_else(|| {
             UpstreamHealthError::Registry(EndpointRegistryError::ClusterNotFound(
                 cluster_name.clone(),
@@ -483,9 +500,10 @@ impl UpstreamHealthRegistry {
         for endpoint in cluster.endpoints() {
             let key =
                 EndpointKey { cluster: cluster_name.clone(), endpoint_id: endpoint.id().clone() };
-            let Some(record) = records.get(&key) else {
-                continue;
-            };
+            let record = records.get(&key).ok_or_else(|| UpstreamHealthError::InconsistentState {
+                cluster: cluster_name.clone(),
+                endpoint_id: endpoint.id().clone(),
+            })?;
             if endpoint.state().is_ready() && record.status.is_available() {
                 ready_endpoints += 1;
             }
@@ -504,10 +522,22 @@ impl UpstreamHealthRegistry {
         cluster_name: &lb_net_core::UpstreamClusterName,
         endpoint_id: &lb_net_core::UpstreamEndpointId,
     ) -> Result<EndpointHealthSnapshot, UpstreamHealthError> {
+        let _topology = self.topology.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let cluster = self.registry.cluster(cluster_name).ok_or_else(|| {
+            UpstreamHealthError::Registry(EndpointRegistryError::ClusterNotFound(
+                cluster_name.clone(),
+            ))
+        })?;
+        if cluster.endpoint(endpoint_id).is_none() {
+            return Err(UpstreamHealthError::EndpointNotTracked {
+                cluster: cluster_name.clone(),
+                endpoint_id: endpoint_id.clone(),
+            });
+        }
         let records = self.records.read().unwrap_or_else(|poisoned| poisoned.into_inner());
         let record = records
             .get(&EndpointKey { cluster: cluster_name.clone(), endpoint_id: endpoint_id.clone() })
-            .ok_or_else(|| UpstreamHealthError::EndpointNotTracked {
+            .ok_or_else(|| UpstreamHealthError::InconsistentState {
                 cluster: cluster_name.clone(),
                 endpoint_id: endpoint_id.clone(),
             })?;
@@ -520,6 +550,7 @@ impl UpstreamHealthRegistry {
         cluster_name: &lb_net_core::UpstreamClusterName,
         include_unhealthy: bool,
     ) -> Result<Vec<EndpointSelectionCandidate>, UpstreamHealthError> {
+        let _topology = self.topology.read().unwrap_or_else(|poisoned| poisoned.into_inner());
         let cluster = self.registry.cluster(cluster_name).ok_or_else(|| {
             UpstreamHealthError::Registry(EndpointRegistryError::ClusterNotFound(
                 cluster_name.clone(),
@@ -534,9 +565,10 @@ impl UpstreamHealthRegistry {
             }
             let key =
                 EndpointKey { cluster: cluster_name.clone(), endpoint_id: endpoint.id().clone() };
-            let Some(record) = records.get(&key) else {
-                continue;
-            };
+            let record = records.get(&key).ok_or_else(|| UpstreamHealthError::InconsistentState {
+                cluster: cluster_name.clone(),
+                endpoint_id: endpoint.id().clone(),
+            })?;
             let snapshot = record.snapshot(&self.policy);
             let allowed = snapshot.status.is_available()
                 || (include_unhealthy
@@ -581,6 +613,7 @@ impl UpstreamHealthRegistry {
         endpoint_id: &lb_net_core::UpstreamEndpointId,
         signal: HealthSignal,
     ) -> Result<EndpointHealthSnapshot, UpstreamHealthError> {
+        let _topology = self.topology.read().unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut records = self.records.write().unwrap_or_else(|poisoned| poisoned.into_inner());
         let key = EndpointKey { cluster: cluster_name.clone(), endpoint_id: endpoint_id.clone() };
         let record =
@@ -744,5 +777,63 @@ fn event_for_transition(
             lb_observability::UpstreamHealthEventKind::Recovered,
             "endpoint recovered and is fully healthy",
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    use super::{
+        EndpointHealthPolicy, EndpointKey, UpstreamHealthError, UpstreamHealthRegistry,
+    };
+
+    fn endpoint(
+        id: &str,
+        port: u16,
+        weight: u16,
+    ) -> Result<lb_net_core::UpstreamEndpoint, Box<dyn std::error::Error>> {
+        Ok(lb_net_core::UpstreamEndpoint::new(
+            lb_net_core::UpstreamEndpointId::new(id)?,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
+            lb_net_core::EndpointState::Ready,
+            lb_net_core::EndpointMetadata { zone: None, locality: None, weight },
+        )?)
+    }
+
+    #[test]
+    fn inconsistent_endpoint_records_are_reported_explicitly(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let registry = UpstreamHealthRegistry::new(EndpointHealthPolicy::default());
+        let cluster_name = lb_net_core::UpstreamClusterName::new("payments")?;
+        let endpoint_id = lb_net_core::UpstreamEndpointId::new("a")?;
+        registry.insert_cluster(lb_net_core::UpstreamCluster::new(
+            cluster_name.clone(),
+            vec![endpoint(endpoint_id.as_str(), 8080, 3)?],
+        )?)?;
+
+        let mut records = registry.records.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+        records.remove(&EndpointKey {
+            cluster: cluster_name.clone(),
+            endpoint_id: endpoint_id.clone(),
+        });
+        drop(records);
+
+        assert!(matches!(
+            registry.endpoint_health(&cluster_name, &endpoint_id),
+            Err(UpstreamHealthError::InconsistentState { cluster, endpoint_id: id })
+                if cluster == cluster_name && id == endpoint_id
+        ));
+        assert!(matches!(
+            registry.cluster_state(&cluster_name),
+            Err(UpstreamHealthError::InconsistentState { cluster, endpoint_id: id })
+                if cluster == cluster_name && id == endpoint_id
+        ));
+        assert!(matches!(
+            registry.selection_candidates(&cluster_name, false),
+            Err(UpstreamHealthError::InconsistentState { cluster, endpoint_id: id })
+                if cluster == cluster_name && id == endpoint_id
+        ));
+        Ok(())
     }
 }

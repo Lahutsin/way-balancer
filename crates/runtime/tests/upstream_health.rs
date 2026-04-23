@@ -5,7 +5,9 @@ use lb_net_core::{
     EndpointMetadata, EndpointState, UpstreamCluster, UpstreamClusterName, UpstreamClusterState,
     UpstreamEndpoint, UpstreamEndpointId,
 };
-use lb_runtime::{EndpointHealthPolicy, EndpointHealthStatus, UpstreamHealthRegistry};
+use lb_runtime::{
+    EndpointHealthPolicy, EndpointHealthStatus, UpstreamHealthError, UpstreamHealthRegistry,
+};
 
 fn endpoint(
     id: &str,
@@ -167,5 +169,26 @@ fn new_endpoint_starts_in_warmup_and_emits_events() -> Result<(), Box<dyn std::e
         .iter()
         .any(|event| event.kind == lb_observability::UpstreamHealthEventKind::WarmupCompleted));
 
+    Ok(())
+}
+
+#[test]
+fn removed_cluster_rejects_stale_endpoint_health_reads(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let registry = UpstreamHealthRegistry::new(policy());
+    let cluster_name = UpstreamClusterName::new("removed")?;
+    let endpoint_id = UpstreamEndpointId::new("a")?;
+    registry.insert_cluster(UpstreamCluster::new(
+        cluster_name.clone(),
+        vec![endpoint(endpoint_id.as_str(), 8080, 1)?],
+    )?)?;
+
+    assert!(registry.remove_cluster(&cluster_name).is_some());
+    assert!(matches!(
+        registry.endpoint_health(&cluster_name, &endpoint_id),
+        Err(UpstreamHealthError::Registry(lb_runtime::EndpointRegistryError::ClusterNotFound(
+            name,
+        ))) if name == cluster_name
+    ));
     Ok(())
 }
