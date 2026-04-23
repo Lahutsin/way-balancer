@@ -1,3 +1,4 @@
+#[path = "workspace_serve/mod.rs"]
 mod workspace_serve;
 
 use std::error::Error;
