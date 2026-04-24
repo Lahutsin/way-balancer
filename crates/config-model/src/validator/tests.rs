@@ -18,12 +18,22 @@ mod tests {
         NamedLocalConcurrencyLimitPolicyConfig, NamedLocalRateLimitPolicyConfig,
         NamedOverloadResponsePolicyConfig, NamedRetryBudgetPolicyConfig,
         NamedFaultInjectionPolicyConfig,
+        NamedAuthorizationPolicyConfig, NamedExternalAuthPolicyConfig,
+        NamedJwtAuthPolicyConfig, NamedUpstreamIdentityPolicyConfig,
+        NamedRequestClassificationPolicyConfig,
         NamedTrafficMirrorPolicyConfig,
         NamedTransformPolicyConfig, OverloadResponsePolicyConfig, PathRewriteTransformConfig,
         PolicyBindingConfig, PolicyResourcesConfig, RequestTransformConfig, ResponseTransformConfig,
+        AuthorizationPolicyConfig, ExternalAuthPolicyConfig, JwtAuthPolicyConfig,
+        RequestClassificationContextConfig, RequestClassificationPolicyConfig,
+        BodyInspectionScoringConfig, HeaderAnomalyScoringConfig,
+        RequestClassificationSignalWeightsConfig, RequestClassifierSensitivityConfig,
+        UpstreamIdentityPolicyConfig, JwtJwksSourceConfig, IdentityTrustBundleSourceConfig,
         RouteConfig, TrafficMirrorPolicyConfig, TransformPolicyConfig, UpgradePolicyConfig, UpgradeProtocolConfig,
+        DiscoverySourceConfig,
         FaultInjectionPolicyConfig, FaultInjectionDelayConfig, FaultInjectionAbortConfig,
         UpstreamClusterConfig, UpstreamEndpointConfig, UpstreamTrafficPolicyConfig,
+        UpstreamTransportConfig,
         WorkspaceConfig,
     };
 
@@ -83,18 +93,22 @@ mod tests {
             }],
             upstream_clusters: vec![UpstreamClusterConfig {
                 name: String::from("payments"),
+                transport: UpstreamTransportConfig::Http1,
                 endpoints: vec![UpstreamEndpointConfig::foundation(
                     "payments-a",
                     payments_endpoint_addr,
                 )],
+                discovery: None,
                 traffic_policy: UpstreamTrafficPolicyConfig::default(),
                 policies: PolicyBindingConfig::default(),
             }, UpstreamClusterConfig {
                 name: String::from("payments-shadow"),
+                transport: UpstreamTransportConfig::Http1,
                 endpoints: vec![UpstreamEndpointConfig::foundation(
                     "payments-shadow-a",
                     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9002),
                 )],
+                discovery: None,
                 traffic_policy: UpstreamTrafficPolicyConfig::default(),
                 policies: PolicyBindingConfig::default(),
             }],
@@ -132,6 +146,7 @@ mod tests {
                     spec: crate::TimeoutHierarchyConfig {
                         request_timeout_ms: 30_000,
                         attempt_timeout_ms: 10_000,
+                        per_try_timeout_ms: None,
                         connect_timeout_ms: 1_000,
                         idle_timeout_ms: 5_000,
                     },
@@ -211,6 +226,7 @@ mod tests {
                     spec: TrafficMirrorPolicyConfig {
                         percentage: 20,
                         target_upstream_cluster: String::from("payments-shadow"),
+                        methods: Vec::new(),
                     },
                 }],
                 fault_injections: vec![NamedFaultInjectionPolicyConfig {
@@ -224,6 +240,54 @@ mod tests {
                             percentage: 5,
                             http_status: 503,
                         }),
+                    },
+                }],
+                jwt_auth_policies: vec![NamedJwtAuthPolicyConfig {
+                    name: String::from("jwt-default"),
+                    spec: JwtAuthPolicyConfig {
+                        issuers: vec![String::from("https://issuer.example")],
+                        audiences: vec![String::from("edge-api")],
+                        jwks: Some(JwtJwksSourceConfig::File {
+                            path: String::from("/etc/way-balancer/jwks.json"),
+                            refresh_secs: 60,
+                        }),
+                        required_claims: vec![String::from("sub")],
+                        clock_skew_secs: 30,
+                    },
+                }],
+                external_auth_policies: vec![NamedExternalAuthPolicyConfig {
+                    name: String::from("ext-authz"),
+                    spec: ExternalAuthPolicyConfig {
+                        endpoint: String::from("http://authz.local/check"),
+                        timeout_ms: 500,
+                        ..ExternalAuthPolicyConfig::default()
+                    },
+                }],
+                authorization_policies: vec![NamedAuthorizationPolicyConfig {
+                    name: String::from("rbac-default"),
+                    spec: AuthorizationPolicyConfig::default(),
+                }],
+                upstream_identity_policies: vec![NamedUpstreamIdentityPolicyConfig {
+                    name: String::from("spiffe-default"),
+                    spec: UpstreamIdentityPolicyConfig {
+                        trust_bundle: IdentityTrustBundleSourceConfig::File {
+                            path: String::from("/etc/way-balancer/trust-bundle.pem"),
+                            refresh_secs: 60,
+                        },
+                        allowed_trust_domains: vec![String::from("example.org")],
+                        ..UpstreamIdentityPolicyConfig::default()
+                    },
+                }],
+                request_classification_policies: vec![NamedRequestClassificationPolicyConfig {
+                    name: String::from("waf-baseline"),
+                    spec: RequestClassificationPolicyConfig {
+                        sensitivity: RequestClassifierSensitivityConfig::Medium,
+                        challenge_threshold: 55,
+                        block_threshold: 80,
+                        signal_weights: RequestClassificationSignalWeightsConfig::default(),
+                        context: RequestClassificationContextConfig::default(),
+                        header_scoring: HeaderAnomalyScoringConfig::default(),
+                        body_scoring: BodyInspectionScoringConfig::default(),
                     },
                 }],
             },
@@ -275,6 +339,50 @@ mod tests {
     }
 
     #[test]
+    fn validator_accepts_discovery_backed_upstream_without_static_endpoints(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = valid_workspace()?;
+        config.upstream_clusters[0].endpoints.clear();
+        config.upstream_clusters[0].discovery = Some(DiscoverySourceConfig::DnsAaaa {
+            hostname: String::from("payments.internal"),
+            port: 8443,
+            min_refresh_secs: 5,
+        });
+
+        let report = validate_workspace_config(&config);
+
+        assert!(report.is_empty(), "{}", report.operator_summary());
+        Ok(())
+    }
+
+    #[test]
+    fn validator_rejects_invalid_discovery_shapes_and_mixed_endpoint_mode(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = valid_workspace()?;
+        config.upstream_clusters[0].discovery = Some(DiscoverySourceConfig::KubernetesEndpointSlice {
+            namespace: String::from(" "),
+            service: String::new(),
+        });
+
+        let report = validate_workspace_config(&config);
+        assert!(report.errors.iter().any(|error| error.path == "upstream_clusters[0].discovery"));
+        assert!(report
+            .errors
+            .iter()
+            .any(|error| error.path == "upstream_clusters[0].discovery.namespace"));
+        assert!(report
+            .errors
+            .iter()
+            .any(|error| error.path == "upstream_clusters[0].discovery.service"));
+
+        config.upstream_clusters[0].endpoints.clear();
+        config.upstream_clusters[0].discovery = None;
+        let report = validate_workspace_config(&config);
+        assert!(report.errors.iter().any(|error| error.path == "upstream_clusters[0].endpoints"));
+        Ok(())
+    }
+
+    #[test]
     fn validator_rejects_invalid_references() -> Result<(), Box<dyn std::error::Error>> {
         let mut config = valid_workspace()?;
         config.listeners[0].routes.push(String::from("missing-route"));
@@ -309,13 +417,26 @@ mod tests {
         ];
         config.upstream_clusters.push(UpstreamClusterConfig {
             name: String::from("payments-canary"),
+            transport: UpstreamTransportConfig::Http1,
             endpoints: vec![UpstreamEndpointConfig::foundation(
                 "payments-canary-a",
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9001),
             )],
+            discovery: None,
             traffic_policy: UpstreamTrafficPolicyConfig::default(),
             policies: PolicyBindingConfig::default(),
         });
+
+        let report = validate_workspace_config(&config);
+
+        assert!(report.is_empty(), "{}", report.operator_summary());
+        Ok(())
+    }
+
+    #[test]
+    fn validator_accepts_http3_upstream_transport() -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = valid_workspace()?;
+        config.upstream_clusters[0].transport = UpstreamTransportConfig::Http3;
 
         let report = validate_workspace_config(&config);
 
@@ -378,10 +499,12 @@ mod tests {
         ];
         config.upstream_clusters.push(UpstreamClusterConfig {
             name: String::from("payments-canary"),
+            transport: UpstreamTransportConfig::Http1,
             endpoints: vec![UpstreamEndpointConfig::foundation(
                 "payments-canary-a",
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9001),
             )],
+            discovery: None,
             traffic_policy: UpstreamTrafficPolicyConfig::default(),
             policies: PolicyBindingConfig::default(),
         });
@@ -473,6 +596,7 @@ mod tests {
             spec: TrafficMirrorPolicyConfig {
                 percentage: 10,
                 target_upstream_cluster: String::from("payments"),
+                methods: Vec::new(),
             },
         });
 
@@ -527,6 +651,59 @@ mod tests {
             error.code == ValidationCode::InvalidPolicyScope
                 && error.path == "routes[0].policies.fault_injection"
         }));
+        Ok(())
+    }
+
+    #[test]
+    fn validator_rejects_invalid_l7_policy_scopes(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = valid_workspace()?;
+        config.upstream_clusters[0].policies.jwt_auth_policy = Some(String::from("jwt-default"));
+        config.listeners[0].policies.upstream_identity_policy =
+            Some(String::from("spiffe-default"));
+
+        let report = validate_workspace_config(&config);
+
+        assert!(report.errors.iter().any(|error| {
+            error.code == ValidationCode::InvalidPolicyScope
+                && error.path == "upstream_clusters[0].policies.jwt_auth_policy"
+        }));
+        assert!(report.errors.iter().any(|error| {
+            error.code == ValidationCode::InvalidPolicyScope
+                && error.path == "listeners[0].policies.upstream_identity_policy"
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn validator_rejects_invalid_l7_policy_shapes(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = valid_workspace()?;
+        config.policies.jwt_auth_policies[0].spec.jwks = None;
+        config.policies.external_auth_policies[0].spec.endpoint = String::new();
+        config.policies.upstream_identity_policies[0]
+            .spec
+            .allowed_trust_domains
+            .clear();
+        config.policies.upstream_identity_policies[0]
+            .spec
+            .allowed_spiffe_ids
+            .clear();
+
+        let report = validate_workspace_config(&config);
+
+        assert!(report
+            .errors
+            .iter()
+            .any(|error| error.path == "policies.jwt_auth_policies[0].spec.jwks"));
+        assert!(report
+            .errors
+            .iter()
+            .any(|error| error.path == "policies.external_auth_policies[0].spec.endpoint"));
+        assert!(report
+            .errors
+            .iter()
+            .any(|error| error.path == "policies.upstream_identity_policies[0].spec"));
         Ok(())
     }
 
@@ -785,6 +962,7 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut config = valid_workspace()?;
         config.policies.retry_budgets[0].spec.window_ms = 0;
+        config.policies.timeout_hierarchies[0].spec.per_try_timeout_ms = Some(40_000);
         config.policies.overload_responses[0].spec.shedding_signal_threshold = 0;
         config.policies.overload_responses[0].spec.brownout_features.push(
             crate::BrownoutFeatureConfig {
@@ -798,6 +976,7 @@ mod tests {
 
         assert!(summary
             .contains("Schema InvalidPolicyField at policies.retry_budgets[0].spec.window_ms"));
+        assert!(summary.contains("Schema InvalidPolicyField at policies.timeout_hierarchies[0].spec"));
         assert!(
             summary.contains("Schema InvalidPolicyField at policies.overload_responses[0].spec")
         );
@@ -1018,6 +1197,127 @@ mod tests {
         assert!(report.errors.iter().any(|error| {
             error.code == ValidationCode::InvalidPolicyScope
                 && error.path == "routes[0].policies.hostile_edge_protection"
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn validator_rejects_invalid_request_classification_policy_and_scope(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = valid_workspace()?;
+        config.policies.request_classification_policies.push(
+            NamedRequestClassificationPolicyConfig {
+                name: String::from("waf-invalid"),
+                spec: RequestClassificationPolicyConfig {
+                    challenge_threshold: 90,
+                    block_threshold: 60,
+                    signal_weights: RequestClassificationSignalWeightsConfig {
+                        header_anomaly: 0,
+                        body_anomaly: 0,
+                        query_anomaly: 0,
+                        user_agent_anomaly: 0,
+                        reputation: 0,
+                        bot_signal: 0,
+                    },
+                    context: RequestClassificationContextConfig {
+                        include_headers: vec![String::from("bad header")],
+                        include_query_params: vec![String::from(" ")],
+                        ..RequestClassificationContextConfig::default()
+                    },
+                    header_scoring: crate::HeaderAnomalyScoringConfig {
+                        max_header_count: 0,
+                        max_header_value_length: 0,
+                        max_duplicate_headers_per_name: 0,
+                        suspicious_headers: vec![String::from("bad header")],
+                        suspicious_user_agent_patterns: vec![String::from(" ")],
+                    },
+                    body_scoring: crate::BodyInspectionScoringConfig {
+                        max_inspect_bytes: 0,
+                        max_body_bytes: 0,
+                        min_suspicious_token_length: 0,
+                        suspicious_patterns: vec![String::from(" ")],
+                        allowlisted_content_types: vec![String::from(" ")],
+                    },
+                    ..RequestClassificationPolicyConfig::default()
+                },
+            },
+        );
+        config.upstream_clusters[0].policies.request_classification_policy =
+            Some(String::from("waf-invalid"));
+
+        let report = validate_workspace_config(&config);
+
+        assert!(report.errors.iter().any(|error| {
+            error.code == ValidationCode::InvalidPolicyField
+                && error.path == "policies.request_classification_policies[1].spec"
+        }));
+        assert!(report.errors.iter().any(|error| {
+            error.code == ValidationCode::InvalidPolicyField
+                && error.path == "policies.request_classification_policies[1].spec.signal_weights"
+        }));
+        assert!(report.errors.iter().any(|error| {
+            error.code == ValidationCode::InvalidPolicyField
+                && error.path
+                    == "policies.request_classification_policies[1].spec.context.include_headers[0]"
+        }));
+        assert!(report.errors.iter().any(|error| {
+            error.code == ValidationCode::InvalidPolicyField
+                && error.path
+                    == "policies.request_classification_policies[1].spec.context.include_query_params[0]"
+        }));
+        assert!(report.errors.iter().any(|error| {
+            error.code == ValidationCode::InvalidPolicyField
+                && error.path
+                    == "policies.request_classification_policies[1].spec.header_scoring.max_header_count"
+        }));
+        assert!(report.errors.iter().any(|error| {
+            error.code == ValidationCode::InvalidPolicyField
+                && error.path
+                    == "policies.request_classification_policies[1].spec.header_scoring.max_header_value_length"
+        }));
+        assert!(report.errors.iter().any(|error| {
+            error.code == ValidationCode::InvalidPolicyField
+                && error.path
+                    == "policies.request_classification_policies[1].spec.header_scoring.max_duplicate_headers_per_name"
+        }));
+        assert!(report.errors.iter().any(|error| {
+            error.code == ValidationCode::InvalidPolicyField
+                && error.path
+                    == "policies.request_classification_policies[1].spec.header_scoring.suspicious_headers[0]"
+        }));
+        assert!(report.errors.iter().any(|error| {
+            error.code == ValidationCode::InvalidPolicyField
+                && error.path
+                    == "policies.request_classification_policies[1].spec.header_scoring.suspicious_user_agent_patterns[0]"
+        }));
+        assert!(report.errors.iter().any(|error| {
+            error.code == ValidationCode::InvalidPolicyField
+                && error.path
+                    == "policies.request_classification_policies[1].spec.body_scoring.max_inspect_bytes"
+        }));
+        assert!(report.errors.iter().any(|error| {
+            error.code == ValidationCode::InvalidPolicyField
+                && error.path
+                    == "policies.request_classification_policies[1].spec.body_scoring.max_body_bytes"
+        }));
+        assert!(report.errors.iter().any(|error| {
+            error.code == ValidationCode::InvalidPolicyField
+                && error.path
+                    == "policies.request_classification_policies[1].spec.body_scoring.min_suspicious_token_length"
+        }));
+        assert!(report.errors.iter().any(|error| {
+            error.code == ValidationCode::InvalidPolicyField
+                && error.path
+                    == "policies.request_classification_policies[1].spec.body_scoring.suspicious_patterns[0]"
+        }));
+        assert!(report.errors.iter().any(|error| {
+            error.code == ValidationCode::InvalidPolicyField
+                && error.path
+                    == "policies.request_classification_policies[1].spec.body_scoring.allowlisted_content_types[0]"
+        }));
+        assert!(report.errors.iter().any(|error| {
+            error.code == ValidationCode::InvalidPolicyScope
+                && error.path == "upstream_clusters[0].policies.request_classification_policy"
         }));
         Ok(())
     }

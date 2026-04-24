@@ -62,7 +62,25 @@ fn local_http1_response(
 
 fn request_is_safe_stale_reuse_retry_candidate(request: &lb_proto_http::Http1RequestHead) -> bool {
     matches!(request.body_kind, lb_proto_http::BodyKind::None)
-        && matches!(request.method.as_str(), "GET" | "HEAD" | "OPTIONS" | "TRACE")
+        && (request_method_is_idempotent(&request.method)
+            || request_has_idempotency_key_override(&request.headers))
+}
+
+fn request_method_is_idempotent(method: &str) -> bool {
+    method.eq_ignore_ascii_case("GET")
+        || method.eq_ignore_ascii_case("HEAD")
+        || method.eq_ignore_ascii_case("OPTIONS")
+        || method.eq_ignore_ascii_case("TRACE")
+        || method.eq_ignore_ascii_case("PUT")
+        || method.eq_ignore_ascii_case("DELETE")
+}
+
+fn request_has_idempotency_key_override(headers: &[lb_proto_http::HttpHeader]) -> bool {
+    headers.iter().any(|header| {
+        (header.name.eq_ignore_ascii_case("idempotency-key")
+            || header.name.eq_ignore_ascii_case("x-idempotency-key"))
+            && !header.value.trim().is_empty()
+    })
 }
 
 

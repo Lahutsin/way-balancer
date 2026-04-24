@@ -1,16 +1,29 @@
 #![forbid(unsafe_code)]
 
 mod anonymous_sources;
+mod bot_signal_adapter;
 mod config_application;
+mod discovery;
 mod emergency_protection;
+mod extension_surface;
 mod failure_management;
+mod hedging;
+mod header_anomaly_scoring;
 mod http1_proxy;
 mod http2_proxy;
+mod http3_upstream;
 mod http_cache;
+mod l7_auth;
 mod local_limits;
+mod lifecycle;
 mod overload_management;
 mod probe_semantics;
+mod request_body_inspection;
+mod request_classification_adaptive_mitigation;
+mod request_classification;
+mod request_classification_enforcement;
 mod protocol_protection;
+mod reputation_adapter;
 mod route_enumeration;
 mod source_guards;
 mod tcp_proxy;
@@ -24,12 +37,20 @@ pub use anonymous_sources::{
     AnonymousSourceCategory, AnonymousSourceFilterPolicy, AnonymousSourceFilterSnapshot,
     AnonymousSourceFilterState,
 };
+pub use bot_signal_adapter::{
+    BotSignalAdapterChain, BotSignalInput, BotSignalProvider, BotSignalVerdict,
+};
 pub use config_application::{
     AppliedSnapshotRecord, AppliedSnapshotSummary, DataplaneSnapshotManager,
     DataplaneSnapshotStatus, InvalidApplyRequest, NoopSnapshotActivationHook,
     SnapshotActivationError, SnapshotActivationHook, SnapshotApplyAck, SnapshotApplyError,
     SnapshotApplyFailure, SnapshotApplyFailureCategory, SnapshotApplyLifecycle,
     SnapshotApplyMetrics, SnapshotApplyOutcome, SnapshotApplyRequest,
+};
+pub use discovery::{
+    failure_backoff_delay, jittered_refresh_delay, DiscoveryEndpoint, DiscoveryMembershipReconciler,
+    DiscoveryProviderKind, DiscoveryReconcileError, DiscoveryReconcileOutcome,
+    DiscoveryRefreshHealth, DiscoveryRefreshState, DiscoverySnapshot, DiscoverySourceId,
 };
 pub use emergency_protection::{
     AbuseEventCategory, AbuseEventInput, AbuseEventLabel, AbuseForensicsError,
@@ -38,12 +59,25 @@ pub use emergency_protection::{
     EmergencyModeSwitchResult, EmergencyProtectionController, EmergencyProtectionMode,
     EmergencyProtectionProfile, EmergencyProtectionSnapshot, SlowClientMitigationLevel,
 };
+pub use extension_surface::{
+    ExtensionCompatibilityPolicy, ExtensionDescriptor, ExtensionHookBinding, ExtensionHookPhase,
+    ExtensionLifecycleState, ExtensionRegistry, ExtensionRegistryError, ExternalAuthHookDecision,
+    ExternalAuthHookError, ExternalAuthHookRequest, HookExecutionPlanEntry,
+    PolicyPlugin, PolicyPluginDecision, PolicyPluginDescriptor,
+    PolicyPluginDisabledFallback, PolicyPluginError, PolicyPluginEvaluationOutcome,
+    PolicyPluginIsolationPolicy, PolicyPluginRegistration, PolicyPluginRegistry,
+    PolicyPluginRegistryError,
+    PolicyPluginRequestContext, PolicyPluginResponse, RegisteredExtension,
+    RuntimeExternalAuthHook,
+};
 pub use failure_management::{
     CircuitBreaker, CircuitBreakerPolicy, CircuitBreakerSnapshot, CircuitBreakerState,
     FailureManagementError, FailureManagementMetrics, FailureManager, RetryBudget,
     RetryBudgetPolicy, RetryBudgetSnapshot, TimeoutCategory, TimeoutHierarchy,
     UpstreamFailureClass,
 };
+pub use hedging::{execute_with_hedge, HedgeOutcome, RequestHedgingPolicy};
+pub use header_anomaly_scoring::HeaderAnomalyScorer;
 pub use http1_proxy::{
     proxy_http1_connection, proxy_http1_connection_with_downstream_addr,
     proxy_http1_request_with_downstream_addr, Http1ConnectionMetrics,
@@ -53,6 +87,9 @@ pub use http1_proxy::{
 pub use http2_proxy::{
     proxy_http2_connection, proxy_http2_connection_with_downstream_addr, Http2ConnectionMetrics,
     Http2ConnectionReport, Http2ProxyConfig, Http2ProxyError, Http2RouteUpstream,
+};
+pub use http3_upstream::{
+    clear_http3_test_root_certificates, set_http3_test_root_certificates,
 };
 pub use http_cache::{
     build_http_cache_key_material, HttpCacheEntry, HttpCacheEntrySnapshot, HttpCacheFreshness,
@@ -66,11 +103,17 @@ pub use http_cache::{
     HTTP_CACHE_INVALIDATION_MAX_EVENT_ID_LEN, HTTP_CACHE_INVALIDATION_MAX_ISSUER_LEN,
     HTTP_CACHE_INVALIDATION_MAX_PATH_PREFIX_LEN, HTTP_CACHE_INVALIDATION_MAX_SCOPE_LEN,
 };
+pub use l7_auth::{
+    AuthorizationPolicyRuntime, AuthorizationVerificationError, ExternalAuthCheckResult,
+    ExternalAuthPolicyRuntime, ExternalAuthVerificationError, JwtAuthPolicyRuntime,
+    JwtAuthVerificationError, UpstreamIdentityPolicyRuntime, UpstreamIdentityVerificationError,
+};
 pub use local_limits::{
     LimitContext, LocalConcurrencyLease, LocalConcurrencyLimitConfig, LocalConcurrencyLimiter,
     LocalConcurrencyLimiterMetrics, LocalLimitError, LocalLimitKeyKind, LocalLimitScope,
     LocalRateLimitConfig, LocalRateLimiter, LocalRateLimiterMetrics, RateLimitDecision,
 };
+pub use lifecycle::{LifecycleState, LifecycleStateMachine, LifecycleTransitionError};
 pub use overload_management::{
     BrownoutFeature, BrownoutFeatureState, BrownoutHookRegistry, OverloadManagementError,
     OverloadManager, OverloadMetrics, OverloadPolicy, OverloadSignal, OverloadSignalKind,
@@ -79,6 +122,24 @@ pub use overload_management::{
 pub use probe_semantics::{
     LivenessProbeState, ProbeEvaluation, ProbeMetrics, ProbeSemanticsEvaluator,
     ReadinessProbeState, RuntimeProbeInput, StartupProbeState,
+};
+pub use request_body_inspection::RequestBodyInspector;
+pub use request_classification_adaptive_mitigation::{
+    RequestClassificationAdaptiveMitigationDecision, RequestClassificationAdaptiveMitigationPolicy,
+    RequestClassificationAdaptiveMitigator,
+};
+pub use reputation_adapter::{
+    ReputationAdapterChain, ReputationSignalInput, ReputationSignalProvider, ReputationVerdict,
+};
+pub use request_classification::{
+    RequestClassificationAction, RequestClassificationAdapterContext,
+    RequestClassificationPolicyRuntime, RequestClassificationResult,
+    RequestClassifierSignal, RequestClassifierSignalKind,
+};
+pub use request_classification_enforcement::{
+    RequestClassificationAuditRecord, RequestClassificationAuthContext,
+    RequestClassificationEnforcer, RequestClassificationEnforcementAction,
+    RequestClassificationEnforcementDecision, RequestClassificationEnforcementPolicy,
 };
 pub use protocol_protection::{ProtocolAnomalyCategory, SlowClientStage};
 pub use route_enumeration::{
@@ -95,7 +156,8 @@ pub use tcp_proxy::{
     ProxySessionReport, TcpProxyConfig, TcpProxyError,
 };
 pub use telemetry::{
-    HttpCacheRequestOutcome, HttpCacheRevalidationResult, HttpUpgradeResult, RuntimeTelemetry,
+    ExtensionPolicyPluginOutcome, HttpCacheRequestOutcome, HttpCacheRevalidationResult,
+    HttpUpgradeResult, RuntimeTelemetry,
 };
 pub use trusted_client_ip::{
     TrustedClientIpError, TrustedClientIpHeaderSource, TrustedClientIpPolicy,
@@ -109,8 +171,8 @@ pub use upstream_balancer::{
     UpstreamSelectionPolicy, WeightedRouteDestination,
 };
 pub use upstream_health::{
-    EndpointHealthPolicy, EndpointHealthSnapshot, EndpointHealthStatus, UpstreamHealthError,
-    UpstreamHealthMetrics, UpstreamHealthRegistry,
+    EndpointHealthPolicy, EndpointHealthSnapshot, EndpointHealthStatus, ProtocolHealthClass,
+    UpstreamHealthError, UpstreamHealthMetrics, UpstreamHealthRegistry,
 };
 pub use upstream_registry::{EndpointRegistry, EndpointRegistryError, EndpointRegistryMetrics};
 
@@ -190,6 +252,10 @@ pub struct EffectiveRouteDestinationPolicy {
     pub retry_budget: Option<String>,
     pub timeout_hierarchy: Option<String>,
     pub circuit_breaker: Option<String>,
+    pub jwt_auth_policy: Option<String>,
+    pub external_auth_policy: Option<String>,
+    pub authorization_policy: Option<String>,
+    pub upstream_identity_policy: Option<String>,
     pub transform_policy: Option<String>,
     pub traffic_mirror: Option<String>,
     pub fault_injection: Option<String>,
@@ -197,6 +263,24 @@ pub struct EffectiveRouteDestinationPolicy {
     pub local_concurrency_limits: Vec<String>,
     pub effective_request_transform: Option<lb_config_model::RequestTransformConfig>,
     pub effective_response_transform: Option<lb_config_model::ResponseTransformConfig>,
+}
+
+/// Per-destination gRPC status classification policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrpcFailurePolicy {
+    pub retryable_statuses: Vec<u16>,
+    pub timeout_statuses: Vec<u16>,
+    pub overloaded_statuses: Vec<u16>,
+}
+
+impl Default for GrpcFailurePolicy {
+    fn default() -> Self {
+        Self {
+            retryable_statuses: vec![13, 14],
+            timeout_statuses: vec![4],
+            overloaded_statuses: vec![8],
+        }
+    }
 }
 
 /// Deterministic lifecycle states for a running listener.

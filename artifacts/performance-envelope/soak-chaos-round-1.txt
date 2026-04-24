@@ -1,0 +1,18 @@
+warning: function `classify_grpc_response_failure` is never used
+   --> crates/runtime/src/http2_proxy/destination_policies.rs:246:4
+    |
+246 | fn classify_grpc_response_failure(status: u16) -> Option<crate::Upstrea...
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `lb-runtime` (lib) generated 1 warning
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.38s
+     Running tests/soak_chaos.rs (target/debug/deps/soak_chaos-275415baee5fbcb6)
+
+running 2 tests
+test http2_upstream_flap_chaos_soak_keeps_fd_growth_bounded ... ok
+test http1_upstream_flap_chaos_soak_keeps_fd_growth_bounded ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.55s
+

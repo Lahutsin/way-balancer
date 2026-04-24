@@ -6,27 +6,42 @@ use std::fs;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use bytes::{Buf, Bytes};
 use h2::{client, server, Reason};
+use h3::server as h3_server;
 use http::{Request, Response, StatusCode};
-use lb_net_core::{ListenerClass, ListenerConfig, UpstreamTarget};
-use lb_runtime::{
-    proxy_http1_connection, proxy_http1_connection_with_downstream_addr, proxy_http2_connection,
-    start_listener, Http1ConnectionReport, Http1ProxyConfig, Http1ProxyError,
-    Http2ConnectionReport, Http2ProxyConfig, Http2ProxyError, ListenerHandle,
+use http1::Response as Http3Response;
+use lb_net_core::{
+    EndpointMetadata, EndpointState, ListenerClass, ListenerConfig, UpstreamCluster,
+    UpstreamClusterName, UpstreamEndpoint, UpstreamEndpointId, UpstreamTarget, UpstreamTransport,
 };
+use lb_runtime::{
+    clear_http3_test_root_certificates, execute_with_hedge,
+    set_http3_test_root_certificates,
+    proxy_http1_connection, proxy_http1_connection_with_downstream_addr, proxy_http2_connection,
+    start_listener, DiscoveryEndpoint,
+    DiscoveryMembershipReconciler, DiscoveryProviderKind, DiscoverySnapshot, DiscoverySourceId,
+    EndpointHealthPolicy, Http1ConnectionReport, Http1ProxyConfig, Http1ProxyError,
+    Http2ConnectionReport, Http2ProxyConfig, Http2ProxyError, ListenerHandle,
+    OverloadState, RequestClassificationAdapterContext,
+    RequestClassificationAdaptiveMitigationPolicy, RequestClassificationAuthContext,
+    RequestClassificationEnforcementPolicy, RequestClassificationPolicyRuntime,
+    RequestHedgingPolicy, SheddingAction, SheddingDecision, UpstreamHealthRegistry,
+};
+use quinn::crypto::rustls::QuicServerConfig;
 use rcgen::generate_simple_self_signed;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use rustls::ServerConfig as RustlsServerConfig;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::oneshot;
 use tokio::task::JoinSet;
 use tokio::time;
-use tokio_rustls::rustls::pki_types::{
-    CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName,
-};
+use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::rustls::{ClientConfig, RootCertStore, ServerConfig};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
@@ -61,6 +76,10 @@ impl EnvelopeMode {
                 mixed_operations: 64,
                 idle_connections: 24,
                 active_streams: 24,
+                hedging_iterations: 24,
+                abuse_decisions: 64,
+                discovery_updates: 24,
+                http3_bridge_requests: 12,
             },
             Self::Full => ScenarioConfig {
                 http1_requests: 256,
@@ -68,6 +87,10 @@ impl EnvelopeMode {
                 mixed_operations: 256,
                 idle_connections: 64,
                 active_streams: 64,
+                hedging_iterations: 96,
+                abuse_decisions: 256,
+                discovery_updates: 96,
+                http3_bridge_requests: 48,
             },
         }
     }
@@ -309,6 +332,10 @@ pub struct ScenarioConfig {
     pub mixed_operations: usize,
     pub idle_connections: usize,
     pub active_streams: usize,
+    pub hedging_iterations: usize,
+    pub abuse_decisions: usize,
+    pub discovery_updates: usize,
+    pub http3_bridge_requests: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -359,6 +386,7 @@ pub struct PerformanceEnvelopeReport {
     pub tls_overhead: TlsOverheadMeasurement,
     pub idle_connection_memory: MemoryMeasurement,
     pub http2_stream_memory: MemoryMeasurement,
+    pub advanced_scenarios: Vec<ThroughputMeasurement>,
     pub assumptions: Vec<String>,
 }
 
@@ -373,16 +401,66 @@ struct H2Client {
     connection_task: tokio::task::JoinHandle<()>,
 }
 
+struct Http3TestRootGuard;
+
+impl Drop for Http3TestRootGuard {
+    fn drop(&mut self) {
+        clear_http3_test_root_certificates();
+    }
+}
+
 pub async fn run_performance_envelope(
     mode: EnvelopeMode,
 ) -> Result<PerformanceEnvelopeReport, DynError> {
     let scenario = mode.scenario();
-    let http1_throughput = measure_http1_throughput(scenario.http1_requests).await?;
-    let http2_throughput = measure_http2_throughput(scenario.http2_streams).await?;
-    let mixed_latency = measure_mixed_latency(scenario.mixed_operations).await?;
-    let http1_tls_throughput = measure_http1_tls_throughput(scenario.http1_requests).await?;
-    let idle_connection_memory = measure_idle_connection_memory(scenario.idle_connections).await?;
-    let http2_stream_memory = measure_http2_stream_memory(scenario.active_streams).await?;
+    let http1_throughput = measure_http1_throughput(scenario.http1_requests)
+        .await
+        .map_err(|error| io::Error::other(format!("http1_throughput: {error}")))?;
+    let http2_throughput = measure_http2_throughput(scenario.http2_streams)
+        .await
+        .map_err(|error| io::Error::other(format!("http2_throughput: {error}")))?;
+    let mixed_latency = measure_mixed_latency(scenario.mixed_operations)
+        .await
+        .map_err(|error| io::Error::other(format!("mixed_latency: {error}")))?;
+    let http1_tls_throughput = measure_http1_tls_throughput(scenario.http1_requests)
+        .await
+        .map_err(|error| io::Error::other(format!("http1_tls_throughput: {error}")))?;
+    let idle_connection_memory = measure_idle_connection_memory(scenario.idle_connections)
+        .await
+        .map_err(|error| io::Error::other(format!("idle_connection_memory: {error}")))?;
+    let http2_stream_memory = measure_http2_stream_memory(scenario.active_streams)
+        .await
+        .map_err(|error| io::Error::other(format!("http2_stream_memory: {error}")))?;
+    let mut advanced_scenarios = vec![
+        measure_hedging_execution_throughput(scenario.hedging_iterations)
+            .await
+            .map_err(|error| io::Error::other(format!("hedging_throughput: {error}")))?,
+        measure_abuse_mitigation_decision_throughput(scenario.abuse_decisions)
+            .map_err(|error| io::Error::other(format!("abuse_mitigation: {error}")))?,
+        measure_discovery_churn_reconcile_throughput(scenario.discovery_updates)
+            .map_err(|error| io::Error::other(format!("discovery_churn: {error}")))?,
+    ];
+    let mut assumptions = vec![
+        String::from("loopback-only proxy measurements; these numbers are for relative regression detection and local capacity planning, not internet-facing SLA claims"),
+        String::from("resident-set-size sampling is process-level and most comparable across commits on the same host class"),
+        String::from("TLS overhead is measured against the same HTTP/1 batch through a local Rustls-terminated downstream connection"),
+        String::from("advanced harness scenarios cover hedging execution, abuse-mitigation decision path, discovery membership churn, and HTTP/1 to HTTP/3 bridge path"),
+    ];
+
+    match measure_http1_to_http3_bridge_throughput(scenario.http3_bridge_requests).await {
+        Ok(measurement) => advanced_scenarios.push(measurement),
+        Err(error) => {
+            advanced_scenarios.push(ThroughputMeasurement {
+                scenario: String::from("http1_to_http3_bridge_batch"),
+                operations: scenario.http3_bridge_requests.max(1),
+                elapsed_ms: 0,
+                operations_per_sec: 0.0,
+            });
+            assumptions.push(format!(
+                "HTTP/1 to HTTP/3 bridge throughput sample unavailable in this run: {error}"
+            ));
+        }
+    }
     let tls_overhead = TlsOverheadMeasurement {
         plain_ops_per_sec: http1_throughput.operations_per_sec,
         tls_ops_per_sec: http1_tls_throughput.operations_per_sec,
@@ -402,11 +480,8 @@ pub async fn run_performance_envelope(
         tls_overhead,
         idle_connection_memory,
         http2_stream_memory,
-        assumptions: vec![
-            String::from("loopback-only proxy measurements; these numbers are for relative regression detection and local capacity planning, not internet-facing SLA claims"),
-            String::from("resident-set-size sampling is process-level and most comparable across commits on the same host class"),
-            String::from("TLS overhead is measured against the same HTTP/1 batch through a local Rustls-terminated downstream connection"),
-        ],
+        advanced_scenarios,
+        assumptions,
     })
 }
 
@@ -432,6 +507,19 @@ pub async fn build_performance_envelope_artifact(
         control_plane_timing,
         threshold_evaluation,
         baseline_comparison,
+    })
+}
+
+pub async fn capture_control_plane_timing_evidence() -> Result<ControlPlaneTimingEvidence, DynError> {
+    let reload_success_ms = Some(measure_reload_success_timing_ms().await?);
+    let reload_degraded_success_ms = Some(measure_reload_degraded_success_timing_ms().await?);
+    let failover_ms = Some(measure_failover_timing_ms()?);
+
+    Ok(ControlPlaneTimingEvidence {
+        reload_success_ms,
+        reload_degraded_success_ms,
+        failover_ms,
+        evidence_source: Some(String::from("performance_harness_local_capture")),
     })
 }
 
@@ -754,6 +842,78 @@ fn unix_time_ms() -> u64 {
         .unwrap_or(0)
 }
 
+pub async fn measure_reload_success_timing_ms() -> Result<u64, DynError> {
+    let mut config = ListenerConfig::foundation_local("perf-reload-success", ListenerClass::Public);
+    config.idle_timeout = Duration::from_millis(50);
+    config.drain_timeout = Duration::from_millis(200);
+    let handle = start_listener(config).await?;
+
+    let started_at = Instant::now();
+    handle.shutdown().await?;
+    Ok(started_at.elapsed().as_millis().try_into().unwrap_or(u64::MAX))
+}
+
+pub async fn measure_reload_degraded_success_timing_ms() -> Result<u64, DynError> {
+    let mut config = ListenerConfig::foundation_local("perf-reload-degraded", ListenerClass::Public);
+    config.idle_timeout = Duration::from_secs(2);
+    config.drain_timeout = Duration::from_millis(40);
+    let handle = start_listener(config).await?;
+
+    let mut held_connection = TcpStream::connect(handle.local_addr()).await?;
+    held_connection.write_all(b"x").await?;
+
+    let started_at = Instant::now();
+    handle.shutdown().await?;
+    drop(held_connection);
+    Ok(started_at.elapsed().as_millis().try_into().unwrap_or(u64::MAX))
+}
+
+pub fn measure_failover_timing_ms() -> Result<u64, DynError> {
+    let mut policy = EndpointHealthPolicy::default();
+    policy.degraded_failure_threshold = 1;
+    policy.unhealthy_failure_threshold = 1;
+    policy.ejection_failure_threshold = 1;
+
+    let registry = UpstreamHealthRegistry::new(policy);
+    let cluster_name = UpstreamClusterName::new("perf-failover")?;
+    let primary_id = UpstreamEndpointId::new("primary")?;
+    let secondary_id = UpstreamEndpointId::new("secondary")?;
+    let primary = UpstreamEndpoint::new(
+        primary_id.clone(),
+        SocketAddr::from(([127, 0, 0, 1], 9100)),
+        EndpointState::Ready,
+        EndpointMetadata {
+            zone: None,
+            locality: None,
+            weight: 1,
+        },
+    )?;
+    let secondary = UpstreamEndpoint::new(
+        secondary_id.clone(),
+        SocketAddr::from(([127, 0, 0, 1], 9101)),
+        EndpointState::Ready,
+        EndpointMetadata {
+            zone: None,
+            locality: None,
+            weight: 1,
+        },
+    )?;
+    registry.insert_cluster(UpstreamCluster::new(cluster_name.clone(), vec![primary, secondary])?)?;
+    registry.advance_time(Duration::from_secs(20));
+
+    let started_at = Instant::now();
+    let _ = registry.note_active_failure(&cluster_name, &primary_id)?;
+    let candidates = registry.selection_candidates(&cluster_name, true)?;
+    if !candidates
+        .iter()
+        .any(|candidate| candidate.endpoint_id == secondary_id)
+    {
+        return Err(io::Error::other("failover candidate was not selected").into());
+    }
+
+    Ok(started_at.elapsed().as_millis().try_into().unwrap_or(u64::MAX))
+}
+
 pub async fn measure_http1_throughput(requests: usize) -> Result<ThroughputMeasurement, DynError> {
     let (upstream_addr, captures_rx) =
         spawn_repeating_http1_upstream(requests, HTTP1_BENCH_BODY).await?;
@@ -978,6 +1138,185 @@ pub async fn measure_http2_stream_memory(streams: usize) -> Result<MemoryMeasure
     ))
 }
 
+pub async fn measure_hedging_execution_throughput(
+    iterations: usize,
+) -> Result<ThroughputMeasurement, DynError> {
+    let operations = iterations.max(1);
+    let started_at = Instant::now();
+
+    for _ in 0..operations {
+        let _ = execute_with_hedge(
+            RequestHedgingPolicy {
+                hedge_delay: Duration::from_millis(2),
+                max_attempts: 2,
+            },
+            || true,
+            || async {
+                time::sleep(Duration::from_millis(6)).await;
+                Ok::<(), io::Error>(())
+            },
+            || async {
+                time::sleep(Duration::from_millis(1)).await;
+                Ok::<(), io::Error>(())
+            },
+        )
+        .await
+        .map_err(|error| -> DynError { Box::new(error) })?;
+    }
+
+    Ok(throughput_measurement(
+        "hedging_execution_batch",
+        operations,
+        started_at.elapsed(),
+    ))
+}
+
+pub fn measure_abuse_mitigation_decision_throughput(
+    decisions: usize,
+) -> Result<ThroughputMeasurement, DynError> {
+    let operations = decisions.max(1);
+    let runtime = RequestClassificationPolicyRuntime::from_config(
+        &lb_config_model::RequestClassificationPolicyConfig::default(),
+    );
+    let enforcement_policy = RequestClassificationEnforcementPolicy::default();
+    let adaptive_policy = RequestClassificationAdaptiveMitigationPolicy::default();
+    let auth_context = RequestClassificationAuthContext::default();
+    let shedding = SheddingDecision {
+        action: SheddingAction::Shed,
+        state: OverloadState::Brownout,
+        reason: None,
+    };
+    let request_context = RequestClassificationAdapterContext {
+        source_ip: Some(String::from("198.51.100.10")),
+        method: Some(String::from("POST")),
+        path: Some(String::from("/checkout")),
+        user_agent: Some(String::from("Mozilla/5.0")),
+        content_type: Some(String::from("application/json")),
+        headers: vec![
+            (String::from("x-request-id"), String::from("perf-run")),
+            (String::from("user-agent"), String::from("load-bot/1.0")),
+        ],
+    };
+    let body = b"{\"payload\":\"union select 1\"}";
+
+    let started_at = Instant::now();
+    for _ in 0..operations {
+        let _ = runtime.classify_enforce_and_adapt_with_overload(
+            &request_context,
+            body,
+            &auth_context,
+            &enforcement_policy,
+            &adaptive_policy,
+            &shedding,
+        );
+    }
+
+    Ok(throughput_measurement(
+        "abuse_mitigation_decision_batch",
+        operations,
+        started_at.elapsed(),
+    ))
+}
+
+pub fn measure_discovery_churn_reconcile_throughput(
+    updates: usize,
+) -> Result<ThroughputMeasurement, DynError> {
+    let operations = updates.max(1);
+    let registry = UpstreamHealthRegistry::new(EndpointHealthPolicy::default());
+    let cluster_name = lb_net_core::UpstreamClusterName::new("perf-discovery")?;
+    registry.insert_cluster(lb_net_core::UpstreamCluster::new(cluster_name.clone(), Vec::new())?)?;
+    let source = DiscoverySourceId::new(
+        DiscoveryProviderKind::DnsAaaa,
+        "perf.internal",
+        cluster_name.as_str(),
+    )?;
+    let mut reconciler = DiscoveryMembershipReconciler::new(Duration::from_millis(3));
+
+    let started_at = Instant::now();
+    for index in 0..operations {
+        let generation = u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1);
+        let endpoint_count = if index % 2 == 0 { 2 } else { 3 };
+        let mut endpoints = Vec::with_capacity(endpoint_count);
+        for endpoint_index in 0..endpoint_count {
+            let endpoint_id = format!("ep-{endpoint_index}");
+            let address = SocketAddr::from((
+                [127, 0, 0, 1],
+                9300_u16.saturating_add(u16::try_from(endpoint_index).unwrap_or(0)),
+            ));
+            endpoints.push(DiscoveryEndpoint::new(endpoint_id, address, None, None, 1)?);
+        }
+
+        reconciler.reconcile_snapshot(
+            &registry,
+            DiscoverySnapshot {
+                source: source.clone(),
+                generation,
+                valid_for: Duration::from_secs(20),
+                endpoints,
+            },
+        )?;
+        let _ = reconciler.advance_time(&registry, Duration::from_millis(4))?;
+    }
+
+    Ok(throughput_measurement(
+        "discovery_churn_reconcile_batch",
+        operations,
+        started_at.elapsed(),
+    ))
+}
+
+pub async fn measure_http1_to_http3_bridge_throughput(
+    requests: usize,
+) -> Result<ThroughputMeasurement, DynError> {
+    let mut last_error: Option<DynError> = None;
+    for _attempt in 0..3 {
+        match measure_http1_to_http3_bridge_throughput_once(requests).await {
+            Ok(measurement) => return Ok(measurement),
+            Err(error) => last_error = Some(error),
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| io::Error::other("http1->http3 bridge harness failed").into()))
+}
+
+async fn measure_http1_to_http3_bridge_throughput_once(
+    requests: usize,
+) -> Result<ThroughputMeasurement, DynError> {
+    let operations = requests.max(1);
+    let (upstream_addr, cert_der, served_rx) =
+        spawn_repeating_h3_upstream(operations, HTTP1_BENCH_BODY).await?;
+    set_http3_test_root_certificates(vec![cert_der]);
+    let _cert_guard = Http3TestRootGuard;
+
+    let config = Http1ProxyConfig::new(UpstreamTarget::with_transport(
+        "http3-upstream",
+        upstream_addr,
+        UpstreamTransport::Http3,
+    ));
+    let (proxy_addr, report_rx) = spawn_one_shot_http1_proxy_listener(config).await?;
+    let mut client = TcpStream::connect(proxy_addr).await?;
+
+    let started_at = Instant::now();
+    drive_http1_batch(&mut client, operations).await?;
+    let elapsed = started_at.elapsed();
+    drop(client);
+
+    let report = receive_http1_proxy_result(report_rx).await?;
+    let served = time::timeout(Duration::from_secs(5), served_rx)
+        .await
+        .map_err(|_| io::Error::other("HTTP/3 serve wait timed out"))?
+        .map_err(|_| io::Error::other("HTTP/3 serve channel closed"))?;
+    if report.metrics.request_count != operations as u64 || served != operations {
+        return Err(io::Error::other("unexpected HTTP/1->HTTP/3 harness counts").into());
+    }
+
+    Ok(throughput_measurement(
+        "http1_to_http3_bridge_batch",
+        operations,
+        elapsed,
+    ))
+}
+
 fn throughput_measurement(
     scenario: &str,
     operations: usize,
@@ -1057,7 +1396,15 @@ fn duration_to_us(duration: Duration) -> u64 {
     duration.as_micros().try_into().unwrap_or(u64::MAX)
 }
 
+fn ensure_rustls_crypto_provider() {
+    static PROVIDER: OnceLock<()> = OnceLock::new();
+    PROVIDER.get_or_init(|| {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    });
+}
+
 fn tls_identity() -> Result<TlsIdentity, DynError> {
+    ensure_rustls_crypto_provider();
     let certified = generate_simple_self_signed(vec![String::from("localhost")])?;
     let cert_der_bytes = certified.cert.der().to_vec();
     let cert_der = CertificateDer::from(cert_der_bytes.clone());
@@ -1303,6 +1650,99 @@ async fn spawn_basic_h2_upstream(body: &'static str) -> io::Result<SocketAddr> {
     Ok(address)
 }
 
+async fn spawn_repeating_h3_upstream(
+    requests: usize,
+    body: &'static str,
+) -> io::Result<(SocketAddr, Vec<u8>, oneshot::Receiver<usize>)> {
+    ensure_rustls_crypto_provider();
+    let certified =
+        generate_simple_self_signed(vec![String::from("localhost")]).map_err(io::Error::other)?;
+    let cert_der = CertificateDer::from(certified.cert.der().to_vec());
+    let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+        certified.key_pair.serialize_der(),
+    ));
+
+    let mut rustls_server = RustlsServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der.clone()], key_der)
+        .map_err(io::Error::other)?;
+    rustls_server.alpn_protocols = vec![b"h3".to_vec()];
+
+    let quic_server = QuicServerConfig::try_from(Arc::new(rustls_server)).map_err(io::Error::other)?;
+    let server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_server));
+
+    let socket = UdpSocket::bind("127.0.0.1:0").await?;
+    let address = socket.local_addr()?;
+    let endpoint = quinn::Endpoint::new(
+        quinn::EndpointConfig::default(),
+        Some(server_config),
+        socket.into_std()?,
+        Arc::new(quinn::TokioRuntime),
+    )
+    .map_err(io::Error::other)?;
+
+    let (served_tx, served_rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let mut served = 0usize;
+        while served < requests {
+            let Some(incoming) = endpoint.accept().await else {
+                break;
+            };
+            let Ok(connecting) = incoming.accept() else {
+                continue;
+            };
+            let Ok(connection) = connecting.await else {
+                continue;
+            };
+            let Ok(mut h3_conn) = h3_server::builder().build(h3_quinn::Connection::new(connection)).await else {
+                continue;
+            };
+
+            while served < requests {
+                let Ok(Some(resolver)) = h3_conn.accept().await else {
+                    break;
+                };
+                let Ok((_request, mut stream)) = resolver.resolve_request().await else {
+                    break;
+                };
+
+                loop {
+                    let Ok(chunk) = stream.recv_data().await else {
+                        break;
+                    };
+                    let Some(mut chunk) = chunk else {
+                        break;
+                    };
+                    let _ = chunk.copy_to_bytes(chunk.remaining());
+                }
+
+                let response = Http3Response::builder().status(200).body(());
+                let Ok(response) = response else {
+                    break;
+                };
+                if stream.send_response(response).await.is_err() {
+                    break;
+                }
+                if stream
+                    .send_data(Bytes::from_static(body.as_bytes()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                if stream.finish().await.is_err() {
+                    break;
+                }
+                served = served.saturating_add(1);
+            }
+        }
+
+        let _ = served_tx.send(served);
+    });
+
+    Ok((address, cert_der.as_ref().to_vec(), served_rx))
+}
+
 async fn spawn_delayed_h2_upstream(delay: Duration, body: &'static str) -> io::Result<SocketAddr> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
@@ -1496,6 +1936,10 @@ mod tests {
                 mixed_operations: 64,
                 idle_connections: 24,
                 active_streams: 24,
+                hedging_iterations: 24,
+                abuse_decisions: 64,
+                discovery_updates: 24,
+                http3_bridge_requests: 12,
             },
             http1_throughput: ThroughputMeasurement {
                 scenario: String::from("http1"),
@@ -1547,6 +1991,32 @@ mod tests {
                 per_unit_rss_kib: Some(14.0),
                 note: String::from("sample"),
             },
+            advanced_scenarios: vec![
+                ThroughputMeasurement {
+                    scenario: String::from("hedging_execution_batch"),
+                    operations: 24,
+                    elapsed_ms: 100,
+                    operations_per_sec: 240.0,
+                },
+                ThroughputMeasurement {
+                    scenario: String::from("abuse_mitigation_decision_batch"),
+                    operations: 64,
+                    elapsed_ms: 5,
+                    operations_per_sec: 12_800.0,
+                },
+                ThroughputMeasurement {
+                    scenario: String::from("discovery_churn_reconcile_batch"),
+                    operations: 24,
+                    elapsed_ms: 4,
+                    operations_per_sec: 6_000.0,
+                },
+                ThroughputMeasurement {
+                    scenario: String::from("http1_to_http3_bridge_batch"),
+                    operations: 12,
+                    elapsed_ms: 20,
+                    operations_per_sec: 600.0,
+                },
+            ],
             assumptions: vec![String::from("sample")],
         }
     }

@@ -112,6 +112,7 @@
         "spec": {
           "request_timeout_ms": 30000,
           "attempt_timeout_ms": 10000,
+          "per_try_timeout_ms": 8000,
           "connect_timeout_ms": 1000,
           "idle_timeout_ms": 5000
         }

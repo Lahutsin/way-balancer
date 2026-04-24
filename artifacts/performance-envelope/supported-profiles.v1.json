@@ -1,0 +1,63 @@
+{
+  "schema_version": "v1",
+  "profiles": [
+    {
+      "name": "loopback_regression_v1",
+      "claim_tier": "experimental",
+      "summary": "fast local regression profile for loopback-only throughput, latency, and memory trend detection",
+      "host_assumptions": {
+        "label": "developer_loopback_host"
+      },
+      "network_assumptions": {
+        "label": "loopback_only",
+        "path": "single-host local sockets",
+        "expected_rtt_ms": 0.1
+      },
+      "tls_mode": "rustls_terminated_downstream_optional",
+      "connection_mix": "http1_batch + http2_stream_batch + mixed interleaved",
+      "request_payload_bytes": 0,
+      "hostile_edge_posture": "not a supported external capacity claim",
+      "evidence_requirements": [
+        "use this profile for relative regressions only",
+        "do not treat loopback-only numbers as supportable customer capacity claims"
+      ]
+    },
+    {
+      "name": "lab_small_non_loopback_v1",
+      "claim_tier": "supported",
+      "summary": "initial supported small-host non-loopback profile for release evidence and conservative capacity claims",
+      "host_assumptions": {
+        "label": "small_host_v1",
+        "cpu_cores": 4,
+        "memory_gib": 16,
+        "nic_gbps": 10
+      },
+      "network_assumptions": {
+        "label": "single_az_non_loopback",
+        "path": "client host to dataplane host over dedicated lab network",
+        "expected_rtt_ms": 1.5
+      },
+      "tls_mode": "tls_terminated_downstream_with_hostile_edge_controls_enabled",
+      "connection_mix": "http1 + http2 + persistent mixed traffic with reload and failover timing evidence",
+      "request_payload_bytes": 1024,
+      "hostile_edge_posture": "source quota and handshake guard enabled during supported envelope validation",
+      "supported_thresholds": {
+        "min_http1_ops_per_sec": 2500,
+        "min_http2_ops_per_sec": 8000,
+        "max_mixed_p50_us": 5000,
+        "max_mixed_p95_us": 12000,
+        "max_mixed_p99_us": 20000,
+        "max_idle_connection_rss_kib_per_unit": 16,
+        "max_http2_stream_rss_kib_per_unit": 24,
+        "max_reload_success_ms": 5000,
+        "max_reload_degraded_success_ms": 15000,
+        "max_failover_ms": 3000
+      },
+      "evidence_requirements": [
+        "record the measured reload timing from GET /status reload_last_success_duration_ms",
+        "record degraded-success timing when reload_applied_overlap_drain_timeout occurs",
+        "record failover timing from the supported lab procedure before promoting claims to release evidence"
+      ]
+    }
+  ]
+}

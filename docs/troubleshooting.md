@@ -1,5 +1,26 @@
 # Troubleshooting
 
+## Request Classification Enforcement Decisions
+
+When request-classification is enabled, enforcement now maps classifier outputs and auth context into one of `allow`, `tag`, `challenge`, `throttle`, or `block`.
+
+If outcomes look too strict or too permissive:
+
+- inspect enforcement audit reasons first to determine whether mapping came from classifier action, auth fail-open, trusted-principal exception, or auth-context risk hints
+- verify whether `x-way-balancer-abuse-disposition` or `x-way-balancer-risk-tier` headers were injected by upstream auth context mapping
+- confirm that external auth fail-open was not active when challenge decisions were expected (fail-open currently maps challenge to throttle)
+- review trusted-principal exception configuration before concluding classifier thresholds are incorrect
+
+## Body Inspection And Adaptive Mitigation
+
+If classification behavior changes only for requests with payload bodies or only during overload windows:
+
+- verify `body_scoring.max_inspect_bytes` is large enough to include meaningful payload prefixes for your workload
+- verify `body_scoring.max_body_bytes` is not set below normal request sizes for known-safe endpoints
+- verify `body_scoring.allowlisted_content_types` covers expected binary or protocol-specific payloads (for example gRPC content types)
+- inspect adaptive decision reasons to confirm whether overload shedding escalated `tag` to `challenge` or `challenge` to `throttle`
+- if trusted-principal traffic is unexpectedly escalated, verify audit reasons include the trusted-principal exception and that principal identity mapping is correct
+
 ## Scope
 
 This page is the shortest path from a symptom to the right diagnostic endpoint or runbook. It focuses on the most likely operator problems in the current workspace mode.
@@ -179,6 +200,39 @@ Common causes:
 - route-level source CIDRs are matching against the raw peer address because trusted forwarding was not configured
 
 If the request became unavailable immediately after a config or topology change, do not assume the runtime quietly rebalanced away a missing endpoint. The health registry now fails closed when cluster topology and tracked endpoint health diverge, so treat sudden `route backend unavailable` or `no eligible endpoints` outcomes after reload churn as a signal to inspect reload status and reconcile the intended endpoint set rather than retry blindly.
+
+### Retry Refused For Unsafe Request Shapes
+
+Retry behavior is intentionally idempotency-aware.
+
+- automatic stale-reuse retries are allowed for idempotent methods (`GET`, `HEAD`, `OPTIONS`, `TRACE`, `PUT`, `DELETE`) when the request is replayable
+- `POST` requests are treated as unsafe by default and are not retried automatically
+- to opt into retry for replayable `POST` requests, send a non-empty `idempotency-key` (or `x-idempotency-key`) header
+
+If an expected retry does not happen, check request method, body replayability, and idempotency key presence before adjusting retry budgets.
+
+Destination-local retries are also health-gated:
+
+- retries are denied when the selected destination endpoint is already ejected
+- retries are denied when the destination circuit breaker is open
+
+In these cases, increase retry budgets will not help until destination health recovers.
+
+### Endpoints Eject Too Aggressively Or Too Slowly
+
+When endpoint availability flaps, validate which ejection path actually triggered:
+
+1. combined active+passive failures crossing `ejection_failure_threshold`
+2. consecutive passive failures crossing `consecutive_passive_failure_ejection_threshold`
+3. passive outlier window success rate falling below `success_rate_ejection_threshold_percent`
+
+The passive outlier path only activates after `outlier_window_size` samples have been observed for an endpoint.
+
+If multiple endpoints are failing at once, verify `cluster_ejection_budget_percent` before assuming ejection is broken. Budget caps intentionally keep at least part of a cluster routable by preventing unlimited parallel ejections.
+
+If one protocol is noisy but others are healthy, check protocol-scoped passive counters in endpoint health snapshots. Passive failures are tracked by protocol class so HTTP/1 and HTTP/2 bursts do not silently collapse into one undifferentiated counter.
+
+During recovery, expect `Warming` status and reduced effective weight until slow-start completes. If traffic returns too quickly or too slowly after recovery, check `warmup_duration` together with `slow_start_min_weight_percent`.
 
 ### Effective Client IP Looks Wrong
 

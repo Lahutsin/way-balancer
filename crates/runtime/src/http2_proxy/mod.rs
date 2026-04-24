@@ -33,6 +33,7 @@ include!("connection_proxy.rs");
 include!("stream_entry.rs");
 include!("stream_forwarding.rs");
 include!("route_selection.rs");
+include!("request_auth.rs");
 include!("request_transforms.rs");
 include!("destination_policies.rs");
 include!("traffic_mirroring.rs");

@@ -1,0 +1,170 @@
+warning: function `classify_grpc_response_failure` is never used
+   --> crates/runtime/src/http2_proxy/destination_policies.rs:246:4
+    |
+246 | fn classify_grpc_response_failure(status: u16) -> Option<crate::Upstrea...
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `lb-runtime` (lib) generated 1 warning
+    Finished `release` profile [optimized] target(s) in 0.47s
+     Running `target/release/examples/performance_envelope --mode smoke`
+{
+  "schema_version": "v1",
+  "generated_at_unix_ms": 1776993370484,
+  "profile": {
+    "name": "loopback_regression_v1",
+    "claim_tier": "experimental",
+    "summary": "fast local regression profile for loopback-only throughput, latency, and memory trend detection",
+    "host_class": {
+      "label": "developer_loopback_host",
+      "cpu_cores": null,
+      "memory_gib": null,
+      "nic_gbps": null
+    },
+    "network_profile": {
+      "label": "loopback_only",
+      "path": "single-host local sockets",
+      "expected_rtt_ms": 0.1
+    },
+    "tls_mode": "rustls_terminated_downstream_optional",
+    "connection_mix": "http1_batch + http2_stream_batch + mixed interleaved",
+    "request_payload_bytes": 0,
+    "hostile_edge_posture": "not a supported external capacity claim",
+    "supported_envelope": null,
+    "regression_guardrails": {
+      "max_throughput_drop_pct": 15.0,
+      "max_latency_increase_pct": 20.0,
+      "max_memory_growth_pct": 15.0,
+      "max_timing_regression_pct": 10.0
+    },
+    "evidence_requirements": [
+      "use this profile for relative regressions only",
+      "do not treat loopback-only numbers as supportable customer capacity claims"
+    ]
+  },
+  "report": {
+    "mode": "smoke",
+    "scenario": {
+      "http1_requests": 64,
+      "http2_streams": 64,
+      "mixed_operations": 64,
+      "idle_connections": 24,
+      "active_streams": 24,
+      "hedging_iterations": 24,
+      "abuse_decisions": 64,
+      "discovery_updates": 24,
+      "http3_bridge_requests": 12
+    },
+    "http1_throughput": {
+      "scenario": "http1_proxy_batch",
+      "operations": 64,
+      "elapsed_ms": 16,
+      "operations_per_sec": 3896.855116144549
+    },
+    "http2_throughput": {
+      "scenario": "http2_proxy_stream_batch",
+      "operations": 64,
+      "elapsed_ms": 3,
+      "operations_per_sec": 19165.021918496554
+    },
+    "mixed_latency": {
+      "scenario": "mixed_http1_http2_interleaved",
+      "samples": 64,
+      "mean_us": 278.46875,
+      "p50_us": 265,
+      "p95_us": 408,
+      "p99_us": 415,
+      "max_us": 537
+    },
+    "http1_tls_throughput": {
+      "scenario": "http1_proxy_batch_tls",
+      "operations": 64,
+      "elapsed_ms": 12,
+      "operations_per_sec": 5044.981130588155
+    },
+    "tls_overhead": {
+      "plain_ops_per_sec": 3896.855116144549,
+      "tls_ops_per_sec": 5044.981130588155,
+      "throughput_penalty_pct": -29.46288687221025
+    },
+    "idle_connection_memory": {
+      "scenario": "idle_listener_connections",
+      "units": 24,
+      "baseline_rss_kib": 13008,
+      "peak_rss_kib": 13072,
+      "delta_rss_kib": 64,
+      "per_unit_rss_kib": 2.6666666666666665,
+      "note": "resident-set-size delta while the bounded listener keeps loopback idle connections admitted"
+    },
+    "http2_stream_memory": {
+      "scenario": "http2_active_streams",
+      "units": 24,
+      "baseline_rss_kib": 13104,
+      "peak_rss_kib": 13200,
+      "delta_rss_kib": 96,
+      "per_unit_rss_kib": 4.0,
+      "note": "resident-set-size delta while the proxy keeps a single downstream HTTP/2 connection busy with concurrent delayed upstream streams"
+    },
+    "advanced_scenarios": [
+      {
+        "scenario": "hedging_execution_batch",
+        "operations": 24,
+        "elapsed_ms": 138,
+        "operations_per_sec": 172.79638814077654
+      },
+      {
+        "scenario": "abuse_mitigation_decision_batch",
+        "operations": 64,
+        "elapsed_ms": 0,
+        "operations_per_sec": 176836.12540996968
+      },
+      {
+        "scenario": "discovery_churn_reconcile_batch",
+        "operations": 24,
+        "elapsed_ms": 0,
+        "operations_per_sec": 48060.07509386733
+      },
+      {
+        "scenario": "http1_to_http3_bridge_batch",
+        "operations": 12,
+        "elapsed_ms": 0,
+        "operations_per_sec": 0.0
+      }
+    ],
+    "assumptions": [
+      "loopback-only proxy measurements; these numbers are for relative regression detection and local capacity planning, not internet-facing SLA claims",
+      "resident-set-size sampling is process-level and most comparable across commits on the same host class",
+      "TLS overhead is measured against the same HTTP/1 batch through a local Rustls-terminated downstream connection",
+      "advanced harness scenarios cover hedging execution, abuse-mitigation decision path, discovery membership churn, and HTTP/1 to HTTP/3 bridge path",
+      "HTTP/1 to HTTP/3 bridge throughput sample unavailable in this run: sequence not found"
+    ]
+  },
+  "control_plane_timing": {
+    "reload_success_ms": null,
+    "reload_degraded_success_ms": null,
+    "failover_ms": null,
+    "evidence_source": null
+  },
+  "threshold_evaluation": {
+    "claim_tier": "experimental",
+    "supported_claim_ready": false,
+    "checks": []
+  },
+  "baseline_comparison": null
+}
+warning: function `classify_grpc_response_failure` is never used
+   --> crates/runtime/src/http2_proxy/destination_policies.rs:246:4
+    |
+246 | fn classify_grpc_response_failure(status: u16) -> Option<crate::Upstrea...
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `lb-runtime` (lib) generated 1 warning
+   Compiling lb-runtime v0.1.0 (/Volumes/DATA/Coding/way-balancer/crates/runtime)
+    Finished `bench` profile [optimized] target(s) in 9.60s
+     Running benches/performance_scenarios.rs (target/release/deps/performance_scenarios-97f9872d53cc437a)
+error: Unrecognized option: 'sample-size'
+error: bench failed, to rerun pass `-p lb-runtime --bench performance_scenarios`
+advanced performance scenario artifacts written to target/performance-envelope

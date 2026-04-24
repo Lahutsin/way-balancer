@@ -12,14 +12,72 @@ use crate::PolicyBindingConfig;
 pub struct UpstreamClusterConfig {
     /// Human-readable cluster name.
     pub name: String,
+    /// Explicit application transport protocol for upstream requests.
+    #[serde(default)]
+    pub transport: UpstreamTransportConfig,
     /// Static endpoint definitions.
     pub endpoints: Vec<UpstreamEndpointConfig>,
+    /// Optional dynamic endpoint discovery source.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub discovery: Option<DiscoverySourceConfig>,
     /// Declarative cluster traffic policy.
     #[serde(default)]
     pub traffic_policy: UpstreamTrafficPolicyConfig,
     /// Attached named policy references.
     #[serde(default)]
     pub policies: PolicyBindingConfig,
+}
+
+/// Declarative upstream application transport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpstreamTransportConfig {
+    /// Proxy requests using an HTTP/1 upstream transport.
+    #[default]
+    Http1,
+    /// Proxy requests using an HTTP/2 upstream transport.
+    Http2,
+    /// Proxy requests using an HTTP/3 upstream transport.
+    Http3,
+}
+
+impl From<UpstreamTransportConfig> for lb_net_core::UpstreamTransport {
+    fn from(value: UpstreamTransportConfig) -> Self {
+        match value {
+            UpstreamTransportConfig::Http1 => Self::Http1,
+            UpstreamTransportConfig::Http2 => Self::Http2,
+            UpstreamTransportConfig::Http3 => Self::Http3,
+        }
+    }
+}
+
+/// Declarative dynamic discovery source model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum DiscoverySourceConfig {
+    /// Resolve A/AAAA records for a fixed host and port.
+    DnsAaaa {
+        hostname: String,
+        port: u16,
+        #[serde(default)]
+        min_refresh_secs: u64,
+    },
+    /// Resolve SRV records and map targets to endpoint addresses.
+    DnsSrv {
+        service: String,
+        #[serde(default)]
+        min_refresh_secs: u64,
+    },
+    /// Consume Kubernetes EndpointSlice updates for one Service.
+    KubernetesEndpointSlice {
+        namespace: String,
+        service: String,
+    },
+    /// Consume Consul-like service catalog updates.
+    ConsulLike {
+        service: String,
+        datacenter: Option<String>,
+    },
 }
 
 /// Declarative cluster traffic policy.
@@ -325,6 +383,7 @@ mod tests {
     use super::{
         compile_clusters, AffinityFallbackConfig, AffinityPolicyConfig, EndpointStateConfig,
         UpstreamClusterConfig, UpstreamEndpointConfig, UpstreamTrafficPolicyConfig,
+        UpstreamTransportConfig,
         WorkspaceConfigError,
     };
 
@@ -333,19 +392,23 @@ mod tests {
         let clusters = vec![
             UpstreamClusterConfig {
                 name: String::from("payments"),
+                transport: UpstreamTransportConfig::Http1,
                 endpoints: vec![UpstreamEndpointConfig::foundation(
                     "a",
                     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080),
                 )],
+                discovery: None,
                 traffic_policy: UpstreamTrafficPolicyConfig::default(),
                 policies: crate::PolicyBindingConfig::default(),
             },
             UpstreamClusterConfig {
                 name: String::from("payments"),
+                transport: UpstreamTransportConfig::Http1,
                 endpoints: vec![UpstreamEndpointConfig::foundation(
                     "b",
                     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8081),
                 )],
+                discovery: None,
                 traffic_policy: UpstreamTrafficPolicyConfig::default(),
                 policies: crate::PolicyBindingConfig::default(),
             },
@@ -373,7 +436,9 @@ mod tests {
 
         let clusters = compile_clusters(&[UpstreamClusterConfig {
             name: String::from("payments"),
+            transport: UpstreamTransportConfig::Http1,
             endpoints: vec![endpoint],
+            discovery: None,
             traffic_policy: UpstreamTrafficPolicyConfig::default(),
             policies: crate::PolicyBindingConfig::default(),
         }])?;
@@ -427,6 +492,26 @@ mod tests {
                 fallback: AffinityFallbackConfig::BalanceHealthy,
             })
         );
+        Ok(())
+    }
+
+    #[test]
+    fn upstream_transport_parses_http3() -> Result<(), Box<dyn std::error::Error>> {
+        let cluster = serde_json::from_str::<UpstreamClusterConfig>(
+            r#"{
+                "name": "edge-h3",
+                "transport": "http3",
+                "endpoints": [
+                    {
+                        "id": "a",
+                        "address": "127.0.0.1:8443",
+                        "weight": 1
+                    }
+                ]
+            }"#,
+        )?;
+
+        assert_eq!(cluster.transport, UpstreamTransportConfig::Http3);
         Ok(())
     }
 }

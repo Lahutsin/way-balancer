@@ -59,6 +59,8 @@ pub struct Http2ConnectionReport {
     pub metrics: Http2ConnectionMetrics,
     /// Snapshot of route-backend selection metrics when route backend pools are configured.
     pub route_selection_metrics: Option<crate::UpstreamSelectionMetrics>,
+    /// Decision-trace events emitted while processing streams on this connection.
+    pub decision_trace_events: Vec<lb_observability::TelemetryEvent>,
 }
 
 /// Errors returned by the HTTP/2 proxy runtime.

@@ -31,6 +31,8 @@ include!("header_validation.rs");
 include!("named_transforms.rs");
 include!("named_http_caches.rs");
 include!("named_fault_injections.rs");
+include!("named_l7_auth_policies.rs");
+include!("named_waf_policies.rs");
 include!("named_local_limits.rs");
 include!("named_resilience_policies.rs");
 include!("named_overload_and_edge.rs");

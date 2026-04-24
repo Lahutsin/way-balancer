@@ -35,6 +35,7 @@ enum AdminRequestAction {
     Validate,
     Audit,
     Reload,
+    Restart,
     CachePurge,
     CacheInvalidate,
     Unknown,
@@ -44,7 +45,9 @@ impl AdminRequestAction {
     fn permission(self) -> AdminPermission {
         match self {
             Self::Audit => AdminPermission::Audit,
-            Self::Reload | Self::CachePurge | Self::CacheInvalidate => AdminPermission::Write,
+            Self::Reload | Self::Restart | Self::CachePurge | Self::CacheInvalidate => {
+                AdminPermission::Write
+            }
             Self::Healthz | Self::Readyz | Self::Status | Self::Validate | Self::Unknown => {
                 AdminPermission::Read
             }
@@ -59,6 +62,7 @@ impl AdminRequestAction {
             Self::Validate => "validate",
             Self::Audit => "audit",
             Self::Reload => "reload",
+            Self::Restart => "restart",
             Self::CachePurge => "cache_purge",
             Self::CacheInvalidate => "cache_invalidate",
             Self::Unknown => "unknown",
@@ -654,6 +658,111 @@ where
                     }
                 }
             }
+            AdminRequestAction::Restart => {
+                let restart_plan = supervisor.describe_restart_audit_plan().await.ok();
+                let started_detail = restart_plan.as_ref().map_or_else(
+                    || String::from("warm restart started; plan preview unavailable before apply"),
+                    ReloadAuditPlan::restart_start_detail,
+                );
+                let started_code = restart_plan.as_ref().map_or_else(
+                    || String::from("restart_started_unknown"),
+                    |plan| String::from(plan.restart_start_code()),
+                );
+                record_admin_audit(
+                    &state,
+                    AdminAuditEvent {
+                        observed_at_unix_ms: unix_time_ms(),
+                        request_id: request_context.request_id.clone(),
+                        listener: listener_name.clone(),
+                        actor: request_context.actor.clone(),
+                        auth_mode: request_context.auth_mode.clone(),
+                        action: action_name.clone(),
+                        code: started_code,
+                        source: request_context.source.to_string(),
+                        outcome: String::from("started"),
+                        detail: started_detail,
+                    },
+                )
+                .await
+                .map_err(|error| io::Error::other(error.to_string()))?;
+
+                match supervisor.warm_restart().await {
+                    Ok(outcome) => {
+                        let success_code = restart_plan.as_ref().map_or_else(
+                            || String::from("restart_applied"),
+                            |plan| String::from(plan.restart_success_code(&outcome)),
+                        );
+                        let success_detail = restart_plan.as_ref().map_or_else(
+                            || String::from("warm restart applied"),
+                            |plan| plan.restart_success_detail(&outcome),
+                        );
+                        *state.last_restart_outcome_code.lock().await = success_code;
+                        *state.last_restart_result.lock().await = success_detail.clone();
+                        if api_mode.uses_versioned_contract() {
+                            let last_restart_outcome_code =
+                                state.last_restart_outcome_code.lock().await.clone();
+                            let last_restart_result = state.last_restart_result.lock().await.clone();
+                            write_versioned_admin_success(
+                                &mut stream,
+                                "200 OK",
+                                &[],
+                                &request_context.request_id,
+                                serde_json::json!({
+                                    "result": "warm_restart_applied",
+                                    "outcome_code": last_restart_outcome_code,
+                                    "detail": last_restart_result,
+                                    "restarted_listeners": outcome.restarted_listener_count,
+                                    "completed_drains": outcome.completed_drain_count,
+                                    "drain_timeouts": outcome.drain_timeout_count,
+                                    "degraded": outcome.timed_out_during_drain(),
+                                }),
+                            )
+                            .await?;
+                        } else {
+                            crate::write_http_response(
+                                &mut stream,
+                                "200 OK",
+                                "text/plain; charset=utf-8",
+                                b"warm restart applied\n",
+                            )
+                            .await?;
+                        }
+                        (String::from("executed"), success_detail)
+                    }
+                    Err(error) => {
+                        let failure_code = restart_plan.as_ref().map_or_else(
+                            || String::from("restart_failed_apply"),
+                            |plan| String::from(plan.restart_failure_code()),
+                        );
+                        *state.last_restart_outcome_code.lock().await = failure_code;
+                        let detail = restart_plan.as_ref().map_or_else(
+                            || format!("warm restart failed: {error}"),
+                            |plan| plan.restart_failure_detail(&error),
+                        );
+                        if api_mode.uses_versioned_contract() {
+                            write_versioned_admin_error(
+                                &mut stream,
+                                "500 Internal Server Error",
+                                &[],
+                                &request_context.request_id,
+                                lb_admin_api::AdminApiErrorCode::ReloadFailed,
+                                detail.clone(),
+                                false,
+                            )
+                            .await?;
+                        } else {
+                            crate::write_http_response(
+                                &mut stream,
+                                "500 Internal Server Error",
+                                "text/plain; charset=utf-8",
+                                format!("{detail}\n").as_bytes(),
+                            )
+                            .await?;
+                        }
+                        (String::from("failed"), detail)
+                    }
+                }
+            }
             AdminRequestAction::CachePurge => {
                 match handle_admin_cache_purge(&state, &request_body).await {
                     Ok(response) => {
@@ -799,10 +908,10 @@ where
         }
     };
 
-    let audit_code = if matches!(action, AdminRequestAction::Reload) {
-        state.last_reload_outcome_code.lock().await.clone()
-    } else {
-        admin_audit_code(&action_name, &audit_outcome.0)
+    let audit_code = match action {
+        AdminRequestAction::Reload => state.last_reload_outcome_code.lock().await.clone(),
+        AdminRequestAction::Restart => state.last_restart_outcome_code.lock().await.clone(),
+        _ => admin_audit_code(&action_name, &audit_outcome.0),
     };
 
     record_admin_audit(
@@ -834,6 +943,7 @@ fn classify_admin_request_action(method: &str, target: &str) -> AdminRequestActi
         ("GET", "/validate") => AdminRequestAction::Validate,
         ("GET", "/audit") => AdminRequestAction::Audit,
         ("POST", "/reload") => AdminRequestAction::Reload,
+        ("POST", "/restart") => AdminRequestAction::Restart,
         ("POST", "/cache/purge") => AdminRequestAction::CachePurge,
         ("POST", "/cache/invalidate") => AdminRequestAction::CacheInvalidate,
         _ => AdminRequestAction::Unknown,

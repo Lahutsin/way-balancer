@@ -19,6 +19,8 @@
 - `EVID-008` Final review record completed:
 - `EVID-009` Stability contract reviewed and aligned with the candidate:
 - `EVID-010` Supported performance-envelope artifact attached when the candidate makes absolute capacity claims:
+- `EVID-011` HTTP/3 support-boundary contract reviewed and validated for the candidate shape:
+- `EVID-012` Published soak-capacity automation manifest attached and validated:
 
 ## GA Exit Criteria
 

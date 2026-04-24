@@ -151,6 +151,27 @@ impl EndpointRegistry {
         })
     }
 
+    /// Updates endpoint readiness state in place.
+    pub fn set_endpoint_state(
+        &self,
+        cluster_name: &lb_net_core::UpstreamClusterName,
+        endpoint_id: &lb_net_core::UpstreamEndpointId,
+        state: lb_net_core::EndpointState,
+    ) -> Result<(), EndpointRegistryError> {
+        let mut clusters = self.clusters.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(cluster) = clusters.get_mut(cluster_name) else {
+            return Err(EndpointRegistryError::ClusterNotFound(cluster_name.clone()));
+        };
+        if cluster.set_endpoint_state(endpoint_id, state) {
+            Ok(())
+        } else {
+            Err(EndpointRegistryError::EndpointNotFound {
+                cluster: cluster_name.clone(),
+                endpoint_id: endpoint_id.clone(),
+            })
+        }
+    }
+
     /// Returns a cluster snapshot if present.
     #[must_use]
     pub fn cluster(

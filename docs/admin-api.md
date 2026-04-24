@@ -237,6 +237,59 @@ Key fleet surfaces:
 
 The contract is `bounded_eventual`: the fleet is only considered converged when every targeted node reports the desired version and digest within the configured divergence budget.
 
+### Staged Waves and Health Gates
+
+Feature 05 extends the library contract with staged rollout planning and wave-level health gates.
+
+Key staged planning surfaces:
+
+- `FleetStagedRolloutRequest` and `FleetStagedRolloutPlan`
+- `FleetRolloutWaveDefinition`
+- `FleetHealthGatePolicy` (`required` and `best_effort` modes)
+- `plan_staged_rollout(...)` validation for full node coverage and wave consistency
+
+Key wave gate ingestion and evaluation surfaces:
+
+- `FleetNodeBackend::fetch_health_signals(node_id, window_ms)`
+- `collect_wave_health_signals(...)`
+- `evaluate_wave_gate(...)` / `evaluate_wave_gate_with_policy(...)`
+- `FleetWaveGateVerdict`: `passed`, `pending`, `failed`
+
+### Abort and Automatic Rollback Semantics
+
+Wave gate outcomes can now drive explicit abort and automatic rollback decisions:
+
+- `FleetRolloutCoordinator::decide_wave_abort_and_rollback(...)`
+- `FleetRolloutCoordinator::execute_auto_rollback_if_needed(...)`
+- `FleetAbortRollbackDecision`
+- `FleetAutoRollbackOutcome`
+
+Current abort reasons are machine-readable:
+
+- `wave_gate_failed`
+- `wave_gate_timed_out`
+
+When automatic rollback is enabled for a failed decision, rollback targets the shared last-known-good fleet version (`target_version: None` path in `FleetRollbackRequest`) and reports whether rollback converged.
+
+### Rich Staged Status Surfaces
+
+Feature 05 also adds dedicated status rendering for staged rollouts:
+
+- `render_staged_status_surface(...)`
+- `FleetStagedStatusSurface`
+- `FleetWaveStatusSurface`
+- `FleetNodeStatusSurface`
+
+Wave status is machine-readable (`pending`, `in_progress`, `passed`, `failed`, `aborted`, `blocked`) and includes gate counters (`evaluated_nodes`, `failing_nodes`, `missing_nodes`) plus `degraded` and `timed_out` flags.
+
+Fleet staged status includes high-level rollout state (`progressing`, `aborted`, `rolled_back`, `converged`, `degraded`) and rollback projection fields (`rollback_target_version`, `rollback_succeeded`).
+
+Per-node status includes convergence state, mapped wave identity, and ingested gate signal when available.
+
+### HTTP Surface Note
+
+These staged fleet semantics are currently exposed as stable `lb-admin-api` library surfaces. A built-in `/fleet/*` endpoint in `lb-dataplane` is still additive future work.
+
 ## Reload Semantics
 
 `POST /reload` applies the current config from disk only after it compiles successfully.

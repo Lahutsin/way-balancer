@@ -53,7 +53,27 @@ fn prepare_upstream_request_template(
 
 fn request_is_safe_stale_reuse_retry_candidate(request: &Request<RecvStream>) -> bool {
     request.body().is_end_stream()
-        && matches!(request.method().as_str(), "GET" | "HEAD" | "OPTIONS" | "TRACE")
+        && (request_method_is_idempotent(request.method().as_str())
+            || request_has_idempotency_key_override(request))
+}
+
+fn request_method_is_idempotent(method: &str) -> bool {
+    method.eq_ignore_ascii_case("GET")
+        || method.eq_ignore_ascii_case("HEAD")
+        || method.eq_ignore_ascii_case("OPTIONS")
+        || method.eq_ignore_ascii_case("TRACE")
+        || method.eq_ignore_ascii_case("PUT")
+        || method.eq_ignore_ascii_case("DELETE")
+}
+
+fn request_has_idempotency_key_override(request: &Request<RecvStream>) -> bool {
+    ["idempotency-key", "x-idempotency-key"].iter().any(|name| {
+        request
+            .headers()
+            .get(*name)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| !value.trim().is_empty())
+    })
 }
 
 fn http2_stale_reuse_retryable_error(error: &h2::Error) -> bool {

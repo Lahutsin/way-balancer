@@ -44,16 +44,18 @@ Use this document together with the compatibility matrix, stability contract, an
 ## Protocol And Feature Boundaries
 
 - Supported config API surface for `0.1.x`: `v1_alpha1` as exposed by `lb_runtime::RuntimeMetadata`.
-- Supported proxy foundations: TCP, HTTP/1.1, HTTP/2, first-phase downstream HTTP/3 over QUIC, gRPC-shaped HTTP/2 traffic, HTTPS termination with configured PEM material, and documented admin HTTP control endpoints.
+- Supported proxy foundations: TCP, HTTP/1.1, HTTP/2, downstream HTTP/3 over QUIC, upstream HTTP/3 request dispatch, gRPC-shaped HTTP/2 traffic, HTTPS termination with configured PEM material, and documented admin HTTP control endpoints.
 - Supported configuration features include typed routing, cache policy, affinity, overload handling, hostile-edge guards, and attested snapshot rollout or rollback.
 - Supported listener deployment shapes include IPv4 single-stack, IPv6-only, and dual-stack public listeners when they follow the documented `bind_mode` constraints.
 - Loopback performance artifacts remain supported only as regression tools.
 - Absolute performance or capacity claims are supported only when backed by a named supported profile artifact such as `lab_small_non_loopback_v1`.
 
-The current HTTP/3 support boundary is intentionally narrow:
+The current HTTP/3 support boundary for `0.1.x` is:
 
-- supported: public HTTP/3 listeners that terminate QUIC plus TLS 1.3 and route requests through the documented downstream HTTP/3 to upstream HTTP/1 bridge
-- not yet supported: upstream HTTP/3 proxying, admin HTTP/3 listeners, or proxy protocol on QUIC listeners
+- supported: public HTTP/3 listeners that terminate QUIC plus TLS 1.3
+- supported: downstream HTTP/1 and HTTP/3 paths can target upstream clusters configured with `transport: http3`
+- supported: graceful upstream drain handling for HTTP/3 (`H3_NO_ERROR`/no-error close patterns) with local `503 upstream draining` behavior
+- not yet supported: admin HTTP/3 listeners, proxy protocol on QUIC listeners, or transparent upstream QUIC passthrough/tunnel mode
 
 ## Failure-Mode Support Boundaries
 
@@ -69,6 +71,7 @@ A candidate should be presented as supported only when:
 
 - the deployment shape fits one of the supported topologies above
 - the compatibility matrix, stability contract, and GA review record are complete
+- the secure-default boundary expansion gate in `docs/runbooks/security-hardening.md` is satisfied for any newly broadened surface
 - all required evidence in the release checklist is attached
 - any capacity claim stays inside the documented supported performance profile assumptions
 

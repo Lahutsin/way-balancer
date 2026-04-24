@@ -65,6 +65,7 @@ mod tests {
         let parse_response =
             Http1ProxyError::ParseResponse(lb_proto_http::Http1ParseError::IncompleteHead);
         let response_io = Http1ProxyError::ResponseIo(io::Error::other("response failed"));
+        let graceful_drain = Http1ProxyError::UpstreamGracefulDrain;
 
         assert_eq!(request_idle.slow_client_stage(), Some(SlowClientStage::RequestBody));
         assert_eq!(response_limit.anomaly_category(), None);
@@ -80,6 +81,8 @@ mod tests {
         assert!(std::error::Error::source(&connect).is_some());
         assert!(std::error::Error::source(&parse_request).is_some());
         assert!(std::error::Error::source(&response_io).is_some());
+        assert!(graceful_drain.to_string().contains("gracefully draining"));
+        assert!(std::error::Error::source(&graceful_drain).is_none());
         assert!(matches!(response_parse, Http1ProxyError::ParseResponse(_)));
     }
 

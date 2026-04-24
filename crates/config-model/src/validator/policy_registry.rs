@@ -10,6 +10,11 @@ struct PolicyRegistry {
     transforms: BTreeSet<String>,
     traffic_mirrors: BTreeSet<String>,
     fault_injections: BTreeSet<String>,
+    jwt_auth_policies: BTreeSet<String>,
+    external_auth_policies: BTreeSet<String>,
+    authorization_policies: BTreeSet<String>,
+    upstream_identity_policies: BTreeSet<String>,
+    request_classification_policies: BTreeSet<String>,
     traffic_mirror_specs: BTreeMap<String, crate::TrafficMirrorPolicyConfig>,
     rate_limit_scopes: BTreeMap<String, LocalLimitScopeConfig>,
     concurrency_limit_scopes: BTreeMap<String, LocalLimitScopeConfig>,
@@ -33,6 +38,11 @@ impl PolicyRegistry {
             transforms: BTreeSet::new(),
             traffic_mirrors: BTreeSet::new(),
             fault_injections: BTreeSet::new(),
+            jwt_auth_policies: BTreeSet::new(),
+            external_auth_policies: BTreeSet::new(),
+            authorization_policies: BTreeSet::new(),
+            upstream_identity_policies: BTreeSet::new(),
+            request_classification_policies: BTreeSet::new(),
             traffic_mirror_specs: BTreeMap::new(),
             rate_limit_scopes: BTreeMap::new(),
             concurrency_limit_scopes: BTreeMap::new(),
@@ -49,6 +59,8 @@ impl PolicyRegistry {
         validate_named_transforms(resources, &mut registry, report);
         validate_named_traffic_mirrors(resources, upstream_names, &mut registry, report);
         validate_named_fault_injections(resources, &mut registry, report);
+        validate_named_l7_auth_policies(resources, &mut registry, report);
+        validate_named_request_classification_policies(resources, &mut registry, report);
 
         registry
     }
@@ -91,6 +103,18 @@ fn validate_named_traffic_mirrors(
                     policy.name, policy.spec.target_upstream_cluster
                 ),
             ));
+        }
+        for (method_index, method) in policy.spec.methods.iter().enumerate() {
+            if lb_proto_http::normalize_http_method(method).is_none() {
+                report.errors.push(ValidationError::schema(
+                    ValidationCode::InvalidPolicyField,
+                    format!("{base_path}.spec.methods[{method_index}]"),
+                    format!(
+                        "traffic mirroring policy {} declares invalid method {}",
+                        policy.name, method
+                    ),
+                ));
+            }
         }
         registry.traffic_mirror_specs.insert(policy.name.clone(), policy.spec.clone());
     }

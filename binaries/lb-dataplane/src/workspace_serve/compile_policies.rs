@@ -261,6 +261,149 @@ fn compile_route_destination_policy_runtime(
         .collect()
 }
 
+fn compile_route_destination_jwt_auth_runtime(
+    config: &lb_config_model::WorkspaceConfig,
+    route_backend_policy_diagnostics: &BTreeMap<String, Vec<lb_runtime::EffectiveRouteDestinationPolicy>>,
+) -> Result<BTreeMap<String, BTreeMap<String, lb_runtime::JwtAuthPolicyRuntime>>, DynError> {
+    route_backend_policy_diagnostics
+        .iter()
+        .map(|(route_name, diagnostics)| {
+            let destination_runtime = diagnostics
+                .iter()
+                .filter_map(|diagnostic| {
+                    diagnostic
+                        .jwt_auth_policy
+                        .as_deref()
+                        .map(|policy_name| (diagnostic.upstream_cluster.clone(), policy_name.to_string()))
+                })
+                .map(|(upstream_cluster, policy_name)| {
+                    let policy = config
+                        .policies
+                        .jwt_auth_policies
+                        .iter()
+                        .find(|policy| policy.name == policy_name)
+                        .ok_or_else(|| {
+                            to_dyn_error(format!("unknown jwt auth policy {policy_name}"))
+                        })?;
+                    let runtime = lb_runtime::JwtAuthPolicyRuntime::from_config(&policy.spec)
+                        .map_err(to_dyn_error)?;
+                    Ok((upstream_cluster, runtime))
+                })
+                .collect::<Result<BTreeMap<_, _>, DynError>>()?;
+            Ok((route_name.clone(), destination_runtime))
+        })
+        .collect()
+}
+
+fn compile_route_destination_external_auth_runtime(
+    config: &lb_config_model::WorkspaceConfig,
+    route_backend_policy_diagnostics: &BTreeMap<String, Vec<lb_runtime::EffectiveRouteDestinationPolicy>>,
+) -> Result<
+    BTreeMap<String, BTreeMap<String, lb_runtime::ExternalAuthPolicyRuntime>>,
+    DynError,
+> {
+    route_backend_policy_diagnostics
+        .iter()
+        .map(|(route_name, diagnostics)| {
+            let destination_runtime = diagnostics
+                .iter()
+                .filter_map(|diagnostic| {
+                    diagnostic.external_auth_policy.as_deref().map(|policy_name| {
+                        (diagnostic.upstream_cluster.clone(), policy_name.to_string())
+                    })
+                })
+                .map(|(upstream_cluster, policy_name)| {
+                    let policy = config
+                        .policies
+                        .external_auth_policies
+                        .iter()
+                        .find(|policy| policy.name == policy_name)
+                        .ok_or_else(|| {
+                            to_dyn_error(format!("unknown external auth policy {policy_name}"))
+                        })?;
+                    let runtime = lb_runtime::ExternalAuthPolicyRuntime::from_config(&policy.spec)
+                        .map_err(to_dyn_error)?;
+                    Ok((upstream_cluster, runtime))
+                })
+                .collect::<Result<BTreeMap<_, _>, DynError>>()?;
+            Ok((route_name.clone(), destination_runtime))
+        })
+        .collect()
+}
+
+fn compile_route_destination_authorization_runtime(
+    config: &lb_config_model::WorkspaceConfig,
+    route_backend_policy_diagnostics: &BTreeMap<String, Vec<lb_runtime::EffectiveRouteDestinationPolicy>>,
+) -> Result<
+    BTreeMap<String, BTreeMap<String, lb_runtime::AuthorizationPolicyRuntime>>,
+    DynError,
+> {
+    route_backend_policy_diagnostics
+        .iter()
+        .map(|(route_name, diagnostics)| {
+            let destination_runtime = diagnostics
+                .iter()
+                .filter_map(|diagnostic| {
+                    diagnostic.authorization_policy.as_deref().map(|policy_name| {
+                        (diagnostic.upstream_cluster.clone(), policy_name.to_string())
+                    })
+                })
+                .map(|(upstream_cluster, policy_name)| {
+                    let policy = config
+                        .policies
+                        .authorization_policies
+                        .iter()
+                        .find(|policy| policy.name == policy_name)
+                        .ok_or_else(|| {
+                            to_dyn_error(format!("unknown authorization policy {policy_name}"))
+                        })?;
+                    let runtime = lb_runtime::AuthorizationPolicyRuntime::from_config(&policy.spec);
+                    Ok((upstream_cluster, runtime))
+                })
+                .collect::<Result<BTreeMap<_, _>, DynError>>()?;
+            Ok((route_name.clone(), destination_runtime))
+        })
+        .collect()
+}
+
+fn compile_route_destination_upstream_identity_runtime(
+    config: &lb_config_model::WorkspaceConfig,
+    route_backend_policy_diagnostics: &BTreeMap<String, Vec<lb_runtime::EffectiveRouteDestinationPolicy>>,
+) -> Result<
+    BTreeMap<String, BTreeMap<String, lb_runtime::UpstreamIdentityPolicyRuntime>>,
+    DynError,
+> {
+    route_backend_policy_diagnostics
+        .iter()
+        .map(|(route_name, diagnostics)| {
+            let destination_runtime = diagnostics
+                .iter()
+                .filter_map(|diagnostic| {
+                    diagnostic.upstream_identity_policy.as_deref().map(|policy_name| {
+                        (diagnostic.upstream_cluster.clone(), policy_name.to_string())
+                    })
+                })
+                .map(|(upstream_cluster, policy_name)| {
+                    let policy = config
+                        .policies
+                        .upstream_identity_policies
+                        .iter()
+                        .find(|policy| policy.name == policy_name)
+                        .ok_or_else(|| {
+                            to_dyn_error(format!(
+                                "unknown upstream identity policy {policy_name}"
+                            ))
+                        })?;
+                    let runtime = lb_runtime::UpstreamIdentityPolicyRuntime::from_config(&policy.spec)
+                        .map_err(to_dyn_error)?;
+                    Ok((upstream_cluster, runtime))
+                })
+                .collect::<Result<BTreeMap<_, _>, DynError>>()?;
+            Ok((route_name.clone(), destination_runtime))
+        })
+        .collect()
+}
+
 fn resolve_named_local_rate_limiter(
     config: &lb_config_model::WorkspaceConfig,
     cache: &mut BTreeMap<String, Arc<lb_runtime::LocalRateLimiter>>,
@@ -364,9 +507,10 @@ fn resolve_named_timeout_hierarchy(
         .iter()
         .find(|policy| policy.name == policy_name)
         .ok_or_else(|| to_dyn_error(format!("unknown timeout hierarchy policy {policy_name}")))?;
+    let per_try_timeout_ms = policy.spec.per_try_timeout_ms.unwrap_or(policy.spec.attempt_timeout_ms);
     Ok(lb_runtime::TimeoutHierarchy {
         request_timeout: Duration::from_millis(policy.spec.request_timeout_ms),
-        attempt_timeout: Duration::from_millis(policy.spec.attempt_timeout_ms),
+        attempt_timeout: Duration::from_millis(per_try_timeout_ms),
         connect_timeout: Duration::from_millis(policy.spec.connect_timeout_ms),
         idle_timeout: Duration::from_millis(policy.spec.idle_timeout_ms),
     })
@@ -579,6 +723,16 @@ fn resolve_effective_route_backend_policy_diagnostics(
                 .normalized_destinations()
                 .into_iter()
                 .map(|destination| {
+                    let upstream_cluster = config
+                        .upstream_clusters
+                        .iter()
+                        .find(|entry| entry.name == destination.upstream_cluster)
+                        .ok_or_else(|| {
+                            to_dyn_error(format!(
+                                "route {} references unknown upstream cluster {}",
+                                route.name, destination.upstream_cluster
+                            ))
+                        })?;
                     let destination_transform_name = destination.policies.transform_policy.as_deref();
                     let destination_request_transform = destination_transform_name
                         .map(|policy_name| {
@@ -616,6 +770,26 @@ fn resolve_effective_route_backend_policy_diagnostics(
                             route.policies.circuit_breaker.as_ref(),
                             destination.policies.circuit_breaker.as_ref(),
                         ),
+                        jwt_auth_policy: pick_effective_policy_name(
+                            listener.policies.jwt_auth_policy.as_ref(),
+                            route.policies.jwt_auth_policy.as_ref(),
+                            destination.policies.jwt_auth_policy.as_ref(),
+                        ),
+                        external_auth_policy: pick_effective_policy_name(
+                            listener.policies.external_auth_policy.as_ref(),
+                            route.policies.external_auth_policy.as_ref(),
+                            destination.policies.external_auth_policy.as_ref(),
+                        ),
+                        authorization_policy: pick_effective_policy_name(
+                            listener.policies.authorization_policy.as_ref(),
+                            route.policies.authorization_policy.as_ref(),
+                            destination.policies.authorization_policy.as_ref(),
+                        ),
+                        upstream_identity_policy: destination
+                            .policies
+                            .upstream_identity_policy
+                            .clone()
+                            .or_else(|| upstream_cluster.policies.upstream_identity_policy.clone()),
                         transform_policy: pick_effective_policy_name(
                             listener.policies.transform_policy.as_ref(),
                             route.policies.transform_policy.as_ref(),

@@ -73,6 +73,18 @@ This runbook summarizes the current edge and control-plane hardening posture for
 - Reserve `handshake_guard.max_inflight` for listeners that terminate TLS or otherwise spend meaningful work in early connection setup.
 - Prefer tightening source aggregation and quotas over raising global `max_connections` when healthy traffic is being crowded out by a small number of sources.
 
+## Secure-Default Boundary Expansion Gate
+
+Before broadening support boundaries for discovery, auth, extension, or HTTP/3 surfaces, release owners must confirm all of the following in release evidence:
+
+- artifact attestation remains required in the default production posture and unsigned flows stay outside supported production scope
+- `security.insecure_dev_mode` is absent from the candidate production posture and any temporary exception is time-bounded and explicitly acknowledged
+- `artifacts/sbom/README.md` and `artifacts/provenance/README.md` references are updated to the candidate artifact locations
+- extension API compatibility and fail-closed plugin behavior remain documented in `docs/runbooks/compatibility-matrix.md`
+- HTTP/3 supported and unsupported topology statements remain explicit in `docs/runbooks/support-boundaries.md`
+
+If any item above cannot be demonstrated, treat the candidate as not ready for support-boundary expansion and keep the affected surface outside the supported contract.
+
 ## Focused Validation
 
 Security-sensitive regression coverage currently includes:

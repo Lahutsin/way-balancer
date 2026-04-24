@@ -1,0 +1,144 @@
+{
+  "schema_version": "v1",
+  "generated_at_unix_ms": 1776993368038,
+  "profile": {
+    "name": "loopback_regression_v1",
+    "claim_tier": "experimental",
+    "summary": "fast local regression profile for loopback-only throughput, latency, and memory trend detection",
+    "host_class": {
+      "label": "developer_loopback_host",
+      "cpu_cores": null,
+      "memory_gib": null,
+      "nic_gbps": null
+    },
+    "network_profile": {
+      "label": "loopback_only",
+      "path": "single-host local sockets",
+      "expected_rtt_ms": 0.1
+    },
+    "tls_mode": "rustls_terminated_downstream_optional",
+    "connection_mix": "http1_batch + http2_stream_batch + mixed interleaved",
+    "request_payload_bytes": 0,
+    "hostile_edge_posture": "not a supported external capacity claim",
+    "supported_envelope": null,
+    "regression_guardrails": {
+      "max_throughput_drop_pct": 15.0,
+      "max_latency_increase_pct": 20.0,
+      "max_memory_growth_pct": 15.0,
+      "max_timing_regression_pct": 10.0
+    },
+    "evidence_requirements": [
+      "use this profile for relative regressions only",
+      "do not treat loopback-only numbers as supportable customer capacity claims"
+    ]
+  },
+  "report": {
+    "mode": "smoke",
+    "scenario": {
+      "http1_requests": 64,
+      "http2_streams": 64,
+      "mixed_operations": 64,
+      "idle_connections": 24,
+      "active_streams": 24,
+      "hedging_iterations": 24,
+      "abuse_decisions": 64,
+      "discovery_updates": 24,
+      "http3_bridge_requests": 12
+    },
+    "http1_throughput": {
+      "scenario": "http1_proxy_batch",
+      "operations": 64,
+      "elapsed_ms": 15,
+      "operations_per_sec": 4153.461848798024
+    },
+    "http2_throughput": {
+      "scenario": "http2_proxy_stream_batch",
+      "operations": 64,
+      "elapsed_ms": 2,
+      "operations_per_sec": 22430.891824220318
+    },
+    "mixed_latency": {
+      "scenario": "mixed_http1_http2_interleaved",
+      "samples": 64,
+      "mean_us": 275.671875,
+      "p50_us": 252,
+      "p95_us": 405,
+      "p99_us": 509,
+      "max_us": 549
+    },
+    "http1_tls_throughput": {
+      "scenario": "http1_proxy_batch_tls",
+      "operations": 64,
+      "elapsed_ms": 12,
+      "operations_per_sec": 5309.569470241025
+    },
+    "tls_overhead": {
+      "plain_ops_per_sec": 4153.461848798024,
+      "tls_ops_per_sec": 5309.569470241025,
+      "throughput_penalty_pct": -27.83479573256627
+    },
+    "idle_connection_memory": {
+      "scenario": "idle_listener_connections",
+      "units": 24,
+      "baseline_rss_kib": 13232,
+      "peak_rss_kib": 13248,
+      "delta_rss_kib": 16,
+      "per_unit_rss_kib": 0.6666666666666666,
+      "note": "resident-set-size delta while the bounded listener keeps loopback idle connections admitted"
+    },
+    "http2_stream_memory": {
+      "scenario": "http2_active_streams",
+      "units": 24,
+      "baseline_rss_kib": 13248,
+      "peak_rss_kib": 13392,
+      "delta_rss_kib": 144,
+      "per_unit_rss_kib": 6.0,
+      "note": "resident-set-size delta while the proxy keeps a single downstream HTTP/2 connection busy with concurrent delayed upstream streams"
+    },
+    "advanced_scenarios": [
+      {
+        "scenario": "hedging_execution_batch",
+        "operations": 24,
+        "elapsed_ms": 136,
+        "operations_per_sec": 175.8827492895033
+      },
+      {
+        "scenario": "abuse_mitigation_decision_batch",
+        "operations": 64,
+        "elapsed_ms": 0,
+        "operations_per_sec": 104589.34790175791
+      },
+      {
+        "scenario": "discovery_churn_reconcile_batch",
+        "operations": 24,
+        "elapsed_ms": 0,
+        "operations_per_sec": 28722.460844703637
+      },
+      {
+        "scenario": "http1_to_http3_bridge_batch",
+        "operations": 12,
+        "elapsed_ms": 0,
+        "operations_per_sec": 0.0
+      }
+    ],
+    "assumptions": [
+      "loopback-only proxy measurements; these numbers are for relative regression detection and local capacity planning, not internet-facing SLA claims",
+      "resident-set-size sampling is process-level and most comparable across commits on the same host class",
+      "TLS overhead is measured against the same HTTP/1 batch through a local Rustls-terminated downstream connection",
+      "advanced harness scenarios cover hedging execution, abuse-mitigation decision path, discovery membership churn, and HTTP/1 to HTTP/3 bridge path",
+      "HTTP/1 to HTTP/3 bridge throughput sample unavailable in this run: sequence not found"
+    ]
+  },
+  "control_plane_timing": {
+    "reload_success_ms": 0,
+    "reload_degraded_success_ms": 0,
+    "failover_ms": 0,
+    "evidence_source": "performance_harness_local_capture"
+  },
+  "threshold_evaluation": {
+    "claim_tier": "experimental",
+    "supported_claim_ready": false,
+    "checks": []
+  },
+  "baseline_comparison": null
+}

@@ -1,0 +1,19 @@
+{
+  "schema_version": "v1",
+  "generated_at_unix_ms": 1776993380000,
+  "profile": "loopback_regression_v1",
+  "soak_rounds": 1,
+  "capacity_modes": ["smoke"],
+  "scenario_runs": 1,
+  "bench_sample_size": 5,
+  "capture_control_plane_timing": "1",
+  "soak_logs": [
+    {"round": 1, "log": "target/performance-envelope/soak-chaos-round-1.txt"}
+  ],
+  "artifacts": {
+    "envelope_prefix": "target/performance-envelope/envelope-loopback_regression_v1-<mode>.json",
+    "criterion_prefix": "target/performance-envelope/criterion-loopback_regression_v1-<mode>.txt",
+    "scenario_json": "target/performance-envelope/scenarios-smoke.json",
+    "scenario_criterion": "target/performance-envelope/criterion-scenarios.txt"
+  }
+}

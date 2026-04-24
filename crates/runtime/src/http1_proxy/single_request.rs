@@ -24,6 +24,13 @@ pub async fn proxy_http1_request_with_downstream_addr(
 
     let destination_policy =
         route_destination_policy_runtime(config, request.route.as_ref(), &selected_upstream);
+    if verify_route_destination_jwt_auth(config, &request, &selected_upstream).is_err() {
+        return Ok(local_http1_response(
+            request.keep_alive,
+            StatusCode::UNAUTHORIZED,
+            "unauthorized\n",
+        ));
+    }
     if let Some(transform) = destination_policy.and_then(|policy| policy.request_transform.as_ref()) {
         request = original_request;
         if apply_request_transform(&mut request, transform).is_err() {
@@ -34,9 +41,43 @@ pub async fn proxy_http1_request_with_downstream_addr(
             ));
         }
     }
+    if let Err(outcome) =
+        enforce_route_destination_external_auth(config, &mut request, &selected_upstream).await
+    {
+        let (status, body) = match outcome {
+            ExternalAuthEnforcementOutcome::Denied => (StatusCode::FORBIDDEN, "forbidden\n"),
+            ExternalAuthEnforcementOutcome::ServiceUnavailable => {
+                (StatusCode::SERVICE_UNAVAILABLE, "auth service unavailable\n")
+            }
+            ExternalAuthEnforcementOutcome::InvalidResponse => {
+                (StatusCode::BAD_GATEWAY, "auth service invalid response\n")
+            }
+        };
+        return Ok(local_http1_response(request.keep_alive, status, body));
+    }
+    if let Err(outcome) =
+        enforce_route_destination_upstream_identity(config, &request, &selected_upstream)
+    {
+        let (status, body) = match outcome {
+            UpstreamIdentityEnforcementOutcome::ServiceUnavailable => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "upstream identity unavailable\n",
+            ),
+        };
+        return Ok(local_http1_response(request.keep_alive, status, body));
+    }
+    if let Err(outcome) =
+        enforce_route_destination_authorization(config, &request, &selected_upstream)
+    {
+        let (status, body) = match outcome {
+            AuthorizationEnforcementOutcome::Denied => (StatusCode::FORBIDDEN, "forbidden\n"),
+        };
+        return Ok(local_http1_response(request.keep_alive, status, body));
+    }
 
     let effective_client_ip = downstream_addr.ip();
     let _destination_concurrency_leases = match enforce_destination_local_limits(
+        config,
         destination_policy,
         &request,
         &selected_upstream,
@@ -49,6 +90,71 @@ pub async fn proxy_http1_request_with_downstream_addr(
         effective_destination_response_transform(config, request.route.as_ref(), destination_policy);
     let effective_timeouts =
         effective_destination_upstream_timeouts(&config.timeouts, destination_policy);
+    let normalized_request_headers = lb_proto_http::normalize_request_headers(
+        &request.headers,
+        effective_client_ip,
+        request.keep_alive,
+        &request.body_kind,
+    );
+
+    if selected_upstream.target.transport == lb_net_core::UpstreamTransport::Http3 {
+        let h3_response = match crate::http3_upstream::dispatch_http3_upstream_request(
+            &selected_upstream.target,
+            &request.method,
+            &request.target,
+            &normalized_request_headers,
+            request_body,
+            effective_client_ip,
+            effective_timeouts.connect_timeout,
+            effective_timeouts.idle_timeout,
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(crate::http3_upstream::Http3UpstreamError::GracefulDrain) => {
+                return Ok(local_http1_response(
+                    request.keep_alive,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "upstream draining\n",
+                ));
+            }
+            Err(source) => {
+                return Err(Http1ProxyError::ResponseIo(std::io::Error::other(source)));
+            }
+        };
+
+        let body_kind = lb_proto_http::BodyKind::ContentLength(h3_response.body.len() as u64);
+        let mut normalized_response_headers =
+            lb_proto_http::normalize_response_headers(&h3_response.headers, false, &body_kind);
+        if !normalized_response_headers
+            .iter()
+            .any(|header| header.name.eq_ignore_ascii_case("content-length"))
+        {
+            normalized_response_headers.push(lb_proto_http::HttpHeader {
+                name: String::from("content-length"),
+                value: h3_response.body.len().to_string(),
+            });
+        }
+        if let Some(transform) = response_transform {
+            apply_http1_header_mutations(&mut normalized_response_headers, &transform.header_mutations);
+        }
+        match classify_http1_response_failure(h3_response.status) {
+            Some(class) => record_destination_failure(destination_policy, class),
+            None => record_destination_success(destination_policy),
+        }
+
+        return Ok(Http1SingleRequestResponse {
+            head: lb_proto_http::Http1ResponseHead {
+                version: lb_proto_http::SupportedHttpVersion::Http1,
+                status: h3_response.status,
+                reason: h3_response.reason,
+                headers: normalized_response_headers,
+                body_kind,
+                keep_alive: false,
+            },
+            body: h3_response.body,
+        });
+    }
 
     let mut stream = time::timeout(
         effective_timeouts.connect_timeout,
@@ -62,13 +168,6 @@ pub async fn proxy_http1_request_with_downstream_addr(
         target: selected_upstream.target.address,
         source,
     })?;
-
-    let normalized_request_headers = lb_proto_http::normalize_request_headers(
-        &request.headers,
-        effective_client_ip,
-        request.keep_alive,
-        &request.body_kind,
-    );
     let request_head = lb_proto_http::encode_request_head(
         &request.method,
         &request.target,

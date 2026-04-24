@@ -3,10 +3,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::{
     AbuseControlError, AbuseForensicsExportRequest, AbuseProtectionAdminService, AdminStatus,
     AdminSupportBundle, EmergencyModeAdminRequest, HttpCacheAdminService, HttpCachePurgeError,
-    HttpCachePurgeRequest, HttpCachePurgeResponse, PublishResponse, PublishedSnapshotRecord,
-    PublishedSnapshotSummary, RollbackRequest, RolloutCoordinator, RolloutError, RolloutRequest,
-    RolloutResponse, SnapshotControlService, SnapshotLookupError, SnapshotPublicationError,
-    SnapshotPublishRequest,
+    HttpCachePurgeRequest, HttpCachePurgeResponse, ListenerCanaryApplyRequest,
+    ListenerCanaryApplyResponse, ListenerCanaryCoordinator, ListenerCanaryError,
+    PromotionApplyRequest,
+    PromotionApplyResponse, PromotionCoordinator, PromotionError, PromotionPreviewRequest,
+    PromotionPreviewResponse, PublishResponse, PublishedSnapshotRecord,
+    PublishedSnapshotSummary, RollbackRequest, RolloutCoordinator, RolloutError,
+    RolloutRequest, RolloutResponse, SnapshotControlService, SnapshotLookupError,
+    SnapshotPublicationError, SnapshotPublishRequest,
 };
 
 const MAX_TOKEN_ID_LEN: usize = 128;
@@ -145,6 +149,8 @@ pub enum AdminOperationError {
     Publish(SnapshotPublicationError),
     Lookup(SnapshotLookupError),
     Rollout(RolloutError),
+    Promotion(PromotionError),
+    ListenerCanary(ListenerCanaryError),
     Abuse(AbuseControlError),
     CachePurge(HttpCachePurgeError),
 }
@@ -156,6 +162,10 @@ impl std::fmt::Display for AdminOperationError {
             Self::Publish(error) => write!(formatter, "publish operation failed: {error}"),
             Self::Lookup(error) => write!(formatter, "lookup operation failed: {error}"),
             Self::Rollout(error) => write!(formatter, "rollout operation failed: {error}"),
+            Self::Promotion(error) => write!(formatter, "promotion operation failed: {error}"),
+            Self::ListenerCanary(error) => {
+                write!(formatter, "listener-canary operation failed: {error}")
+            }
             Self::Abuse(error) => write!(formatter, "abuse-control operation failed: {error}"),
             Self::CachePurge(error) => write!(formatter, "cache purge operation failed: {error}"),
         }
@@ -169,6 +179,8 @@ impl std::error::Error for AdminOperationError {
             Self::Publish(error) => Some(error),
             Self::Lookup(error) => Some(error),
             Self::Rollout(error) => Some(error),
+            Self::Promotion(error) => Some(error),
+            Self::ListenerCanary(error) => Some(error),
             Self::Abuse(error) => Some(error),
             Self::CachePurge(error) => Some(error),
         }
@@ -339,6 +351,56 @@ impl AdminAuthService {
             .authorize(bearer_token, AdminPermission::RolloutSnapshots)
             .map_err(AdminOperationError::Auth)?;
         rollout.rollback(control, dataplane, request).map_err(AdminOperationError::Rollout)
+    }
+
+    pub fn preview_promotion(
+        &mut self,
+        control: &SnapshotControlService,
+        promotion: &mut PromotionCoordinator,
+        bearer_token: Option<&str>,
+        request: PromotionPreviewRequest,
+    ) -> Result<PromotionPreviewResponse, AdminOperationError> {
+        let _identity = self
+            .authorize(bearer_token, AdminPermission::ReadControlState)
+            .map_err(AdminOperationError::Auth)?;
+        promotion.preview(control, request).map_err(AdminOperationError::Promotion)
+    }
+
+    pub fn apply_promotion(
+        &mut self,
+        control: &SnapshotControlService,
+        promotion: &mut PromotionCoordinator,
+        rollout: &mut RolloutCoordinator,
+        dataplane: &mut lb_runtime::DataplaneSnapshotManager,
+        bearer_token: Option<&str>,
+        request: PromotionApplyRequest,
+    ) -> Result<PromotionApplyResponse, AdminOperationError> {
+        let _identity = self
+            .authorize(bearer_token, AdminPermission::RolloutSnapshots)
+            .map_err(AdminOperationError::Auth)?;
+        promotion
+            .apply(control, rollout, dataplane, request)
+            .map_err(AdminOperationError::Promotion)
+    }
+
+    pub fn apply_listener_canary<B>(
+        &mut self,
+        control: &SnapshotControlService,
+        listener_canary: &mut ListenerCanaryCoordinator,
+        fleet: &mut crate::FleetRolloutCoordinator,
+        backend: &mut B,
+        bearer_token: Option<&str>,
+        request: ListenerCanaryApplyRequest,
+    ) -> Result<ListenerCanaryApplyResponse, AdminOperationError>
+    where
+        B: crate::FleetNodeBackend,
+    {
+        let _identity = self
+            .authorize(bearer_token, AdminPermission::RolloutSnapshots)
+            .map_err(AdminOperationError::Auth)?;
+        listener_canary
+            .apply(control, fleet, backend, request)
+            .map_err(AdminOperationError::ListenerCanary)
     }
 
     pub fn switch_emergency_mode(

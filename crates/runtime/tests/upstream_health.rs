@@ -6,7 +6,8 @@ use lb_net_core::{
     UpstreamEndpoint, UpstreamEndpointId,
 };
 use lb_runtime::{
-    EndpointHealthPolicy, EndpointHealthStatus, UpstreamHealthError, UpstreamHealthRegistry,
+    EndpointHealthPolicy, EndpointHealthStatus, ProtocolHealthClass, UpstreamHealthError,
+    UpstreamHealthRegistry,
 };
 
 fn endpoint(
@@ -30,6 +31,11 @@ fn policy() -> EndpointHealthPolicy {
         recovery_success_threshold: 2,
         ejection_duration: Duration::from_secs(30),
         warmup_duration: Duration::from_secs(20),
+        consecutive_passive_failure_ejection_threshold: 5,
+        outlier_window_size: 20,
+        success_rate_ejection_threshold_percent: 50,
+        cluster_ejection_budget_percent: 50,
+        slow_start_min_weight_percent: 10,
     }
 }
 
@@ -190,5 +196,132 @@ fn removed_cluster_rejects_stale_endpoint_health_reads(
             name,
         ))) if name == cluster_name
     ));
+    Ok(())
+}
+
+#[test]
+fn consecutive_passive_failures_eject_endpoint() -> Result<(), Box<dyn std::error::Error>> {
+    let mut health_policy = policy();
+    health_policy.unhealthy_failure_threshold = 100;
+    health_policy.ejection_failure_threshold = 100;
+    health_policy.consecutive_passive_failure_ejection_threshold = 3;
+
+    let registry = UpstreamHealthRegistry::new(health_policy);
+    let cluster_name = UpstreamClusterName::new("catalog")?;
+    let endpoint_id = UpstreamEndpointId::new("a")?;
+    registry.insert_cluster(UpstreamCluster::new(
+        cluster_name.clone(),
+        vec![endpoint(endpoint_id.as_str(), 8080, 2)?],
+    )?)?;
+    registry.advance_time(Duration::from_secs(20));
+
+    assert_eq!(
+        registry.note_passive_failure(&cluster_name, &endpoint_id)?.status,
+        EndpointHealthStatus::Degraded
+    );
+    assert_eq!(
+        registry.note_passive_failure(&cluster_name, &endpoint_id)?.status,
+        EndpointHealthStatus::Degraded
+    );
+    assert_eq!(
+        registry.note_passive_failure(&cluster_name, &endpoint_id)?.status,
+        EndpointHealthStatus::Ejected
+    );
+    Ok(())
+}
+
+#[test]
+fn passive_outlier_window_ejects_low_success_rate_endpoint(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut health_policy = policy();
+    health_policy.unhealthy_failure_threshold = 100;
+    health_policy.ejection_failure_threshold = 100;
+    health_policy.consecutive_passive_failure_ejection_threshold = 100;
+    health_policy.outlier_window_size = 4;
+    health_policy.success_rate_ejection_threshold_percent = 50;
+
+    let registry = UpstreamHealthRegistry::new(health_policy);
+    let cluster_name = UpstreamClusterName::new("checkout")?;
+    let endpoint_id = UpstreamEndpointId::new("a")?;
+    registry.insert_cluster(UpstreamCluster::new(
+        cluster_name.clone(),
+        vec![endpoint(endpoint_id.as_str(), 8080, 2)?],
+    )?)?;
+    registry.advance_time(Duration::from_secs(20));
+
+    let _ = registry.note_passive_success(&cluster_name, &endpoint_id)?;
+    let _ = registry.note_passive_failure(&cluster_name, &endpoint_id)?;
+    let _ = registry.note_passive_failure(&cluster_name, &endpoint_id)?;
+    let snapshot = registry.note_passive_failure(&cluster_name, &endpoint_id)?;
+
+    assert_eq!(snapshot.status, EndpointHealthStatus::Ejected);
+    Ok(())
+}
+
+#[test]
+fn cluster_ejection_budget_limits_parallel_ejections() -> Result<(), Box<dyn std::error::Error>> {
+    let mut health_policy = policy();
+    health_policy.degraded_failure_threshold = 1;
+    health_policy.unhealthy_failure_threshold = 2;
+    health_policy.ejection_failure_threshold = 3;
+    health_policy.cluster_ejection_budget_percent = 50;
+
+    let registry = UpstreamHealthRegistry::new(health_policy);
+    let cluster_name = UpstreamClusterName::new("search")?;
+    let first_id = UpstreamEndpointId::new("a")?;
+    let second_id = UpstreamEndpointId::new("b")?;
+    registry.insert_cluster(UpstreamCluster::new(
+        cluster_name.clone(),
+        vec![
+            endpoint(first_id.as_str(), 8080, 1)?,
+            endpoint(second_id.as_str(), 8081, 1)?,
+        ],
+    )?)?;
+    registry.advance_time(Duration::from_secs(20));
+
+    for _ in 0..3 {
+        let _ = registry.note_active_failure(&cluster_name, &first_id)?;
+    }
+    assert_eq!(
+        registry.endpoint_health(&cluster_name, &first_id)?.status,
+        EndpointHealthStatus::Ejected
+    );
+
+    for _ in 0..3 {
+        let _ = registry.note_active_failure(&cluster_name, &second_id)?;
+    }
+    assert_eq!(
+        registry.endpoint_health(&cluster_name, &second_id)?.status,
+        EndpointHealthStatus::Unhealthy
+    );
+    Ok(())
+}
+
+#[test]
+fn passive_failures_are_tracked_per_protocol_class() -> Result<(), Box<dyn std::error::Error>> {
+    let registry = UpstreamHealthRegistry::new(policy());
+    let cluster_name = UpstreamClusterName::new("api")?;
+    let endpoint_id = UpstreamEndpointId::new("a")?;
+    registry.insert_cluster(UpstreamCluster::new(
+        cluster_name.clone(),
+        vec![endpoint(endpoint_id.as_str(), 8080, 1)?],
+    )?)?;
+    registry.advance_time(Duration::from_secs(20));
+
+    let _ = registry.note_passive_failure_for_protocol(
+        &cluster_name,
+        &endpoint_id,
+        ProtocolHealthClass::Http1,
+    )?;
+    let _ = registry.note_passive_failure_for_protocol(
+        &cluster_name,
+        &endpoint_id,
+        ProtocolHealthClass::Http2,
+    )?;
+    let snapshot = registry.endpoint_health(&cluster_name, &endpoint_id)?;
+
+    assert_eq!(snapshot.passive_failures_by_protocol.get(&ProtocolHealthClass::Http1), Some(&1));
+    assert_eq!(snapshot.passive_failures_by_protocol.get(&ProtocolHealthClass::Http2), Some(&1));
+    assert_eq!(snapshot.passive_failures, 1);
     Ok(())
 }

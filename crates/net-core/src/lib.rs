@@ -246,6 +246,20 @@ impl fmt::Display for ListenerConfigError {
 
 impl std::error::Error for ListenerConfigError {}
 
+/// Explicit application transport protocol for an upstream target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpstreamTransport {
+    Http1,
+    Http2,
+    Http3,
+}
+
+impl Default for UpstreamTransport {
+    fn default() -> Self {
+        Self::Http1
+    }
+}
+
 /// Static upstream target used by the initial L4 proxy path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpstreamTarget {
@@ -253,13 +267,33 @@ pub struct UpstreamTarget {
     pub name: String,
     /// Upstream TCP address.
     pub address: SocketAddr,
+    /// Explicit upstream application transport.
+    pub transport: UpstreamTransport,
 }
 
 impl UpstreamTarget {
     /// Creates an upstream target.
     #[must_use]
     pub fn new(name: impl Into<String>, address: SocketAddr) -> Self {
-        Self { name: name.into(), address }
+        Self {
+            name: name.into(),
+            address,
+            transport: UpstreamTransport::Http1,
+        }
+    }
+
+    /// Creates an upstream target with explicit transport selection.
+    #[must_use]
+    pub fn with_transport(
+        name: impl Into<String>,
+        address: SocketAddr,
+        transport: UpstreamTransport,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            address,
+            transport,
+        }
     }
 }
 

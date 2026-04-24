@@ -112,7 +112,6 @@ mod tests {
         assert_eq!(parsed, Some("198.51.100.7:45678".parse()?));
         Ok(())
     }
-
     #[test]
     fn proxy_protocol_v2_parser_extracts_source_address() -> Result<(), DynError> {
         let mut header = [0_u8; 16];
@@ -516,6 +515,8 @@ mod tests {
                 no_healthy_fallback: lb_config_model::NoHealthyFallbackConfig::Fail,
                 affinity: None,
             },
+            transport: lb_config_model::UpstreamTransportConfig::Http1,
+            discovery: None,
             policies: lb_config_model::PolicyBindingConfig::default(),
         })?;
         pool.advance_time(ROUTE_BACKEND_WARMUP_DURATION);
@@ -695,6 +696,8 @@ mod tests {
                 no_healthy_fallback: lb_config_model::NoHealthyFallbackConfig::Fail,
                 affinity: None,
             },
+            transport: lb_config_model::UpstreamTransportConfig::Http1,
+            discovery: None,
             policies: lb_config_model::PolicyBindingConfig::default(),
         })?;
         pool.advance_time(ROUTE_BACKEND_WARMUP_DURATION);
@@ -746,6 +749,8 @@ mod tests {
                 no_healthy_fallback: lb_config_model::NoHealthyFallbackConfig::Fail,
                 affinity: None,
             },
+            transport: lb_config_model::UpstreamTransportConfig::Http1,
+            discovery: None,
             policies: lb_config_model::PolicyBindingConfig::default(),
         })?;
         pool.advance_time(ROUTE_BACKEND_WARMUP_DURATION);
@@ -780,6 +785,8 @@ mod tests {
                 no_healthy_fallback: lb_config_model::NoHealthyFallbackConfig::Fail,
                 affinity: None,
             },
+            transport: lb_config_model::UpstreamTransportConfig::Http1,
+            discovery: None,
             policies: lb_config_model::PolicyBindingConfig::default(),
         })?;
         pool.advance_time(ROUTE_BACKEND_WARMUP_DURATION);
@@ -830,6 +837,8 @@ mod tests {
                 no_healthy_fallback: lb_config_model::NoHealthyFallbackConfig::Fail,
                 affinity: None,
             },
+            transport: lb_config_model::UpstreamTransportConfig::Http1,
+            discovery: None,
             policies: lb_config_model::PolicyBindingConfig::default(),
         })?;
 
@@ -1534,6 +1543,7 @@ mod tests {
                 "spec": {
                     "request_timeout_ms": 30000,
                     "attempt_timeout_ms": 10000,
+                    "per_try_timeout_ms": 8000,
                     "connect_timeout_ms": 1000,
                     "idle_timeout_ms": 5000
                 }
@@ -1682,7 +1692,15 @@ mod tests {
         );
         assert_eq!(canary_runtime.rate_limiters.len(), 3);
         assert_eq!(canary_runtime.concurrency_limiters.len(), 2);
-        assert!(canary_runtime.failure_manager.is_some());
+        let failure_manager = canary_runtime
+            .failure_manager
+            .as_ref()
+            .ok_or("missing canary failure manager")?;
+        assert_eq!(
+            failure_manager.effective_timeout(lb_runtime::TimeoutCategory::Attempt),
+            Duration::from_millis(8_000)
+        );
+        assert!(canary_runtime.enforce_timeout_hierarchy);
         assert!(canary_runtime.enforce_retry_budget);
         Ok(())
     }
@@ -2422,7 +2440,8 @@ mod tests {
         let status = send_admin_status(admin_addr).await?;
         assert!(status.contains("\"reload_health\": \"healthy\""));
         assert!(status.contains("\"last_reload_outcome_code\": \"reload_applied_in_place\""));
-        assert!(status.contains("\"last_reload_result\": \"configuration applied\""));
+        assert!(status.contains("\"last_reload_result\":"));
+        assert!(status.contains("configuration applied"));
         assert!(!status.contains("reload_failed_rollback_preserved"));
 
         let response = send_http1_request(public_addr, "/").await?;
@@ -2746,6 +2765,135 @@ mod tests {
         assert!(audit.contains("\"code\": \"reload_applied_in_place\""));
 
         restarted.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn warm_restart_replaces_listener_and_reports_machine_readable_outcome(
+    ) -> Result<(), DynError> {
+        std::env::set_var("LB_CTL_ADMIN_SECRET", "admin-secret");
+        let upstream = spawn_tagged_http1_upstream("upstream-restart").await?;
+        let path = write_temp_config(
+            "warm-restart-success",
+            &workspace_config_json("127.0.0.1:0", "127.0.0.1:0", "http1", &upstream.to_string()),
+        )?;
+        let supervisor = ServeSupervisor::start(
+            path.to_str().ok_or("utf8 path")?.to_string(),
+            Arc::new(String::from("admin-secret")),
+        )
+        .await?;
+
+        let before = supervisor.listener_statuses().await;
+        let old_public_addr = before
+            .iter()
+            .find(|status| status.class == lb_config_model::ListenerClassConfig::Public)
+            .ok_or("missing public listener")?
+            .local_addr;
+        let admin_addr = before
+            .iter()
+            .find(|status| status.class == lb_config_model::ListenerClassConfig::Admin)
+            .ok_or("missing admin listener")?
+            .local_addr;
+
+        let restart = send_admin_restart(admin_addr).await?;
+        assert!(restart.starts_with("HTTP/1.1 200 OK"));
+
+        let after = supervisor.listener_statuses().await;
+        let new_public_addr = after
+            .iter()
+            .find(|status| status.class == lb_config_model::ListenerClassConfig::Public)
+            .ok_or("missing public listener after restart")?
+            .local_addr;
+        assert_ne!(old_public_addr, new_public_addr);
+
+        let response = send_http1_request(new_public_addr, "/").await?;
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(response.contains("upstream-restart"));
+
+        let status = send_admin_status(admin_addr).await?;
+        let status_json = parse_http_json_body(&status)?;
+        assert_eq!(json_u64_field(&status_json, "restart_requests")?, 1);
+        assert_eq!(json_u64_field(&status_json, "restart_success_count")?, 1);
+        assert_eq!(json_u64_field(&status_json, "restart_failure_count")?, 0);
+        assert!(json_u64_field(&status_json, "restart_last_duration_ms")? >= 1);
+        assert!(json_u64_field(&status_json, "restart_last_success_duration_ms")? >= 1);
+        assert_eq!(json_u64_field(&status_json, "restart_last_failure_duration_ms")?, 0);
+        assert!(status.contains("\"last_restart_outcome_code\": \"restart_applied_overlap_drain\""));
+
+        let audit = send_admin_audit(admin_addr).await?;
+        assert!(audit.contains("\"code\": \"restart_started_overlap_drain\""));
+        assert!(audit.contains("\"code\": \"restart_applied_overlap_drain\""));
+
+        supervisor.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn warm_restart_timeout_is_reported_with_machine_readable_outcome(
+    ) -> Result<(), DynError> {
+        std::env::set_var("LB_CTL_ADMIN_SECRET", "admin-secret");
+        let (upstream_a, accepted_rx, release_tx) =
+            spawn_blocked_http1_upstream("upstream-restart-timeout-a").await?;
+        let upstream_b = spawn_tagged_http1_upstream("upstream-restart-timeout-b").await?;
+        let path = write_temp_config(
+            "warm-restart-timeout",
+            &workspace_config_json_with_drain_timeout(
+                "127.0.0.1:0",
+                "127.0.0.1:0",
+                "http1",
+                &upstream_a.to_string(),
+                50,
+            ),
+        )?;
+        let supervisor = ServeSupervisor::start(
+            path.to_str().ok_or("utf8 path")?.to_string(),
+            Arc::new(String::from("admin-secret")),
+        )
+        .await?;
+
+        let statuses = supervisor.listener_statuses().await;
+        let public_addr = statuses
+            .iter()
+            .find(|status| status.class == lb_config_model::ListenerClassConfig::Public)
+            .ok_or("missing public listener")?
+            .local_addr;
+        let admin_addr = statuses
+            .iter()
+            .find(|status| status.class == lb_config_model::ListenerClassConfig::Admin)
+            .ok_or("missing admin listener")?
+            .local_addr;
+
+        let first = start_http1_request(public_addr, "/").await?;
+        accepted_rx.await.map_err(to_dyn_error)?;
+
+        fs::write(
+            &path,
+            workspace_config_json_with_drain_timeout(
+                "127.0.0.1:0",
+                "127.0.0.1:0",
+                "http1",
+                &upstream_b.to_string(),
+                50,
+            ),
+        )?;
+
+        let restart = send_admin_restart(admin_addr).await?;
+        assert!(restart.starts_with("HTTP/1.1 200 OK"));
+
+        let status = send_admin_status(admin_addr).await?;
+        let status_json = parse_http_json_body(&status)?;
+        assert_eq!(json_u64_field(&status_json, "restart_requests")?, 1);
+        assert_eq!(json_u64_field(&status_json, "restart_success_count")?, 1);
+        assert_eq!(json_u64_field(&status_json, "restart_failure_count")?, 0);
+        assert!(status.contains("\"last_restart_outcome_code\": \"restart_applied_overlap_drain_timeout\""));
+
+        let audit = send_admin_audit(admin_addr).await?;
+        assert!(audit.contains("\"code\": \"restart_started_overlap_drain\""));
+        assert!(audit.contains("\"code\": \"restart_applied_overlap_drain_timeout\""));
+
+        drop(first);
+        let _ = release_tx.send(());
+        supervisor.shutdown().await?;
         Ok(())
     }
 
@@ -3528,6 +3676,10 @@ mod tests {
         assert!(status.contains("\"replacement\":{\"state\":\"drain_timeout_expired\""));
         assert!(status.contains("\"drain_timeout_recent\":[{"));
         assert!(status.contains(&format!("\"configured_bind\":\"{}\"", initial_public_bind)));
+        let status_json = parse_http_json_body(&status)?;
+        assert_eq!(json_u64_field(&status_json, "reload_drained_listener_count")?, 1);
+        assert_eq!(json_u64_field(&status_json, "reload_completed_drain_count")?, 0);
+        assert_eq!(json_u64_field(&status_json, "reload_drain_timeout_count")?, 1);
 
         let audit = send_admin_audit(admin_addr).await?;
         assert!(audit.contains("\"code\": \"reload_applied_overlap_drain_timeout\""));
@@ -3808,6 +3960,9 @@ mod tests {
         assert!(json_u64_field(&final_status_json, "reload_last_duration_ms")? >= 1);
         assert!(json_u64_field(&final_status_json, "reload_last_success_duration_ms")? >= 1);
         assert!(json_u64_field(&final_status_json, "reload_total_duration_ms")? >= 1);
+        assert!(json_u64_field(&final_status_json, "reload_drained_listener_count")? >= 1);
+        assert!(json_u64_field(&final_status_json, "reload_completed_drain_count")? >= 1);
+        assert_eq!(json_u64_field(&final_status_json, "reload_drain_timeout_count")?, 0);
         assert!(
             json_u64_field(&final_status_json, "reload_max_duration_ms")?
                 >= json_u64_field(&final_status_json, "reload_last_duration_ms")?
@@ -6806,6 +6961,18 @@ mod tests {
         stream
             .write_all(
                 b"POST /reload HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer admin-secret\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+            )
+            .await?;
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await?;
+        String::from_utf8(response).map_err(to_dyn_error)
+    }
+
+    async fn send_admin_restart(address: SocketAddr) -> Result<String, DynError> {
+        let mut stream = TcpStream::connect(address).await?;
+        stream
+            .write_all(
+                b"POST /restart HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer admin-secret\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
             )
             .await?;
         let mut response = Vec::new();

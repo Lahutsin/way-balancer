@@ -102,7 +102,7 @@ See [examples/load-balancer/proxy-protocol-fronted.json](../examples/load-balanc
 
 ## HTTP/3 Listener Model
 
-The config model and serve runtime now support `protocol: "http3"` for the first QUIC slice.
+The config model and serve runtime support `protocol: "http3"` for public QUIC listeners.
 
 Current rules:
 
@@ -112,17 +112,17 @@ Current rules:
 - `http3` listeners require TLS 1.3 termination material because QUIC runs only on TLS 1.3
 - proxy protocol is not currently supported on `http3` listeners
 
-First supported topology:
+Current supported topology:
 
 - downstream HTTP/3 over QUIC on a public listener
 - route matching uses the shared HTTP request classification path
-- upstream dispatch currently bridges into the existing HTTP/1 proxy runtime
+- upstream dispatch uses runtime transport selection and can target upstream clusters configured with `transport: http1|http2|http3`
 
-Current non-goals for this first phase:
+Current non-goals:
 
 - no downstream admin `http3` listeners
-- no upstream HTTP/3 proxying or passthrough
 - no proxy protocol on the QUIC listener
+- no transparent QUIC passthrough/tunnel mode
 
 Minimal example:
 
@@ -349,15 +349,26 @@ Explicit route destinations may attach backend-local policy bindings through `ro
 The current typed model allows destination-local references for:
 
 - `retry_budget`
-
-For HTTP/2 gRPC traffic, retry budgets also gate protocol-aware retries derived from final `grpc-status` values. The runtime currently treats `4` (`DEADLINE_EXCEEDED`), `8` (`RESOURCE_EXHAUSTED`), `13` (`INTERNAL`), and `14` (`UNAVAILABLE`) as retryable unary gRPC failures, with `8` classified as overload and `4` classified as timeout.
 - `timeout_hierarchy`
 - `circuit_breaker`
 - `transform_policy`
 - `traffic_mirror`
 - `fault_injection`
+- `jwt_auth_policy`
+- `external_auth_policy`
+- `authorization_policy`
+- `upstream_identity_policy`
 - `local_rate_limits`
 - `local_concurrency_limits`
+
+For HTTP/2 gRPC traffic, retry budgets also gate protocol-aware retries derived from final `grpc-status` values. The runtime currently treats `4` (`DEADLINE_EXCEEDED`), `8` (`RESOURCE_EXHAUSTED`), `13` (`INTERNAL`), and `14` (`UNAVAILABLE`) as retryable unary gRPC failures, with `8` classified as overload and `4` classified as timeout.
+
+Timeout hierarchy policies support request-level and per-try shaping:
+
+- `request_timeout_ms`: outer request lifetime bound
+- `attempt_timeout_ms`: compatibility field for per-attempt bound
+- `per_try_timeout_ms` (optional): explicit per-try bound that overrides `attempt_timeout_ms` when set
+- `connect_timeout_ms` and `idle_timeout_ms`: must remain less than or equal to the effective per-try timeout
 
 The current validator rejects destination-local references for:
 
@@ -374,6 +385,172 @@ Current compiled-runtime diagnostics now resolve that precedence explicitly for 
 See the checked-in rollout examples in [examples/load-balancer/weighted-route-canary.json](../examples/load-balancer/weighted-route-canary.json) and [examples/load-balancer/weighted-route-blue-green.json](../examples/load-balancer/weighted-route-blue-green.json).
 
 See the checked-in binding examples in [examples/load-balancer/destination-policy-bindings.json](../examples/load-balancer/destination-policy-bindings.json) and [examples/load-balancer/destination-traffic-mirror.json](../examples/load-balancer/destination-traffic-mirror.json).
+
+## L7 Auth And Upstream Identity Policy Schema
+
+Feature 07 item 1 adds typed policy resources and binding references for application-layer auth and upstream identity.
+
+Named policy resources under `policies`:
+
+- `jwt_auth_policies`
+- `external_auth_policies`
+- `authorization_policies`
+- `upstream_identity_policies`
+
+Policy binding references on listeners, routes, destinations, and upstream clusters now include:
+
+- `jwt_auth_policy`
+- `external_auth_policy`
+- `authorization_policy`
+- `upstream_identity_policy`
+
+Current validation and scope rules:
+
+- `jwt_auth_policy`, `external_auth_policy`, and `authorization_policy` may be bound on listeners, routes, and route destinations.
+- `jwt_auth_policy`, `external_auth_policy`, and `authorization_policy` are rejected on direct upstream-cluster bindings.
+- `upstream_identity_policy` may be bound only on upstream clusters or explicit route destinations.
+- `upstream_identity_policy` is rejected on listener and route bindings.
+- JWT policy validation currently enforces issuer and audience presence, non-empty required claim names, a bounded `clock_skew_secs`, and a concrete JWKS source.
+- External auth policy validation currently enforces a non-empty endpoint, positive timeout, header name validity, and non-empty context mapping keys.
+- Upstream identity policy validation currently enforces a trust bundle source plus at least one allowed trust domain or SPIFFE identity.
+
+Current runtime behavior for JWT auth bindings:
+
+- when an effective `jwt_auth_policy` is bound for the selected route destination, requests must include `Authorization: Bearer <token>`
+- missing bearer headers are rejected locally with `401`
+- local verification enforces signature validation and issuer/audience checks plus required-claim presence
+- successful verification allows normal upstream forwarding
+
+Current runtime behavior for external auth bindings:
+
+- when an effective `external_auth_policy` is bound for the selected route destination, runtime performs an HTTP JSON authorization call to the configured endpoint
+- deny decisions from the external service are rejected locally with `403`
+- transport or response failures return `503` or `502` unless `fail_open = true`, in which case runtime allows the request
+- configured `context_mappings` copy values from external auth response `context` into target request headers before upstream dispatch
+
+Current runtime behavior for authorization bindings:
+
+- when an effective `authorization_policy` is bound for the selected route destination, runtime evaluates rules after JWT and external auth checks and before upstream dispatch
+- first matching rule applies; unmatched requests use `default_decision`
+- deny decisions are rejected locally with `403`
+- rule matching supports claim/header presence and scope or role checks using request headers
+- scopes are read from `x-auth-scopes` or `x-auth-scope` (space/comma tokenized)
+- roles are read from `x-auth-roles` or `x-auth-role` (space/comma tokenized)
+- claim presence checks accept header names `claim`, `x-auth-<claim>`, or `x-auth-claim-<claim>`
+- authorization decisions emit request-flow decision trace telemetry with `decision=policy_enforcement` and `policy=authorization`
+
+Current runtime behavior for upstream identity bindings:
+
+- when an effective `upstream_identity_policy` is bound for the selected route destination, runtime requires upstream peer identity from mTLS transport
+- current upstream HTTP/1 and HTTP/2 forwarding paths do not expose upstream peer identity yet
+- until upstream mTLS transport identity plumbing lands, bound upstream identity policies fail closed with local `503`
+- effective policy precedence for upstream identity is destination override first, then upstream-cluster binding
+
+Current limitations for this slice:
+
+- remote JWKS fetch (`jwt_jwks_source.type = remote`) is not executed in runtime yet
+- file-based JWT JWKS and upstream identity trust bundles are refreshed on request-path verification according to configured `refresh_secs`
+- invalid refreshed JWKS or trust bundles fail closed (`401` for JWT verification failure, `503` for upstream identity policy enforcement failure)
+
+## Extension Surface Runtime Contract
+
+Feature 08 defines the extension execution contract used by custom auth and policy integrations.
+
+Current runtime contract:
+
+- extension API compatibility is negotiated through `api_version` and enforced at plugin registration time
+- incompatible plugin versions are rejected before request-path execution
+- optional plugins may be disabled with explicit fallback behavior (`allow`, `deny`, `abstain`)
+- required plugins fail closed when disabled
+- plugin execution is sandboxed in-process with bounded execution timeout and panic containment
+- repeated plugin execution failures trigger temporary isolation (cooldown quarantine)
+- isolated optional plugins use configured fallback behavior; isolated required plugins fail closed
+
+Current extension observability surface:
+
+- `runtime_extension_policy_plugin_evaluations_total` tracks plugin outcomes by plugin name, result, and reason
+- `runtime_extension_compatibility_rejections_total` tracks rejected plugin registrations by plugin name and reason
+- extension policy/plugin outcomes emit machine-readable decision events (`decision.policy.enforced`) with scope and policy labels
+
+Current compatibility note:
+
+- stable extension hook and policy plugin contract in this release line is `api_version = v1`
+
+## WAF Request Classification Model
+
+Feature 09 item 1 introduces typed request classification policy resources that define anomaly-score behavior and classifier context projection.
+
+Named policy resources under `policies`:
+
+- `request_classification_policies`
+
+Policy binding references:
+
+- `request_classification_policy` may be bound on listeners, routes, and route destinations
+- `request_classification_policy` is rejected on direct upstream-cluster bindings
+
+Current model fields:
+
+- sensitivity profile (`low`, `medium`, `high`)
+- challenge and block thresholds over normalized score range `0..=100`
+- weighted signal model (`header_anomaly`, `body_anomaly`, `query_anomaly`, `user_agent_anomaly`, `reputation`, `bot_signal`)
+- classifier context projection controls for method, path, source IP, user-agent, selected headers, and selected query keys
+- bounded body inspection controls (`body_scoring.max_inspect_bytes`, `body_scoring.max_body_bytes`, `body_scoring.min_suspicious_token_length`, `body_scoring.suspicious_patterns`, `body_scoring.allowlisted_content_types`)
+
+Current validation rules:
+
+- `challenge_threshold` must be strictly less than `block_threshold`
+- at least one classifier signal weight must be non-zero
+- configured context header names must be valid HTTP header names
+- configured context query parameter names must be non-empty
+- `body_scoring.max_inspect_bytes`, `body_scoring.max_body_bytes`, and `body_scoring.min_suspicious_token_length` must be non-zero
+- `body_scoring.suspicious_patterns` and `body_scoring.allowlisted_content_types` must not contain empty entries
+
+Current runtime model behavior for this slice:
+
+- runtime supports deterministic anomaly-score normalization from weighted classifier signals
+- normalized score maps to action suggestion: `allow`, `challenge`, or `block`
+- this slice defines typed model and normalization only; header scoring and enforcement wiring land in subsequent Feature 09 slices
+
+Current header anomaly scoring behavior:
+
+- `header_scoring.max_header_count` raises header-anomaly signals when request header count exceeds the threshold
+- `header_scoring.max_header_value_length` raises header-anomaly signals when any header value is oversized
+- `header_scoring.max_duplicate_headers_per_name` raises header-anomaly signals for repeated normalized header names
+- `header_scoring.suspicious_headers` raises high-confidence header-anomaly signals when matched
+- `header_scoring.suspicious_user_agent_patterns` raises user-agent-anomaly signals on case-insensitive pattern match
+- header and user-agent anomaly signals are normalized into the same weighted anomaly-score pipeline used by request classification
+
+Current reputation and bot-signal adapter behavior:
+
+- runtime exposes pluggable provider contracts for reputation and bot-signal ingestion
+- each adapter chain can ingest multiple providers and emit normalized `reputation` or `bot_signal` classifier signals
+- provider errors can optionally emit bounded fallback signals, allowing operators to keep deterministic scoring when upstream feeds are degraded
+- adapter-originated signals are folded into the same weighted anomaly-score pipeline and threshold mapping (`allow`, `challenge`, `block`)
+
+Current enforcement and audit behavior:
+
+- runtime maps classifier outputs and auth context into enforcement actions: `allow`, `tag`, `challenge`, `throttle`, `block`
+- `challenge` recommendations downgrade to `throttle` when external auth fail-open is active to reduce false-negative abuse acceptance during auth-service degradation
+- trusted-principal exceptions can bypass challenge-path false positives while still preserving audit visibility
+- auth context can request explicit block disposition via `x-way-balancer-abuse-disposition: block`
+- auth context risk-tier hints (`x-way-balancer-risk-tier: elevated|high`) can force `tag` on otherwise-allow requests for downstream monitoring
+- each enforcement decision emits an audit record with classifier action, final action, signal scores, principal, fail-open state, and explainable reasons
+
+Current bounded body inspection behavior:
+
+- runtime body scoring inspects at most `body_scoring.max_inspect_bytes` bytes and never scans the full payload when larger bodies are present
+- payloads larger than `body_scoring.max_body_bytes` emit high-confidence `body_anomaly` signals
+- configured suspicious body patterns are matched case-insensitively against the bounded inspected window
+- text-like content-types can emit `body_anomaly` when payload bytes look binary or heavily obfuscated
+- content-type allowlist prefixes in `body_scoring.allowlisted_content_types` skip pattern and obfuscation checks to reduce false positives on known binary protocols
+
+Current adaptive mitigation behavior with overload controls:
+
+- classification and enforcement can be coordinated with overload shedding state through runtime adaptive mitigation
+- under active overload shedding, enforcement `tag` can be escalated to `challenge`
+- under brownout shedding, enforcement `challenge` can be escalated to `throttle`
+- trusted-principal false-positive exceptions are preserved and are not escalated by overload adaptation
 
 ## Fault Injection Policy
 
@@ -440,6 +617,7 @@ Current rules:
 
 - `spec.percentage` must be between `1` and `100`
 - `spec.target_upstream_cluster` must reference an existing upstream cluster
+- `spec.methods` (when non-empty) must contain only valid HTTP methods and acts as an allow-list for mirrored requests
 - the mirror target must differ from the primary destination `upstream_cluster`
 - listener-level, route-level, and direct upstream-cluster bindings are rejected; mirroring is destination-local only
 
@@ -450,7 +628,8 @@ Example:
 	"name": "shadow-payments",
 	"spec": {
 		"percentage": 20,
-		"target_upstream_cluster": "payments-shadow"
+		"target_upstream_cluster": "payments-shadow",
+		"methods": ["GET", "HEAD"]
 	}
 }
 ```
@@ -473,6 +652,7 @@ Current dataplane support launches best-effort non-blocking shadow requests for 
 Current runtime behavior:
 
 - mirror dispatch is percentage-gated deterministically from the normalized request identity
+- when `spec.methods` is set, only matching request methods are mirrored
 - the primary response path does not wait for the mirror backend and does not fail closed on mirror errors
 - mirror target resolution uses the named `target_upstream_cluster` directly, with the same cluster selection policy used for normal upstream dispatch
 - connection reports now expose `mirror_dispatch_count`, `mirror_skip_count`, and `mirror_dispatch_failure_count`
@@ -622,6 +802,59 @@ Current behavior:
 - affinity is intended for stateful workloads and should be used sparingly because it can amplify hot spots
 
 See [Affinity](affinity.md) for deployment guidance, example patterns, and failure interpretation.
+
+## Upstream Transport Selection
+
+Upstream clusters can now explicitly declare an application transport via `upstream_clusters[].transport`.
+
+Supported values:
+
+- `http1`
+- `http2`
+- `http3`
+
+Current behavior:
+
+- the field defaults to `http1` when omitted
+- this slice introduces explicit modeling and runtime selection wiring
+- full HTTP/3 upstream dispatch semantics are delivered in the next HTTP/3 slices
+
+## Service Discovery Sources
+
+Upstream clusters can now declare a dynamic discovery source through `upstream_clusters[].discovery`.
+
+Important constraints:
+
+- choose one endpoint mode per cluster: static `endpoints` or dynamic `discovery`
+- do not set both `endpoints` and `discovery` in the same cluster
+- each discovery provider requires non-empty identity fields
+
+Supported discovery source types:
+
+- `dns_aaaa`: resolve one hostname to A/AAAA addresses, then map to `hostname:port`
+- `dns_srv`: resolve SRV records for service-driven host+port membership
+- `kubernetes_endpoint_slice`: consume EndpointSlice updates for one Kubernetes Service
+- `consul_like`: consume service-catalog style updates (watch or long-poll adapter)
+
+Example discovery-backed upstream:
+
+```json
+{
+	"name": "payments",
+	"transport": "http1",
+	"endpoints": [],
+	"discovery": {
+		"type": "kubernetes_endpoint_slice",
+		"namespace": "edge",
+		"service": "payments"
+	},
+	"traffic_policy": {
+		"algorithm": "round_robin",
+		"locality": "disabled",
+		"no_healthy_fallback": "fail"
+	}
+}
+```
 
 ## Security Posture
 

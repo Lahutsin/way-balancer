@@ -1,0 +1,32 @@
+dataplane_envelope_http1/http1_proxy_batch
+                        time:   [4.5205 ms 4.7357 ms 4.9058 ms]
+                        thrpt:  [13.046 Kelem/s 13.514 Kelem/s 14.158 Kelem/s]
+                 change:
+                        time:   [+0.7958% +4.2165% +8.0643%] (p = 0.04 < 0.05)
+                        thrpt:  [-7.4625% -4.0459% -0.7895%]
+                        Change within noise threshold.
+
+dataplane_envelope_http1_tls/http1_proxy_batch_tls
+                        time:   [5.3617 ms 5.7239 ms 5.9982 ms]
+                        thrpt:  [10.670 Kelem/s 11.181 Kelem/s 11.937 Kelem/s]
+                 change:
+                        time:   [+4.4287% +9.0412% +13.954%] (p = 0.00 < 0.05)
+                        thrpt:  [-12.246% -8.2916% -4.2409%]
+                        Performance has regressed.
+
+dataplane_envelope_http2/http2_proxy_stream_batch
+                        time:   [56.093 ms 56.541 ms 57.022 ms]
+                        thrpt:  [1.1224 Kelem/s 1.1319 Kelem/s 1.1410 Kelem/s]
+                 change:
+                        time:   [-1.8295% -1.0323% -0.1712%] (p = 0.03 < 0.05)
+                        thrpt:  [+0.1715% +1.0430% +1.8636%]
+                        Change within noise threshold.
+
+mixed_http1_http2_interleaved_batch
+                        time:   [67.787 ms 68.483 ms 69.232 ms]
+                        change: [-5.7239% -4.0560% -2.5098%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 2 outliers among 10 measurements (20.00%)
+  1 (10.00%) low mild
+  1 (10.00%) high mild
+

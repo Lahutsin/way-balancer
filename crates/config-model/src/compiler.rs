@@ -9,7 +9,8 @@ use crate::{
     ConfigApiVersion, EndpointStateConfig, ListenerCertificateSourceConfig, ListenerClassConfig,
     ListenerProtocolConfig, PolicyBindingConfig, PolicyResourcesConfig, RouteMatchConfig,
     RouteDestinationConfig, UpgradePolicyConfig,
-    UpstreamTrafficPolicyConfig, ValidationReport, WorkspaceConfig, WorkspaceConfigError,
+    UpstreamTrafficPolicyConfig, UpstreamTransportConfig, ValidationReport, WorkspaceConfig,
+    WorkspaceConfigError,
     WorkspaceSecurityConfig,
 };
 
@@ -160,6 +161,7 @@ pub struct UpstreamEndpointSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpstreamClusterSnapshot {
     name: String,
+    transport: UpstreamTransportConfig,
     endpoints: Vec<UpstreamEndpointSnapshot>,
     traffic_policy: UpstreamTrafficPolicyConfig,
     policies: PolicyBindingConfig,
@@ -466,6 +468,7 @@ pub(crate) fn compile_workspace_snapshot(
         .iter()
         .map(|cluster| UpstreamClusterSnapshot {
             name: cluster.name.clone(),
+            transport: cluster.transport,
             endpoints: cluster
                 .endpoints
                 .iter()
@@ -578,6 +581,7 @@ fn workspace_config_from_snapshot_view(view: &WorkspaceSnapshotView) -> Workspac
             .iter()
             .map(|cluster| crate::UpstreamClusterConfig {
                 name: cluster.name.clone(),
+                transport: cluster.transport,
                 endpoints: cluster
                     .endpoints
                     .iter()
@@ -590,6 +594,7 @@ fn workspace_config_from_snapshot_view(view: &WorkspaceSnapshotView) -> Workspac
                         weight: endpoint.weight,
                     })
                     .collect(),
+                discovery: None,
                 traffic_policy: cluster.traffic_policy.clone(),
                 policies: cluster.policies.clone(),
             })
@@ -802,6 +807,7 @@ mod tests {
         PolicyBindingConfig, PolicyResourcesConfig, RetryBudgetPolicyConfig, RouteConfig,
         RouteDestinationConfig, UpgradePolicyConfig,
         UpstreamClusterConfig, UpstreamEndpointConfig, UpstreamTrafficPolicyConfig,
+        UpstreamTransportConfig,
         WorkspaceConfig,
     };
 
@@ -829,10 +835,12 @@ mod tests {
             routes: vec![RouteConfig::foundation_path_prefix("api", "/api", "payments")],
             upstream_clusters: vec![UpstreamClusterConfig {
                 name: String::from("payments"),
+                transport: UpstreamTransportConfig::Http1,
                 endpoints: vec![UpstreamEndpointConfig::foundation(
                     "payments-a",
                     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9000),
                 )],
+                discovery: None,
                 traffic_policy: UpstreamTrafficPolicyConfig::default(),
                 policies: PolicyBindingConfig::default(),
             }],
@@ -915,7 +923,7 @@ mod tests {
                 "  \"metadata\": {\n",
                 "    \"format_version\": \"v1\",\n",
                 "    \"api_version\": \"v1_alpha1\",\n",
-                "    \"digest_sha256\": \"67894242c683b24ad889ac4d340a34a6700e26c27e83d0264a39bb29cc1bf333\"\n",
+                "    \"digest_sha256\": \"6267e857bb782ab386a48dd01eaaee7d48f956d5c2c9246acf7ed8db1957ebb7\"\n",
                 "  },\n",
                 "  \"workspace_name\": \"edge\",\n",
                 "  \"security\": {\n",
@@ -939,7 +947,11 @@ mod tests {
                 "    \"http_caches\": [],\n",
                 "    \"transforms\": [],\n",
                 "    \"traffic_mirrors\": [],\n",
-                "    \"fault_injections\": []\n",
+                "    \"fault_injections\": [],\n",
+                "    \"jwt_auth_policies\": [],\n",
+                "    \"external_auth_policies\": [],\n",
+                "    \"authorization_policies\": [],\n",
+                "    \"upstream_identity_policies\": []\n",
                 "  },\n",
                 "  \"listeners\": [\n",
                 "    {\n",
@@ -988,7 +1000,11 @@ mod tests {
                 "        \"cache_policy\": null,\n",
                 "        \"transform_policy\": null,\n",
                 "        \"traffic_mirror\": null,\n",
-                "        \"fault_injection\": null\n",
+                "        \"fault_injection\": null,\n",
+                "        \"jwt_auth_policy\": null,\n",
+                "        \"external_auth_policy\": null,\n",
+                "        \"authorization_policy\": null,\n",
+                "        \"upstream_identity_policy\": null\n",
                 "      }\n",
                 "    }\n",
                 "  ],\n",
@@ -1015,13 +1031,18 @@ mod tests {
                 "        \"cache_policy\": null,\n",
                 "        \"transform_policy\": null,\n",
                 "        \"traffic_mirror\": null,\n",
-                "        \"fault_injection\": null\n",
+                "        \"fault_injection\": null,\n",
+                "        \"jwt_auth_policy\": null,\n",
+                "        \"external_auth_policy\": null,\n",
+                "        \"authorization_policy\": null,\n",
+                "        \"upstream_identity_policy\": null\n",
                 "      }\n",
                 "    }\n",
                 "  ],\n",
                 "  \"upstream_clusters\": [\n",
                 "    {\n",
                 "      \"name\": \"payments\",\n",
+                "      \"transport\": \"http1\",\n",
                 "      \"endpoints\": [\n",
                 "        {\n",
                 "          \"id\": \"payments-a\",\n",
@@ -1048,7 +1069,11 @@ mod tests {
                 "        \"cache_policy\": null,\n",
                 "        \"transform_policy\": null,\n",
                 "        \"traffic_mirror\": null,\n",
-                "        \"fault_injection\": null\n",
+                "        \"fault_injection\": null,\n",
+                "        \"jwt_auth_policy\": null,\n",
+                "        \"external_auth_policy\": null,\n",
+                "        \"authorization_policy\": null,\n",
+                "        \"upstream_identity_policy\": null\n",
                 "      }\n",
                 "    }\n",
                 "  ]\n",
@@ -1205,10 +1230,12 @@ mod tests {
         previous_config.upstream_clusters[0].name = String::from("payments-stable");
         previous_config.upstream_clusters.push(UpstreamClusterConfig {
             name: String::from("payments-canary"),
+            transport: UpstreamTransportConfig::Http1,
             endpoints: vec![UpstreamEndpointConfig::foundation(
                 "payments-canary-a",
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9001),
             )],
+            discovery: None,
             traffic_policy: UpstreamTrafficPolicyConfig::default(),
             policies: PolicyBindingConfig::default(),
         });

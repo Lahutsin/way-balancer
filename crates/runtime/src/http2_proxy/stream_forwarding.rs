@@ -66,6 +66,7 @@ async fn proxy_one_http2_stream(
         &route_input,
         &config.routes,
     );
+    let route_label = route_match.as_ref().map(|route| route.label.as_str());
     if route_match.is_some()
         && record_query_probe(
             config,
@@ -96,12 +97,26 @@ async fn proxy_one_http2_stream(
         None
     };
 
-    let selected_upstream = match resolve_stream_upstream(
+    let route_selection_started = Instant::now();
+    let upstream_resolution = resolve_stream_upstream(
         config,
         route_match.as_ref(),
         request.uri().path_and_query().map(|value| value.as_str()).unwrap_or("/"),
         request.headers(),
-    ) {
+    );
+    if let (Some(request_telemetry), Some(route)) =
+        (config.request_telemetry.as_ref(), route_match.as_ref())
+    {
+        let _ = request_telemetry.telemetry.record_route_latency(
+            &request_telemetry.scope,
+            &route.label,
+            lb_observability::TraceHookPhase::UpstreamSelected,
+            route_selection_started.elapsed(),
+        );
+    }
+    record_route_selection_decision(config, route_match.as_ref(), &upstream_resolution);
+
+    let selected_upstream = match upstream_resolution {
         RequestUpstreamResolution::Selected(upstream) => upstream,
         RequestUpstreamResolution::Reject(status) => {
             let _blocked = status == StatusCode::FORBIDDEN
@@ -114,6 +129,14 @@ async fn proxy_one_http2_stream(
 
     let destination_policy =
         route_destination_policy_runtime(config, route_match.as_ref(), &selected_upstream);
+    if verify_route_destination_jwt_auth(config, &request, route_match.as_ref(), &selected_upstream)
+        .is_err()
+    {
+        send_local_response(respond, StatusCode::UNAUTHORIZED)
+            .map_err(|_| StreamForwardError::SendResponse)?;
+        metrics.record_response_status(StatusCode::UNAUTHORIZED.as_u16());
+        return Ok(());
+    }
     if let Some(transform) = destination_policy.and_then(|policy| policy.request_transform.as_ref()) {
         *request.uri_mut() = original_uri.clone();
         *request.headers_mut() = original_headers.clone();
@@ -127,12 +150,63 @@ async fn proxy_one_http2_stream(
             }
         };
     }
+    if let Err(outcome) = enforce_route_destination_external_auth(
+        config,
+        &mut request,
+        route_match.as_ref(),
+        &selected_upstream,
+    )
+    .await
+    {
+        let status = match outcome {
+            ExternalAuthEnforcementOutcome::Denied => StatusCode::FORBIDDEN,
+            ExternalAuthEnforcementOutcome::ServiceUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            ExternalAuthEnforcementOutcome::InvalidResponse => StatusCode::BAD_GATEWAY,
+        };
+        send_local_response(respond, status).map_err(|_| StreamForwardError::SendResponse)?;
+        metrics.record_response_status(status.as_u16());
+        return Ok(());
+    }
+    if let Err(outcome) = enforce_route_destination_upstream_identity(
+        config,
+        &request,
+        route_match.as_ref(),
+        &selected_upstream,
+    ) {
+        let status = match outcome {
+            UpstreamIdentityEnforcementOutcome::ServiceUnavailable => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
+        };
+        send_local_response(respond, status).map_err(|_| StreamForwardError::SendResponse)?;
+        metrics.record_response_status(status.as_u16());
+        return Ok(());
+    }
+    if let Err(outcome) = enforce_route_destination_authorization(
+        config,
+        &request,
+        route_match.as_ref(),
+        &selected_upstream,
+    ) {
+        let status = match outcome {
+            AuthorizationEnforcementOutcome::Denied => StatusCode::FORBIDDEN,
+        };
+        send_local_response(respond, status).map_err(|_| StreamForwardError::SendResponse)?;
+        metrics.record_response_status(status.as_u16());
+        return Ok(());
+    }
     let destination_response_transform = effective_destination_response_transform(
         config,
         route_match.as_ref(),
         destination_policy,
     );
+    let _destination_latency = DestinationLatencyRecorder::new(
+        config.request_telemetry.as_ref(),
+        route_label,
+        selected_destination_label(&selected_upstream),
+    );
     let _destination_concurrency_leases = match enforce_destination_local_limits(
+        config,
         destination_policy,
         route_match.as_ref(),
         &selected_upstream,
@@ -230,7 +304,9 @@ async fn proxy_one_http2_stream(
                         .map_err(|_| StreamForwardError::SendResponse)?;
                     metrics.record_response_status(StatusCode::GATEWAY_TIMEOUT.as_u16());
                     record_passive_health_result(
+                        config,
                         &selected_upstream,
+                        route_label,
                         &Err(StreamForwardError::IdleTimeout(StreamIdlePhase::UpstreamResponse)),
                     );
                     return Err(StreamForwardError::IdleTimeout(StreamIdlePhase::UpstreamResponse));
@@ -241,7 +317,9 @@ async fn proxy_one_http2_stream(
                         .map_err(|_| StreamForwardError::SendResponse)?;
                     metrics.record_response_status(StatusCode::BAD_GATEWAY.as_u16());
                     record_passive_health_result(
+                        config,
                         &selected_upstream,
+                        route_label,
                         &Err(StreamForwardError::UpstreamRequest),
                     );
                     return Err(StreamForwardError::UpstreamRequest);
@@ -280,6 +358,10 @@ async fn proxy_one_http2_stream(
                     && allow_destination_retry(
                         destination_policy,
                         crate::UpstreamFailureClass::Temporary,
+                        Some(&selected_upstream),
+                        config.request_telemetry.as_ref(),
+                        route_label,
+                        Some(selected_destination_label(&selected_upstream)),
                     )
                 {
                     retried_stale_client = true;
@@ -290,7 +372,12 @@ async fn proxy_one_http2_stream(
                 metrics.record_response_status(StatusCode::BAD_GATEWAY.as_u16());
                 let classified_error =
                     classify_http2_upstream_error(&error, StreamForwardError::UpstreamReady);
-                record_passive_health_result(&selected_upstream, &Err(classified_error));
+                record_passive_health_result(
+                    config,
+                    &selected_upstream,
+                    route_label,
+                    &Err(classified_error),
+                );
                 return Err(classified_error);
             }
 
@@ -315,6 +402,10 @@ async fn proxy_one_http2_stream(
                         && allow_destination_retry(
                             destination_policy,
                             crate::UpstreamFailureClass::Temporary,
+                            Some(&selected_upstream),
+                            config.request_telemetry.as_ref(),
+                            route_label,
+                            Some(selected_destination_label(&selected_upstream)),
                         )
                     {
                         retried_stale_client = true;
@@ -325,7 +416,12 @@ async fn proxy_one_http2_stream(
                     metrics.record_response_status(StatusCode::BAD_GATEWAY.as_u16());
                     let classified_error =
                         classify_http2_upstream_error(&error, StreamForwardError::UpstreamRequest);
-                    record_passive_health_result(&selected_upstream, &Err(classified_error));
+                    record_passive_health_result(
+                        config,
+                        &selected_upstream,
+                        route_label,
+                        &Err(classified_error),
+                    );
                     return Err(classified_error);
                 }
             }
@@ -435,7 +531,9 @@ async fn proxy_one_http2_stream(
                 .map_err(|_| StreamForwardError::SendResponse)?;
             metrics.record_response_status(StatusCode::GATEWAY_TIMEOUT.as_u16());
             record_passive_health_result(
+                config,
                 &selected_upstream,
+                route_label,
                 &Err(StreamForwardError::IdleTimeout(StreamIdlePhase::UpstreamResponse)),
             );
             return Err(StreamForwardError::IdleTimeout(StreamIdlePhase::UpstreamResponse));
@@ -453,160 +551,49 @@ async fn proxy_one_http2_stream(
                 && allow_destination_retry(
                     destination_policy,
                     crate::UpstreamFailureClass::Temporary,
+                    Some(&selected_upstream),
+                    config.request_telemetry.as_ref(),
+                    route_label,
+                    Some(selected_destination_label(&selected_upstream)),
                 )
             {
-                let (retry_upstream_client, _) = match upstream_clients
-                    .ensure_client(&selected_upstream.target, &effective_timeouts)
-                    .await
-                {
-                    Ok(client) => client,
-                    Err(UpstreamClientConnectError::ConnectTimeout { .. }) => {
-                        record_destination_timeout(destination_policy, crate::TimeoutCategory::Connect);
-                        send_local_response(respond, StatusCode::GATEWAY_TIMEOUT)
-                            .map_err(|_| StreamForwardError::SendResponse)?;
-                        metrics.record_response_status(StatusCode::GATEWAY_TIMEOUT.as_u16());
-                        record_passive_health_result(
-                            &selected_upstream,
-                            &Err(StreamForwardError::IdleTimeout(
-                                StreamIdlePhase::UpstreamResponse,
-                            )),
-                        );
-                        return Err(StreamForwardError::IdleTimeout(
-                            StreamIdlePhase::UpstreamResponse,
-                        ));
-                    }
-                    Err(_) => {
-                        record_destination_failure(
-                            destination_policy,
-                            crate::UpstreamFailureClass::Connect,
-                        );
-                        send_local_response(respond, StatusCode::BAD_GATEWAY)
-                            .map_err(|_| StreamForwardError::SendResponse)?;
-                        metrics.record_response_status(StatusCode::BAD_GATEWAY.as_u16());
-                        let classified_error = classify_http2_upstream_error(
-                            &error,
-                            StreamForwardError::UpstreamResponse,
-                        );
-                        record_passive_health_result(&selected_upstream, &Err(classified_error));
-                        return Err(classified_error);
-                    }
-                };
-
                 let Some(retry_request_template) = retryable_upstream_request.clone() else {
                     return Err(StreamForwardError::UpstreamResponse);
                 };
-                let retry_request = retry_request_template.into_request()?;
-
-                let retry_response = {
-                    let mut retry_send_request = retry_upstream_client.send_request.lock().await;
-                    if poll_fn(|cx| retry_send_request.poll_ready(cx)).await.is_err() {
-                        drop(retry_send_request);
-                        upstream_clients.remove_client(&selected_upstream.target).await;
-                        record_destination_failure(
-                            destination_policy,
-                            crate::UpstreamFailureClass::Temporary,
-                        );
-                        send_local_response(respond, StatusCode::BAD_GATEWAY)
-                            .map_err(|_| StreamForwardError::SendResponse)?;
-                        metrics.record_response_status(StatusCode::BAD_GATEWAY.as_u16());
-                        let classified_error = classify_http2_upstream_error(
-                            &error,
-                            StreamForwardError::UpstreamReady,
-                        );
-                        record_passive_health_result(&selected_upstream, &Err(classified_error));
-                        return Err(classified_error);
-                    }
-
-                    let (retry_response_future, retry_upstream_send_stream) =
-                        match retry_send_request.send_request(retry_request, true) {
-                            Ok(result) => result,
-                            Err(error) => {
-                                drop(retry_send_request);
-                                upstream_clients.remove_client(&selected_upstream.target).await;
-                                record_destination_failure(
-                                    destination_policy,
-                                    crate::UpstreamFailureClass::Temporary,
-                                );
-                                send_local_response(respond, StatusCode::BAD_GATEWAY)
-                                    .map_err(|_| StreamForwardError::SendResponse)?;
-                                metrics.record_response_status(StatusCode::BAD_GATEWAY.as_u16());
-                                let classified_error = classify_http2_upstream_error(
-                                    &error,
-                                    StreamForwardError::UpstreamRequest,
-                                );
-                                record_passive_health_result(
-                                    &selected_upstream,
-                                    &Err(classified_error),
-                                );
-                                return Err(classified_error);
-                            }
-                        };
-                    drop(retry_send_request);
-                    drop(retry_upstream_send_stream);
-
-                    let (retry_response_timeout, retry_response_timeout_category) =
-                        match bounded_dispatch_timeout(
-                            destination_policy,
-                            crate::TimeoutCategory::Idle,
-                            effective_timeouts.idle_timeout,
-                            request_started,
-                            attempt_started,
+                match dispatch_retry_response_with_optional_hedge(
+                    upstream_clients.clone(),
+                    selected_upstream.target.clone(),
+                    effective_timeouts,
+                    destination_policy.cloned(),
+                    retry_request_template,
+                    request_started,
+                    attempt_started,
+                    config.request_hedging_policy,
+                )
+                .await
+                {
+                    Ok((retry_response, _)) => retry_response,
+                    Err(retry_error) => {
+                        let status = if matches!(
+                            retry_error,
+                            StreamForwardError::IdleTimeout(StreamIdlePhase::UpstreamResponse)
                         ) {
-                            Ok(value) => value,
-                            Err(category) => {
-                                record_destination_timeout(destination_policy, category);
-                                send_local_response(respond, StatusCode::GATEWAY_TIMEOUT)
-                                    .map_err(|_| StreamForwardError::SendResponse)?;
-                                metrics.record_response_status(StatusCode::GATEWAY_TIMEOUT.as_u16());
-                                return Ok(());
-                            }
+                            StatusCode::GATEWAY_TIMEOUT
+                        } else {
+                            StatusCode::BAD_GATEWAY
                         };
-
-                    match time::timeout(retry_response_timeout, retry_response_future).await {
-                        Err(_) => {
-                            upstream_clients.remove_client(&selected_upstream.target).await;
-                            record_destination_timeout(
-                                destination_policy,
-                                retry_response_timeout_category,
-                            );
-                            send_local_response(respond, StatusCode::GATEWAY_TIMEOUT)
-                                .map_err(|_| StreamForwardError::SendResponse)?;
-                            metrics.record_response_status(StatusCode::GATEWAY_TIMEOUT.as_u16());
-                            record_passive_health_result(
-                                &selected_upstream,
-                                &Err(StreamForwardError::IdleTimeout(
-                                    StreamIdlePhase::UpstreamResponse,
-                                )),
-                            );
-                            return Err(StreamForwardError::IdleTimeout(
-                                StreamIdlePhase::UpstreamResponse,
-                            ));
-                        }
-                        Ok(Ok(response)) => response,
-                        Ok(Err(error)) => {
-                            upstream_clients.remove_client(&selected_upstream.target).await;
-                            record_destination_failure(
-                                destination_policy,
-                                crate::UpstreamFailureClass::Temporary,
-                            );
-                            send_local_response(respond, StatusCode::BAD_GATEWAY)
-                                .map_err(|_| StreamForwardError::SendResponse)?;
-                            metrics.record_response_status(StatusCode::BAD_GATEWAY.as_u16());
-                            let classified_error = classify_http2_upstream_error(
-                                &error,
-                                StreamForwardError::UpstreamResponse,
-                            );
-                            record_passive_health_result(
-                                &selected_upstream,
-                                &Err(classified_error),
-                            );
-                            return Err(classified_error);
-                        }
+                        send_local_response(respond, status)
+                            .map_err(|_| StreamForwardError::SendResponse)?;
+                        metrics.record_response_status(status.as_u16());
+                        record_passive_health_result(
+                            config,
+                            &selected_upstream,
+                            route_label,
+                            &Err(retry_error),
+                        );
+                        return Err(StreamForwardError::UpstreamResponse);
                     }
-                };
-
-                retry_upstream_client.mark_used(Instant::now());
-                retry_response
+                }
             } else {
                 record_destination_failure(destination_policy, crate::UpstreamFailureClass::Temporary);
                 let _ = error;
@@ -614,7 +601,9 @@ async fn proxy_one_http2_stream(
                     .map_err(|_| StreamForwardError::SendResponse)?;
                 metrics.record_response_status(StatusCode::BAD_GATEWAY.as_u16());
                 record_passive_health_result(
+                    config,
                     &selected_upstream,
+                    route_label,
                     &Err(StreamForwardError::UpstreamResponse),
                 );
                 return Err(StreamForwardError::UpstreamResponse);
@@ -687,8 +676,21 @@ async fn proxy_one_http2_stream(
             .is_none_or(|payload| grpc_payload_has_at_most_one_message(payload.body.as_ref()))
             && grpc_payload_has_at_most_one_message(buffered_response_payload.body.as_ref());
 
-        if let Some(class) = grpc_status.and_then(classify_grpc_response_failure) {
-            if unary_grpc_retry_safe && allow_destination_retry(destination_policy, class) {
+        let grpc_failure_policy =
+            grpc_failure_policy_for_destination(config, route_match.as_ref(), &selected_upstream);
+        if let Some(class) =
+            grpc_status.and_then(|status| classify_grpc_response_failure_with_policy(grpc_failure_policy, status))
+        {
+            if unary_grpc_retry_safe
+                && allow_destination_retry(
+                    destination_policy,
+                    class,
+                    Some(&selected_upstream),
+                    config.request_telemetry.as_ref(),
+                    route_label,
+                    Some(selected_destination_label(&selected_upstream)),
+                )
+            {
                 record_destination_failure(destination_policy, class);
                 let Some(retry_request_template) = retryable_upstream_request.clone() else {
                     return Err(StreamForwardError::UpstreamResponse);
@@ -708,7 +710,9 @@ async fn proxy_one_http2_stream(
                             .map_err(|_| StreamForwardError::SendResponse)?;
                         metrics.record_response_status(StatusCode::BAD_GATEWAY.as_u16());
                         record_passive_health_result(
+                            config,
                             &selected_upstream,
+                            route_label,
                             &Err(StreamForwardError::UpstreamReady),
                         );
                         return Err(StreamForwardError::UpstreamReady);
@@ -731,7 +735,9 @@ async fn proxy_one_http2_stream(
                                     .map_err(|_| StreamForwardError::SendResponse)?;
                                 metrics.record_response_status(StatusCode::BAD_GATEWAY.as_u16());
                                 record_passive_health_result(
+                                    config,
                                     &selected_upstream,
+                                    route_label,
                                     &Err(StreamForwardError::UpstreamRequest),
                                 );
                                 return Err(StreamForwardError::UpstreamRequest);
@@ -777,7 +783,9 @@ async fn proxy_one_http2_stream(
                                 .map_err(|_| StreamForwardError::SendResponse)?;
                             metrics.record_response_status(StatusCode::GATEWAY_TIMEOUT.as_u16());
                             record_passive_health_result(
+                                config,
                                 &selected_upstream,
+                                route_label,
                                 &Err(StreamForwardError::IdleTimeout(
                                     StreamIdlePhase::UpstreamResponse,
                                 )),
@@ -797,7 +805,9 @@ async fn proxy_one_http2_stream(
                                 .map_err(|_| StreamForwardError::SendResponse)?;
                             metrics.record_response_status(StatusCode::BAD_GATEWAY.as_u16());
                             record_passive_health_result(
+                                config,
                                 &selected_upstream,
+                                route_label,
                                 &Err(StreamForwardError::UpstreamResponse),
                             );
                             return Err(StreamForwardError::UpstreamResponse);
@@ -890,8 +900,12 @@ async fn proxy_one_http2_stream(
         }
 
         metrics.record_response_status(response_status.as_u16());
+        let grpc_failure_policy =
+            grpc_failure_policy_for_destination(config, route_match.as_ref(), &selected_upstream);
         match grpc_status
-            .and_then(classify_grpc_response_failure)
+            .and_then(|status| {
+                classify_grpc_response_failure_with_policy(grpc_failure_policy, status)
+            })
             .or_else(|| classify_http2_response_failure(response_status))
         {
             Some(class) => record_destination_failure(destination_policy, class),
@@ -900,7 +914,12 @@ async fn proxy_one_http2_stream(
 
         upstream_client.mark_used(Instant::now());
         upstream_client.note_completed_stream();
-        record_passive_health_result(&selected_upstream, &Ok(response_status.as_u16()));
+        record_passive_health_result(
+            config,
+            &selected_upstream,
+            route_label,
+            &Ok(response_status.as_u16()),
+        );
         return Ok(());
     }
 
@@ -983,8 +1002,223 @@ async fn proxy_one_http2_stream(
 
     upstream_client.mark_used(Instant::now());
     upstream_client.note_completed_stream();
-    record_passive_health_result(&selected_upstream, &Ok(response_status.as_u16()));
+    record_passive_health_result(
+        config,
+        &selected_upstream,
+        route_label,
+        &Ok(response_status.as_u16()),
+    );
 
     Ok(())
+}
+
+struct DestinationLatencyRecorder<'a> {
+    request_telemetry: Option<&'a HttpRequestTelemetryConfig>,
+    route_label: Option<&'a str>,
+    destination: &'a str,
+    started_at: Instant,
+}
+
+impl<'a> DestinationLatencyRecorder<'a> {
+    fn new(
+        request_telemetry: Option<&'a HttpRequestTelemetryConfig>,
+        route_label: Option<&'a str>,
+        destination: &'a str,
+    ) -> Self {
+        Self {
+            request_telemetry,
+            route_label,
+            destination,
+            started_at: Instant::now(),
+        }
+    }
+}
+
+impl Drop for DestinationLatencyRecorder<'_> {
+    fn drop(&mut self) {
+        let (Some(request_telemetry), Some(route_label)) = (self.request_telemetry, self.route_label)
+        else {
+            return;
+        };
+        let elapsed = self.started_at.elapsed();
+        let _ = request_telemetry.telemetry.record_destination_latency(
+            &request_telemetry.scope,
+            self.destination,
+            lb_observability::TraceHookPhase::ResponseCompleted,
+            elapsed,
+        );
+        let _ = request_telemetry.telemetry.record_route_latency(
+            &request_telemetry.scope,
+            route_label,
+            lb_observability::TraceHookPhase::ResponseCompleted,
+            elapsed,
+        );
+    }
+}
+
+async fn dispatch_retry_response_with_optional_hedge(
+    upstream_clients: UpstreamClientRegistry,
+    target: lb_net_core::UpstreamTarget,
+    effective_timeouts: lb_net_core::ConnectionTimeouts,
+    destination_policy: Option<crate::http1_proxy::RouteDestinationPolicyRuntime>,
+    retry_request_template: UpstreamRequestTemplate,
+    request_started: Instant,
+    attempt_started: Instant,
+    hedging_policy: Option<crate::RequestHedgingPolicy>,
+) -> Result<(Response<RecvStream>, crate::HedgeOutcome), StreamForwardError> {
+    let Some(policy) = hedging_policy else {
+        let response = dispatch_retry_response_attempt(
+            upstream_clients,
+            target,
+            effective_timeouts,
+            destination_policy,
+            retry_request_template,
+            request_started,
+            attempt_started,
+            false,
+        )
+        .await?;
+        return Ok((
+            response,
+            crate::HedgeOutcome {
+                hedge_launched: false,
+                winner_attempt: 1,
+            },
+        ));
+    };
+
+    crate::execute_with_hedge(
+        policy,
+        || true,
+        {
+            let upstream_clients = upstream_clients.clone();
+            let target = target.clone();
+            let destination_policy = destination_policy.clone();
+            let retry_request_template = retry_request_template.clone();
+            move || {
+                dispatch_retry_response_attempt(
+                    upstream_clients,
+                    target,
+                    effective_timeouts,
+                    destination_policy,
+                    retry_request_template,
+                    request_started,
+                    attempt_started,
+                    true,
+                )
+            }
+        },
+        {
+            let upstream_clients = upstream_clients.clone();
+            let target = target.clone();
+            let destination_policy = destination_policy.clone();
+            let retry_request_template = retry_request_template.clone();
+            move || {
+                dispatch_retry_response_attempt(
+                    upstream_clients,
+                    target,
+                    effective_timeouts,
+                    destination_policy,
+                    retry_request_template,
+                    request_started,
+                    attempt_started,
+                    true,
+                )
+            }
+        },
+    )
+    .await
+}
+
+async fn dispatch_retry_response_attempt(
+    upstream_clients: UpstreamClientRegistry,
+    target: lb_net_core::UpstreamTarget,
+    effective_timeouts: lb_net_core::ConnectionTimeouts,
+    destination_policy: Option<crate::http1_proxy::RouteDestinationPolicyRuntime>,
+    retry_request_template: UpstreamRequestTemplate,
+    request_started: Instant,
+    attempt_started: Instant,
+    force_fresh_client: bool,
+) -> Result<Response<RecvStream>, StreamForwardError> {
+    if force_fresh_client {
+        upstream_clients.remove_client(&target).await;
+    }
+    let (retry_upstream_client, _) = match upstream_clients
+        .ensure_client(&target, &effective_timeouts)
+        .await
+    {
+        Ok(client) => client,
+        Err(UpstreamClientConnectError::ConnectTimeout { .. }) => {
+            record_destination_timeout(destination_policy.as_ref(), crate::TimeoutCategory::Connect);
+            return Err(StreamForwardError::IdleTimeout(StreamIdlePhase::UpstreamResponse));
+        }
+        Err(_) => {
+            record_destination_failure(destination_policy.as_ref(), crate::UpstreamFailureClass::Connect);
+            return Err(StreamForwardError::UpstreamResponse);
+        }
+    };
+
+    let retry_request = retry_request_template.into_request()?;
+    let mut retry_send_request = retry_upstream_client.send_request.lock().await;
+    if let Err(error) = poll_fn(|cx| retry_send_request.poll_ready(cx)).await {
+        drop(retry_send_request);
+        upstream_clients.remove_client(&target).await;
+        record_destination_failure(destination_policy.as_ref(), crate::UpstreamFailureClass::Temporary);
+        return Err(classify_http2_upstream_error(
+            &error,
+            StreamForwardError::UpstreamReady,
+        ));
+    }
+
+    let (retry_response_future, retry_upstream_send_stream) =
+        match retry_send_request.send_request(retry_request, true) {
+            Ok(result) => result,
+            Err(error) => {
+                drop(retry_send_request);
+                upstream_clients.remove_client(&target).await;
+                record_destination_failure(
+                    destination_policy.as_ref(),
+                    crate::UpstreamFailureClass::Temporary,
+                );
+                return Err(classify_http2_upstream_error(
+                    &error,
+                    StreamForwardError::UpstreamRequest,
+                ));
+            }
+        };
+    drop(retry_send_request);
+    drop(retry_upstream_send_stream);
+
+    let (retry_response_timeout, retry_response_timeout_category) = bounded_dispatch_timeout(
+        destination_policy.as_ref(),
+        crate::TimeoutCategory::Idle,
+        effective_timeouts.idle_timeout,
+        request_started,
+        attempt_started,
+    )
+    .map_err(|category| {
+        record_destination_timeout(destination_policy.as_ref(), category);
+        StreamForwardError::IdleTimeout(StreamIdlePhase::UpstreamResponse)
+    })?;
+
+    let response = match time::timeout(retry_response_timeout, retry_response_future).await {
+        Err(_) => {
+            upstream_clients.remove_client(&target).await;
+            record_destination_timeout(destination_policy.as_ref(), retry_response_timeout_category);
+            return Err(StreamForwardError::IdleTimeout(StreamIdlePhase::UpstreamResponse));
+        }
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => {
+            upstream_clients.remove_client(&target).await;
+            record_destination_failure(destination_policy.as_ref(), crate::UpstreamFailureClass::Temporary);
+            return Err(classify_http2_upstream_error(
+                &error,
+                StreamForwardError::UpstreamResponse,
+            ));
+        }
+    };
+
+    retry_upstream_client.mark_used(Instant::now());
+    Ok(response)
 }
 

@@ -11,10 +11,13 @@ use bytes::{Buf, Bytes};
 use h2::{client, server, Reason};
 use http::{Request, Response, StatusCode};
 use ipnet::IpNet;
+use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use lb_config_model::{
+    AuthorizationDecisionConfig, AuthorizationPolicyConfig, AuthorizationRuleConfig,
     FaultInjectionAbortConfig, FaultInjectionDelayConfig, FaultInjectionPolicyConfig,
-    HeaderMutationConfig, PathRewriteTransformConfig, RequestTransformConfig,
-    ResponseTransformConfig, TrafficMirrorPolicyConfig,
+    HeaderMutationConfig, JwtAuthPolicyConfig, JwtJwksSourceConfig,
+    PathRewriteTransformConfig, RequestTransformConfig, ResponseTransformConfig,
+    TrafficMirrorPolicyConfig,
 };
 use lb_net_core::{
     EndpointMetadata, EndpointState, UpstreamCluster, UpstreamClusterName, UpstreamEndpoint,
@@ -22,14 +25,17 @@ use lb_net_core::{
 };
 use lb_runtime::{
     proxy_http2_connection, AffinityFallbackPolicy, AffinityPolicy, AnonymousSourceFilterPolicy,
-    CircuitBreakerPolicy, EndpointHealthPolicy, FailureManager, Http2ConnectionReport,
-    Http2ProxyConfig, Http2ProxyError, Http2RouteUpstream, LoadBalancingAlgorithm,
+    CircuitBreakerPolicy, EndpointHealthPolicy, FailureManager,
+    Http2ConnectionReport, Http2ProxyConfig, Http2ProxyError, Http2RouteUpstream, LoadBalancingAlgorithm,
     LocalLimitKeyKind, LocalLimitScope, LocalRateLimitConfig, LocalRateLimiter,
     LocalityRoutingPolicy, NoHealthyFallback, ProtocolAnomalyCategory, RetryBudgetPolicy,
+    RequestHedgingPolicy,
     RouteBackendPool, RouteDestinationPolicyRuntime, RouteEnumerationProtectionPolicy,
+    AuthorizationPolicyRuntime, RuntimeTelemetry, JwtAuthPolicyRuntime,
     SourceAggregation, TimeoutCategory, TimeoutHierarchy, TrustedClientIpPolicy,
     UpstreamSelectionPolicy, WeightedRouteDestination,
 };
+use serde::{Deserialize, Serialize};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 use tokio::task::JoinSet;
@@ -38,8 +44,12 @@ use tokio::time;
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn proxies_multiplexed_http2_streams() -> Result<(), Box<dyn std::error::Error>> {
     let upstream_addr = spawn_basic_h2_upstream().await?;
+    let telemetry = Arc::new(RuntimeTelemetry::new()?);
     let (proxy_addr, report_rx) =
-        spawn_one_shot_http2_proxy_listener(proxy_config(upstream_addr)).await?;
+        spawn_one_shot_http2_proxy_listener(
+            proxy_config(upstream_addr).with_request_telemetry("public-h2", Arc::clone(&telemetry)),
+        )
+        .await?;
 
     let mut client = connect_h2_client(proxy_addr).await?;
     let response_one = send_h2_request(&mut client, "/slow", None).await?;
@@ -57,6 +67,15 @@ async fn proxies_multiplexed_http2_streams() -> Result<(), Box<dyn std::error::E
     assert_eq!(report.metrics.request_count, 2);
     assert_eq!(report.metrics.response_status_counts.get(&200), Some(&2));
     assert!(report.metrics.peak_active_streams >= 2);
+    assert!(
+        report
+            .decision_trace_events
+            .iter()
+            .any(|event| event.code == lb_observability::TelemetryEventCode::DecisionRouteSelected)
+    );
+    let metrics = telemetry.export_metrics();
+    assert!(metrics.contains("runtime_route_latency_samples_total"));
+    assert!(metrics.contains("runtime_destination_latency_samples_total"));
 
     Ok(())
 }
@@ -146,8 +165,49 @@ async fn evicts_idle_http2_upstream_clients_before_reuse() -> Result<(), Box<dyn
 async fn retries_safe_http2_request_once_after_reused_upstream_client_closes(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let upstream_addr = spawn_connection_indexed_h2_upstream(true).await?;
+    let telemetry = Arc::new(RuntimeTelemetry::new()?);
     let (proxy_addr, report_rx) =
-        spawn_one_shot_http2_proxy_listener(proxy_config(upstream_addr)).await?;
+        spawn_one_shot_http2_proxy_listener(
+            proxy_config(upstream_addr).with_request_telemetry("public-h2", Arc::clone(&telemetry)),
+        )
+        .await?;
+
+    let mut client = connect_h2_client(proxy_addr).await?;
+    let first_response = send_h2_request(&mut client, "/first", None).await?;
+    let first_received = receive_h2_response(first_response).await?;
+    assert_eq!(first_received.0, StatusCode::OK);
+    assert_eq!(first_received.1, "conn-1");
+
+    let second_response = send_h2_request(&mut client, "/second", None).await?;
+    let second_received = receive_h2_response(second_response).await?;
+    assert_eq!(second_received.0, StatusCode::OK);
+    assert_eq!(second_received.1, "conn-2");
+    drop(client);
+
+    let report = receive_proxy_result(report_rx).await?;
+    assert_eq!(report.metrics.request_count, 2);
+    assert_eq!(report.metrics.response_status_counts.get(&200), Some(&2));
+    let metrics = telemetry.export_metrics();
+    assert!(metrics.contains("runtime_decision_events_total"));
+    assert!(
+        report
+            .decision_trace_events
+            .iter()
+            .any(|event| event.code == lb_observability::TelemetryEventCode::DecisionRouteSelected)
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hedging_policy_keeps_stale_reuse_retry_successful(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let upstream_addr = spawn_connection_indexed_h2_upstream(true).await?;
+    let mut config = proxy_config(upstream_addr).with_request_hedging_policy(RequestHedgingPolicy {
+        hedge_delay: Duration::from_millis(5),
+        max_attempts: 2,
+    });
+    config.timeouts.idle_timeout = Duration::from_secs(2);
+    let (proxy_addr, report_rx) = spawn_one_shot_http2_proxy_listener(config).await?;
 
     let mut client = connect_h2_client(proxy_addr).await?;
     let first_response = send_h2_request(&mut client, "/first", None).await?;
@@ -191,6 +251,64 @@ async fn does_not_retry_unsafe_http2_request_after_reused_upstream_client_gracef
     assert_eq!(report.metrics.request_count, 2);
     assert_eq!(report.metrics.response_status_counts.get(&200), Some(&1));
     assert_eq!(report.metrics.response_status_counts.get(&502), Some(&1));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn does_not_retry_http2_post_without_idempotency_override_even_when_end_stream(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let upstream_addr = spawn_connection_indexed_h2_upstream(true).await?;
+    let (proxy_addr, report_rx) =
+        spawn_one_shot_http2_proxy_listener(proxy_config(upstream_addr)).await?;
+
+    let mut client = connect_h2_client(proxy_addr).await?;
+    let first_response = send_h2_request(&mut client, "/first", None).await?;
+    let first_received = receive_h2_response(first_response).await?;
+    assert_eq!(first_received.0, StatusCode::OK);
+    assert_eq!(first_received.1, "conn-1");
+
+    let second_response = send_h2_request_with_method(&mut client, "POST", "/second", None).await?;
+    let second_received = receive_h2_response(second_response).await?;
+    assert_eq!(second_received.0, StatusCode::BAD_GATEWAY);
+    assert_eq!(second_received.1, "");
+    drop(client);
+
+    let report = receive_proxy_result(report_rx).await?;
+    assert_eq!(report.metrics.request_count, 2);
+    assert_eq!(report.metrics.response_status_counts.get(&200), Some(&1));
+    assert_eq!(report.metrics.response_status_counts.get(&502), Some(&1));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn retries_http2_post_with_idempotency_key_override_when_request_is_replayable(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let upstream_addr = spawn_connection_indexed_h2_upstream(true).await?;
+    let (proxy_addr, report_rx) =
+        spawn_one_shot_http2_proxy_listener(proxy_config(upstream_addr)).await?;
+
+    let mut client = connect_h2_client(proxy_addr).await?;
+    let first_response = send_h2_request(&mut client, "/first", None).await?;
+    let first_received = receive_h2_response(first_response).await?;
+    assert_eq!(first_received.0, StatusCode::OK);
+    assert_eq!(first_received.1, "conn-1");
+
+    let second_response = send_h2_request_with_method_and_headers(
+        &mut client,
+        "POST",
+        "/second",
+        None,
+        &[("idempotency-key", "order-42")],
+    )
+    .await?;
+    let second_received = receive_h2_response(second_response).await?;
+    assert_eq!(second_received.0, StatusCode::OK);
+    assert_eq!(second_received.1, "conn-2");
+    drop(client);
+
+    let report = receive_proxy_result(report_rx).await?;
+    assert_eq!(report.metrics.request_count, 2);
+    assert_eq!(report.metrics.response_status_counts.get(&200), Some(&2));
     Ok(())
 }
 
@@ -402,6 +520,7 @@ async fn mirrors_bodyless_http2_request_without_affecting_primary_response(
                 traffic_mirror: Some(TrafficMirrorPolicyConfig {
                     percentage: 100,
                     target_upstream_cluster: String::from("frontend-shadow"),
+                    methods: Vec::new(),
                 }),
                 fault_injection: None,
                 rate_limiters: Vec::new(),
@@ -431,6 +550,234 @@ async fn mirrors_bodyless_http2_request_without_affecting_primary_response(
     assert_eq!(report.metrics.mirror_dispatch_count, 1);
     assert_eq!(report.metrics.mirror_skip_count, 0);
     assert_eq!(report.metrics.mirror_dispatch_failure_count, 0);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mirror_policy_method_allow_list_skips_http2_post(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (primary_upstream_addr, primary_capture_rx) = spawn_request_capture_h2_upstream().await?;
+    let (shadow_upstream_addr, shadow_capture_rx) = spawn_request_capture_h2_upstream().await?;
+    let primary_pool = route_backend_pool(
+        "frontend-primary",
+        vec![("primary-a", primary_upstream_addr, 1, None, None)],
+        EndpointHealthPolicy::default(),
+        UpstreamSelectionPolicy::default(),
+    )?;
+    let shadow_pool = route_backend_pool(
+        "frontend-shadow",
+        vec![("shadow-a", shadow_upstream_addr, 1, None, None)],
+        EndpointHealthPolicy::default(),
+        UpstreamSelectionPolicy::default(),
+    )?;
+
+    let mut config = proxy_config(primary_upstream_addr)
+        .with_route_backend_pools([(String::from("api"), primary_pool)])
+        .with_mirror_backend_pools([(String::from("frontend-shadow"), shadow_pool)])
+        .with_route_destination_policies([(String::from("api"), std::collections::BTreeMap::from([(
+            String::from("frontend-primary"),
+            RouteDestinationPolicyRuntime {
+                request_transform: None,
+                response_transform: None,
+                traffic_mirror: Some(TrafficMirrorPolicyConfig {
+                    percentage: 100,
+                    target_upstream_cluster: String::from("frontend-shadow"),
+                    methods: vec![String::from("GET")],
+                }),
+                fault_injection: None,
+                rate_limiters: Vec::new(),
+                concurrency_limiters: Vec::new(),
+                failure_manager: None,
+                enforce_retry_budget: false,
+                enforce_timeout_hierarchy: false,
+                enforce_circuit_breaker: false,
+            },
+        )]))]);
+    config.routes = vec![lb_proto_http::RoutePrefixRule::new("api", "/api")];
+    let (proxy_addr, report_rx) = spawn_one_shot_http2_proxy_listener(config).await?;
+
+    let mut client = connect_h2_client(proxy_addr).await?;
+    let response = send_h2_request_with_method(&mut client, "POST", "/api/orders", None).await?;
+    let received = receive_h2_response(response).await?;
+    assert_eq!(received.0, StatusCode::OK);
+    drop(client);
+
+    let primary_capture = time::timeout(Duration::from_secs(2), primary_capture_rx).await??;
+    assert_eq!(primary_capture.path_and_query, "/api/orders");
+    assert!(time::timeout(Duration::from_millis(100), shadow_capture_rx).await.is_err());
+
+    let report = receive_proxy_result(report_rx).await?;
+    assert_eq!(report.metrics.request_count, 1);
+    assert_eq!(report.metrics.mirror_dispatch_count, 0);
+    assert_eq!(report.metrics.mirror_skip_count, 1);
+    assert_eq!(report.metrics.mirror_dispatch_failure_count, 0);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn jwt_auth_policy_rejects_http2_stream_without_bearer(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let upstream_addr = reserve_unused_addr().await?;
+    let pool = route_backend_pool(
+        "frontend-primary",
+        vec![("primary-a", upstream_addr, 1, None, None)],
+        EndpointHealthPolicy::default(),
+        UpstreamSelectionPolicy::default(),
+    )?;
+    let mut config = proxy_config(upstream_addr)
+        .with_route_backend_pools([(String::from("api"), pool)])
+        .with_route_destination_jwt_auth_policies([(String::from("api"), std::collections::BTreeMap::from([(
+            String::from("frontend-primary"),
+            jwt_auth_policy_runtime()?,
+        )]))]);
+    config.routes = vec![lb_proto_http::RoutePrefixRule::new("api", "/")];
+
+    let (proxy_addr, report_rx) = spawn_one_shot_http2_proxy_listener(config).await?;
+    let mut client = connect_h2_client(proxy_addr).await?;
+    let response = send_h2_request(&mut client, "/secure", None).await?;
+    let received = receive_h2_response(response).await?;
+    assert_eq!(received.0, StatusCode::UNAUTHORIZED);
+    drop(client);
+
+    let report = receive_proxy_result(report_rx).await?;
+    assert_eq!(report.metrics.request_count, 1);
+    assert_eq!(report.metrics.response_status_counts.get(&401), Some(&1));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn jwt_auth_policy_accepts_http2_stream_with_valid_bearer(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let upstream_addr = spawn_tagged_h2_upstream("jwt-ok").await?;
+    let pool = route_backend_pool(
+        "frontend-primary",
+        vec![("primary-a", upstream_addr, 1, None, None)],
+        EndpointHealthPolicy::default(),
+        UpstreamSelectionPolicy::default(),
+    )?;
+    let mut config = proxy_config(upstream_addr)
+        .with_route_backend_pools([(String::from("api"), pool)])
+        .with_route_destination_jwt_auth_policies([(String::from("api"), std::collections::BTreeMap::from([(
+            String::from("frontend-primary"),
+            jwt_auth_policy_runtime()?,
+        )]))]);
+    config.routes = vec![lb_proto_http::RoutePrefixRule::new("api", "/")];
+
+    let token = issue_test_jwt("https://issuer.example", "edge-api")?;
+    let (proxy_addr, report_rx) = spawn_one_shot_http2_proxy_listener(config).await?;
+    let mut client = connect_h2_client(proxy_addr).await?;
+    let response = send_h2_request_with_method_and_headers(
+        &mut client,
+        "GET",
+        "/secure",
+        None,
+        &[("authorization", &format!("Bearer {token}"))],
+    )
+    .await?;
+    let received = receive_h2_response(response).await?;
+    assert_eq!(received.0, StatusCode::OK);
+    assert_eq!(received.1, "jwt-ok");
+    drop(client);
+
+    let report = receive_proxy_result(report_rx).await?;
+    assert_eq!(report.metrics.request_count, 1);
+    assert_eq!(report.metrics.response_status_counts.get(&200), Some(&1));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn authorization_policy_rejects_http2_stream_without_required_scope(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let upstream_addr = reserve_unused_addr().await?;
+    let pool = route_backend_pool(
+        "frontend-primary",
+        vec![("primary-a", upstream_addr, 1, None, None)],
+        EndpointHealthPolicy::default(),
+        UpstreamSelectionPolicy::default(),
+    )?;
+    let telemetry = Arc::new(RuntimeTelemetry::new()?);
+    let mut config = proxy_config(upstream_addr)
+        .with_route_backend_pools([(String::from("api"), pool)])
+        .with_route_destination_authorization_policies([(
+            String::from("api"),
+            std::collections::BTreeMap::from([(
+                String::from("frontend-primary"),
+                authorization_policy_runtime(),
+            )]),
+        )])
+        .with_request_telemetry("public-h2", Arc::clone(&telemetry));
+    config.routes = vec![lb_proto_http::RoutePrefixRule::new("api", "/")];
+
+    let (proxy_addr, report_rx) = spawn_one_shot_http2_proxy_listener(config).await?;
+    let mut client = connect_h2_client(proxy_addr).await?;
+    let response = send_h2_request_with_method_and_headers(
+        &mut client,
+        "GET",
+        "/secure",
+        None,
+        &[
+            ("x-auth-principal", "alice"),
+            ("x-auth-scopes", "profile.read"),
+            ("x-auth-roles", "reader"),
+        ],
+    )
+    .await?;
+    let received = receive_h2_response(response).await?;
+    assert_eq!(received.0, StatusCode::FORBIDDEN);
+    drop(client);
+
+    let report = receive_proxy_result(report_rx).await?;
+    assert_eq!(report.metrics.request_count, 1);
+    assert_eq!(report.metrics.response_status_counts.get(&403), Some(&1));
+    let metrics = telemetry.export_metrics();
+    assert!(metrics.contains("runtime_decision_events_total"));
+    assert!(metrics.contains("policy=\"authorization\""));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn authorization_policy_accepts_http2_stream_with_matching_headers(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let upstream_addr = spawn_tagged_h2_upstream("authz-ok").await?;
+    let pool = route_backend_pool(
+        "frontend-primary",
+        vec![("primary-a", upstream_addr, 1, None, None)],
+        EndpointHealthPolicy::default(),
+        UpstreamSelectionPolicy::default(),
+    )?;
+    let mut config = proxy_config(upstream_addr)
+        .with_route_backend_pools([(String::from("api"), pool)])
+        .with_route_destination_authorization_policies([(
+            String::from("api"),
+            std::collections::BTreeMap::from([(
+                String::from("frontend-primary"),
+                authorization_policy_runtime(),
+            )]),
+        )]);
+    config.routes = vec![lb_proto_http::RoutePrefixRule::new("api", "/")];
+
+    let (proxy_addr, report_rx) = spawn_one_shot_http2_proxy_listener(config).await?;
+    let mut client = connect_h2_client(proxy_addr).await?;
+    let response = send_h2_request_with_method_and_headers(
+        &mut client,
+        "GET",
+        "/secure",
+        None,
+        &[
+            ("x-auth-principal", "alice"),
+            ("x-auth-scopes", "payments.read payments.write"),
+            ("x-auth-roles", "admin,reader"),
+        ],
+    )
+    .await?;
+    let received = receive_h2_response(response).await?;
+    assert_eq!(received.0, StatusCode::OK);
+    assert_eq!(received.1, "authz-ok");
+    drop(client);
+
+    let report = receive_proxy_result(report_rx).await?;
+    assert_eq!(report.metrics.request_count, 1);
+    assert_eq!(report.metrics.response_status_counts.get(&200), Some(&1));
     Ok(())
 }
 
@@ -617,6 +964,7 @@ async fn applies_response_transforms_before_http2_downstream_write(
 async fn destination_retry_budget_blocks_http2_stale_reuse_retry(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let upstream_addr = spawn_connection_indexed_h2_upstream(true).await?;
+    let telemetry = Arc::new(RuntimeTelemetry::new()?);
     let pool = route_backend_pool(
         "frontend-primary",
         vec![("primary-a", upstream_addr, 1, None, None)],
@@ -659,7 +1007,8 @@ async fn destination_retry_budget_blocks_http2_stale_reuse_retry(
                 enforce_timeout_hierarchy: false,
                 enforce_circuit_breaker: false,
             },
-        )]))]);
+        )]))])
+        .with_request_telemetry("public-h2", Arc::clone(&telemetry));
     config.routes = vec![lb_proto_http::RoutePrefixRule::new("api", "/")];
 
     let (proxy_addr, report_rx) = spawn_one_shot_http2_proxy_listener(config).await?;
@@ -683,6 +1032,93 @@ async fn destination_retry_budget_blocks_http2_stale_reuse_retry(
 
     let metrics = failure_manager.metrics();
     assert_eq!(metrics.retry_budget_exhausted_count, 1);
+    let telemetry_metrics = telemetry.export_metrics();
+    assert!(telemetry_metrics.contains("runtime_decision_events_total"));
+    assert!(telemetry_metrics.contains("decision=\"retry\""));
+    assert!(telemetry_metrics.contains("result=\"rejected\""));
+    assert!(
+        report
+            .decision_trace_events
+            .iter()
+            .any(|event| event.code == lb_observability::TelemetryEventCode::DecisionRetryEvaluated)
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn destination_circuit_breaker_blocks_http2_stale_reuse_retry(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let upstream_addr = spawn_connection_indexed_h2_upstream(true).await?;
+    let telemetry = Arc::new(RuntimeTelemetry::new()?);
+    let pool = route_backend_pool(
+        "frontend-primary",
+        vec![("primary-a", upstream_addr, 1, None, None)],
+        EndpointHealthPolicy::default(),
+        UpstreamSelectionPolicy {
+            algorithm: LoadBalancingAlgorithm::RoundRobin,
+            locality: LocalityRoutingPolicy::Disabled,
+            no_healthy_fallback: NoHealthyFallback::Fail,
+            affinity: None,
+        },
+    )?;
+    let failure_manager = Arc::new(FailureManager::new(
+        RetryBudgetPolicy::default(),
+        TimeoutHierarchy {
+            request_timeout: Duration::from_secs(2),
+            attempt_timeout: Duration::from_secs(2),
+            connect_timeout: Duration::from_millis(250),
+            idle_timeout: Duration::from_secs(2),
+        },
+        CircuitBreakerPolicy {
+            open_failure_threshold: 1,
+            open_duration: Duration::from_secs(60),
+            half_open_success_threshold: 1,
+        },
+    )?);
+
+    let mut config = proxy_config(upstream_addr)
+        .with_route_backend_pools([(String::from("api"), pool)])
+        .with_route_destination_policies([(String::from("api"), std::collections::BTreeMap::from([(
+            String::from("frontend-primary"),
+            RouteDestinationPolicyRuntime {
+                request_transform: None,
+                response_transform: None,
+                traffic_mirror: None,
+                fault_injection: None,
+                rate_limiters: Vec::new(),
+                concurrency_limiters: Vec::new(),
+                failure_manager: Some(failure_manager.clone()),
+                enforce_retry_budget: true,
+                enforce_timeout_hierarchy: false,
+                enforce_circuit_breaker: true,
+            },
+        )]))])
+        .with_request_telemetry("public-h2", Arc::clone(&telemetry));
+    config.routes = vec![lb_proto_http::RoutePrefixRule::new("api", "/")];
+
+    let (proxy_addr, report_rx) = spawn_one_shot_http2_proxy_listener(config).await?;
+    let mut client = connect_h2_client(proxy_addr).await?;
+
+    let first_response = send_h2_request(&mut client, "/first", None).await?;
+    let first_received = receive_h2_response(first_response).await?;
+    assert_eq!(first_received.0, StatusCode::OK);
+
+    let second_response = send_h2_request(&mut client, "/second", None).await?;
+    let second_received = receive_h2_response(second_response).await?;
+    assert_eq!(second_received.0, StatusCode::BAD_GATEWAY);
+    drop(client);
+
+    let report = receive_proxy_result(report_rx).await?;
+    assert_eq!(report.metrics.request_count, 2);
+    assert_eq!(report.metrics.response_status_counts.get(&200), Some(&1));
+    assert_eq!(report.metrics.response_status_counts.get(&502), Some(&1));
+
+    let metrics = failure_manager.metrics();
+    assert!(metrics.breaker_open_rejection_count >= 1);
+    let telemetry_metrics = telemetry.export_metrics();
+    assert!(telemetry_metrics.contains("runtime_decision_events_total"));
+    assert!(telemetry_metrics.contains("decision=\"retry\""));
+    assert!(telemetry_metrics.contains("policy=\"circuit_breaker\""));
     Ok(())
 }
 
@@ -690,6 +1126,7 @@ async fn destination_retry_budget_blocks_http2_stale_reuse_retry(
 async fn destination_timeout_hierarchy_returns_gateway_timeout_for_http2(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let upstream_addr = spawn_basic_h2_upstream().await?;
+    let telemetry = Arc::new(RuntimeTelemetry::new()?);
     let pool = route_backend_pool(
         "frontend-primary",
         vec![("primary-a", upstream_addr, 1, None, None)],
@@ -728,7 +1165,8 @@ async fn destination_timeout_hierarchy_returns_gateway_timeout_for_http2(
                 enforce_timeout_hierarchy: true,
                 enforce_circuit_breaker: false,
             },
-        )]))]);
+        )]))])
+        .with_request_telemetry("public-h2", Arc::clone(&telemetry));
     config.routes = vec![lb_proto_http::RoutePrefixRule::new("api", "/")];
 
     let (proxy_addr, report_rx) = spawn_one_shot_http2_proxy_listener(config).await?;
@@ -745,6 +1183,8 @@ async fn destination_timeout_hierarchy_returns_gateway_timeout_for_http2(
 
     let metrics = failure_manager.metrics();
     assert_eq!(metrics.timeout_category_counts.get(&TimeoutCategory::Request), Some(&1));
+    let telemetry_metrics = telemetry.export_metrics();
+    assert!(telemetry_metrics.contains("runtime_destination_latency_samples_total"));
     Ok(())
 }
 
@@ -946,12 +1386,14 @@ async fn routes_http2_requests_by_host_and_path() -> Result<(), Box<dyn std::err
 async fn unmatched_http2_host_filtered_routes_return_forbidden(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let fallback_upstream_addr = spawn_tagged_h2_upstream("fallback-route").await?;
+    let telemetry = Arc::new(RuntimeTelemetry::new()?);
     let mut config = proxy_config(fallback_upstream_addr)
         .with_route_upstreams([Http2RouteUpstream {
             route_label: String::from("api"),
             upstream: UpstreamTarget::new("api-h2-upstream", fallback_upstream_addr),
         }])
-        .rejecting_unmatched_routes();
+        .rejecting_unmatched_routes()
+        .with_request_telemetry("public-h2", Arc::clone(&telemetry));
     config.routes = vec![lb_proto_http::RoutePrefixRule::new("api", "/api")
         .with_hostnames(vec![String::from("example.com")])];
     let (proxy_addr, report_rx) = spawn_one_shot_http2_proxy_listener(config).await?;
@@ -966,6 +1408,16 @@ async fn unmatched_http2_host_filtered_routes_return_forbidden(
     let report = receive_proxy_result(report_rx).await?;
     assert_eq!(report.metrics.request_count, 1);
     assert_eq!(report.metrics.response_status_counts.get(&403), Some(&1));
+    let metrics = telemetry.export_metrics();
+    assert!(metrics.contains("runtime_decision_events_total"));
+    assert!(metrics.contains("decision=\"route_selection\""));
+    assert!(metrics.contains("result=\"rejected\""));
+    assert!(
+        report
+            .decision_trace_events
+            .iter()
+            .any(|event| event.code == lb_observability::TelemetryEventCode::DecisionRouteSelected)
+    );
     Ok(())
 }
 
@@ -1207,6 +1659,11 @@ async fn route_backend_pool_passive_failures_keep_failed_http2_endpoint_out_of_r
             recovery_success_threshold: 1,
             ejection_duration: Duration::from_secs(30),
             warmup_duration: Duration::ZERO,
+            consecutive_passive_failure_ejection_threshold: 5,
+            outlier_window_size: 20,
+            success_rate_ejection_threshold_percent: 50,
+            cluster_ejection_budget_percent: 50,
+            slow_start_min_weight_percent: 10,
         },
         UpstreamSelectionPolicy {
             algorithm: LoadBalancingAlgorithm::RoundRobin,
@@ -1266,6 +1723,11 @@ async fn graceful_http2_drain_does_not_mark_route_backend_unhealthy(
             recovery_success_threshold: 1,
             ejection_duration: Duration::from_secs(30),
             warmup_duration: Duration::ZERO,
+            consecutive_passive_failure_ejection_threshold: 5,
+            outlier_window_size: 20,
+            success_rate_ejection_threshold_percent: 50,
+            cluster_ejection_budget_percent: 50,
+            slow_start_min_weight_percent: 10,
         },
         UpstreamSelectionPolicy {
             algorithm: LoadBalancingAlgorithm::RoundRobin,
@@ -1324,6 +1786,11 @@ async fn repeated_graceful_http2_drains_do_not_accumulate_route_backend_failures
             recovery_success_threshold: 1,
             ejection_duration: Duration::from_secs(30),
             warmup_duration: Duration::ZERO,
+            consecutive_passive_failure_ejection_threshold: 5,
+            outlier_window_size: 20,
+            success_rate_ejection_threshold_percent: 50,
+            cluster_ejection_budget_percent: 50,
+            slow_start_min_weight_percent: 10,
         },
         UpstreamSelectionPolicy {
             algorithm: LoadBalancingAlgorithm::RoundRobin,
@@ -1553,6 +2020,11 @@ async fn weighted_route_backend_pool_reports_http2_destination_fallback_metrics(
             recovery_success_threshold: 1,
             ejection_duration: Duration::from_secs(30),
             warmup_duration: Duration::ZERO,
+            consecutive_passive_failure_ejection_threshold: 5,
+            outlier_window_size: 20,
+            success_rate_ejection_threshold_percent: 50,
+            cluster_ejection_budget_percent: 50,
+            slow_start_min_weight_percent: 10,
         },
         UpstreamSelectionPolicy::default(),
     )?;
@@ -1603,6 +2075,11 @@ async fn route_backend_pool_include_unhealthy_fallback_keeps_http2_backend_reach
             recovery_success_threshold: 2,
             ejection_duration: Duration::from_secs(30),
             warmup_duration: Duration::ZERO,
+            consecutive_passive_failure_ejection_threshold: 5,
+            outlier_window_size: 20,
+            success_rate_ejection_threshold_percent: 50,
+            cluster_ejection_budget_percent: 50,
+            slow_start_min_weight_percent: 10,
         },
         UpstreamSelectionPolicy {
             algorithm: LoadBalancingAlgorithm::RoundRobin,
@@ -1625,6 +2102,11 @@ async fn route_backend_pool_include_unhealthy_fallback_keeps_http2_backend_reach
             recovery_success_threshold: 2,
             ejection_duration: Duration::from_secs(30),
             warmup_duration: Duration::ZERO,
+            consecutive_passive_failure_ejection_threshold: 5,
+            outlier_window_size: 20,
+            success_rate_ejection_threshold_percent: 50,
+            cluster_ejection_budget_percent: 50,
+            slow_start_min_weight_percent: 10,
         },
         UpstreamSelectionPolicy {
             algorithm: LoadBalancingAlgorithm::RoundRobin,
@@ -2048,6 +2530,58 @@ async fn receive_proxy_result(
 
 fn proxy_config(upstream_addr: SocketAddr) -> Http2ProxyConfig {
     Http2ProxyConfig::new(UpstreamTarget::new("http2-upstream", upstream_addr))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct JwtTestClaims {
+    iss: String,
+    aud: String,
+    exp: usize,
+    sub: String,
+}
+
+fn jwt_auth_policy_runtime() -> Result<JwtAuthPolicyRuntime, Box<dyn std::error::Error>> {
+    let config = JwtAuthPolicyConfig {
+        issuers: vec![String::from("https://issuer.example")],
+        audiences: vec![String::from("edge-api")],
+        jwks: Some(JwtJwksSourceConfig::Inline {
+            jwks_json: String::from(
+                r#"{"keys":[{"kty":"oct","k":"c3VwZXItc2VjcmV0","alg":"HS256","kid":"jwt-key-1"}]}"#,
+            ),
+        }),
+        required_claims: vec![String::from("sub")],
+        clock_skew_secs: 30,
+    };
+    Ok(JwtAuthPolicyRuntime::from_config(&config)?)
+}
+
+fn authorization_policy_runtime() -> AuthorizationPolicyRuntime {
+    AuthorizationPolicyRuntime::from_config(&AuthorizationPolicyConfig {
+        rules: vec![AuthorizationRuleConfig {
+            name: String::from("payments-reader"),
+            action: AuthorizationDecisionConfig::Allow,
+            any_claims: vec![String::from("principal")],
+            required_scopes: vec![String::from("payments.read")],
+            required_roles: vec![String::from("reader")],
+        }],
+        default_decision: AuthorizationDecisionConfig::Deny,
+    })
+}
+
+fn issue_test_jwt(iss: &str, aud: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let claims = JwtTestClaims {
+        iss: String::from(iss),
+        aud: String::from(aud),
+        exp: 4_102_444_800,
+        sub: String::from("alice"),
+    };
+    let mut header = Header::new(Algorithm::HS256);
+    header.kid = Some(String::from("jwt-key-1"));
+    Ok(encode(
+        &header,
+        &claims,
+        &EncodingKey::from_secret(b"super-secret"),
+    )?)
 }
 
 #[derive(Debug)]

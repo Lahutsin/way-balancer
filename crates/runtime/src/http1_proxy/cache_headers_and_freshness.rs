@@ -322,6 +322,7 @@ fn error_allows_stale_if_error(error: &Http1ProxyError) -> bool {
             | Http1ProxyError::Connect { .. }
             | Http1ProxyError::ParseResponse(_)
             | Http1ProxyError::RequestIo(_)
+            | Http1ProxyError::UpstreamGracefulDrain
             | Http1ProxyError::IdleTimeout("request body")
             | Http1ProxyError::IdleTimeout("response head")
     )

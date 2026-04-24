@@ -22,6 +22,7 @@ The following surfaces are considered stable within `0.1.x` unless this document
 - operator runbooks referenced by release evidence and runtime metadata
 - admin and dataplane behaviors already documented as required production workflows
 - the versioned `/v1/*` admin API envelope, stable error-code taxonomy, and additive machine-readable status fields documented in `docs/admin-api.md`
+- extension hook and policy plugin runtime contract (`api_version = v1`) with documented fallback and isolation semantics
 
 Stable means:
 
@@ -41,6 +42,7 @@ Stable means:
 - Rollout and rollback must preserve digest and attestation validation semantics.
 - Listener reload behavior, config preview behavior, and rollback-safe apply guarantees are part of the stable operator-facing contract once documented in the corresponding runbooks.
 - Telemetry, counters, and status output may grow additively within the release line, but existing documented semantics must not silently invert.
+- Extension plugin compatibility checks, disabled fallback behavior, and required-plugin fail-closed semantics must not silently invert within the release line.
 
 ### Operator Interface Contract
 

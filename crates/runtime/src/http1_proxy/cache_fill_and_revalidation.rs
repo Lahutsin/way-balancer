@@ -33,6 +33,108 @@ where
 
     let effective_timeouts =
         effective_destination_upstream_timeouts(&config.timeouts, destination_policy);
+
+    if selected_upstream.transport == lb_net_core::UpstreamTransport::Http3 {
+        drop_upstream_connection(upstream, last_upstream_activity, upstream_connected_at);
+        *active_upstream = Some(selected_upstream.clone());
+        *upstream_addr = selected_upstream.address;
+
+        let normalized_request_headers = lb_proto_http::normalize_request_headers(
+            &request.headers,
+            effective_client_ip,
+            request.keep_alive,
+            &request.body_kind,
+        );
+
+        let mut request_body_writer = VecAsyncWriter::default();
+        relay_body(
+            downstream,
+            downstream_buffer,
+            &mut request_body_writer,
+            &request.body_kind,
+            config.limits.max_body_bytes,
+            effective_timeouts.idle_timeout,
+            RelayDirection::Request,
+        )
+        .await?;
+        let request_body = request_body_writer.into_inner();
+
+        let h3_response = match crate::http3_upstream::dispatch_http3_upstream_request(
+            selected_upstream,
+            &request.method,
+            &request.target,
+            &normalized_request_headers,
+            &request_body,
+            effective_client_ip,
+            effective_timeouts.connect_timeout,
+            effective_timeouts.idle_timeout,
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(crate::http3_upstream::Http3UpstreamError::GracefulDrain) => {
+                write_local_response(
+                    downstream,
+                    request.keep_alive,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "upstream draining\n",
+                )
+                .await
+                .map_err(Http1ProxyError::ResponseIo)?;
+                metrics.request_count += 1;
+                *metrics
+                    .response_status_counts
+                    .entry(StatusCode::SERVICE_UNAVAILABLE.as_u16())
+                    .or_insert(0) += 1;
+                return Ok(StatusCode::SERVICE_UNAVAILABLE.as_u16());
+            }
+            Err(source) => {
+                return Err(Http1ProxyError::ResponseIo(std::io::Error::other(source)));
+            }
+        };
+
+        let body_kind = lb_proto_http::BodyKind::ContentLength(h3_response.body.len() as u64);
+        let mut normalized_response_headers =
+            lb_proto_http::normalize_response_headers(&h3_response.headers, request.keep_alive, &body_kind);
+        if !normalized_response_headers
+            .iter()
+            .any(|header| header.name.eq_ignore_ascii_case("content-length"))
+        {
+            normalized_response_headers.push(lb_proto_http::HttpHeader {
+                name: String::from("content-length"),
+                value: h3_response.body.len().to_string(),
+            });
+        }
+        if let Some(transform) = response_transform {
+            apply_http1_header_mutations(&mut normalized_response_headers, &transform.header_mutations);
+        }
+        let response_head = lb_proto_http::encode_response_head(
+            lb_proto_http::SupportedHttpVersion::Http1,
+            h3_response.status,
+            &h3_response.reason,
+            &normalized_response_headers,
+        );
+        downstream.write_all(&response_head).await.map_err(Http1ProxyError::ResponseIo)?;
+        if !h3_response.body.is_empty() {
+            downstream
+                .write_all(&h3_response.body)
+                .await
+                .map_err(Http1ProxyError::ResponseIo)?;
+        }
+
+        metrics.request_count += 1;
+        *metrics
+            .response_status_counts
+            .entry(h3_response.status)
+            .or_insert(0) += 1;
+        match classify_http1_response_failure(h3_response.status) {
+            Some(class) => record_destination_failure(destination_policy, class),
+            None => record_destination_success(destination_policy),
+        }
+
+        return Ok(h3_response.status);
+    }
+
     let request_started = Instant::now();
     let mut retried_stale_reuse = false;
     let mut close_upstream = false;
@@ -117,6 +219,10 @@ where
                     && allow_destination_retry(
                         destination_policy,
                         crate::UpstreamFailureClass::Connect,
+                        None,
+                        config.request_telemetry.as_ref(),
+                        request.route.as_ref().map(|route| route.label.as_str()),
+                        Some(selected_upstream.name.as_str()),
                     )
                 {
                     retried_stale_reuse = true;
@@ -229,6 +335,10 @@ where
                         && allow_destination_retry(
                             destination_policy,
                             crate::UpstreamFailureClass::Temporary,
+                            None,
+                            config.request_telemetry.as_ref(),
+                            request.route.as_ref().map(|route| route.label.as_str()),
+                            Some(selected_upstream.name.as_str()),
                         )
                     {
                         retried_stale_reuse = true;

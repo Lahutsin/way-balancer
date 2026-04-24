@@ -90,7 +90,31 @@ where
             .unwrap_or(Duration::ZERO),
         metrics: metrics.snapshot(),
         route_selection_metrics: route_selection_metrics(&config.route_backend_pools),
+        decision_trace_events: decision_trace_events_for_report(config),
     })
+}
+
+fn decision_trace_events_for_report(config: &Http2ProxyConfig) -> Vec<lb_observability::TelemetryEvent> {
+    let Some(request_telemetry) = config.request_telemetry.as_ref() else {
+        return Vec::new();
+    };
+
+    request_telemetry
+        .telemetry
+        .snapshot()
+        .events
+        .into_iter()
+        .filter(|event| {
+            event.scope == request_telemetry.scope
+                && matches!(
+                    event.code,
+                    lb_observability::TelemetryEventCode::DecisionRouteSelected
+                        | lb_observability::TelemetryEventCode::DecisionRetryEvaluated
+                        | lb_observability::TelemetryEventCode::DecisionHealthEjection
+                        | lb_observability::TelemetryEventCode::DecisionPolicyEnforced
+                )
+        })
+        .collect()
 }
 
 fn route_selection_metrics(

@@ -66,6 +66,32 @@ fn validate_upstream_cluster(
         }
     }
 
+    if cluster.endpoints.is_empty() && cluster.discovery.is_none() {
+        report.errors.push(ValidationError::schema(
+            ValidationCode::InvalidUpstreamField,
+            format!("{base_path}.endpoints"),
+            format!(
+                "upstream cluster {} must declare static endpoints or a discovery source",
+                cluster.name
+            ),
+        ));
+    }
+
+    if !cluster.endpoints.is_empty() && cluster.discovery.is_some() {
+        report.errors.push(ValidationError::schema(
+            ValidationCode::InvalidUpstreamField,
+            format!("{base_path}.discovery"),
+            format!(
+                "upstream cluster {} must not mix static endpoints with discovery",
+                cluster.name
+            ),
+        ));
+    }
+
+    if let Some(discovery) = &cluster.discovery {
+        validate_discovery_source(discovery, &cluster.name, &base_path, report);
+    }
+
     if let Some(affinity) = &cluster.traffic_policy.affinity {
         match affinity {
             AffinityPolicyConfig::HeaderHash { header_name, .. } => {
@@ -102,6 +128,87 @@ fn validate_upstream_cluster(
         policy_registry,
         report,
     );
+}
+
+fn validate_discovery_source(
+    discovery: &crate::DiscoverySourceConfig,
+    cluster_name: &str,
+    base_path: &str,
+    report: &mut ValidationReport,
+) {
+    match discovery {
+        crate::DiscoverySourceConfig::DnsAaaa {
+            hostname,
+            port,
+            ..
+        } => {
+            if hostname.trim().is_empty() {
+                report.errors.push(ValidationError::schema(
+                    ValidationCode::InvalidUpstreamField,
+                    format!("{base_path}.discovery.hostname"),
+                    format!(
+                        "upstream cluster {cluster_name} must use a non-empty DNS hostname"
+                    ),
+                ));
+            }
+            if *port == 0 {
+                report.errors.push(ValidationError::schema(
+                    ValidationCode::InvalidUpstreamField,
+                    format!("{base_path}.discovery.port"),
+                    format!("upstream cluster {cluster_name} must use a non-zero DNS port"),
+                ));
+            }
+        }
+        crate::DiscoverySourceConfig::DnsSrv { service, .. } => {
+            if service.trim().is_empty() {
+                report.errors.push(ValidationError::schema(
+                    ValidationCode::InvalidUpstreamField,
+                    format!("{base_path}.discovery.service"),
+                    format!(
+                        "upstream cluster {cluster_name} must use a non-empty DNS SRV service"
+                    ),
+                ));
+            }
+        }
+        crate::DiscoverySourceConfig::KubernetesEndpointSlice { namespace, service } => {
+            if namespace.trim().is_empty() {
+                report.errors.push(ValidationError::schema(
+                    ValidationCode::InvalidUpstreamField,
+                    format!("{base_path}.discovery.namespace"),
+                    format!(
+                        "upstream cluster {cluster_name} must use a non-empty Kubernetes namespace"
+                    ),
+                ));
+            }
+            if service.trim().is_empty() {
+                report.errors.push(ValidationError::schema(
+                    ValidationCode::InvalidUpstreamField,
+                    format!("{base_path}.discovery.service"),
+                    format!(
+                        "upstream cluster {cluster_name} must use a non-empty Kubernetes service"
+                    ),
+                ));
+            }
+        }
+        crate::DiscoverySourceConfig::ConsulLike { service, datacenter } => {
+            if service.trim().is_empty() {
+                report.errors.push(ValidationError::schema(
+                    ValidationCode::InvalidUpstreamField,
+                    format!("{base_path}.discovery.service"),
+                    format!("upstream cluster {cluster_name} must use a non-empty Consul service"),
+                ));
+            }
+            if datacenter.as_deref().is_some_and(|value| value.trim().is_empty()) {
+                report.errors.push(ValidationError::schema(
+                    ValidationCode::InvalidUpstreamField,
+                    format!("{base_path}.discovery.datacenter"),
+                    format!(
+                        "upstream cluster {cluster_name} must not use an empty Consul datacenter"
+                    ),
+                ));
+            }
+        }
+    }
 }
 
 fn is_valid_affinity_token(value: &str) -> bool {

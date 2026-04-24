@@ -13,6 +13,7 @@
 | Runtime and admin API | Same workspace release line only | Mixed release lines are not supported for GA evidence in `0.1.x`. |
 | Control-plane snapshot artifacts | Same config API version only | Published and applied snapshots must keep the compiled `api_version` within the supported set exposed by `RuntimeMetadata`. |
 | Upstream affinity policy | Same `v1_alpha1` schema and `0.1.x` release line | `header_hash` and `cookie_hash` remain opt-in and preserve healthy fallback semantics only. |
+| Extension hook and policy plugin contract | Same extension `api_version = v1` within `0.1.x` | Incompatible plugin API versions are rejected at registration; required plugins fail closed when disabled or isolated, optional plugins use configured fallback. |
 | Kubernetes translation output | Same workspace release line only | Generated `WorkspaceConfig` must remain on supported config API versions and secure defaults. |
 | Artifact attestation | Required by default | Unsigned artifacts are rejected unless `security.insecure_dev_mode` is explicitly acknowledged. |
 | Supported performance claims | Named supported profile evidence only | Absolute capacity claims require a supported artifact such as `lab_small_non_loopback_v1`; loopback-only artifacts stay regression-only. |

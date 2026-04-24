@@ -39,6 +39,11 @@ fn health_policy() -> EndpointHealthPolicy {
         recovery_success_threshold: 1,
         ejection_duration: Duration::from_secs(30),
         warmup_duration: Duration::ZERO,
+        consecutive_passive_failure_ejection_threshold: 5,
+        outlier_window_size: 20,
+        success_rate_ejection_threshold_percent: 50,
+        cluster_ejection_budget_percent: 50,
+        slow_start_min_weight_percent: 10,
     }
 }
 

@@ -55,6 +55,53 @@ fn resolve_stream_upstream(
     }
 }
 
+fn selected_destination_label(selected_upstream: &SelectedUpstream) -> &str {
+    selected_upstream
+        .route_backend
+        .as_ref()
+        .map_or(selected_upstream.target.name.as_str(), |backend| {
+            backend.cluster_name().as_str()
+        })
+}
+
+fn record_route_selection_decision(
+    config: &Http2ProxyConfig,
+    route: Option<&lb_proto_http::RouteMatch>,
+    resolution: &RequestUpstreamResolution,
+) {
+    let Some(request_telemetry) = config.request_telemetry.as_ref() else {
+        return;
+    };
+    let route_label = route.map(|value| value.label.as_str());
+
+    match resolution {
+        RequestUpstreamResolution::Selected(selected) => {
+            let _ = request_telemetry.telemetry.record_decision_trace(
+                &request_telemetry.scope,
+                lb_observability::DecisionTraceKind::RouteSelection,
+                "selected",
+                route_label,
+                Some(selected_destination_label(selected)),
+                None,
+                None,
+                "upstream selected for HTTP/2 stream",
+            );
+        }
+        RequestUpstreamResolution::Reject(status) => {
+            let _ = request_telemetry.telemetry.record_decision_trace(
+                &request_telemetry.scope,
+                lb_observability::DecisionTraceKind::RouteSelection,
+                "rejected",
+                route_label,
+                None,
+                None,
+                None,
+                &format!("route resolution rejected stream with status {status}"),
+            );
+        }
+    }
+}
+
 
 fn select_http2_route_upstream(
     config: &Http2ProxyConfig,

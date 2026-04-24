@@ -99,6 +99,41 @@ fn validate_policy_binding(
         &registry.fault_injections,
         report,
     );
+    validate_single_policy_ref(
+        binding.jwt_auth_policy.as_deref(),
+        &format!("{base_path}.jwt_auth_policy"),
+        "jwt auth policy",
+        &registry.jwt_auth_policies,
+        report,
+    );
+    validate_single_policy_ref(
+        binding.external_auth_policy.as_deref(),
+        &format!("{base_path}.external_auth_policy"),
+        "external auth policy",
+        &registry.external_auth_policies,
+        report,
+    );
+    validate_single_policy_ref(
+        binding.authorization_policy.as_deref(),
+        &format!("{base_path}.authorization_policy"),
+        "authorization policy",
+        &registry.authorization_policies,
+        report,
+    );
+    validate_single_policy_ref(
+        binding.upstream_identity_policy.as_deref(),
+        &format!("{base_path}.upstream_identity_policy"),
+        "upstream identity policy",
+        &registry.upstream_identity_policies,
+        report,
+    );
+    validate_single_policy_ref(
+        binding.request_classification_policy.as_deref(),
+        &format!("{base_path}.request_classification_policy"),
+        "request classification policy",
+        &registry.request_classification_policies,
+        report,
+    );
     if binding.transform_policy.is_some()
         && matches!(target, PolicyBindingTarget::UpstreamCluster(_))
     {
@@ -157,6 +192,49 @@ fn validate_policy_binding(
             ValidationCode::InvalidPolicyScope,
             format!("{base_path}.cache_policy"),
             "http cache policies may not be bound to route destinations",
+        ));
+    }
+    if binding.jwt_auth_policy.is_some() && matches!(target, PolicyBindingTarget::UpstreamCluster(_)) {
+        report.errors.push(ValidationError::semantic(
+            ValidationCode::InvalidPolicyScope,
+            format!("{base_path}.jwt_auth_policy"),
+            "jwt auth policies may only be bound to listeners, routes, or route destinations",
+        ));
+    }
+    if binding.external_auth_policy.is_some()
+        && matches!(target, PolicyBindingTarget::UpstreamCluster(_))
+    {
+        report.errors.push(ValidationError::semantic(
+            ValidationCode::InvalidPolicyScope,
+            format!("{base_path}.external_auth_policy"),
+            "external auth policies may only be bound to listeners, routes, or route destinations",
+        ));
+    }
+    if binding.authorization_policy.is_some()
+        && matches!(target, PolicyBindingTarget::UpstreamCluster(_))
+    {
+        report.errors.push(ValidationError::semantic(
+            ValidationCode::InvalidPolicyScope,
+            format!("{base_path}.authorization_policy"),
+            "authorization policies may only be bound to listeners, routes, or route destinations",
+        ));
+    }
+    if binding.upstream_identity_policy.is_some()
+        && matches!(target, PolicyBindingTarget::Listener(_) | PolicyBindingTarget::Route(_))
+    {
+        report.errors.push(ValidationError::semantic(
+            ValidationCode::InvalidPolicyScope,
+            format!("{base_path}.upstream_identity_policy"),
+            "upstream identity policies may only be bound to upstream clusters or route destinations",
+        ));
+    }
+    if binding.request_classification_policy.is_some()
+        && matches!(target, PolicyBindingTarget::UpstreamCluster(_))
+    {
+        report.errors.push(ValidationError::semantic(
+            ValidationCode::InvalidPolicyScope,
+            format!("{base_path}.request_classification_policy"),
+            "request classification policies may only be bound to listeners, routes, or route destinations",
         ));
     }
 }

@@ -193,7 +193,21 @@ where
             break;
         }
 
-        let selected_upstream = match resolve_request_upstream(config, &request) {
+        let route_selection_started = Instant::now();
+        let upstream_resolution = resolve_request_upstream(config, &request);
+        if let (Some(request_telemetry), Some(route)) =
+            (config.request_telemetry.as_ref(), request.route.as_ref())
+        {
+            let _ = request_telemetry.telemetry.record_route_latency(
+                &request_telemetry.scope,
+                &route.label,
+                lb_observability::TraceHookPhase::UpstreamSelected,
+                route_selection_started.elapsed(),
+            );
+        }
+        record_route_selection_decision(config, request.route.as_ref(), &upstream_resolution);
+
+        let selected_upstream = match upstream_resolution {
             RequestUpstreamResolution::Selected(upstream) => upstream,
             RequestUpstreamResolution::Reject(status, reason) => {
                 let blocked = status == StatusCode::FORBIDDEN
@@ -218,6 +232,25 @@ where
 
         let destination_policy =
             route_destination_policy_runtime(config, request.route.as_ref(), &selected_upstream);
+        if verify_route_destination_jwt_auth(config, &request, &selected_upstream).is_err() {
+            write_local_response(
+                &mut downstream,
+                request.keep_alive,
+                StatusCode::UNAUTHORIZED,
+                "unauthorized\n",
+            )
+            .await
+            .map_err(Http1ProxyError::ResponseIo)?;
+            metrics.request_count += 1;
+            *metrics
+                .response_status_counts
+                .entry(StatusCode::UNAUTHORIZED.as_u16())
+                .or_insert(0) += 1;
+            if !request.keep_alive {
+                break;
+            }
+            continue;
+        }
         if let Some(transform) = destination_policy.and_then(|policy| policy.request_transform.as_ref())
         {
             request = original_request;
@@ -241,12 +274,70 @@ where
                 continue;
             }
         }
+        if let Err(outcome) =
+            enforce_route_destination_external_auth(config, &mut request, &selected_upstream).await
+        {
+            let (status, reason) = match outcome {
+                ExternalAuthEnforcementOutcome::Denied => (StatusCode::FORBIDDEN, "forbidden\n"),
+                ExternalAuthEnforcementOutcome::ServiceUnavailable => {
+                    (StatusCode::SERVICE_UNAVAILABLE, "auth service unavailable\n")
+                }
+                ExternalAuthEnforcementOutcome::InvalidResponse => {
+                    (StatusCode::BAD_GATEWAY, "auth service invalid response\n")
+                }
+            };
+            write_local_response(&mut downstream, request.keep_alive, status, reason)
+                .await
+                .map_err(Http1ProxyError::ResponseIo)?;
+            metrics.request_count += 1;
+            *metrics.response_status_counts.entry(status.as_u16()).or_insert(0) += 1;
+            if !request.keep_alive {
+                break;
+            }
+            continue;
+        }
+        if let Err(outcome) =
+            enforce_route_destination_upstream_identity(config, &request, &selected_upstream)
+        {
+            let (status, reason) = match outcome {
+                UpstreamIdentityEnforcementOutcome::ServiceUnavailable => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "upstream identity unavailable\n",
+                ),
+            };
+            write_local_response(&mut downstream, request.keep_alive, status, reason)
+                .await
+                .map_err(Http1ProxyError::ResponseIo)?;
+            metrics.request_count += 1;
+            *metrics.response_status_counts.entry(status.as_u16()).or_insert(0) += 1;
+            if !request.keep_alive {
+                break;
+            }
+            continue;
+        }
+        if let Err(outcome) =
+            enforce_route_destination_authorization(config, &request, &selected_upstream)
+        {
+            let (status, reason) = match outcome {
+                AuthorizationEnforcementOutcome::Denied => (StatusCode::FORBIDDEN, "forbidden\n"),
+            };
+            write_local_response(&mut downstream, request.keep_alive, status, reason)
+                .await
+                .map_err(Http1ProxyError::ResponseIo)?;
+            metrics.request_count += 1;
+            *metrics.response_status_counts.entry(status.as_u16()).or_insert(0) += 1;
+            if !request.keep_alive {
+                break;
+            }
+            continue;
+        }
         let destination_response_transform = effective_destination_response_transform(
             config,
             request.route.as_ref(),
             destination_policy,
         );
         let _destination_concurrency_leases = match enforce_destination_local_limits(
+            config,
             destination_policy,
             &request,
             &selected_upstream,
@@ -337,6 +428,7 @@ where
                         reason,
                         "cache lookup required origin fetch",
                     );
+                    let destination_started = Instant::now();
                     let result = process_uncached_request(
                         &mut upstream,
                         &mut active_upstream,
@@ -361,7 +453,18 @@ where
                         now,
                     )
                     .await;
-                    record_passive_health_result(&selected_upstream, &result);
+                    record_destination_latency_sample(
+                        config,
+                        request.route.as_ref(),
+                        &selected_upstream,
+                        destination_started,
+                    );
+                    record_passive_health_result(
+                        config,
+                        &selected_upstream,
+                        request.route.as_ref().map(|route| route.label.as_str()),
+                        &result,
+                    );
                     match result {
                         Err(error)
                             if stale_fallback.is_some() && error_allows_stale_if_error(&error) =>
@@ -403,6 +506,7 @@ where
                         reason,
                         "request bypassed shared cache",
                     );
+                    let destination_started = Instant::now();
                     let result = process_uncached_request(
                         &mut upstream,
                         &mut active_upstream,
@@ -427,13 +531,25 @@ where
                         now,
                     )
                     .await;
-                    record_passive_health_result(&selected_upstream, &result);
+                    record_destination_latency_sample(
+                        config,
+                        request.route.as_ref(),
+                        &selected_upstream,
+                        destination_started,
+                    );
+                    record_passive_health_result(
+                        config,
+                        &selected_upstream,
+                        request.route.as_ref().map(|route| route.label.as_str()),
+                        &result,
+                    );
                     if result? == StatusCode::SWITCHING_PROTOCOLS.as_u16() {
                         break;
                     }
                 }
             }
         } else {
+            let destination_started = Instant::now();
             let result = process_uncached_request(
                 &mut upstream,
                 &mut active_upstream,
@@ -458,7 +574,18 @@ where
                 now,
             )
             .await;
-            record_passive_health_result(&selected_upstream, &result);
+            record_destination_latency_sample(
+                config,
+                request.route.as_ref(),
+                &selected_upstream,
+                destination_started,
+            );
+            record_passive_health_result(
+                config,
+                &selected_upstream,
+                request.route.as_ref().map(|route| route.label.as_str()),
+                &result,
+            );
             if result? == StatusCode::SWITCHING_PROTOCOLS.as_u16() {
                 break;
             }
@@ -478,5 +605,56 @@ where
         connect_duration,
         metrics,
         route_selection_metrics: route_selection_metrics(&config.route_backend_pools),
+        decision_trace_events: decision_trace_events_for_report(config),
     })
+}
+
+fn record_destination_latency_sample(
+    config: &Http1ProxyConfig,
+    route: Option<&lb_proto_http::RouteMatch>,
+    selected_upstream: &SelectedUpstream,
+    started_at: Instant,
+) {
+    let Some(request_telemetry) = config.request_telemetry.as_ref() else {
+        return;
+    };
+    let Some(route) = route else {
+        return;
+    };
+
+    let _ = request_telemetry.telemetry.record_destination_latency(
+        &request_telemetry.scope,
+        selected_destination_label(selected_upstream),
+        lb_observability::TraceHookPhase::ResponseCompleted,
+        started_at.elapsed(),
+    );
+    let _ = request_telemetry.telemetry.record_route_latency(
+        &request_telemetry.scope,
+        &route.label,
+        lb_observability::TraceHookPhase::ResponseCompleted,
+        started_at.elapsed(),
+    );
+}
+
+fn decision_trace_events_for_report(config: &Http1ProxyConfig) -> Vec<lb_observability::TelemetryEvent> {
+    let Some(request_telemetry) = config.request_telemetry.as_ref() else {
+        return Vec::new();
+    };
+
+    request_telemetry
+        .telemetry
+        .snapshot()
+        .events
+        .into_iter()
+        .filter(|event| {
+            event.scope == request_telemetry.scope
+                && matches!(
+                    event.code,
+                    lb_observability::TelemetryEventCode::DecisionRouteSelected
+                        | lb_observability::TelemetryEventCode::DecisionRetryEvaluated
+                        | lb_observability::TelemetryEventCode::DecisionHealthEjection
+                        | lb_observability::TelemetryEventCode::DecisionPolicyEnforced
+                )
+        })
+        .collect()
 }

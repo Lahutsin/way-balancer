@@ -103,6 +103,18 @@ kubectl get lease lb-k8s-controller -n way-balancer-system -o yaml
 
 Expected failover timing with the default settings is approximately $15$ to $17$ seconds from the last successful renewal, depending on API-server latency and scheduling delay.
 
+## Discovery Health Checks
+
+For EndpointSlice-driven service discovery, inspect the controller status surface and track `endpoint_slice_stats`:
+
+- `endpoint_update_count`: total accepted EndpointSlice upsert/delete updates
+- `coalesced_update_count`: repeated churn on the same Service before a flush
+- `stale_update_count`: old generations dropped safely
+- `malformed_update_count`: rejected invalid slices
+- `flush_count`: number of materialization flushes into the current resource set
+
+When `stale_update_count` or `malformed_update_count` rises steadily, treat that as a discovery health issue and inspect EndpointSlice generations and shape in-cluster.
+
 ## Upgrade
 
 1. Build and push the new controller image.

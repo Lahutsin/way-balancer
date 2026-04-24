@@ -43,6 +43,61 @@ pub enum FleetRecommendedAction {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum FleetAbortReason {
+    WaveGateFailed,
+    WaveGateTimedOut,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FleetAutoRollbackMode {
+    Disabled,
+    OnFailedGate,
+    OnFailedOrTimedOut,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetRollbackPolicyConfig {
+    pub auto_rollback_mode: FleetAutoRollbackMode,
+}
+
+impl Default for FleetRollbackPolicyConfig {
+    fn default() -> Self {
+        Self { auto_rollback_mode: FleetAutoRollbackMode::OnFailedOrTimedOut }
+    }
+}
+
+impl FleetRollbackPolicyConfig {
+    #[must_use]
+    pub const fn should_auto_rollback(self, timed_out: bool) -> bool {
+        match self.auto_rollback_mode {
+            FleetAutoRollbackMode::Disabled => false,
+            FleetAutoRollbackMode::OnFailedGate => !timed_out,
+            FleetAutoRollbackMode::OnFailedOrTimedOut => true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetAbortRollbackDecision {
+    pub wave_id: String,
+    pub should_abort: bool,
+    pub should_auto_rollback: bool,
+    pub reason: Option<FleetAbortReason>,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetAutoRollbackOutcome {
+    pub attempted: bool,
+    pub succeeded: bool,
+    pub target_version: Option<String>,
+    pub convergence_state: Option<FleetConvergenceState>,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum FleetNodeConvergenceState {
     Converged,
     Pending,
@@ -267,6 +322,14 @@ impl std::error::Error for FleetRolloutError {
 pub trait FleetNodeBackend {
     fn fetch_status(&self, node_id: &str) -> Result<FleetNodeRuntimeStatus, FleetNodeBackendError>;
 
+    fn fetch_health_signals(
+        &self,
+        _node_id: &str,
+        _window_ms: u64,
+    ) -> Result<Option<crate::FleetNodeHealthSignal>, FleetNodeBackendError> {
+        Ok(None)
+    }
+
     fn rollout_node(
         &mut self,
         node_id: &str,
@@ -403,6 +466,105 @@ impl FleetRolloutCoordinator {
     #[must_use]
     pub const fn metrics(&self) -> FleetRolloutMetrics {
         self.metrics
+    }
+
+    #[must_use]
+    pub fn decide_wave_abort_and_rollback(
+        gate: &crate::FleetWaveGateEvaluation,
+        rollback_policy: FleetRollbackPolicyConfig,
+    ) -> FleetAbortRollbackDecision {
+        match gate.verdict {
+            crate::FleetWaveGateVerdict::Passed => FleetAbortRollbackDecision {
+                wave_id: gate.wave_id.clone(),
+                should_abort: false,
+                should_auto_rollback: false,
+                reason: None,
+                detail: String::from("wave gate passed; rollout can continue"),
+            },
+            crate::FleetWaveGateVerdict::Pending if !gate.timed_out => {
+                FleetAbortRollbackDecision {
+                    wave_id: gate.wave_id.clone(),
+                    should_abort: false,
+                    should_auto_rollback: false,
+                    reason: None,
+                    detail: String::from("wave gate pending within timeout; keep observing"),
+                }
+            }
+            crate::FleetWaveGateVerdict::Pending | crate::FleetWaveGateVerdict::Failed => {
+                let reason = if gate.timed_out {
+                    FleetAbortReason::WaveGateTimedOut
+                } else {
+                    FleetAbortReason::WaveGateFailed
+                };
+                let should_auto_rollback = rollback_policy.should_auto_rollback(gate.timed_out);
+                FleetAbortRollbackDecision {
+                    wave_id: gate.wave_id.clone(),
+                    should_abort: true,
+                    should_auto_rollback,
+                    reason: Some(reason),
+                    detail: if should_auto_rollback {
+                        String::from("wave gate failed; aborting rollout and triggering automatic rollback")
+                    } else {
+                        String::from("wave gate failed; aborting rollout and waiting for operator rollback")
+                    },
+                }
+            }
+        }
+    }
+
+    pub fn execute_auto_rollback_if_needed<B>(
+        &mut self,
+        control: &SnapshotControlService,
+        backend: &mut B,
+        node_ids: &[String],
+        decision: &FleetAbortRollbackDecision,
+        requested_by: Option<String>,
+        reason: Option<String>,
+        max_allowed_divergence_ms: u64,
+        occurred_at_unix_ms: u64,
+    ) -> Result<FleetAutoRollbackOutcome, FleetRolloutError>
+    where
+        B: FleetNodeBackend,
+    {
+        if !decision.should_auto_rollback {
+            return Ok(FleetAutoRollbackOutcome {
+                attempted: false,
+                succeeded: false,
+                target_version: None,
+                convergence_state: None,
+                detail: String::from("automatic rollback not requested by decision policy"),
+            });
+        }
+
+        let rollback_reason = Some(match reason {
+            Some(existing) => format!("{existing}; automatic rollback after {}", decision.detail),
+            None => format!("automatic rollback after {}", decision.detail),
+        });
+        let response = self.rollback_at(
+            control,
+            backend,
+            FleetRollbackRequest {
+                target_version: None,
+                requested_by,
+                reason: rollback_reason,
+                node_ids: node_ids.to_vec(),
+                max_allowed_divergence_ms,
+            },
+            occurred_at_unix_ms,
+        )?;
+
+        let succeeded = matches!(response.convergence.state, FleetConvergenceState::Converged);
+        Ok(FleetAutoRollbackOutcome {
+            attempted: true,
+            succeeded,
+            target_version: Some(response.desired_version),
+            convergence_state: Some(response.convergence.state),
+            detail: if succeeded {
+                String::from("automatic rollback converged fleet to the shared last-known-good snapshot")
+            } else {
+                String::from("automatic rollback executed but fleet did not fully converge")
+            },
+        })
     }
 
     fn shared_rollback_candidate<B>(
@@ -799,9 +961,9 @@ mod tests {
     use lb_test_support::{configure_test_trusted_signers, test_artifact_attestation};
 
     use super::{
-        FleetConvergenceState, FleetNodeBackend, FleetNodeBackendError, FleetNodeRuntimeStatus,
-        FleetRecommendedAction, FleetRollbackRequest, FleetRolloutCoordinator,
-        FleetRolloutError, FleetRolloutRequest, FleetRolloutStrategy,
+        FleetAbortReason, FleetConvergenceState, FleetNodeBackend, FleetNodeBackendError,
+        FleetNodeRuntimeStatus, FleetRecommendedAction, FleetRollbackRequest,
+        FleetRolloutCoordinator, FleetRolloutError, FleetRolloutRequest, FleetRolloutStrategy,
     };
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1202,5 +1364,170 @@ mod tests {
         assert!(response.convergence.partial_rollout);
         assert_eq!(response.node_outcomes[1].result, super::FleetNodeActionResult::Failed);
         Ok(())
+    }
+
+    fn failed_gate_evaluation(timed_out: bool) -> crate::FleetWaveGateEvaluation {
+        crate::FleetWaveGateEvaluation {
+            wave_id: String::from("wave-1"),
+            verdict: crate::FleetWaveGateVerdict::Failed,
+            degraded: true,
+            mode: crate::FleetHealthGateMode::Required,
+            evaluated_nodes: 1,
+            missing_nodes: 1,
+            failing_nodes: 1,
+            timed_out,
+            detail: String::from("synthetic wave gate failure"),
+            signals: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn failed_wave_gate_decision_aborts_and_enables_auto_rollback() {
+        let gate = failed_gate_evaluation(false);
+
+        let decision = FleetRolloutCoordinator::decide_wave_abort_and_rollback(
+            &gate,
+            super::FleetRollbackPolicyConfig {
+                auto_rollback_mode: super::FleetAutoRollbackMode::OnFailedOrTimedOut,
+            },
+        );
+
+        assert!(decision.should_abort);
+        assert!(decision.should_auto_rollback);
+        assert_eq!(decision.reason, Some(FleetAbortReason::WaveGateFailed));
+    }
+
+    #[test]
+    fn timed_out_wave_gate_decision_maps_to_timeout_reason() {
+        let gate = failed_gate_evaluation(true);
+
+        let decision = FleetRolloutCoordinator::decide_wave_abort_and_rollback(
+            &gate,
+            super::FleetRollbackPolicyConfig {
+                auto_rollback_mode: super::FleetAutoRollbackMode::OnFailedOrTimedOut,
+            },
+        );
+
+        assert!(decision.should_abort);
+        assert!(decision.should_auto_rollback);
+        assert_eq!(decision.reason, Some(FleetAbortReason::WaveGateTimedOut));
+    }
+
+    #[test]
+    fn auto_rollback_converges_when_all_nodes_accept() -> Result<(), Box<dyn std::error::Error>> {
+        let mut control = crate::SnapshotControlService::new();
+        publish_snapshot(&mut control, "stable-1", "stable", 10)?;
+        let stable_digest = control.get_version("stable-1")?.digest_sha256.clone();
+
+        let mut backend = MockBackend::default()
+            .with_known_digest("stable-1", &stable_digest)
+            .with_node(
+                "node-a",
+                Some("canary-2"),
+                Some(&digest_for_version("canary-2")),
+                ApplyMode::Immediate,
+            )
+            .with_node(
+                "node-b",
+                Some("canary-2"),
+                Some(&digest_for_version("canary-2")),
+                ApplyMode::Immediate,
+            );
+        backend.nodes.get_mut("node-a").unwrap().status.last_known_good_version =
+            Some(String::from("stable-1"));
+        backend.nodes.get_mut("node-b").unwrap().status.last_known_good_version =
+            Some(String::from("stable-1"));
+
+        let decision = FleetRolloutCoordinator::decide_wave_abort_and_rollback(
+            &failed_gate_evaluation(false),
+            super::FleetRollbackPolicyConfig {
+                auto_rollback_mode: super::FleetAutoRollbackMode::OnFailedOrTimedOut,
+            },
+        );
+        let mut coordinator = FleetRolloutCoordinator::new();
+
+        let outcome = coordinator.execute_auto_rollback_if_needed(
+            &control,
+            &mut backend,
+            &[String::from("node-a"), String::from("node-b")],
+            &decision,
+            Some(String::from("operator")),
+            Some(String::from("wave gate abort")),
+            1_000,
+            100,
+        )?;
+
+        assert!(outcome.attempted);
+        assert!(outcome.succeeded);
+        assert_eq!(outcome.target_version.as_deref(), Some("stable-1"));
+        assert_eq!(outcome.convergence_state, Some(FleetConvergenceState::Converged));
+        Ok(())
+    }
+
+    #[test]
+    fn auto_rollback_marks_failure_when_node_rejects() -> Result<(), Box<dyn std::error::Error>> {
+        let mut control = crate::SnapshotControlService::new();
+        publish_snapshot(&mut control, "stable-1", "stable", 10)?;
+        let stable_digest = control.get_version("stable-1")?.digest_sha256.clone();
+
+        let mut backend = MockBackend::default()
+            .with_known_digest("stable-1", &stable_digest)
+            .with_node(
+                "node-a",
+                Some("canary-2"),
+                Some(&digest_for_version("canary-2")),
+                ApplyMode::Immediate,
+            )
+            .with_node(
+                "node-b",
+                Some("canary-2"),
+                Some(&digest_for_version("canary-2")),
+                ApplyMode::Immediate,
+            )
+            .with_rollback_failure("node-b");
+        backend.nodes.get_mut("node-a").unwrap().status.last_known_good_version =
+            Some(String::from("stable-1"));
+        backend.nodes.get_mut("node-b").unwrap().status.last_known_good_version =
+            Some(String::from("stable-1"));
+
+        let decision = FleetRolloutCoordinator::decide_wave_abort_and_rollback(
+            &failed_gate_evaluation(false),
+            super::FleetRollbackPolicyConfig {
+                auto_rollback_mode: super::FleetAutoRollbackMode::OnFailedOrTimedOut,
+            },
+        );
+        let mut coordinator = FleetRolloutCoordinator::new();
+
+        let outcome = coordinator.execute_auto_rollback_if_needed(
+            &control,
+            &mut backend,
+            &[String::from("node-a"), String::from("node-b")],
+            &decision,
+            Some(String::from("operator")),
+            Some(String::from("wave gate abort")),
+            1_000,
+            100,
+        )?;
+
+        assert!(outcome.attempted);
+        assert!(!outcome.succeeded);
+        assert_eq!(outcome.target_version.as_deref(), Some("stable-1"));
+        assert_eq!(outcome.convergence_state, Some(FleetConvergenceState::Degraded));
+        Ok(())
+    }
+
+    #[test]
+    fn timed_out_gate_with_failed_only_policy_disables_auto_rollback() {
+        let gate = failed_gate_evaluation(true);
+        let decision = FleetRolloutCoordinator::decide_wave_abort_and_rollback(
+            &gate,
+            super::FleetRollbackPolicyConfig {
+                auto_rollback_mode: super::FleetAutoRollbackMode::OnFailedGate,
+            },
+        );
+
+        assert!(decision.should_abort);
+        assert!(!decision.should_auto_rollback);
+        assert_eq!(decision.reason, Some(FleetAbortReason::WaveGateTimedOut));
     }
 }

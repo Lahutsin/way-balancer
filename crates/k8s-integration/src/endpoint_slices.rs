@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, SocketAddr};
+use std::time::Duration;
 
 use crate::{GatewayApiResourceSet, ObjectMeta, ServiceEndpointResource};
 use serde::{Deserialize, Serialize};
@@ -88,6 +89,49 @@ impl std::fmt::Display for EndpointSliceApplyError {
 }
 
 impl std::error::Error for EndpointSliceApplyError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiscoverySnapshotBuildError {
+    InvalidClusterName {
+        namespace: String,
+        service: String,
+        port: u16,
+        detail: String,
+    },
+    InvalidEndpointId {
+        namespace: String,
+        service: String,
+        endpoint_id: String,
+        detail: String,
+    },
+}
+
+impl std::fmt::Display for DiscoverySnapshotBuildError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidClusterName {
+                namespace,
+                service,
+                port,
+                detail,
+            } => write!(
+                formatter,
+                "failed to build discovery cluster name for {namespace}/{service}:{port}: {detail}"
+            ),
+            Self::InvalidEndpointId {
+                namespace,
+                service,
+                endpoint_id,
+                detail,
+            } => write!(
+                formatter,
+                "failed to build discovery endpoint id {endpoint_id} for {namespace}/{service}: {detail}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DiscoverySnapshotBuildError {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct EndpointSliceStats {
@@ -194,6 +238,74 @@ impl EndpointSliceController {
         next
     }
 
+    pub fn build_discovery_snapshots(
+        &self,
+        valid_for: Duration,
+    ) -> Result<Vec<lb_runtime::DiscoverySnapshot>, DiscoverySnapshotBuildError> {
+        let mut slices_by_service: BTreeMap<(String, String), Vec<&EndpointSliceResource>> =
+            BTreeMap::new();
+        for slice in self.slices.values() {
+            slices_by_service
+                .entry((slice.metadata.namespace.clone(), slice.service_name.clone()))
+                .or_default()
+                .push(slice);
+        }
+
+        let mut snapshots = Vec::new();
+        for ((namespace, service), slices) in slices_by_service {
+            let mut generation = 0_u64;
+            let mut endpoint_map = BTreeMap::new();
+            let mut port = 0_u16;
+
+            for slice in slices {
+                generation = generation.max(slice.generation);
+                port = slice.ports[0];
+                for endpoint in &slice.endpoints {
+                    if !endpoint.conditions.ready
+                        || !endpoint.conditions.serving
+                        || endpoint.conditions.terminating
+                    {
+                        continue;
+                    }
+                    let resolved = lb_runtime::DiscoveryEndpoint::new(
+                        endpoint.id.clone(),
+                        SocketAddr::new(endpoint.addresses[0], slice.ports[0]),
+                        None,
+                        None,
+                        1,
+                    )
+                    .map_err(|error| DiscoverySnapshotBuildError::InvalidEndpointId {
+                        namespace: namespace.clone(),
+                        service: service.clone(),
+                        endpoint_id: endpoint.id.clone(),
+                        detail: error.to_string(),
+                    })?;
+                    endpoint_map.insert(endpoint.id.clone(), resolved);
+                }
+            }
+
+            let source = lb_runtime::DiscoverySourceId::new(
+                lb_runtime::DiscoveryProviderKind::KubernetesEndpointSlice,
+                format!("{namespace}/{service}"),
+                format!("{namespace}.{service}.{port}"),
+            )
+            .map_err(|error| DiscoverySnapshotBuildError::InvalidClusterName {
+                namespace: namespace.clone(),
+                service: service.clone(),
+                port,
+                detail: error.to_string(),
+            })?;
+
+            snapshots.push(lb_runtime::DiscoverySnapshot {
+                source,
+                generation,
+                valid_for,
+                endpoints: endpoint_map.into_values().collect(),
+            });
+        }
+        Ok(snapshots)
+    }
+
     #[must_use]
     pub const fn stats(&self) -> EndpointSliceStats {
         self.stats
@@ -239,6 +351,7 @@ fn validate_slice(slice: &EndpointSliceResource) -> Result<(), EndpointSliceAppl
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::time::Duration;
 
     use super::{
         DiscoveryApiVersion, EndpointAddressType, EndpointSliceApplyError, EndpointSliceConditions,
@@ -383,5 +496,21 @@ mod tests {
         let next = controller.flush_into(&resources);
 
         assert!(next.services[0].endpoints.is_empty());
+    }
+
+    #[test]
+    fn endpoint_slices_build_runtime_discovery_snapshots() -> Result<(), Box<dyn std::error::Error>> {
+        let mut controller = EndpointSliceController::new();
+        let _ = controller.upsert_slice(slice(5, &["payments-a", "payments-b"]))?;
+
+        let snapshots = controller.build_discovery_snapshots(Duration::from_secs(30))?;
+
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].source.provider, lb_runtime::DiscoveryProviderKind::KubernetesEndpointSlice);
+        assert_eq!(snapshots[0].source.source_name, "edge/payments");
+        assert_eq!(snapshots[0].source.cluster_name.as_str(), "edge.payments.8081");
+        assert_eq!(snapshots[0].generation, 5);
+        assert_eq!(snapshots[0].endpoints.len(), 2);
+        Ok(())
     }
 }

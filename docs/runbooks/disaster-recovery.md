@@ -49,6 +49,10 @@ If startup can bootstrap the current config successfully after a crash, the data
 
 If `control_plane_journal.recovery.in_flight_operation.lifecycle_code` reports `reload_started_overlap_drain`, treat the recovery as replacement-aware: inspect the listed `affected_listeners` and confirm each one has now returned to the expected `replacement.state` in `GET /status` before considering the instance operationally settled. When `operator_guidance.recommended_action` becomes `investigate_stalled_drain`, the recovered drain has already exceeded its persisted expected completion window and should stop being treated as a normal transitional tail.
 
+For recovered instances that resume reload activity, also inspect `reload_drained_listener_count`, `reload_completed_drain_count`, and `reload_drain_timeout_count` in `GET /status`. These counters provide bounded no-drop accounting evidence for listener replacement drains after restart.
+
+For explicit warm-restart operations (`POST /restart`), use `last_restart_outcome_code` plus restart counters in `GET /status` to verify whether replacement drains completed within bounds (`restart_applied_overlap_drain`) or timed out (`restart_applied_overlap_drain_timeout`).
+
 The same recovery block now publishes `reconciled_listeners`, which records the live `listener_state`, `replacement_state`, and a machine-readable `reconciliation_verdict` observed after startup. Use `settled` as the fast path, treat `replacement_still_draining` as transitional, and escalate `replacement_failed_preserved`, `replacement_drain_timeout`, `missing`, or generic `needs_review` before considering the instance fully reconciled.
 
 Once the operator validates the intended config and completes a new successful `POST /reload`, `control_plane_journal.recovery.state` should move to `resolved`. Use that transition as the end of the local crash-recovery workflow for the dataplane instance.
@@ -63,6 +67,7 @@ The local journal is intentionally bounded. It keeps the latest recent admin aud
 - A restored known-good snapshot can still be rolled out successfully.
 - Last-known-good state remains available for follow-up rollback if restore validation fails later.
 - `GET /status` on serve-mode dataplanes reports the expected `control_plane_journal.recovery.state` and the restored desired and applied snapshot identity.
+- For staged fleet recovery exercises, rebuild staged status via `render_staged_status_surface(...)` and confirm wave/node semantics are coherent (`blocked` only after upstream failure or abort, node-to-wave mapping intact, rollback projection accurate).
 
 ## Compromise Recovery Notes
 

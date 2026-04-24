@@ -247,11 +247,49 @@ pub enum TelemetrySeverity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TelemetryEventCategory {
     Runtime,
+    Decision,
     Health,
     Failure,
     Tracing,
     Overload,
     Cache,
+}
+
+/// Decision-trace kinds shared by dataplane and control-plane telemetry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecisionTraceKind {
+    RouteSelection,
+    Retry,
+    HealthEjection,
+    PolicyEnforcement,
+    DiscoveryUpdate,
+    RolloutUpdate,
+}
+
+impl DecisionTraceKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RouteSelection => "route_selection",
+            Self::Retry => "retry",
+            Self::HealthEjection => "health_ejection",
+            Self::PolicyEnforcement => "policy_enforcement",
+            Self::DiscoveryUpdate => "discovery_update",
+            Self::RolloutUpdate => "rollout_update",
+        }
+    }
+
+    #[must_use]
+    pub const fn event_code(self) -> TelemetryEventCode {
+        match self {
+            Self::RouteSelection => TelemetryEventCode::DecisionRouteSelected,
+            Self::Retry => TelemetryEventCode::DecisionRetryEvaluated,
+            Self::HealthEjection => TelemetryEventCode::DecisionHealthEjection,
+            Self::PolicyEnforcement => TelemetryEventCode::DecisionPolicyEnforced,
+            Self::DiscoveryUpdate => TelemetryEventCode::DecisionDiscoveryUpdated,
+            Self::RolloutUpdate => TelemetryEventCode::DecisionRolloutUpdated,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -266,6 +304,12 @@ pub enum TelemetryEventCode {
     RuntimeHttpUpgradeAccepted,
     RuntimeHttpUpgradeRejected,
     RuntimeHttpUpgradeFailed,
+    DecisionRouteSelected,
+    DecisionRetryEvaluated,
+    DecisionHealthEjection,
+    DecisionPolicyEnforced,
+    DecisionDiscoveryUpdated,
+    DecisionRolloutUpdated,
     HealthEndpointDegraded,
     HealthEndpointUnhealthy,
     HealthEndpointEjected,
@@ -306,6 +350,12 @@ impl TelemetryEventCode {
             Self::RuntimeHttpUpgradeAccepted => "runtime.http_upgrade.accepted",
             Self::RuntimeHttpUpgradeRejected => "runtime.http_upgrade.rejected",
             Self::RuntimeHttpUpgradeFailed => "runtime.http_upgrade.failed",
+            Self::DecisionRouteSelected => "decision.route.selected",
+            Self::DecisionRetryEvaluated => "decision.retry.evaluated",
+            Self::DecisionHealthEjection => "decision.health.ejection",
+            Self::DecisionPolicyEnforced => "decision.policy.enforced",
+            Self::DecisionDiscoveryUpdated => "decision.discovery.updated",
+            Self::DecisionRolloutUpdated => "decision.rollout.updated",
             Self::HealthEndpointDegraded => "health.endpoint.degraded",
             Self::HealthEndpointUnhealthy => "health.endpoint.unhealthy",
             Self::HealthEndpointEjected => "health.endpoint.ejected",
@@ -346,6 +396,12 @@ impl TelemetryEventCode {
             | Self::RuntimeHttpUpgradeAccepted
             | Self::RuntimeHttpUpgradeRejected
             | Self::RuntimeHttpUpgradeFailed => TelemetryEventCategory::Runtime,
+            Self::DecisionRouteSelected
+            | Self::DecisionRetryEvaluated
+            | Self::DecisionHealthEjection
+            | Self::DecisionPolicyEnforced
+            | Self::DecisionDiscoveryUpdated
+            | Self::DecisionRolloutUpdated => TelemetryEventCategory::Decision,
             Self::HealthEndpointDegraded
             | Self::HealthEndpointUnhealthy
             | Self::HealthEndpointEjected
@@ -381,6 +437,7 @@ impl TelemetryEventCode {
             }
             Self::RuntimeListenerRejected
             | Self::RuntimeHttpUpgradeRejected
+            | Self::DecisionHealthEjection
             | Self::HealthEndpointUnhealthy
             | Self::HealthEndpointEjected
             | Self::FailureBreakerOpened
@@ -396,6 +453,11 @@ impl TelemetryEventCode {
             | Self::RuntimeListenerDraining
             | Self::RuntimeListenerStopped
             | Self::RuntimeHttpUpgradeAccepted
+            | Self::DecisionRouteSelected
+            | Self::DecisionRetryEvaluated
+            | Self::DecisionPolicyEnforced
+            | Self::DecisionDiscoveryUpdated
+            | Self::DecisionRolloutUpdated
             | Self::HealthEndpointDegraded
             | Self::HealthWarmupStarted
             | Self::HealthWarmupCompleted
@@ -427,6 +489,12 @@ impl TelemetryEventCode {
             Self::RuntimeHttpUpgradeAccepted,
             Self::RuntimeHttpUpgradeRejected,
             Self::RuntimeHttpUpgradeFailed,
+            Self::DecisionRouteSelected,
+            Self::DecisionRetryEvaluated,
+            Self::DecisionHealthEjection,
+            Self::DecisionPolicyEnforced,
+            Self::DecisionDiscoveryUpdated,
+            Self::DecisionRolloutUpdated,
             Self::HealthEndpointDegraded,
             Self::HealthEndpointUnhealthy,
             Self::HealthEndpointEjected,
@@ -460,6 +528,11 @@ pub enum TelemetryLabelKey {
     Component,
     Listener,
     ListenerClass,
+    Route,
+    Destination,
+    Policy,
+    Discovery,
+    Decision,
     State,
     Scope,
     Bucket,
@@ -483,6 +556,11 @@ impl TelemetryLabelKey {
             Self::Component => "component",
             Self::Listener => "listener",
             Self::ListenerClass => "listener_class",
+            Self::Route => "route",
+            Self::Destination => "destination",
+            Self::Policy => "policy",
+            Self::Discovery => "discovery",
+            Self::Decision => "decision",
             Self::State => "state",
             Self::Scope => "scope",
             Self::Bucket => "bucket",
@@ -894,9 +972,9 @@ fn format_metric_value(value: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        CorrelationId, LoggingPolicy, MetricDescriptor, MetricKind, MetricRegistry, SpanId,
-        StructuredLogRecord, TelemetryCollector, TelemetryError, TelemetryEvent,
-        TelemetryEventCode, TelemetryLabel, TelemetryLabelKey, TraceId,
+        CorrelationId, DecisionTraceKind, LoggingPolicy, MetricDescriptor, MetricKind,
+        MetricRegistry, SpanId, StructuredLogRecord, TelemetryCollector, TelemetryError,
+        TelemetryEvent, TelemetryEventCode, TelemetryLabel, TelemetryLabelKey, TraceId,
     };
 
     #[test]
@@ -1022,6 +1100,12 @@ mod tests {
                 "runtime.http_upgrade.accepted",
                 "runtime.http_upgrade.rejected",
                 "runtime.http_upgrade.failed",
+                "decision.route.selected",
+                "decision.retry.evaluated",
+                "decision.health.ejection",
+                "decision.policy.enforced",
+                "decision.discovery.updated",
+                "decision.rollout.updated",
                 "health.endpoint.degraded",
                 "health.endpoint.unhealthy",
                 "health.endpoint.ejected",
@@ -1048,5 +1132,18 @@ mod tests {
                 "cache.revalidated",
             ]
         );
+    }
+
+    #[test]
+    fn decision_trace_catalog_maps_to_event_codes() {
+        assert_eq!(
+            DecisionTraceKind::RouteSelection.event_code(),
+            TelemetryEventCode::DecisionRouteSelected
+        );
+        assert_eq!(
+            DecisionTraceKind::Retry.event_code(),
+            TelemetryEventCode::DecisionRetryEvaluated
+        );
+        assert_eq!(DecisionTraceKind::HealthEjection.as_str(), "health_ejection");
     }
 }

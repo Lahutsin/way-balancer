@@ -2,13 +2,13 @@
 
 ## Purpose
 
-This runbook defines the repeatable performance program used to track dataplane throughput, mixed-traffic latency, memory growth, TLS overhead, first-phase HTTP/3 readiness checks, and control-plane timing boundaries over time.
+This runbook defines the repeatable performance program used to track dataplane throughput, mixed-traffic latency, memory growth, TLS overhead, HTTP/3 operator-validation checks, and control-plane timing boundaries over time.
 
 ## What Is Covered
 
 - HTTP/1 loopback proxy throughput through the runtime proxy path
 - HTTP/2 loopback stream throughput through the runtime proxy path
-- HTTP/3 first-phase readiness through the public QUIC listener and HTTP/1 bridge path
+- HTTP/3 operator validation through the public QUIC listener path and runtime transport selection behavior
 - mixed HTTP/1 plus HTTP/2 latency with persistent loopback clients
 - TLS termination overhead for the HTTP/1 proxy path using `tokio-rustls`
 - resident-memory growth per idle accepted connection and per active HTTP/2 stream
@@ -37,6 +37,22 @@ Run the larger local envelope with:
 ./scripts/measure-performance-envelope.sh full
 ```
 
+Run advanced scenario harnesses (hedging, abuse mitigation, discovery churn, HTTP/1->HTTP/3 bridge):
+
+```sh
+./scripts/measure-performance-scenarios.sh
+```
+
+Run long-run soak and capacity-envelope automation:
+
+```sh
+PERF_SOAK_ROUNDS=3 \
+PERF_CAPACITY_MODES="smoke full" \
+PERF_SCENARIO_RUNS=1 \
+PERF_CAPTURE_CONTROL_PLANE_TIMING=1 \
+./scripts/measure-performance-soak-capacity.sh
+```
+
 Generate a supported-profile artifact with non-loopback timing evidence attached:
 
 ```sh
@@ -45,6 +61,13 @@ PERF_RELOAD_SUCCESS_MS=1800 \
 PERF_RELOAD_DEGRADED_SUCCESS_MS=6200 \
 PERF_FAILOVER_MS=1400 \
 PERF_TIMING_EVIDENCE_SOURCE="GET /status and lab failover trace" \
+./scripts/measure-performance-envelope.sh smoke
+```
+
+Generate an artifact with local harness timing capture for reload and failover (regression use only):
+
+```sh
+PERF_CAPTURE_CONTROL_PLANE_TIMING=1 \
 ./scripts/measure-performance-envelope.sh smoke
 ```
 
@@ -61,6 +84,17 @@ This produces two artifacts under `target/performance-envelope/`:
 - JSON artifact from `cargo run --release -p lb-runtime --example performance_envelope`
 - Criterion report text from `cargo bench -p lb-runtime --bench dataplane_envelope`
 
+Advanced scenario runs add:
+
+- smoke JSON report with `advanced_scenarios` throughput entries
+- Criterion report text from `cargo bench -p lb-runtime --bench performance_scenarios`
+
+Long-run soak and capacity automation adds:
+
+- per-round soak-chaos logs (`soak-chaos-round-*.txt`)
+- envelope and Criterion artifacts for each configured capacity mode
+- consolidated machine-readable run manifest (`soak-capacity-<profile>-<timestamp>.json`)
+
 ## Scenario Assumptions
 
 - Measurements are loopback-only and are meant for regression detection plus capacity planning baselines, not internet-facing latency claims.
@@ -75,6 +109,14 @@ The artifact schema supports two profile tiers:
 
 - `loopback_regression_v1`: experimental regression-only profile for fast local checks. It remains useful for trend detection but is not a supported customer capacity claim.
 - `lab_small_non_loopback_v1`: initial supported small-host profile for release evidence when measurements are collected on a non-loopback lab path and include reload and failover timing evidence.
+
+Machine-readable profile definitions are kept in `artifacts/performance-envelope/supported-profiles.v1.json`.
+
+Validate profile definitions with:
+
+```sh
+./scripts/check-performance-profiles.sh
+```
 
 ### Supported Profile: `lab_small_non_loopback_v1`
 
@@ -108,6 +150,13 @@ Current in-repo coverage defines these regression scenarios:
 - smoke mode: 64 HTTP/1 requests, 64 HTTP/2 streams, 64 mixed operations, 24 idle connections, 24 active streams
 - full mode: 256 HTTP/1 requests, 256 HTTP/2 streams, 256 mixed operations, 64 idle connections, 64 active streams
 
+Advanced scenario harness coverage includes:
+
+- hedging execution path (`hedging_execution_batch`)
+- request-classification abuse-mitigation decision path (`abuse_mitigation_decision_batch`)
+- discovery membership churn reconcile path (`discovery_churn_reconcile_batch`)
+- HTTP/1 downstream to HTTP/3 upstream bridge path (`http1_to_http3_bridge_batch`)
+
 Treat these scenarios as the minimum repeatable local envelope for release candidates and major runtime changes.
 
 ## Latest Smoke Run
@@ -129,6 +178,8 @@ For supported non-loopback profiles, reload and failover timings are recorded fr
 - reload success timing comes from `GET /status` fields such as `reload_last_success_duration_ms`
 - degraded-success timing comes from `GET /status` when the outcome code is `reload_applied_overlap_drain_timeout`
 - failover timing comes from the documented lab failover procedure and must be attached to the artifact with `PERF_FAILOVER_MS` and `PERF_TIMING_EVIDENCE_SOURCE`
+
+For local regression workflows, `PERF_CAPTURE_CONTROL_PLANE_TIMING=1` captures synthetic control-plane timings directly in the performance harness and populates missing timing fields in the artifact. Prefer explicit operator evidence for supportable non-loopback claims.
 
 If these timing fields are missing, the generated artifact remains useful, but it is not ready to support a release-grade non-loopback capacity claim.
 

@@ -241,6 +241,14 @@ fn compile_http1_proxy_config(
         resolve_effective_route_backend_policy_diagnostics(config, listener)?;
     let route_destination_policies =
         compile_route_destination_policy_runtime(config, &route_backend_policy_diagnostics)?;
+    let route_destination_jwt_auth_policies =
+        compile_route_destination_jwt_auth_runtime(config, &route_backend_policy_diagnostics)?;
+    let route_destination_external_auth_policies =
+        compile_route_destination_external_auth_runtime(config, &route_backend_policy_diagnostics)?;
+    let route_destination_authorization_policies =
+        compile_route_destination_authorization_runtime(config, &route_backend_policy_diagnostics)?;
+    let route_destination_upstream_identity_policies =
+        compile_route_destination_upstream_identity_runtime(config, &route_backend_policy_diagnostics)?;
     let (listener_upgrade_protocols, route_upgrade_protocols) =
         resolve_listener_upgrade_policies(config, listener);
     let mut proxy = lb_runtime::Http1ProxyConfig::new(primary_upstream);
@@ -252,6 +260,12 @@ fn compile_http1_proxy_config(
         .with_request_transforms(listener_request_transform, route_request_transforms)
         .with_response_transforms(listener_response_transform, route_response_transforms)
         .with_route_destination_policies(route_destination_policies)
+        .with_route_destination_jwt_auth_policies(route_destination_jwt_auth_policies)
+        .with_route_destination_external_auth_policies(route_destination_external_auth_policies)
+        .with_route_destination_authorization_policies(route_destination_authorization_policies)
+        .with_route_destination_upstream_identity_policies(
+            route_destination_upstream_identity_policies,
+        )
         .with_route_backend_policy_diagnostics(route_backend_policy_diagnostics)
         .with_upgrade_policies(listener_upgrade_protocols, route_upgrade_protocols)
         .with_route_enumeration_protection(default_route_enumeration_policy())
@@ -291,6 +305,14 @@ fn compile_http2_proxy_config(
         resolve_effective_route_backend_policy_diagnostics(config, listener)?;
     let route_destination_policies =
         compile_route_destination_policy_runtime(config, &route_backend_policy_diagnostics)?;
+    let route_destination_jwt_auth_policies =
+        compile_route_destination_jwt_auth_runtime(config, &route_backend_policy_diagnostics)?;
+    let route_destination_external_auth_policies =
+        compile_route_destination_external_auth_runtime(config, &route_backend_policy_diagnostics)?;
+    let route_destination_authorization_policies =
+        compile_route_destination_authorization_runtime(config, &route_backend_policy_diagnostics)?;
+    let route_destination_upstream_identity_policies =
+        compile_route_destination_upstream_identity_runtime(config, &route_backend_policy_diagnostics)?;
     let mut proxy = lb_runtime::Http2ProxyConfig::new(primary_upstream);
     proxy.routes = route_rules;
     proxy.limits = config.defaults.http.http2_limits();
@@ -301,6 +323,12 @@ fn compile_http2_proxy_config(
         .with_request_transforms(listener_request_transform, route_request_transforms)
         .with_response_transforms(listener_response_transform, route_response_transforms)
         .with_route_destination_policies(route_destination_policies)
+        .with_route_destination_jwt_auth_policies(route_destination_jwt_auth_policies)
+        .with_route_destination_external_auth_policies(route_destination_external_auth_policies)
+        .with_route_destination_authorization_policies(route_destination_authorization_policies)
+        .with_route_destination_upstream_identity_policies(
+            route_destination_upstream_identity_policies,
+        )
         .with_route_backend_policy_diagnostics(route_backend_policy_diagnostics)
         .with_route_enumeration_protection(default_route_enumeration_policy())
         .rejecting_unmatched_routes();
@@ -347,6 +375,14 @@ fn compile_https_proxy_config(
         resolve_effective_route_backend_policy_diagnostics(config, listener)?;
     let route_destination_policies =
         compile_route_destination_policy_runtime(config, &route_backend_policy_diagnostics)?;
+    let route_destination_jwt_auth_policies =
+        compile_route_destination_jwt_auth_runtime(config, &route_backend_policy_diagnostics)?;
+    let route_destination_external_auth_policies =
+        compile_route_destination_external_auth_runtime(config, &route_backend_policy_diagnostics)?;
+    let route_destination_authorization_policies =
+        compile_route_destination_authorization_runtime(config, &route_backend_policy_diagnostics)?;
+    let route_destination_upstream_identity_policies =
+        compile_route_destination_upstream_identity_runtime(config, &route_backend_policy_diagnostics)?;
     let (listener_upgrade_protocols, route_upgrade_protocols) =
         resolve_listener_upgrade_policies(config, listener);
     let route_upstreams_http2 = route_upstreams
@@ -372,6 +408,16 @@ fn compile_https_proxy_config(
             route_response_transforms.clone(),
         )
         .with_route_destination_policies(route_destination_policies.clone())
+        .with_route_destination_jwt_auth_policies(route_destination_jwt_auth_policies.clone())
+        .with_route_destination_external_auth_policies(
+            route_destination_external_auth_policies.clone(),
+        )
+        .with_route_destination_authorization_policies(
+            route_destination_authorization_policies.clone(),
+        )
+        .with_route_destination_upstream_identity_policies(
+            route_destination_upstream_identity_policies.clone(),
+        )
         .with_route_backend_policy_diagnostics(route_backend_policy_diagnostics.clone())
         .with_upgrade_policies(listener_upgrade_protocols, route_upgrade_protocols)
         .with_route_enumeration_protection(default_route_enumeration_policy())
@@ -403,6 +449,12 @@ fn compile_https_proxy_config(
         .with_request_transforms(listener_request_transform, route_request_transforms)
         .with_response_transforms(listener_response_transform, route_response_transforms)
         .with_route_destination_policies(route_destination_policies)
+        .with_route_destination_jwt_auth_policies(route_destination_jwt_auth_policies)
+        .with_route_destination_external_auth_policies(route_destination_external_auth_policies)
+        .with_route_destination_authorization_policies(route_destination_authorization_policies)
+        .with_route_destination_upstream_identity_policies(
+            route_destination_upstream_identity_policies,
+        )
         .with_route_backend_policy_diagnostics(route_backend_policy_diagnostics)
         .with_route_enumeration_protection(default_route_enumeration_policy())
         .rejecting_unmatched_routes();

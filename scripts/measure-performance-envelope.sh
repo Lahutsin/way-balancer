@@ -10,8 +10,11 @@ reload_success_ms="${PERF_RELOAD_SUCCESS_MS:-}"
 reload_degraded_success_ms="${PERF_RELOAD_DEGRADED_SUCCESS_MS:-}"
 failover_ms="${PERF_FAILOVER_MS:-}"
 timing_evidence_source="${PERF_TIMING_EVIDENCE_SOURCE:-}"
+capture_control_plane_timing="${PERF_CAPTURE_CONTROL_PLANE_TIMING:-}"
 
 mkdir -p "$output_dir"
+
+./scripts/check-performance-profiles.sh --assert-profile "$profile"
 
 example_output="$output_dir/envelope-${profile}-${mode}.json"
 bench_output="$output_dir/criterion-${profile}-${mode}.txt"
@@ -36,6 +39,10 @@ fi
 
 if [ -n "$timing_evidence_source" ]; then
 	set -- "$@" --timing-evidence-source "$timing_evidence_source"
+fi
+
+if [ -n "$capture_control_plane_timing" ] && [ "$capture_control_plane_timing" != "0" ]; then
+	set -- "$@" --capture-control-plane-timing
 fi
 
 "$@" | tee "$example_output"

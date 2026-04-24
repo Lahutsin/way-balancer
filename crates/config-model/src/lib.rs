@@ -3,10 +3,12 @@
 mod compiler;
 mod defaults;
 mod failure_policy;
+mod l7_auth;
 mod limits;
 mod listener;
 mod overload_policy;
 mod policy;
+mod request_classification;
 mod route;
 mod security;
 mod upstream;
@@ -25,6 +27,12 @@ pub use defaults::{
 };
 pub use failure_policy::{
     CircuitBreakerPolicyConfig, RetryBudgetPolicyConfig, TimeoutHierarchyConfig,
+};
+pub use l7_auth::{
+    AuthContextMappingConfig, AuthorizationDecisionConfig, AuthorizationPolicyConfig,
+    AuthorizationRuleConfig, ExternalAuthPolicyConfig, ExternalAuthProtocolConfig,
+    IdentityTrustBundleSourceConfig, JwtAuthPolicyConfig, JwtJwksSourceConfig,
+    UpstreamIdentityModeConfig, UpstreamIdentityPolicyConfig,
 };
 pub use limits::{
     LocalConcurrencyLimitPolicyConfig, LocalLimitKeyKindConfig, LocalLimitScopeConfig,
@@ -50,13 +58,22 @@ pub use policy::{
     NamedCircuitBreakerPolicyConfig, NamedHostileEdgeProtectionPolicyConfig,
     NamedHttpCachePolicyConfig, NamedLocalConcurrencyLimitPolicyConfig,
     NamedLocalRateLimitPolicyConfig, NamedOverloadResponsePolicyConfig,
+    NamedAuthorizationPolicyConfig, NamedExternalAuthPolicyConfig,
     NamedFaultInjectionPolicyConfig,
+    NamedJwtAuthPolicyConfig, NamedUpstreamIdentityPolicyConfig,
     NamedRetryBudgetPolicyConfig, NamedTimeoutHierarchyPolicyConfig,
     NamedTrafficMirrorPolicyConfig,
-    NamedTransformPolicyConfig, PathRewriteTransformConfig, PolicyBindingConfig,
+    NamedRequestClassificationPolicyConfig, NamedTransformPolicyConfig,
+    PathRewriteTransformConfig, PolicyBindingConfig,
     PolicyResourcesConfig, RequestTransformConfig, ResponseTransformConfig,
     TrafficMirrorPolicyConfig, TransformPolicyConfig, FaultInjectionPolicyConfig,
     FaultInjectionDelayConfig, FaultInjectionAbortConfig,
+};
+pub use request_classification::{
+    BodyInspectionScoringConfig, HeaderAnomalyScoringConfig,
+    RequestClassificationContextConfig,
+    RequestClassificationPolicyConfig, RequestClassificationSignalWeightsConfig,
+    RequestClassifierSensitivityConfig,
 };
 pub use route::{
     RouteConfig, RouteDestinationConfig, RouteHeaderMatchConfig, RouteMatchConfig,
@@ -69,9 +86,10 @@ pub use security::{
     TrustedClientIpConfig, WorkspaceSecurityConfig,
 };
 pub use upstream::{
-    AffinityFallbackConfig, AffinityPolicyConfig, EndpointStateConfig,
+    AffinityFallbackConfig, AffinityPolicyConfig, DiscoverySourceConfig, EndpointStateConfig,
     LoadBalancingAlgorithmConfig, LocalityRoutingConfig, NoHealthyFallbackConfig,
     UpstreamClusterConfig, UpstreamEndpointConfig, UpstreamTrafficPolicyConfig,
+    UpstreamTransportConfig,
     WorkspaceConfigError,
 };
 pub use upgrade::{UpgradePolicyConfig, UpgradeProtocolConfig};
@@ -245,6 +263,7 @@ mod tests {
         ListenerTlsSessionResumptionConfig, ListenerTlsSessionResumptionModeConfig,
         ListenerTlsSniCertificateConfig, ListenerTlsTerminationConfig, PolicyBindingConfig,
         RouteConfig, UpstreamClusterConfig, UpstreamEndpointConfig, UpstreamTrafficPolicyConfig,
+        UpstreamTransportConfig,
         WorkspaceConfig, WorkspaceConfigParser,
     };
 
@@ -278,10 +297,12 @@ mod tests {
             routes: vec![RouteConfig::foundation_path_prefix("api", "/api", "payments")],
             upstream_clusters: vec![UpstreamClusterConfig {
                 name: String::from("payments"),
+                transport: UpstreamTransportConfig::Http1,
                 endpoints: vec![UpstreamEndpointConfig::foundation(
                     "a",
                     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080),
                 )],
+                discovery: None,
                 traffic_policy: UpstreamTrafficPolicyConfig::default(),
                 policies: PolicyBindingConfig::default(),
             }],
@@ -386,6 +407,18 @@ mod tests {
                             }
                         }
                     ],
+                    "timeout_hierarchies": [
+                        {
+                            "name": "standard-timeouts",
+                            "spec": {
+                                "request_timeout_ms": 30000,
+                                "attempt_timeout_ms": 10000,
+                                "per_try_timeout_ms": 8000,
+                                "connect_timeout_ms": 1000,
+                                "idle_timeout_ms": 5000
+                            }
+                        }
+                    ],
                     "traffic_mirrors": [
                         {
                             "name": "shadow-payments",
@@ -481,6 +514,11 @@ mod tests {
         assert_eq!(config.routes[0].policies.retry_budget.as_deref(), Some("standard"));
         assert_eq!(config.routes[0].policies.cache_policy.as_deref(), Some("public-cache"));
         assert_eq!(config.upstream_clusters[0].endpoints[0].state, EndpointStateConfig::Ready);
+        assert_eq!(config.policies.timeout_hierarchies.len(), 1);
+        assert_eq!(
+            config.policies.timeout_hierarchies[0].spec.per_try_timeout_ms,
+            Some(8_000)
+        );
         assert_eq!(config.policies.http_caches.len(), 1);
         assert_eq!(
             config.policies.http_caches[0].spec.authorization,

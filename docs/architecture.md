@@ -27,6 +27,7 @@ flowchart LR
         snapshot --> runtime
         safety --> runtime
         runtime --> routing[Route matching and\nlistener lifecycle]
+        runtime --> extensions[Extension hooks and\nplugin isolation]
         runtime --> selection[Upstream selection\nhealth locality affinity]
         runtime --> cache[HTTP cache\nrevalidate purge invalidate]
         runtime --> protection[Overload limits breakers\nsource and protocol protection]
@@ -70,7 +71,7 @@ flowchart LR
 
 ## Operational Boundaries
 
-- public listeners handle application traffic across HTTP, HTTPS, first-phase HTTP/3 over QUIC, gRPC, and TCP surfaces
+- public listeners handle application traffic across HTTP, HTTPS, HTTP/3 over QUIC, gRPC, and TCP surfaces
 - admin listeners expose privileged control endpoints such as `healthz`, `status`, `validate`, `audit`, `reload`, `cache/purge`, and `cache/invalidate`
 - snapshots compile and validate before activation, allowing preview and rollback workflows
 - cache invalidation and sticky-session affinity are runtime features, but both are driven by typed configuration and bounded operator controls
@@ -85,6 +86,7 @@ The runtime is not one feature. It combines several operational planes that now 
 - upstream health, locality, and affinity selection
 - bounded HTTP cache with revalidation and invalidation
 - overload management, breaker signals, and source or protocol protection
+- extension hook execution, policy plugin compatibility checks, and bounded isolation controls
 
 Topology changes in upstream health are fail-closed by design. If cluster membership and tracked health records diverge during insertion, removal, or reload churn, the runtime now treats that as an explicit inconsistent state instead of silently dropping the affected endpoint from selection.
 
@@ -109,7 +111,7 @@ This split matters because HTTP/1 and HTTP/2 present request metadata differentl
 
 Once a route matches, upstream selection is now also split in two stages: the runtime first chooses a route destination such as stable, canary, blue, or green according to the route weights, and then balances inside that destination's endpoint pool using the cluster traffic policy. That keeps rollout intent at the route layer while preserving health, affinity, and locality behavior inside each upstream cluster.
 
-HTTP/3 currently follows that same route-selection model, but its first supported topology is intentionally narrower than HTTPS: the downstream side terminates QUIC plus HTTP/3 on a public UDP listener, then reuses the existing HTTP/1 upstream proxy path. That gives operators a documented modern edge surface without yet claiming upstream HTTP/3 parity.
+HTTP/3 follows the same route-selection model. The downstream side terminates QUIC plus HTTP/3 on a public UDP listener, and runtime transport selection can dispatch to upstream clusters configured with `transport: http3` in addition to existing HTTP/1 and HTTP/2 paths. The remaining boundary is operational scope (for example admin-plane HTTP/3 listeners and QUIC passthrough), not route-selection semantics.
 
 The runtime also exposes that route-destination decision in its connection reports. When route backend pools are active, `Http1ConnectionReport` and `Http2ConnectionReport` now carry `route_selection_metrics`, including weighted route selection counts, per-destination selection counts, and route-destination fallback counts. That makes local reproductions and integration harnesses show not only which upstream answered, but whether the request stayed on the primary destination or had to fall back.
 

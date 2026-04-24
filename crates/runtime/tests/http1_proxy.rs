@@ -2,34 +2,44 @@
 
 use std::io;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use bytes::Buf;
+use h3::server;
 use ipnet::IpNet;
+use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use lb_config_model::{
-    AuthorizationCacheBehaviorConfig, CacheKeyPolicyConfig, HeaderMutationConfig,
+    AuthorizationCacheBehaviorConfig, AuthorizationDecisionConfig, AuthorizationPolicyConfig,
+    AuthorizationRuleConfig, CacheKeyPolicyConfig, HeaderMutationConfig,
     FaultInjectionAbortConfig, FaultInjectionDelayConfig, FaultInjectionPolicyConfig,
-    HttpCachePolicyConfig, PathRewriteTransformConfig, RequestTransformConfig,
-    ResponseTransformConfig, TrafficMirrorPolicyConfig, UpgradeProtocolConfig,
+    HttpCachePolicyConfig, JwtAuthPolicyConfig, JwtJwksSourceConfig, PathRewriteTransformConfig,
+    RequestTransformConfig, ResponseTransformConfig, TrafficMirrorPolicyConfig,
+    UpgradeProtocolConfig,
 };
 use lb_net_core::{
     EndpointMetadata, EndpointState, UpstreamCluster, UpstreamClusterName, UpstreamEndpoint,
-    UpstreamEndpointId, UpstreamTarget,
+    UpstreamEndpointId, UpstreamTarget, UpstreamTransport,
 };
 use lb_runtime::{
-    build_http_cache_key_material, proxy_http1_connection, AffinityFallbackPolicy, AffinityPolicy,
-    AnonymousSourceFilterPolicy, CircuitBreakerPolicy, EndpointHealthPolicy, FailureManager,
-    Http1ConnectionReport, Http1ProxyConfig, Http1ProxyError, Http1ResponseCacheConfig,
-    Http1RouteUpstream, HttpCacheRequest, HttpCacheStore, HttpCacheStoreConfig,
-    HttpCacheStoreError, LoadBalancingAlgorithm, LocalLimitKeyKind, LocalLimitScope,
-    LocalRateLimitConfig, LocalRateLimiter, LocalityRoutingPolicy, NoHealthyFallback,
-    ProtocolAnomalyCategory, RetryBudgetPolicy, RouteBackendPool,
-    RouteDestinationPolicyRuntime, RouteEnumerationProtectionPolicy, RuntimeTelemetry,
-    SourceAggregation, TimeoutHierarchy, TrustedClientIpPolicy, UpstreamSelectionPolicy,
-    WeightedRouteDestination,
+    build_http_cache_key_material, clear_http3_test_root_certificates, proxy_http1_connection,
+    set_http3_test_root_certificates, AffinityFallbackPolicy, AffinityPolicy,
+    AnonymousSourceFilterPolicy, AuthorizationPolicyRuntime, CircuitBreakerPolicy,
+    EndpointHealthPolicy, FailureManager, Http1ConnectionReport, Http1ProxyConfig,
+    Http1ProxyError, Http1ResponseCacheConfig, Http1RouteUpstream, HttpCacheRequest,
+    HttpCacheStore, HttpCacheStoreConfig, HttpCacheStoreError, JwtAuthPolicyRuntime,
+    LoadBalancingAlgorithm, LocalLimitKeyKind, LocalLimitScope, LocalRateLimitConfig,
+    LocalRateLimiter, LocalityRoutingPolicy, NoHealthyFallback, ProtocolAnomalyCategory,
+    RetryBudgetPolicy, RouteBackendPool, RouteDestinationPolicyRuntime,
+    RouteEnumerationProtectionPolicy, RuntimeTelemetry, SourceAggregation, TimeoutHierarchy,
+    TrustedClientIpPolicy, UpstreamSelectionPolicy, WeightedRouteDestination,
 };
+use quinn::crypto::rustls::QuicServerConfig;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use rustls::ServerConfig as RustlsServerConfig;
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::oneshot;
 use tokio::time;
 
@@ -45,12 +55,32 @@ struct UpgradeCapture {
     tunnel_payload: Vec<u8>,
 }
 
+#[derive(Debug)]
+struct H3RequestCapture {
+    method: String,
+    target: String,
+    headers: Vec<lb_proto_http::HttpHeader>,
+    body: Vec<u8>,
+}
+
+struct H3TestRootGuard;
+
+impl Drop for H3TestRootGuard {
+    fn drop(&mut self) {
+        clear_http3_test_root_certificates();
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn proxies_keep_alive_requests_and_normalizes_headers(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (upstream_addr, captures_rx) = spawn_keep_alive_upstream().await?;
+    let telemetry = Arc::new(RuntimeTelemetry::new()?);
     let (proxy_addr, report_rx) =
-        spawn_one_shot_http1_proxy_listener(proxy_config(upstream_addr)).await?;
+        spawn_one_shot_http1_proxy_listener(
+            proxy_config(upstream_addr).with_request_telemetry("public-http", Arc::clone(&telemetry)),
+        )
+        .await?;
 
     let mut client = TcpStream::connect(proxy_addr).await?;
     client
@@ -80,6 +110,15 @@ async fn proxies_keep_alive_requests_and_normalizes_headers(
     assert_eq!(report.metrics.request_count, 2);
     assert_eq!(report.metrics.response_status_counts.get(&200), Some(&1));
     assert_eq!(report.metrics.response_status_counts.get(&201), Some(&1));
+    assert!(
+        report
+            .decision_trace_events
+            .iter()
+            .any(|event| event.code == lb_observability::TelemetryEventCode::DecisionRouteSelected)
+    );
+    let metrics = telemetry.export_metrics();
+    assert!(metrics.contains("runtime_route_latency_samples_total"));
+    assert!(metrics.contains("runtime_destination_latency_samples_total"));
 
     Ok(())
 }
@@ -111,6 +150,246 @@ async fn retries_safe_http1_request_once_after_reused_upstream_connection_closes
     assert_eq!(captures.len(), 2);
     assert!(captures[0].head.contains("GET /first HTTP/1.1\r\n"));
     assert!(captures[1].head.contains("GET /second HTTP/1.1\r\n"));
+
+    let report = receive_proxy_result(report_rx).await?;
+    assert_eq!(report.metrics.request_count, 2);
+    assert_eq!(report.metrics.response_status_counts.get(&200), Some(&2));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bridges_http1_downstream_to_http3_upstream_with_normalized_headers_and_body(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (upstream_addr, cert_der, capture_rx) = spawn_http3_capture_upstream().await?;
+    time::sleep(Duration::from_millis(20)).await;
+    set_http3_test_root_certificates(vec![cert_der]);
+    let _test_root_guard = H3TestRootGuard;
+    let host_header = format!("localhost:{}", upstream_addr.port());
+
+    let config = Http1ProxyConfig::new(UpstreamTarget::with_transport(
+        "h3-upstream",
+        upstream_addr,
+        UpstreamTransport::Http3,
+    ));
+    let (proxy_addr, report_rx) = spawn_one_shot_http1_proxy_listener(config).await?;
+
+    let mut client = TcpStream::connect(proxy_addr).await?;
+    let request = format!(
+        "POST /bridge HTTP/1.1\r\nHost: {host_header}\r\nConnection: close\r\nProxy-Connection: keep-alive\r\nX-Forwarded-For: 203.0.113.9\r\nContent-Type: text/plain\r\nContent-Length: 11\r\n\r\nhello-world"
+    );
+    client
+        .write_all(request.as_bytes())
+        .await?;
+
+    let report = receive_proxy_result(report_rx).await?;
+    let response = read_http_response(&mut client).await?;
+
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+    assert!(
+        response.contains("h3-bridge"),
+        "unexpected bridge response payload: {response:?}"
+    );
+
+    let capture = receive_h3_capture(capture_rx).await?;
+    assert_eq!(capture.method, "POST");
+    assert_eq!(capture.target, "/bridge");
+    assert_eq!(capture.body, b"hello-world");
+
+    let forwarded_for = capture
+        .headers
+        .iter()
+        .find(|header| header.name.eq_ignore_ascii_case("x-forwarded-for"))
+        .map(|header| header.value.as_str());
+    assert_eq!(forwarded_for, Some("127.0.0.1"));
+    assert!(
+        !capture
+            .headers
+            .iter()
+            .any(|header| header.name.eq_ignore_ascii_case("connection"))
+    );
+    assert!(
+        !capture
+            .headers
+            .iter()
+            .any(|header| header.name.eq_ignore_ascii_case("proxy-connection"))
+    );
+
+    assert_eq!(report.metrics.request_count, 1);
+    assert_eq!(report.metrics.response_status_counts.get(&200), Some(&1));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn destination_circuit_breaker_blocks_http1_stale_reuse_retry(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (upstream_addr, captures_rx) = spawn_reused_connection_close_then_retry_upstream().await?;
+    let telemetry = Arc::new(RuntimeTelemetry::new()?);
+    let pool = route_backend_pool(
+        "frontend-primary",
+        vec![("primary-a", upstream_addr, 1, None, None)],
+        EndpointHealthPolicy::default(),
+        UpstreamSelectionPolicy {
+            algorithm: LoadBalancingAlgorithm::RoundRobin,
+            locality: LocalityRoutingPolicy::Disabled,
+            no_healthy_fallback: NoHealthyFallback::Fail,
+            affinity: None,
+        },
+    )?;
+    let failure_manager = Arc::new(FailureManager::new(
+        RetryBudgetPolicy::default(),
+        TimeoutHierarchy {
+            request_timeout: Duration::from_secs(2),
+            attempt_timeout: Duration::from_secs(2),
+            connect_timeout: Duration::from_millis(250),
+            idle_timeout: Duration::from_secs(2),
+        },
+        CircuitBreakerPolicy {
+            open_failure_threshold: 1,
+            open_duration: Duration::from_secs(60),
+            half_open_success_threshold: 1,
+        },
+    )?);
+
+    let mut config = proxy_config(upstream_addr)
+        .with_route_backend_pools([(String::from("api"), pool)])
+        .with_route_destination_policies([(String::from("api"), std::collections::BTreeMap::from([(
+            String::from("frontend-primary"),
+            RouteDestinationPolicyRuntime {
+                request_transform: None,
+                response_transform: None,
+                traffic_mirror: None,
+                fault_injection: None,
+                rate_limiters: Vec::new(),
+                concurrency_limiters: Vec::new(),
+                failure_manager: Some(failure_manager.clone()),
+                enforce_retry_budget: true,
+                enforce_timeout_hierarchy: false,
+                enforce_circuit_breaker: true,
+            },
+        )]))])
+        .with_request_telemetry("public-http", Arc::clone(&telemetry));
+    config.routes = vec![lb_proto_http::RoutePrefixRule::new("api", "/")];
+
+    let (proxy_addr, report_rx) = spawn_one_shot_http1_proxy_listener(config).await?;
+    let mut client = TcpStream::connect(proxy_addr).await?;
+
+    client
+        .write_all(b"GET /first HTTP/1.1\r\nHost: example.test\r\nConnection: keep-alive\r\n\r\n")
+        .await?;
+    let first_response = read_http_response(&mut client).await?;
+    assert!(first_response.starts_with("HTTP/1.1 200 OK\r\n"));
+
+    client
+        .write_all(b"GET /second HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n")
+        .await?;
+    match read_http_response(&mut client).await {
+        Ok(response) => assert!(response.starts_with("HTTP/1.1 502 Bad Gateway\r\n")),
+        Err(error) => assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof),
+    }
+    drop(client);
+
+    let captures = receive_capture_list(captures_rx).await?;
+    assert_eq!(captures.len(), 1);
+
+    match receive_proxy_result(report_rx).await {
+        Ok(report) => {
+            assert_eq!(report.metrics.request_count, 2);
+            assert_eq!(report.metrics.response_status_counts.get(&200), Some(&1));
+            assert_eq!(report.metrics.response_status_counts.get(&502), Some(&1));
+        }
+        Err(Http1ProxyError::ParseResponse(lb_proto_http::Http1ParseError::IncompleteHead)) => {}
+        Err(Http1ProxyError::ParseResponse(lb_proto_http::Http1ParseError::Io(error)))
+            if matches!(
+                error.kind(),
+                io::ErrorKind::ConnectionReset | io::ErrorKind::UnexpectedEof
+            ) => {}
+        Err(other) => return Err(format!("unexpected proxy result: {other:?}").into()),
+    }
+
+    let metrics = failure_manager.metrics();
+    assert!(metrics.breaker_open_rejection_count >= 1);
+    let telemetry_metrics = telemetry.export_metrics();
+    assert!(telemetry_metrics.contains("runtime_decision_events_total"));
+    assert!(telemetry_metrics.contains("decision=\"retry\""));
+    assert!(telemetry_metrics.contains("policy=\"circuit_breaker\""));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn does_not_retry_unsafe_http1_post_without_idempotency_override(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (upstream_addr, captures_rx) = spawn_reused_connection_close_then_retry_upstream().await?;
+    let (proxy_addr, report_rx) =
+        spawn_one_shot_http1_proxy_listener(proxy_config(upstream_addr)).await?;
+
+    let mut client = TcpStream::connect(proxy_addr).await?;
+    client
+        .write_all(b"GET /first HTTP/1.1\r\nHost: example.test\r\nConnection: keep-alive\r\n\r\n")
+        .await?;
+    let first_response = read_http_response(&mut client).await?;
+    assert!(first_response.starts_with("HTTP/1.1 200 OK\r\n"));
+    assert!(first_response.ends_with("first"));
+
+    client
+        .write_all(
+            b"POST /second HTTP/1.1\r\nHost: example.test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .await?;
+    match read_http_response(&mut client).await {
+        Ok(second_response) => {
+            assert!(second_response.starts_with("HTTP/1.1 502 Bad Gateway\r\n"));
+        }
+        Err(error) => {
+            assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        }
+    }
+    drop(client);
+
+    let captures = receive_capture_list(captures_rx).await?;
+    assert_eq!(captures.len(), 1);
+    assert!(captures[0].head.contains("GET /first HTTP/1.1\r\n"));
+
+    match receive_proxy_result(report_rx).await {
+        Ok(report) => {
+            assert_eq!(report.metrics.request_count, 2);
+            assert_eq!(report.metrics.response_status_counts.get(&200), Some(&1));
+            assert_eq!(report.metrics.response_status_counts.get(&502), Some(&1));
+        }
+        Err(Http1ProxyError::ParseResponse(lb_proto_http::Http1ParseError::IncompleteHead)) => {}
+        Err(other) => return Err(format!("unexpected proxy result: {other:?}").into()),
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retries_http1_post_with_idempotency_key_override(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (upstream_addr, captures_rx) = spawn_reused_connection_close_then_retry_upstream().await?;
+    let (proxy_addr, report_rx) =
+        spawn_one_shot_http1_proxy_listener(proxy_config(upstream_addr)).await?;
+
+    let mut client = TcpStream::connect(proxy_addr).await?;
+    client
+        .write_all(b"GET /first HTTP/1.1\r\nHost: example.test\r\nConnection: keep-alive\r\n\r\n")
+        .await?;
+    let first_response = read_http_response(&mut client).await?;
+    assert!(first_response.starts_with("HTTP/1.1 200 OK\r\n"));
+    assert!(first_response.ends_with("first"));
+
+    client
+        .write_all(
+            b"POST /second HTTP/1.1\r\nHost: example.test\r\nIdempotency-Key: order-42\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .await?;
+    let second_response = read_http_response(&mut client).await?;
+    assert!(second_response.starts_with("HTTP/1.1 200 OK\r\n"));
+    assert!(second_response.ends_with("second"));
+    drop(client);
+
+    let captures = receive_capture_list(captures_rx).await?;
+    assert_eq!(captures.len(), 2);
+    assert!(captures[0].head.contains("GET /first HTTP/1.1\r\n"));
+    assert!(captures[1].head.contains("POST /second HTTP/1.1\r\n"));
 
     let report = receive_proxy_result(report_rx).await?;
     assert_eq!(report.metrics.request_count, 2);
@@ -374,6 +653,7 @@ async fn mirrors_bodyless_http1_request_without_affecting_primary_response(
                 traffic_mirror: Some(TrafficMirrorPolicyConfig {
                     percentage: 100,
                     target_upstream_cluster: String::from("frontend-shadow"),
+                    methods: Vec::new(),
                 }),
                 fault_injection: None,
                 rate_limiters: Vec::new(),
@@ -405,6 +685,229 @@ async fn mirrors_bodyless_http1_request_without_affecting_primary_response(
     assert_eq!(report.metrics.mirror_dispatch_count, 1);
     assert_eq!(report.metrics.mirror_skip_count, 0);
     assert_eq!(report.metrics.mirror_dispatch_failure_count, 0);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mirror_policy_method_allow_list_skips_http1_post(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (primary_upstream_addr, primary_capture_rx) = spawn_single_capture_upstream().await?;
+    let (shadow_upstream_addr, shadow_capture_rx) = spawn_single_capture_upstream().await?;
+    let primary_pool = route_backend_pool(
+        "frontend-primary",
+        vec![("primary-a", primary_upstream_addr, 1, None, None)],
+        EndpointHealthPolicy::default(),
+        UpstreamSelectionPolicy::default(),
+    )?;
+    let shadow_pool = route_backend_pool(
+        "frontend-shadow",
+        vec![("shadow-a", shadow_upstream_addr, 1, None, None)],
+        EndpointHealthPolicy::default(),
+        UpstreamSelectionPolicy::default(),
+    )?;
+
+    let mut config = proxy_config(primary_upstream_addr)
+        .with_route_backend_pools([(String::from("api"), primary_pool)])
+        .with_mirror_backend_pools([(String::from("frontend-shadow"), shadow_pool)])
+        .with_route_destination_policies([(String::from("api"), std::collections::BTreeMap::from([(
+            String::from("frontend-primary"),
+            RouteDestinationPolicyRuntime {
+                request_transform: None,
+                response_transform: None,
+                traffic_mirror: Some(TrafficMirrorPolicyConfig {
+                    percentage: 100,
+                    target_upstream_cluster: String::from("frontend-shadow"),
+                    methods: vec![String::from("GET")],
+                }),
+                fault_injection: None,
+                rate_limiters: Vec::new(),
+                concurrency_limiters: Vec::new(),
+                failure_manager: None,
+                enforce_retry_budget: false,
+                enforce_timeout_hierarchy: false,
+                enforce_circuit_breaker: false,
+            },
+        )]))]);
+    config.routes = vec![lb_proto_http::RoutePrefixRule::new("api", "/api")];
+
+    let (proxy_addr, report_rx) = spawn_one_shot_http1_proxy_listener(config).await?;
+    let mut client = TcpStream::connect(proxy_addr).await?;
+    client
+        .write_all(
+            b"POST /api/orders HTTP/1.1\r\nHost: example.test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .await?;
+    let response = read_http_response(&mut client).await?;
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+    drop(client);
+
+    let primary_capture = receive_capture(primary_capture_rx).await?;
+    assert!(primary_capture.head.contains("POST /api/orders HTTP/1.1\r\n"));
+    assert!(time::timeout(Duration::from_millis(100), shadow_capture_rx).await.is_err());
+
+    let report = receive_proxy_result(report_rx).await?;
+    assert_eq!(report.metrics.request_count, 1);
+    assert_eq!(report.metrics.mirror_dispatch_count, 0);
+    assert_eq!(report.metrics.mirror_skip_count, 1);
+    assert_eq!(report.metrics.mirror_dispatch_failure_count, 0);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn jwt_auth_policy_rejects_http1_request_without_bearer(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let upstream_addr = reserve_unused_addr().await?;
+    let pool = route_backend_pool(
+        "frontend-primary",
+        vec![("primary-a", upstream_addr, 1, None, None)],
+        EndpointHealthPolicy::default(),
+        UpstreamSelectionPolicy::default(),
+    )?;
+    let mut config = proxy_config(upstream_addr)
+        .with_route_backend_pools([(String::from("api"), pool)])
+        .with_route_destination_jwt_auth_policies([(String::from("api"), std::collections::BTreeMap::from([(
+            String::from("frontend-primary"),
+            jwt_auth_policy_runtime()?,
+        )]))]);
+    config.routes = vec![lb_proto_http::RoutePrefixRule::new("api", "/")];
+
+    let (proxy_addr, report_rx) = spawn_one_shot_http1_proxy_listener(config).await?;
+    let mut client = TcpStream::connect(proxy_addr).await?;
+    client
+        .write_all(b"GET /secure HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n")
+        .await?;
+    let response = read_http_response(&mut client).await?;
+    assert!(response.starts_with("HTTP/1.1 401"));
+    drop(client);
+
+    let report = receive_proxy_result(report_rx).await?;
+    assert_eq!(report.metrics.request_count, 1);
+    assert_eq!(report.metrics.response_status_counts.get(&401), Some(&1));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn jwt_auth_policy_accepts_http1_request_with_valid_bearer(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (upstream_addr, capture_rx) = spawn_single_capture_upstream().await?;
+    let pool = route_backend_pool(
+        "frontend-primary",
+        vec![("primary-a", upstream_addr, 1, None, None)],
+        EndpointHealthPolicy::default(),
+        UpstreamSelectionPolicy::default(),
+    )?;
+    let mut config = proxy_config(upstream_addr)
+        .with_route_backend_pools([(String::from("api"), pool)])
+        .with_route_destination_jwt_auth_policies([(String::from("api"), std::collections::BTreeMap::from([(
+            String::from("frontend-primary"),
+            jwt_auth_policy_runtime()?,
+        )]))]);
+    config.routes = vec![lb_proto_http::RoutePrefixRule::new("api", "/")];
+
+    let token = issue_test_jwt("https://issuer.example", "edge-api")?;
+    let (proxy_addr, report_rx) = spawn_one_shot_http1_proxy_listener(config).await?;
+    let mut client = TcpStream::connect(proxy_addr).await?;
+    client
+        .write_all(
+            format!(
+                "GET /secure HTTP/1.1\r\nHost: example.test\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await?;
+    let response = read_http_response(&mut client).await?;
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+    drop(client);
+
+    let capture = receive_capture(capture_rx).await?;
+    assert!(capture.head.contains("authorization: Bearer "));
+
+    let report = receive_proxy_result(report_rx).await?;
+    assert_eq!(report.metrics.request_count, 1);
+    assert_eq!(report.metrics.response_status_counts.get(&200), Some(&1));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn authorization_policy_rejects_http1_request_without_required_scope(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let upstream_addr = reserve_unused_addr().await?;
+    let pool = route_backend_pool(
+        "frontend-primary",
+        vec![("primary-a", upstream_addr, 1, None, None)],
+        EndpointHealthPolicy::default(),
+        UpstreamSelectionPolicy::default(),
+    )?;
+    let telemetry = Arc::new(RuntimeTelemetry::new()?);
+    let mut config = proxy_config(upstream_addr)
+        .with_route_backend_pools([(String::from("api"), pool)])
+        .with_route_destination_authorization_policies([(
+            String::from("api"),
+            std::collections::BTreeMap::from([(
+                String::from("frontend-primary"),
+                authorization_policy_runtime(),
+            )]),
+        )])
+        .with_request_telemetry("public-http", Arc::clone(&telemetry));
+    config.routes = vec![lb_proto_http::RoutePrefixRule::new("api", "/")];
+
+    let (proxy_addr, report_rx) = spawn_one_shot_http1_proxy_listener(config).await?;
+    let mut client = TcpStream::connect(proxy_addr).await?;
+    client
+        .write_all(
+            b"GET /secure HTTP/1.1\r\nHost: example.test\r\nX-Auth-Principal: alice\r\nX-Auth-Scopes: profile.read\r\nX-Auth-Roles: reader\r\nConnection: close\r\n\r\n",
+        )
+        .await?;
+    let response = read_http_response(&mut client).await?;
+    assert!(response.starts_with("HTTP/1.1 403"));
+    drop(client);
+
+    let report = receive_proxy_result(report_rx).await?;
+    assert_eq!(report.metrics.request_count, 1);
+    assert_eq!(report.metrics.response_status_counts.get(&403), Some(&1));
+    let metrics = telemetry.export_metrics();
+    assert!(metrics.contains("runtime_decision_events_total"));
+    assert!(metrics.contains("policy=\"authorization\""));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn authorization_policy_accepts_http1_request_with_matching_headers(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (upstream_addr, capture_rx) = spawn_single_capture_upstream().await?;
+    let pool = route_backend_pool(
+        "frontend-primary",
+        vec![("primary-a", upstream_addr, 1, None, None)],
+        EndpointHealthPolicy::default(),
+        UpstreamSelectionPolicy::default(),
+    )?;
+    let mut config = proxy_config(upstream_addr)
+        .with_route_backend_pools([(String::from("api"), pool)])
+        .with_route_destination_authorization_policies([(
+            String::from("api"),
+            std::collections::BTreeMap::from([(
+                String::from("frontend-primary"),
+                authorization_policy_runtime(),
+            )]),
+        )]);
+    config.routes = vec![lb_proto_http::RoutePrefixRule::new("api", "/")];
+
+    let (proxy_addr, report_rx) = spawn_one_shot_http1_proxy_listener(config).await?;
+    let mut client = TcpStream::connect(proxy_addr).await?;
+    client
+        .write_all(
+            b"GET /secure HTTP/1.1\r\nHost: example.test\r\nX-Auth-Principal: alice\r\nX-Auth-Scopes: payments.read payments.write\r\nX-Auth-Roles: admin,reader\r\nConnection: close\r\n\r\n",
+        )
+        .await?;
+    let response = read_http_response(&mut client).await?;
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+    drop(client);
+
+    let capture = receive_capture(capture_rx).await?;
+    assert!(capture.head.contains("x-auth-scopes: payments.read payments.write"));
+    let report = receive_proxy_result(report_rx).await?;
+    assert_eq!(report.metrics.request_count, 1);
+    assert_eq!(report.metrics.response_status_counts.get(&200), Some(&1));
     Ok(())
 }
 
@@ -807,6 +1310,75 @@ async fn destination_circuit_breaker_rejects_http1_request_after_connect_failure
 
     let metrics = failure_manager.metrics();
     assert_eq!(metrics.breaker_open_rejection_count, 1);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn destination_timeout_hierarchy_returns_gateway_timeout_for_http1(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let upstream_addr = spawn_idle_upstream().await?;
+    let pool = route_backend_pool(
+        "frontend-primary",
+        vec![("primary-a", upstream_addr, 1, None, None)],
+        EndpointHealthPolicy::default(),
+        UpstreamSelectionPolicy {
+            algorithm: LoadBalancingAlgorithm::RoundRobin,
+            locality: LocalityRoutingPolicy::Disabled,
+            no_healthy_fallback: NoHealthyFallback::Fail,
+            affinity: None,
+        },
+    )?;
+    let failure_manager = Arc::new(FailureManager::new(
+        RetryBudgetPolicy::default(),
+        TimeoutHierarchy {
+            request_timeout: Duration::from_millis(200),
+            attempt_timeout: Duration::from_millis(50),
+            connect_timeout: Duration::from_millis(25),
+            idle_timeout: Duration::from_millis(50),
+        },
+        CircuitBreakerPolicy::default(),
+    )?);
+
+    let mut config = proxy_config(upstream_addr)
+        .with_route_backend_pools([(String::from("api"), pool)])
+        .with_route_destination_policies([(String::from("api"), std::collections::BTreeMap::from([(
+            String::from("frontend-primary"),
+            RouteDestinationPolicyRuntime {
+                request_transform: None,
+                response_transform: None,
+                traffic_mirror: None,
+                fault_injection: None,
+                rate_limiters: Vec::new(),
+                concurrency_limiters: Vec::new(),
+                failure_manager: Some(failure_manager),
+                enforce_retry_budget: false,
+                enforce_timeout_hierarchy: true,
+                enforce_circuit_breaker: false,
+            },
+        )]))]);
+    config.routes = vec![lb_proto_http::RoutePrefixRule::new("api", "/")];
+
+    let (proxy_addr, report_rx) = spawn_one_shot_http1_proxy_listener(config).await?;
+
+    let mut client = TcpStream::connect(proxy_addr).await?;
+    client
+        .write_all(b"GET /slow HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n")
+        .await?;
+    match read_http_response(&mut client).await {
+        Ok(response) => assert!(response.starts_with("HTTP/1.1 504 Gateway Timeout\r\n")),
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {}
+        Err(error) => return Err(error.into()),
+    }
+    drop(client);
+
+    match receive_proxy_result(report_rx).await {
+        Ok(report) => {
+            assert_eq!(report.metrics.response_status_counts.get(&504), Some(&1));
+        }
+        Err(Http1ProxyError::ParseResponse(lb_proto_http::Http1ParseError::IncompleteHead)) => {}
+        Err(Http1ProxyError::IdleTimeout("response head")) => {}
+        other => panic!("unexpected proxy result: {other:?}"),
+    }
     Ok(())
 }
 
@@ -1225,12 +1797,14 @@ async fn routes_requests_by_host_and_preserves_query_string(
 async fn unmatched_host_filtered_routes_return_local_forbidden(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let unused_upstream = reserve_unused_addr().await?;
+    let telemetry = Arc::new(RuntimeTelemetry::new()?);
     let mut config = proxy_config(unused_upstream)
         .with_route_upstreams([Http1RouteUpstream {
             route_label: String::from("api"),
             upstream: UpstreamTarget::new("api-upstream", unused_upstream),
         }])
-        .rejecting_unmatched_routes();
+        .rejecting_unmatched_routes()
+        .with_request_telemetry("public-http", Arc::clone(&telemetry));
     config.routes = vec![lb_proto_http::RoutePrefixRule::new("api", "/api")
         .with_hostnames(vec![String::from("example.com")])];
     let (proxy_addr, report_rx) = spawn_one_shot_http1_proxy_listener(config).await?;
@@ -1249,6 +1823,16 @@ async fn unmatched_host_filtered_routes_return_local_forbidden(
     let report = receive_proxy_result(report_rx).await?;
     assert_eq!(report.metrics.request_count, 1);
     assert_eq!(report.metrics.response_status_counts.get(&403), Some(&1));
+    let metrics = telemetry.export_metrics();
+    assert!(metrics.contains("runtime_decision_events_total"));
+    assert!(metrics.contains("decision=\"route_selection\""));
+    assert!(metrics.contains("result=\"rejected\""));
+    assert!(
+        report
+            .decision_trace_events
+            .iter()
+            .any(|event| event.code == lb_observability::TelemetryEventCode::DecisionRouteSelected)
+    );
     Ok(())
 }
 
@@ -1403,6 +1987,11 @@ async fn route_backend_pool_passive_failures_keep_failed_http1_endpoint_out_of_r
             recovery_success_threshold: 1,
             ejection_duration: Duration::from_secs(30),
             warmup_duration: Duration::ZERO,
+            consecutive_passive_failure_ejection_threshold: 5,
+            outlier_window_size: 20,
+            success_rate_ejection_threshold_percent: 50,
+            cluster_ejection_budget_percent: 50,
+            slow_start_min_weight_percent: 10,
         },
         UpstreamSelectionPolicy {
             algorithm: LoadBalancingAlgorithm::RoundRobin,
@@ -1629,6 +2218,11 @@ async fn weighted_route_backend_pool_reports_http1_destination_fallback_metrics(
             recovery_success_threshold: 1,
             ejection_duration: Duration::from_secs(30),
             warmup_duration: Duration::ZERO,
+            consecutive_passive_failure_ejection_threshold: 5,
+            outlier_window_size: 20,
+            success_rate_ejection_threshold_percent: 50,
+            cluster_ejection_budget_percent: 50,
+            slow_start_min_weight_percent: 10,
         },
         UpstreamSelectionPolicy::default(),
     )?;
@@ -1681,6 +2275,11 @@ async fn route_backend_pool_include_unhealthy_fallback_keeps_http1_backend_reach
             recovery_success_threshold: 2,
             ejection_duration: Duration::from_secs(30),
             warmup_duration: Duration::ZERO,
+            consecutive_passive_failure_ejection_threshold: 5,
+            outlier_window_size: 20,
+            success_rate_ejection_threshold_percent: 50,
+            cluster_ejection_budget_percent: 50,
+            slow_start_min_weight_percent: 10,
         },
         UpstreamSelectionPolicy {
             algorithm: LoadBalancingAlgorithm::RoundRobin,
@@ -1712,6 +2311,11 @@ async fn route_backend_pool_include_unhealthy_fallback_keeps_http1_backend_reach
                 recovery_success_threshold: 2,
                 ejection_duration: Duration::from_secs(30),
                 warmup_duration: Duration::ZERO,
+                consecutive_passive_failure_ejection_threshold: 5,
+                outlier_window_size: 20,
+                success_rate_ejection_threshold_percent: 50,
+                cluster_ejection_budget_percent: 50,
+                slow_start_min_weight_percent: 10,
             },
             UpstreamSelectionPolicy {
                 algorithm: LoadBalancingAlgorithm::RoundRobin,
@@ -2711,7 +3315,9 @@ async fn spawn_reused_connection_close_then_retry_upstream(
             }
         }
 
-        if let Ok((mut second_stream, _)) = listener.accept().await {
+        if let Ok(Ok((mut second_stream, _))) =
+            time::timeout(Duration::from_millis(500), listener.accept()).await
+        {
             if let Ok(capture) = read_http_request_capture(&mut second_stream).await {
                 captures.push(capture);
                 let _ = second_stream
@@ -3126,6 +3732,119 @@ async fn spawn_idle_upstream() -> io::Result<SocketAddr> {
     Ok(address)
 }
 
+async fn spawn_http3_capture_upstream(
+) -> Result<(SocketAddr, Vec<u8>, oneshot::Receiver<H3RequestCapture>), Box<dyn std::error::Error>> {
+    ensure_rustls_crypto_provider();
+
+    let certified = rcgen::generate_simple_self_signed(vec![String::from("localhost")])?;
+    let cert_der = CertificateDer::from(certified.cert.der().to_vec());
+    let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+        certified.key_pair.serialize_der(),
+    ));
+
+    let mut rustls_server =
+        RustlsServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der.clone()], key_der)?;
+    rustls_server.alpn_protocols = vec![b"h3".to_vec()];
+
+    let quic_server = QuicServerConfig::try_from(Arc::new(rustls_server))?;
+    let server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_server));
+
+    let socket = UdpSocket::bind("127.0.0.1:0").await?;
+    let address = socket.local_addr()?;
+    let endpoint = quinn::Endpoint::new(
+        quinn::EndpointConfig::default(),
+        Some(server_config),
+        socket.into_std()?,
+        Arc::new(quinn::TokioRuntime),
+    )?;
+
+    let (capture_tx, capture_rx) = oneshot::channel();
+    let (started_tx, started_rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let _ = started_tx.send(());
+        let Some(incoming) = endpoint.accept().await else {
+            return;
+        };
+        let Ok(connecting) = incoming.accept() else {
+            return;
+        };
+        let Ok(connection) = connecting.await else {
+            return;
+        };
+        let Ok(mut h3_conn) = server::builder().build(h3_quinn::Connection::new(connection)).await else {
+            return;
+        };
+        let Ok(Some(resolver)) = h3_conn.accept().await else {
+            return;
+        };
+        let Ok((request, mut stream)) = resolver.resolve_request().await else {
+            return;
+        };
+
+        let mut body = Vec::new();
+        loop {
+            let Ok(chunk) = stream.recv_data().await else {
+                return;
+            };
+            let Some(mut chunk) = chunk else {
+                break;
+            };
+            let bytes = chunk.copy_to_bytes(chunk.remaining());
+            body.extend_from_slice(&bytes);
+        }
+
+        let headers = request
+            .headers()
+            .iter()
+            .filter_map(|(name, value)| {
+                value.to_str().ok().map(|raw| lb_proto_http::HttpHeader {
+                    name: name.as_str().to_ascii_lowercase(),
+                    value: raw.to_string(),
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let capture = H3RequestCapture {
+            method: request.method().as_str().to_string(),
+            target: request.uri().path().to_string(),
+            headers,
+            body,
+        };
+
+        let response = http1::Response::builder()
+            .status(200)
+            .header("content-type", "text/plain")
+            .body(())
+            .expect("valid response");
+        if stream.send_response(response).await.is_err() {
+            return;
+        }
+        if stream
+            .send_data(bytes::Bytes::from_static(b"h3-bridge"))
+            .await
+            .is_err()
+        {
+            return;
+        }
+        let _ = stream.finish().await;
+        let _ = capture_tx.send(capture);
+        time::sleep(Duration::from_millis(50)).await;
+    });
+
+    let _ = started_rx.await;
+
+    Ok((address, cert_der.as_ref().to_vec(), capture_rx))
+}
+
+fn ensure_rustls_crypto_provider() {
+    static PROVIDER: OnceLock<()> = OnceLock::new();
+    PROVIDER.get_or_init(|| {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    });
+}
+
 async fn reserve_unused_addr() -> io::Result<SocketAddr> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     listener.local_addr()
@@ -3266,8 +3985,67 @@ async fn receive_upgrade_capture(
     Ok(capture)
 }
 
+async fn receive_h3_capture(
+    capture_rx: oneshot::Receiver<H3RequestCapture>,
+) -> Result<H3RequestCapture, Box<dyn std::error::Error>> {
+    let capture = time::timeout(Duration::from_secs(2), capture_rx).await??;
+    Ok(capture)
+}
+
 fn proxy_config(upstream_addr: SocketAddr) -> Http1ProxyConfig {
     Http1ProxyConfig::new(UpstreamTarget::new("http-upstream", upstream_addr))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct JwtTestClaims {
+    iss: String,
+    aud: String,
+    exp: usize,
+    sub: String,
+}
+
+fn jwt_auth_policy_runtime() -> Result<JwtAuthPolicyRuntime, Box<dyn std::error::Error>> {
+    let config = JwtAuthPolicyConfig {
+        issuers: vec![String::from("https://issuer.example")],
+        audiences: vec![String::from("edge-api")],
+        jwks: Some(JwtJwksSourceConfig::Inline {
+            jwks_json: String::from(
+                r#"{"keys":[{"kty":"oct","k":"c3VwZXItc2VjcmV0","alg":"HS256","kid":"jwt-key-1"}]}"#,
+            ),
+        }),
+        required_claims: vec![String::from("sub")],
+        clock_skew_secs: 30,
+    };
+    Ok(JwtAuthPolicyRuntime::from_config(&config)?)
+}
+
+fn authorization_policy_runtime() -> AuthorizationPolicyRuntime {
+    AuthorizationPolicyRuntime::from_config(&AuthorizationPolicyConfig {
+        rules: vec![AuthorizationRuleConfig {
+            name: String::from("payments-reader"),
+            action: AuthorizationDecisionConfig::Allow,
+            any_claims: vec![String::from("principal")],
+            required_scopes: vec![String::from("payments.read")],
+            required_roles: vec![String::from("reader")],
+        }],
+        default_decision: AuthorizationDecisionConfig::Deny,
+    })
+}
+
+fn issue_test_jwt(iss: &str, aud: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let claims = JwtTestClaims {
+        iss: String::from(iss),
+        aud: String::from(aud),
+        exp: 4_102_444_800,
+        sub: String::from("alice"),
+    };
+    let mut header = Header::new(Algorithm::HS256);
+    header.kid = Some(String::from("jwt-key-1"));
+    Ok(encode(
+        &header,
+        &claims,
+        &EncodingKey::from_secret(b"super-secret"),
+    )?)
 }
 
 fn route_backend_pool(

@@ -32,6 +32,7 @@ pub struct ManagedResourceStatus {
 pub struct GatewayControllerStatusReport {
     pub observed_generation: u64,
     pub operator_status: OperatorStatus,
+    pub endpoint_slice_stats: EndpointSliceStats,
     pub managed_resources: Vec<ManagedResourceStatus>,
     pub recent_events: Vec<ReconcileTransitionEvent>,
     pub last_candidate_version: Option<String>,
@@ -190,6 +191,7 @@ where
         let operator_status = self.reconciler.status().clone();
         GatewayControllerStatusReport {
             observed_generation: self.observed_generation.max(operator_status.observed_generation),
+            endpoint_slice_stats: self.endpoint_slices.stats(),
             managed_resources: self.collect_managed_resource_statuses(&operator_status),
             recent_events: self.recent_events.iter().cloned().collect(),
             last_candidate_version: self.last_candidate_version.clone(),

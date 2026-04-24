@@ -10,6 +10,7 @@ mod tests {
 
     use super::{
         anonymous_source_blocked, error_is_upstream_passive_failure,
+        classify_grpc_response_failure_with_policy,
         grpc_payload_has_at_most_one_message, header_value,
         record_query_probe, record_unmatched_route, resolve_effective_client_ip,
         resolve_stream_upstream, route_enumeration_source_blocked, select_http2_route_upstream,
@@ -20,6 +21,7 @@ mod tests {
     use crate::{
         AnonymousSourceFilterPolicy, ProtocolAnomalyCategory, RouteEnumerationProtectionPolicy,
         SlowClientStage, SourceAggregation, TrustedClientIpPolicy,
+        GrpcFailurePolicy,
     };
 
     fn localhost_socket(port: u16) -> SocketAddr {
@@ -118,6 +120,32 @@ mod tests {
             0, 0, 0, 0, 1, 8,
         ]));
         assert!(!grpc_payload_has_at_most_one_message(&[0, 0, 0]));
+    }
+
+    #[test]
+    fn grpc_failure_classification_honors_destination_policy() {
+        let policy = GrpcFailurePolicy {
+            retryable_statuses: vec![7, 13],
+            timeout_statuses: vec![4],
+            overloaded_statuses: vec![8],
+        };
+
+        assert_eq!(
+            classify_grpc_response_failure_with_policy(Some(&policy), 7),
+            Some(crate::UpstreamFailureClass::Temporary)
+        );
+        assert_eq!(
+            classify_grpc_response_failure_with_policy(Some(&policy), 4),
+            Some(crate::UpstreamFailureClass::Timeout)
+        );
+        assert_eq!(
+            classify_grpc_response_failure_with_policy(Some(&policy), 8),
+            Some(crate::UpstreamFailureClass::Overloaded)
+        );
+        assert_eq!(
+            classify_grpc_response_failure_with_policy(Some(&policy), 0),
+            None
+        );
     }
 
     #[test]

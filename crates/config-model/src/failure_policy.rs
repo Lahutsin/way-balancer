@@ -13,6 +13,8 @@ pub struct RetryBudgetPolicyConfig {
 pub struct TimeoutHierarchyConfig {
     pub request_timeout_ms: u64,
     pub attempt_timeout_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub per_try_timeout_ms: Option<u64>,
     pub connect_timeout_ms: u64,
     pub idle_timeout_ms: u64,
 }
@@ -36,6 +38,7 @@ mod tests {
         let timeout = TimeoutHierarchyConfig {
             request_timeout_ms: 30_000,
             attempt_timeout_ms: 10_000,
+            per_try_timeout_ms: Some(8_000),
             connect_timeout_ms: 1_000,
             idle_timeout_ms: 5_000,
         };
@@ -46,6 +49,7 @@ mod tests {
         };
 
         assert_eq!(retry.retry_percent, 20);
+        assert_eq!(timeout.per_try_timeout_ms, Some(8_000));
         assert_eq!(timeout.connect_timeout_ms, 1_000);
         assert_eq!(breaker.open_failure_threshold, 5);
     }

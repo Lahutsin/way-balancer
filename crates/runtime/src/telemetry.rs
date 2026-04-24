@@ -2,11 +2,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use lb_observability::{
-    CorrelationId, DiagnosticsLimits, IncomingTraceContext, LoggingPolicy, MetricDescriptor,
-    MetricKind, MetricRegistry, RuntimeDiagnostics, RuntimeDiagnosticsInput, SpanId,
-    StructuredLogRecord, SupportBundleBuilder, TelemetryBufferSnapshot, TelemetryCollector,
-    TelemetryError, TelemetryEvent, TelemetryEventCode, TelemetryLabel, TelemetryLabelKey,
-    TraceContext, TraceContextError, TraceHookPhase, TraceId, TracingPolicy,
+    CorrelationId, DecisionTraceKind, DiagnosticsLimits, IncomingTraceContext, LoggingPolicy,
+    MetricDescriptor, MetricKind, MetricRegistry, RuntimeDiagnostics, RuntimeDiagnosticsInput,
+    SpanId, StructuredLogRecord, SupportBundleBuilder, TelemetryBufferSnapshot,
+    TelemetryCollector, TelemetryError, TelemetryEvent, TelemetryEventCode, TelemetryLabel,
+    TelemetryLabelKey, TraceContext, TraceContextError, TraceHookPhase, TraceId, TracingPolicy,
 };
 
 use crate::{
@@ -68,6 +68,31 @@ pub enum HttpUpgradeResult {
     Accepted,
     Rejected,
     Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtensionPolicyPluginOutcome {
+    Allowed,
+    Denied,
+    Abstained,
+    Failed,
+    TimedOut,
+    Panicked,
+    Fallback,
+}
+
+impl ExtensionPolicyPluginOutcome {
+    const fn metric_result(self) -> &'static str {
+        match self {
+            Self::Allowed => "allowed",
+            Self::Denied => "denied",
+            Self::Abstained => "abstained",
+            Self::Failed => "failed",
+            Self::TimedOut => "timed_out",
+            Self::Panicked => "panicked",
+            Self::Fallback => "fallback",
+        }
+    }
 }
 
 impl HttpUpgradeResult {
@@ -218,6 +243,46 @@ impl RuntimeTelemetry {
                     ],
                 },
                 MetricDescriptor {
+                    name: String::from("runtime_route_latency_samples_total"),
+                    kind: MetricKind::Counter,
+                    help: String::from("Per-route latency bucket samples for request-flow phases"),
+                    allowed_labels: vec![
+                        TelemetryLabelKey::Route,
+                        TelemetryLabelKey::Bucket,
+                        TelemetryLabelKey::Phase,
+                        TelemetryLabelKey::Scope,
+                    ],
+                },
+                MetricDescriptor {
+                    name: String::from("runtime_destination_latency_samples_total"),
+                    kind: MetricKind::Counter,
+                    help: String::from(
+                        "Per-destination latency bucket samples for request-flow phases",
+                    ),
+                    allowed_labels: vec![
+                        TelemetryLabelKey::Destination,
+                        TelemetryLabelKey::Bucket,
+                        TelemetryLabelKey::Phase,
+                        TelemetryLabelKey::Scope,
+                    ],
+                },
+                MetricDescriptor {
+                    name: String::from("runtime_decision_events_total"),
+                    kind: MetricKind::Counter,
+                    help: String::from(
+                        "Decision-trace events for route, retry, health, policy, discovery, and rollout",
+                    ),
+                    allowed_labels: vec![
+                        TelemetryLabelKey::Decision,
+                        TelemetryLabelKey::Result,
+                        TelemetryLabelKey::Route,
+                        TelemetryLabelKey::Destination,
+                        TelemetryLabelKey::Policy,
+                        TelemetryLabelKey::Discovery,
+                        TelemetryLabelKey::Scope,
+                    ],
+                },
+                MetricDescriptor {
                     name: String::from("runtime_trace_hooks_total"),
                     kind: MetricKind::Counter,
                     help: String::from("Total emitted trace hooks"),
@@ -302,6 +367,31 @@ impl RuntimeTelemetry {
                     allowed_labels: vec![
                         TelemetryLabelKey::Scope,
                         TelemetryLabelKey::Result,
+                        TelemetryLabelKey::Reason,
+                    ],
+                },
+                MetricDescriptor {
+                    name: String::from("runtime_extension_policy_plugin_evaluations_total"),
+                    kind: MetricKind::Counter,
+                    help: String::from(
+                        "Total extension policy plugin evaluation outcomes by plugin and result",
+                    ),
+                    allowed_labels: vec![
+                        TelemetryLabelKey::Scope,
+                        TelemetryLabelKey::Policy,
+                        TelemetryLabelKey::Result,
+                        TelemetryLabelKey::Reason,
+                    ],
+                },
+                MetricDescriptor {
+                    name: String::from("runtime_extension_compatibility_rejections_total"),
+                    kind: MetricKind::Counter,
+                    help: String::from(
+                        "Total extension/plugin compatibility rejections by plugin and reason",
+                    ),
+                    allowed_labels: vec![
+                        TelemetryLabelKey::Scope,
+                        TelemetryLabelKey::Policy,
                         TelemetryLabelKey::Reason,
                     ],
                 },
@@ -526,6 +616,70 @@ impl RuntimeTelemetry {
         )
     }
 
+    pub fn record_route_latency(
+        &self,
+        scope: &str,
+        route: &str,
+        phase: TraceHookPhase,
+        latency: Duration,
+    ) -> Result<(), TelemetryError> {
+        self.metrics.increment_counter(
+            "runtime_route_latency_samples_total",
+            vec![
+                TelemetryLabel::new(TelemetryLabelKey::Route, route),
+                TelemetryLabel::new(TelemetryLabelKey::Bucket, latency_bucket_label(latency)),
+                TelemetryLabel::new(TelemetryLabelKey::Phase, phase.as_str()),
+                TelemetryLabel::new(TelemetryLabelKey::Scope, scope),
+            ],
+            1,
+        )
+    }
+
+    pub fn record_destination_latency(
+        &self,
+        scope: &str,
+        destination: &str,
+        phase: TraceHookPhase,
+        latency: Duration,
+    ) -> Result<(), TelemetryError> {
+        self.metrics.increment_counter(
+            "runtime_destination_latency_samples_total",
+            vec![
+                TelemetryLabel::new(TelemetryLabelKey::Destination, destination),
+                TelemetryLabel::new(TelemetryLabelKey::Bucket, latency_bucket_label(latency)),
+                TelemetryLabel::new(TelemetryLabelKey::Phase, phase.as_str()),
+                TelemetryLabel::new(TelemetryLabelKey::Scope, scope),
+            ],
+            1,
+        )
+    }
+
+    pub fn record_decision_trace(
+        &self,
+        scope: &str,
+        kind: DecisionTraceKind,
+        result: &str,
+        route: Option<&str>,
+        destination: Option<&str>,
+        policy: Option<&str>,
+        discovery: Option<&str>,
+        detail: &str,
+    ) -> Result<(), TelemetryError> {
+        let labels = vec![
+            TelemetryLabel::new(TelemetryLabelKey::Decision, kind.as_str()),
+            TelemetryLabel::new(TelemetryLabelKey::Result, result),
+            TelemetryLabel::new(TelemetryLabelKey::Route, route.unwrap_or("none")),
+            TelemetryLabel::new(TelemetryLabelKey::Destination, destination.unwrap_or("none")),
+            TelemetryLabel::new(TelemetryLabelKey::Policy, policy.unwrap_or("none")),
+            TelemetryLabel::new(TelemetryLabelKey::Discovery, discovery.unwrap_or("none")),
+            TelemetryLabel::new(TelemetryLabelKey::Scope, scope),
+        ];
+        self.metrics.increment_counter("runtime_decision_events_total", labels.clone(), 1)?;
+        self.collector
+            .push_event(TelemetryEvent::new(kind.event_code(), scope, detail, labels));
+        Ok(())
+    }
+
     pub fn record_http_cache_metrics(
         &self,
         scope: &str,
@@ -669,6 +823,61 @@ impl RuntimeTelemetry {
             ],
             1,
         )
+    }
+
+    pub fn record_extension_policy_plugin_evaluation(
+        &self,
+        scope: &str,
+        plugin_name: &str,
+        outcome: ExtensionPolicyPluginOutcome,
+        reason: &str,
+    ) -> Result<(), TelemetryError> {
+        let labels = vec![
+            TelemetryLabel::new(TelemetryLabelKey::Scope, scope),
+            TelemetryLabel::new(TelemetryLabelKey::Policy, plugin_name),
+            TelemetryLabel::new(TelemetryLabelKey::Result, outcome.metric_result()),
+            TelemetryLabel::new(TelemetryLabelKey::Reason, reason),
+        ];
+        self.metrics.increment_counter(
+            "runtime_extension_policy_plugin_evaluations_total",
+            labels.clone(),
+            1,
+        )?;
+        self.collector.push_event(TelemetryEvent::new(
+            TelemetryEventCode::DecisionPolicyEnforced,
+            scope,
+            format!(
+                "extension policy plugin {plugin_name} evaluation result {} ({reason})",
+                outcome.metric_result()
+            ),
+            labels,
+        ));
+        Ok(())
+    }
+
+    pub fn record_extension_compatibility_rejection(
+        &self,
+        scope: &str,
+        plugin_name: &str,
+        reason: &str,
+    ) -> Result<(), TelemetryError> {
+        let labels = vec![
+            TelemetryLabel::new(TelemetryLabelKey::Scope, scope),
+            TelemetryLabel::new(TelemetryLabelKey::Policy, plugin_name),
+            TelemetryLabel::new(TelemetryLabelKey::Reason, reason),
+        ];
+        self.metrics.increment_counter(
+            "runtime_extension_compatibility_rejections_total",
+            labels.clone(),
+            1,
+        )?;
+        self.collector.push_event(TelemetryEvent::new(
+            TelemetryEventCode::DecisionPolicyEnforced,
+            scope,
+            format!("extension/plugin compatibility rejected for {plugin_name}: {reason}"),
+            labels,
+        ));
+        Ok(())
     }
 
     #[must_use]
@@ -854,5 +1063,109 @@ fn latency_bucket_label(latency: Duration) -> &'static str {
         "le_1000ms"
     } else {
         "gt_1000ms"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use lb_observability::{DecisionTraceKind, TraceHookPhase};
+
+    use super::{ExtensionPolicyPluginOutcome, RuntimeTelemetry};
+
+    #[test]
+    fn records_route_and_destination_latency_with_dimensions() -> Result<(), Box<dyn std::error::Error>> {
+        let telemetry = RuntimeTelemetry::new()?;
+        telemetry.record_route_latency(
+            "ingress",
+            "route.users.v1",
+            TraceHookPhase::ResponseCompleted,
+            Duration::from_millis(23),
+        )?;
+        telemetry.record_destination_latency(
+            "ingress",
+            "users-svc-10-0-0-8",
+            TraceHookPhase::UpstreamConnected,
+            Duration::from_millis(4),
+        )?;
+
+        let rendered = telemetry.export_metrics();
+        assert!(rendered.contains("runtime_route_latency_samples_total{"));
+        assert!(rendered.contains("route=\"route.users.v1\""));
+        assert!(rendered.contains("bucket=\"le_25ms\""));
+        assert!(rendered.contains("phase=\"response_completed\""));
+        assert!(rendered.contains("scope=\"ingress\""));
+        assert!(rendered.contains("runtime_destination_latency_samples_total{"));
+        assert!(rendered.contains("destination=\"users-svc-10-0-0-8\""));
+        assert!(rendered.contains("bucket=\"le_5ms\""));
+        assert!(rendered.contains("phase=\"upstream_connected\""));
+        Ok(())
+    }
+
+    #[test]
+    fn records_decision_trace_events_and_counters() -> Result<(), Box<dyn std::error::Error>> {
+        let telemetry = RuntimeTelemetry::new()?;
+        telemetry.record_decision_trace(
+            "ingress",
+            DecisionTraceKind::RouteSelection,
+            "selected",
+            Some("route.payments.v2"),
+            Some("payments-svc-10-0-0-9"),
+            Some("canary-20"),
+            Some("k8s-endpoints"),
+            "route selected for request",
+        )?;
+
+        let rendered = telemetry.export_metrics();
+        assert!(rendered.contains("runtime_decision_events_total{"));
+        assert!(rendered.contains("route=\"route.payments.v2\""));
+        assert!(rendered.contains("destination=\"payments-svc-10-0-0-9\""));
+        assert!(rendered.contains("policy=\"canary-20\""));
+        assert!(rendered.contains("discovery=\"k8s-endpoints\""));
+        assert!(rendered.contains("decision=\"route_selection\""));
+        assert!(rendered.contains("result=\"selected\""));
+        assert!(rendered.contains("scope=\"ingress\""));
+
+        let snapshot = telemetry.snapshot();
+        assert_eq!(snapshot.events.len(), 1);
+        assert_eq!(snapshot.events[0].code.as_str(), "decision.route.selected");
+        Ok(())
+    }
+
+    #[test]
+    fn records_extension_plugin_observability_metrics() -> Result<(), Box<dyn std::error::Error>> {
+        let telemetry = RuntimeTelemetry::new()?;
+        telemetry.record_extension_policy_plugin_evaluation(
+            "ingress",
+            "custom-authz",
+            ExtensionPolicyPluginOutcome::TimedOut,
+            "execution timeout",
+        )?;
+        telemetry.record_extension_compatibility_rejection(
+            "ingress",
+            "custom-authz",
+            "unsupported api version v2",
+        )?;
+
+        let rendered = telemetry.export_metrics();
+        assert!(rendered.contains("runtime_extension_policy_plugin_evaluations_total{"));
+        assert!(rendered.contains("policy=\"custom-authz\""));
+        assert!(rendered.contains("result=\"timed_out\""));
+        assert!(rendered.contains("reason=\"execution_timeout\""));
+        assert!(rendered.contains("runtime_extension_compatibility_rejections_total{"));
+
+        let snapshot = telemetry.snapshot();
+        assert!(!snapshot.events.is_empty());
+        assert_eq!(
+            snapshot
+                .events
+                .last()
+                .expect("event should exist")
+                .code
+                .as_str(),
+            "decision.policy.enforced"
+        );
+        Ok(())
     }
 }

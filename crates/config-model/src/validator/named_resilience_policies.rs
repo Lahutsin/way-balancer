@@ -37,19 +37,21 @@ fn validate_named_timeout_hierarchies(
             report,
         );
         let spec = &policy.spec;
+        let per_try_timeout_ms = spec.per_try_timeout_ms.unwrap_or(spec.attempt_timeout_ms);
         let has_zero = spec.request_timeout_ms == 0
             || spec.attempt_timeout_ms == 0
+            || per_try_timeout_ms == 0
             || spec.connect_timeout_ms == 0
             || spec.idle_timeout_ms == 0;
-        let invalid_order = spec.attempt_timeout_ms > spec.request_timeout_ms
-            || spec.connect_timeout_ms > spec.attempt_timeout_ms
-            || spec.idle_timeout_ms > spec.attempt_timeout_ms;
+        let invalid_order = per_try_timeout_ms > spec.request_timeout_ms
+            || spec.connect_timeout_ms > per_try_timeout_ms
+            || spec.idle_timeout_ms > per_try_timeout_ms;
         if has_zero || invalid_order {
             report.errors.push(ValidationError::schema(
                 ValidationCode::InvalidPolicyField,
                 format!("{base_path}.spec"),
                 format!(
-                    "timeout hierarchy policy {} must use non-zero values with connect/idle <= attempt <= request",
+                    "timeout hierarchy policy {} must use non-zero values with connect/idle <= per_try <= request",
                     policy.name
                 ),
             ));

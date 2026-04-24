@@ -24,6 +24,16 @@ pub struct EndpointHealthPolicy {
     pub ejection_duration: Duration,
     /// Duration over which traffic is reintroduced after recovery or insertion.
     pub warmup_duration: Duration,
+    /// Consecutive passive failures required to force ejection.
+    pub consecutive_passive_failure_ejection_threshold: u32,
+    /// Passive sampling window size for success-rate outlier ejection.
+    pub outlier_window_size: usize,
+    /// Minimum acceptable success rate across the passive outlier window.
+    pub success_rate_ejection_threshold_percent: u8,
+    /// Maximum ejected share per cluster (0-100).
+    pub cluster_ejection_budget_percent: u8,
+    /// Minimum slow-start weight percentage used while warming.
+    pub slow_start_min_weight_percent: u8,
 }
 
 impl Default for EndpointHealthPolicy {
@@ -35,8 +45,23 @@ impl Default for EndpointHealthPolicy {
             recovery_success_threshold: 2,
             ejection_duration: Duration::from_secs(30),
             warmup_duration: Duration::from_secs(15),
+            consecutive_passive_failure_ejection_threshold: 5,
+            outlier_window_size: 20,
+            success_rate_ejection_threshold_percent: 50,
+            cluster_ejection_budget_percent: 50,
+            slow_start_min_weight_percent: 10,
         }
     }
+}
+
+/// Protocol class used to isolate passive health signals where needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ProtocolHealthClass {
+    Generic,
+    Http1,
+    Http2,
+    Grpc,
+    Tcp,
 }
 
 /// Effective health status applied on top of the static endpoint model.
@@ -78,6 +103,8 @@ pub struct EndpointHealthSnapshot {
     pub remaining_ejection: Option<Duration>,
     /// Remaining warm-up duration if currently warming.
     pub remaining_warmup: Option<Duration>,
+    /// Consecutive passive failures keyed by protocol class.
+    pub passive_failures_by_protocol: BTreeMap<ProtocolHealthClass, u32>,
 }
 
 /// Aggregate counters and gauges for upstream health management.
@@ -169,6 +196,8 @@ struct EndpointHealthRecord {
     remaining_ejection: Duration,
     warmup_elapsed: Duration,
     nominal_weight: u16,
+    passive_failures_by_protocol: BTreeMap<ProtocolHealthClass, u32>,
+    passive_results_window: VecDeque<bool>,
 }
 
 impl EndpointHealthRecord {
@@ -184,6 +213,8 @@ impl EndpointHealthRecord {
                 remaining_ejection: Duration::ZERO,
                 warmup_elapsed: Duration::ZERO,
                 nominal_weight,
+                passive_failures_by_protocol: BTreeMap::new(),
+                passive_results_window: VecDeque::new(),
             }
         } else {
             Self {
@@ -195,6 +226,8 @@ impl EndpointHealthRecord {
                 remaining_ejection: Duration::ZERO,
                 warmup_elapsed: Duration::ZERO,
                 nominal_weight,
+                passive_failures_by_protocol: BTreeMap::new(),
+                passive_results_window: VecDeque::new(),
             }
         }
     }
@@ -216,6 +249,7 @@ impl EndpointHealthRecord {
             effective_weight: self.effective_weight,
             remaining_ejection,
             remaining_warmup,
+            passive_failures_by_protocol: self.passive_failures_by_protocol.clone(),
         }
     }
 
@@ -378,6 +412,18 @@ impl UpstreamHealthRegistry {
         Ok(endpoint)
     }
 
+    /// Updates endpoint readiness state for drain workflows.
+    pub fn set_endpoint_state(
+        &self,
+        cluster_name: &lb_net_core::UpstreamClusterName,
+        endpoint_id: &lb_net_core::UpstreamEndpointId,
+        state: lb_net_core::EndpointState,
+    ) -> Result<(), UpstreamHealthError> {
+        let _topology = self.topology.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.registry.set_endpoint_state(cluster_name, endpoint_id, state)?;
+        Ok(())
+    }
+
     /// Records an active health-check success.
     pub fn note_active_success(
         &self,
@@ -404,8 +450,22 @@ impl UpstreamHealthRegistry {
         cluster_name: &lb_net_core::UpstreamClusterName,
         endpoint_id: &lb_net_core::UpstreamEndpointId,
     ) -> Result<EndpointHealthSnapshot, UpstreamHealthError> {
+        self.note_passive_success_for_protocol(cluster_name, endpoint_id, ProtocolHealthClass::Generic)
+    }
+
+    /// Records a passive success hint scoped to a protocol class.
+    pub fn note_passive_success_for_protocol(
+        &self,
+        cluster_name: &lb_net_core::UpstreamClusterName,
+        endpoint_id: &lb_net_core::UpstreamEndpointId,
+        protocol: ProtocolHealthClass,
+    ) -> Result<EndpointHealthSnapshot, UpstreamHealthError> {
         self.metrics.passive_success_count.fetch_add(1, Ordering::SeqCst);
-        self.apply_signal(cluster_name, endpoint_id, HealthSignal::PassiveSuccess)
+        self.apply_signal(
+            cluster_name,
+            endpoint_id,
+            HealthSignal::PassiveSuccess { protocol },
+        )
     }
 
     /// Records a passive failure hint.
@@ -414,8 +474,22 @@ impl UpstreamHealthRegistry {
         cluster_name: &lb_net_core::UpstreamClusterName,
         endpoint_id: &lb_net_core::UpstreamEndpointId,
     ) -> Result<EndpointHealthSnapshot, UpstreamHealthError> {
+        self.note_passive_failure_for_protocol(cluster_name, endpoint_id, ProtocolHealthClass::Generic)
+    }
+
+    /// Records a passive failure hint scoped to a protocol class.
+    pub fn note_passive_failure_for_protocol(
+        &self,
+        cluster_name: &lb_net_core::UpstreamClusterName,
+        endpoint_id: &lb_net_core::UpstreamEndpointId,
+        protocol: ProtocolHealthClass,
+    ) -> Result<EndpointHealthSnapshot, UpstreamHealthError> {
         self.metrics.passive_failure_count.fetch_add(1, Ordering::SeqCst);
-        self.apply_signal(cluster_name, endpoint_id, HealthSignal::PassiveFailure)
+        self.apply_signal(
+            cluster_name,
+            endpoint_id,
+            HealthSignal::PassiveFailure { protocol },
+        )
     }
 
     /// Advances ejection and warm-up timers for all tracked endpoints.
@@ -447,6 +521,7 @@ impl UpstreamHealthRegistry {
                     record.nominal_weight,
                     record.warmup_elapsed,
                     self.policy.warmup_duration,
+                    self.policy.slow_start_min_weight_percent,
                 );
                 if record.warmup_elapsed >= self.policy.warmup_duration {
                     record.status = EndpointHealthStatus::Healthy;
@@ -616,37 +691,74 @@ impl UpstreamHealthRegistry {
         let _topology = self.topology.read().unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut records = self.records.write().unwrap_or_else(|poisoned| poisoned.into_inner());
         let key = EndpointKey { cluster: cluster_name.clone(), endpoint_id: endpoint_id.clone() };
-        let record =
-            records.get_mut(&key).ok_or_else(|| UpstreamHealthError::EndpointNotTracked {
-                cluster: cluster_name.clone(),
-                endpoint_id: endpoint_id.clone(),
-            })?;
+        let previous_status;
+        {
+            let record =
+                records.get_mut(&key).ok_or_else(|| UpstreamHealthError::EndpointNotTracked {
+                    cluster: cluster_name.clone(),
+                    endpoint_id: endpoint_id.clone(),
+                })?;
 
-        let previous_status = record.status;
-        match signal {
-            HealthSignal::ActiveFailure => {
-                record.active_failures = record.active_failures.saturating_add(1);
-                record.recovery_successes = 0;
-                transition_on_failures(record, &self.policy);
-            }
-            HealthSignal::PassiveFailure => {
-                record.passive_failures = record.passive_failures.saturating_add(1);
-                record.recovery_successes = 0;
-                transition_on_failures(record, &self.policy);
-            }
-            HealthSignal::ActiveSuccess | HealthSignal::PassiveSuccess => {
-                transition_on_success(record, &self.policy);
+            previous_status = record.status;
+            match signal {
+                HealthSignal::ActiveFailure => {
+                    record.active_failures = record.active_failures.saturating_add(1);
+                    record.recovery_successes = 0;
+                    transition_on_failures(record, &self.policy, false);
+                }
+                HealthSignal::PassiveFailure { protocol } => {
+                    increment_protocol_failure_counter(record, protocol);
+                    refresh_passive_failure_aggregate(record);
+                    push_passive_result(record, false, self.policy.outlier_window_size);
+                    record.recovery_successes = 0;
+                    let force_ejection = passive_failure_triggers_ejection(record, &self.policy);
+                    transition_on_failures(record, &self.policy, force_ejection);
+                }
+                HealthSignal::ActiveSuccess => {
+                    transition_on_success(record, &self.policy);
+                }
+                HealthSignal::PassiveSuccess { protocol } => {
+                    clear_protocol_failure_counter(record, protocol);
+                    refresh_passive_failure_aggregate(record);
+                    push_passive_result(record, true, self.policy.outlier_window_size);
+                    transition_on_success(record, &self.policy);
+                }
             }
         }
 
-        let state_changed = previous_status != record.status;
+        let needs_budget_cap = records
+            .get(&key)
+            .is_some_and(|record| {
+                matches!(record.status, EndpointHealthStatus::Ejected)
+                    && !matches!(previous_status, EndpointHealthStatus::Ejected)
+            })
+            && !can_apply_ejection_budget(&records, cluster_name, endpoint_id, &self.policy);
+
+        if needs_budget_cap {
+            let record = records
+                .get_mut(&key)
+                .expect("tracked endpoint record must remain available during signal application");
+            // Cluster budget is exhausted; cap this endpoint at unhealthy for now.
+            record.status = EndpointHealthStatus::Unhealthy;
+            record.remaining_ejection = Duration::ZERO;
+            record.effective_weight = 0;
+        }
+
+        let current_status = records
+            .get(&key)
+            .expect("tracked endpoint record must remain available during signal application")
+            .status;
+        let state_changed = previous_status != current_status;
         if state_changed {
             self.metrics.state_change_count.fetch_add(1, Ordering::SeqCst);
-            if matches!(record.status, EndpointHealthStatus::Ejected) {
+            if matches!(current_status, EndpointHealthStatus::Ejected) {
                 self.metrics.ejection_count.fetch_add(1, Ordering::SeqCst);
             }
         }
-        let snapshot = record.snapshot(&self.policy);
+        let snapshot = records
+            .get(&key)
+            .expect("tracked endpoint record must remain available during signal application")
+            .snapshot(&self.policy);
         drop(records);
 
         if state_changed {
@@ -681,17 +793,21 @@ impl UpstreamHealthRegistry {
 enum HealthSignal {
     ActiveSuccess,
     ActiveFailure,
-    PassiveSuccess,
-    PassiveFailure,
+    PassiveSuccess { protocol: ProtocolHealthClass },
+    PassiveFailure { protocol: ProtocolHealthClass },
 }
 
-fn transition_on_failures(record: &mut EndpointHealthRecord, policy: &EndpointHealthPolicy) {
+fn transition_on_failures(
+    record: &mut EndpointHealthRecord,
+    policy: &EndpointHealthPolicy,
+    force_ejection: bool,
+) {
     if matches!(record.status, EndpointHealthStatus::Ejected) {
         return;
     }
 
     let combined_failures = record.combined_failures();
-    if combined_failures >= policy.ejection_failure_threshold {
+    if force_ejection || combined_failures >= policy.ejection_failure_threshold {
         record.status = EndpointHealthStatus::Ejected;
         record.remaining_ejection = policy.ejection_duration;
         record.effective_weight = 0;
@@ -719,6 +835,7 @@ fn transition_on_success(record: &mut EndpointHealthRecord, policy: &EndpointHea
     if matches!(record.status, EndpointHealthStatus::Healthy | EndpointHealthStatus::Warming) {
         record.active_failures = 0;
         record.passive_failures = 0;
+        clear_protocol_failure_state(record);
         record.recovery_successes = 0;
         return;
     }
@@ -730,6 +847,7 @@ fn transition_on_success(record: &mut EndpointHealthRecord, policy: &EndpointHea
 
     record.active_failures = 0;
     record.passive_failures = 0;
+    clear_protocol_failure_state(record);
     record.recovery_successes = 0;
     if policy.warmup_duration.is_zero() {
         record.status = EndpointHealthStatus::Healthy;
@@ -741,7 +859,12 @@ fn transition_on_success(record: &mut EndpointHealthRecord, policy: &EndpointHea
     }
 }
 
-fn warmup_weight(nominal_weight: u16, warmup_elapsed: Duration, warmup_duration: Duration) -> u16 {
+fn warmup_weight(
+    nominal_weight: u16,
+    warmup_elapsed: Duration,
+    warmup_duration: Duration,
+    slow_start_min_weight_percent: u8,
+) -> u16 {
     if warmup_duration.is_zero() || warmup_elapsed >= warmup_duration {
         return nominal_weight;
     }
@@ -749,7 +872,116 @@ fn warmup_weight(nominal_weight: u16, warmup_elapsed: Duration, warmup_duration:
     let numerator = nominal_weight as u128 * warmup_elapsed.as_millis();
     let denominator = warmup_duration.as_millis().max(1);
     let progressive_weight = (numerator / denominator) as u16;
-    progressive_weight.max(1).min(nominal_weight)
+    let min_weight = ((u32::from(nominal_weight)
+        .saturating_mul(u32::from(slow_start_min_weight_percent.max(1))))
+        / 100)
+        .max(1) as u16;
+    progressive_weight.max(min_weight).min(nominal_weight)
+}
+
+fn increment_protocol_failure_counter(
+    record: &mut EndpointHealthRecord,
+    protocol: ProtocolHealthClass,
+) {
+    let counter = record.passive_failures_by_protocol.entry(protocol).or_insert(0);
+    *counter = counter.saturating_add(1);
+}
+
+fn clear_protocol_failure_counter(record: &mut EndpointHealthRecord, protocol: ProtocolHealthClass) {
+    record.passive_failures_by_protocol.insert(protocol, 0);
+}
+
+fn refresh_passive_failure_aggregate(record: &mut EndpointHealthRecord) {
+    record.passive_failures = record
+        .passive_failures_by_protocol
+        .values()
+        .copied()
+        .max()
+        .unwrap_or(0);
+}
+
+fn clear_protocol_failure_state(record: &mut EndpointHealthRecord) {
+    for counter in record.passive_failures_by_protocol.values_mut() {
+        *counter = 0;
+    }
+}
+
+fn push_passive_result(record: &mut EndpointHealthRecord, success: bool, window_size: usize) {
+    if window_size == 0 {
+        return;
+    }
+    record.passive_results_window.push_back(success);
+    while record.passive_results_window.len() > window_size {
+        let _ = record.passive_results_window.pop_front();
+    }
+}
+
+fn passive_failure_triggers_ejection(
+    record: &EndpointHealthRecord,
+    policy: &EndpointHealthPolicy,
+) -> bool {
+    let consecutive_trigger = policy.consecutive_passive_failure_ejection_threshold > 0
+        && record.passive_failures >= policy.consecutive_passive_failure_ejection_threshold;
+    if consecutive_trigger {
+        return true;
+    }
+
+    if policy.outlier_window_size == 0
+        || record.passive_results_window.len() < policy.outlier_window_size
+    {
+        return false;
+    }
+
+    let success_count = record
+        .passive_results_window
+        .iter()
+        .filter(|is_success| **is_success)
+        .count() as u32;
+    let observed = record.passive_results_window.len() as u32;
+    success_count.saturating_mul(100)
+        < u32::from(policy.success_rate_ejection_threshold_percent).saturating_mul(observed)
+}
+
+fn can_apply_ejection_budget(
+    records: &BTreeMap<EndpointKey, EndpointHealthRecord>,
+    cluster_name: &lb_net_core::UpstreamClusterName,
+    endpoint_id: &lb_net_core::UpstreamEndpointId,
+    policy: &EndpointHealthPolicy,
+) -> bool {
+    if policy.cluster_ejection_budget_percent >= 100 {
+        return true;
+    }
+    let mut total = 0_u64;
+    let mut ejected = 0_u64;
+    for (key, record) in records {
+        if &key.cluster != cluster_name {
+            continue;
+        }
+        total = total.saturating_add(1);
+        if matches!(record.status, EndpointHealthStatus::Ejected) {
+            ejected = ejected.saturating_add(1);
+        }
+    }
+    if total == 0 {
+        return false;
+    }
+    let allowed = (total.saturating_mul(u64::from(policy.cluster_ejection_budget_percent))
+        .saturating_add(99))
+        / 100;
+    if allowed == 0 {
+        return false;
+    }
+    let this_is_ejected = records
+        .get(&EndpointKey {
+            cluster: cluster_name.clone(),
+            endpoint_id: endpoint_id.clone(),
+        })
+        .is_some_and(|record| matches!(record.status, EndpointHealthStatus::Ejected));
+    if this_is_ejected {
+        ejected <= allowed
+    } else {
+        ejected < allowed
+    }
 }
 
 fn event_for_transition(

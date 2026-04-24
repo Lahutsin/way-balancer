@@ -43,6 +43,8 @@ pub struct Http1ConnectionReport {
     pub metrics: Http1ConnectionMetrics,
     /// Snapshot of route-backend selection metrics when route backend pools are configured.
     pub route_selection_metrics: Option<crate::UpstreamSelectionMetrics>,
+    /// Decision-trace events emitted while processing requests on this connection.
+    pub decision_trace_events: Vec<lb_observability::TelemetryEvent>,
 }
 
 /// Buffered response returned by one-shot HTTP/1 upstream dispatch.
@@ -73,6 +75,8 @@ pub enum Http1ProxyError {
     RequestIo(std::io::Error),
     /// I/O failure while forwarding response bytes downstream.
     ResponseIo(std::io::Error),
+    /// Upstream reported graceful drain and refused a new stream.
+    UpstreamGracefulDrain,
 }
 
 impl fmt::Display for Http1ProxyError {
@@ -101,6 +105,9 @@ impl fmt::Display for Http1ProxyError {
             }
             Self::ResponseIo(source) => {
                 write!(formatter, "HTTP/1.1 downstream write failed: {source}")
+            }
+            Self::UpstreamGracefulDrain => {
+                formatter.write_str("upstream is gracefully draining")
             }
         }
     }

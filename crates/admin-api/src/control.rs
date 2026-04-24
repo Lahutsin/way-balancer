@@ -384,6 +384,73 @@ impl std::fmt::Display for SnapshotLookupError {
 
 impl std::error::Error for SnapshotLookupError {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotImpactSeverity {
+    Low,
+    Medium,
+    High,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotResourceImpactSummary {
+    pub added: u32,
+    pub removed: u32,
+    pub updated: u32,
+}
+
+impl SnapshotResourceImpactSummary {
+    #[must_use]
+    pub const fn total(&self) -> u32 {
+        self.added + self.removed + self.updated
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotImpactAnalysis {
+    pub listeners: SnapshotResourceImpactSummary,
+    pub routes: SnapshotResourceImpactSummary,
+    pub upstream_clusters: SnapshotResourceImpactSummary,
+    pub total_changes: u32,
+    pub severity: SnapshotImpactSeverity,
+    pub reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SnapshotDiffPreview {
+    pub base_version: String,
+    pub base_digest_sha256: String,
+    pub candidate_digest_sha256: String,
+    pub snapshot_diff: WorkspaceSnapshotDiff,
+    pub impact_analysis: SnapshotImpactAnalysis,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SnapshotDiffPreviewError {
+    NoBaselineVersion,
+    Lookup(SnapshotLookupError),
+}
+
+impl std::fmt::Display for SnapshotDiffPreviewError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoBaselineVersion => {
+                write!(formatter, "snapshot diff preview requires at least one published baseline")
+            }
+            Self::Lookup(error) => write!(formatter, "snapshot diff preview failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for SnapshotDiffPreviewError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Lookup(error) => Some(error),
+            Self::NoBaselineVersion => None,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct SystemTimeError(std::time::SystemTimeError);
 
@@ -679,6 +746,32 @@ impl SnapshotControlService {
         self.get_version(version)
     }
 
+    pub fn preview_diff(
+        &self,
+        base_version: Option<&str>,
+        candidate: &WorkspaceSnapshot,
+    ) -> Result<SnapshotDiffPreview, SnapshotDiffPreviewError> {
+        let baseline = match base_version {
+            Some(version) => self.get_version(version).map_err(SnapshotDiffPreviewError::Lookup)?,
+            None => {
+                let latest = self.history.last().ok_or(SnapshotDiffPreviewError::NoBaselineVersion)?;
+                self.records_by_version
+                    .get(latest)
+                    .ok_or(SnapshotDiffPreviewError::NoBaselineVersion)?
+            }
+        };
+
+        let snapshot_diff = baseline.snapshot.diff(candidate);
+        let impact_analysis = analyze_snapshot_impact(&snapshot_diff);
+        Ok(SnapshotDiffPreview {
+            base_version: baseline.version.clone(),
+            base_digest_sha256: baseline.digest_sha256.clone(),
+            candidate_digest_sha256: candidate.metadata().digest_sha256().to_owned(),
+            snapshot_diff,
+            impact_analysis,
+        })
+    }
+
     #[must_use]
     pub fn audit_events(&self) -> &[PublishEvent] {
         &self.audit_events
@@ -861,6 +954,64 @@ fn summarize_snapshot_diff(diff: &WorkspaceSnapshotDiff) -> String {
     parts.join("; ")
 }
 
+fn summarize_change_counts(changes: &[SnapshotResourceChange]) -> SnapshotResourceImpactSummary {
+    let mut added: u32 = 0;
+    let mut removed: u32 = 0;
+    let mut updated: u32 = 0;
+
+    for change in changes {
+        match change.kind {
+            SnapshotChangeKind::Added => added = added.saturating_add(1),
+            SnapshotChangeKind::Removed => removed = removed.saturating_add(1),
+            SnapshotChangeKind::Updated => updated = updated.saturating_add(1),
+        }
+    }
+
+    SnapshotResourceImpactSummary { added, removed, updated }
+}
+
+fn analyze_snapshot_impact(diff: &WorkspaceSnapshotDiff) -> SnapshotImpactAnalysis {
+    let listeners = summarize_change_counts(&diff.listener_changes);
+    let routes = summarize_change_counts(&diff.route_changes);
+    let upstream_clusters = summarize_change_counts(&diff.upstream_cluster_changes);
+    let total_changes = listeners
+        .total()
+        .saturating_add(routes.total())
+        .saturating_add(upstream_clusters.total());
+
+    let mut reasons = Vec::new();
+
+    let has_disruptive_change = listeners.removed > 0
+        || listeners.updated > 0
+        || routes.removed > 0
+        || upstream_clusters.removed > 0;
+    let has_behavior_change = routes.updated > 0 || upstream_clusters.updated > 0 || listeners.added > 0;
+
+    let severity = if has_disruptive_change {
+        reasons.push(String::from(
+            "listener/route/upstream removals or listener updates may disrupt active traffic",
+        ));
+        SnapshotImpactSeverity::High
+    } else if has_behavior_change || total_changes >= 6 {
+        reasons.push(String::from(
+            "routing or upstream behavior changes detected; use staged promotion/canary gates",
+        ));
+        SnapshotImpactSeverity::Medium
+    } else {
+        reasons.push(String::from("limited additive changes; low operational risk"));
+        SnapshotImpactSeverity::Low
+    };
+
+    SnapshotImpactAnalysis {
+        listeners,
+        routes,
+        upstream_clusters,
+        total_changes,
+        severity,
+        reasons,
+    }
+}
+
 fn summarize_resource_changes(kind_label: &str, changes: &[SnapshotResourceChange]) -> String {
     if changes.is_empty() {
         return String::new();
@@ -896,8 +1047,9 @@ mod tests {
 
     use super::{
         InvalidPublishRequest, PublishEventKind, PublishResponseKind, SnapshotBackupBundle,
-        SnapshotControlService, SnapshotLookupError, SnapshotPublicationError,
-        SnapshotPublishRequest, SnapshotRegistryDurableEnvelope,
+        SnapshotControlService, SnapshotDiffPreviewError, SnapshotImpactSeverity,
+        SnapshotLookupError, SnapshotPublicationError, SnapshotPublishRequest,
+        SnapshotRegistryDurableEnvelope,
         SnapshotRegistryRetentionPolicy, SnapshotRegistryStateError, SnapshotRestoreError,
     };
 
@@ -962,24 +1114,80 @@ mod tests {
         });
         config.upstream_clusters.push(lb_config_model::UpstreamClusterConfig {
             name: String::from("payments-stable"),
+            transport: lb_config_model::UpstreamTransportConfig::Http1,
             endpoints: vec![lb_config_model::UpstreamEndpointConfig::foundation(
                 "payments-stable-a",
                 "127.0.0.1:9000".parse()?,
             )],
+            discovery: None,
             traffic_policy: lb_config_model::UpstreamTrafficPolicyConfig::default(),
             policies: lb_config_model::PolicyBindingConfig::default(),
         });
         config.upstream_clusters.push(lb_config_model::UpstreamClusterConfig {
             name: String::from("payments-canary"),
+            transport: lb_config_model::UpstreamTransportConfig::Http1,
             endpoints: vec![lb_config_model::UpstreamEndpointConfig::foundation(
                 "payments-canary-a",
                 "127.0.0.1:9001".parse()?,
             )],
+            discovery: None,
             traffic_policy: lb_config_model::UpstreamTrafficPolicyConfig::default(),
             policies: lb_config_model::PolicyBindingConfig::default(),
         });
         configure_test_trusted_signers(&mut config)?;
         Ok(config.compile_snapshot()?)
+    }
+
+    fn listener_snapshot(
+        bind_address: &str,
+    ) -> Result<lb_config_model::WorkspaceSnapshot, Box<dyn std::error::Error>> {
+        let mut config = WorkspaceConfig::foundation();
+        config.listeners.push(lb_config_model::ListenerResourceConfig {
+            protocol: lb_config_model::ListenerProtocolConfig::Http1,
+            routes: vec![String::from("payments-api")],
+            ..lb_config_model::ListenerResourceConfig::foundation(
+                "public-http",
+                lb_config_model::ListenerClassConfig::Public,
+                8080,
+            )
+        });
+        config.routes.push(lb_config_model::RouteConfig {
+            name: String::from("payments-api"),
+            match_rule: lb_config_model::RouteMatchConfig::PathPrefix {
+                prefix: String::from("/api"),
+                hostnames: vec![String::from("payments.localhost")],
+                methods: Vec::new(),
+                headers: Vec::new(),
+                query_params: Vec::new(),
+                content_types: Vec::new(),
+                grpc_services: Vec::new(),
+                grpc_methods: Vec::new(),
+                source_cidrs: Vec::new(),
+            },
+            upstream_cluster: Some(String::from("payments-stable")),
+            destinations: Vec::new(),
+            policies: lb_config_model::PolicyBindingConfig::default(),
+            upgrade: lb_config_model::UpgradePolicyConfig::default(),
+        });
+        config.upstream_clusters.push(lb_config_model::UpstreamClusterConfig {
+            name: String::from("payments-stable"),
+            transport: lb_config_model::UpstreamTransportConfig::Http1,
+            endpoints: vec![lb_config_model::UpstreamEndpointConfig::foundation(
+                "payments-stable-a",
+                "127.0.0.1:9000".parse()?,
+            )],
+            discovery: None,
+            traffic_policy: lb_config_model::UpstreamTrafficPolicyConfig::default(),
+            policies: lb_config_model::PolicyBindingConfig::default(),
+        });
+        config.listeners[0].bind_address = bind_address.parse()?;
+        configure_test_trusted_signers(&mut config)?;
+        Ok(config.compile_snapshot()?)
+    }
+
+    fn listener_updated_snapshot(
+    ) -> Result<lb_config_model::WorkspaceSnapshot, Box<dyn std::error::Error>> {
+        listener_snapshot("127.0.0.1:18080")
     }
 
     #[test]
@@ -1068,6 +1276,87 @@ mod tests {
         assert!(audit_detail.contains("payments-canary:10"));
         assert!(audit_detail.contains("payments-stable:80"));
         Ok(())
+    }
+
+    #[test]
+    fn preview_diff_uses_latest_baseline_when_version_not_provided(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let stable_snapshot = foundation_snapshot()?;
+        let canary_snapshot = named_snapshot("canary")?;
+        let candidate_snapshot = weighted_route_snapshot(80, 20)?;
+
+        let mut service = SnapshotControlService::new();
+        service.publish_at(
+            SnapshotPublishRequest {
+                version: String::from("stable-v1"),
+                snapshot: stable_snapshot.clone(),
+                artifact_attestation: Some(test_artifact_attestation(&stable_snapshot)?),
+                expected_digest_sha256: Some(stable_snapshot.metadata().digest_sha256().to_owned()),
+                published_by: Some(String::from("operator")),
+                reason: Some(String::from("stable baseline")),
+            },
+            1,
+        )?;
+        service.publish_at(
+            SnapshotPublishRequest {
+                version: String::from("canary-v2"),
+                snapshot: canary_snapshot.clone(),
+                artifact_attestation: Some(test_artifact_attestation(&canary_snapshot)?),
+                expected_digest_sha256: Some(canary_snapshot.metadata().digest_sha256().to_owned()),
+                published_by: Some(String::from("operator")),
+                reason: Some(String::from("promote canary")),
+            },
+            2,
+        )?;
+
+        let preview = service.preview_diff(None, &candidate_snapshot)?;
+        assert_eq!(preview.base_version, "canary-v2");
+        assert_eq!(
+            preview.base_digest_sha256,
+            canary_snapshot.metadata().digest_sha256()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn preview_diff_reports_high_risk_for_listener_updates(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let stable_snapshot = listener_snapshot("127.0.0.1:8080")?;
+        let candidate_snapshot = listener_updated_snapshot()?;
+
+        let mut service = SnapshotControlService::new();
+        service.publish_at(
+            SnapshotPublishRequest {
+                version: String::from("stable-v1"),
+                snapshot: stable_snapshot.clone(),
+                artifact_attestation: Some(test_artifact_attestation(&stable_snapshot)?),
+                expected_digest_sha256: Some(stable_snapshot.metadata().digest_sha256().to_owned()),
+                published_by: Some(String::from("operator")),
+                reason: Some(String::from("stable baseline")),
+            },
+            1,
+        )?;
+
+        let preview = service.preview_diff(Some("stable-v1"), &candidate_snapshot)?;
+        assert_eq!(preview.impact_analysis.severity, SnapshotImpactSeverity::High);
+        assert_eq!(preview.impact_analysis.listeners.updated, 1);
+        assert!(preview
+            .impact_analysis
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("disrupt active traffic")));
+        Ok(())
+    }
+
+    #[test]
+    fn preview_diff_requires_baseline_version() {
+        let candidate_snapshot = foundation_snapshot().expect("snapshot should compile");
+        let service = SnapshotControlService::new();
+
+        let error = service
+            .preview_diff(None, &candidate_snapshot)
+            .expect_err("preview should fail without baseline");
+        assert!(matches!(error, SnapshotDiffPreviewError::NoBaselineVersion));
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 ## Scope
 
-This runbook describes the downstream TLS controls currently supported by `lb-dataplane serve` for `https` and first-phase `http3` listeners.
+This runbook describes the downstream TLS controls currently supported by `lb-dataplane serve` for `https` and `http3` listeners.
 
 ## Supported Listener TLS Policy
 
@@ -41,7 +41,7 @@ Use `sni_certificates` when one HTTPS bind address must terminate certificates f
 
 Duplicate or syntactically invalid SNI names are rejected during config validation.
 
-`http3` support is currently limited to public listeners and downstream QUIC termination. Admin listeners and upstream HTTP/3 proxying are outside the first supported topology.
+`http3` support is currently limited to public listeners and downstream QUIC termination for TLS operations in this runbook. Admin listeners and QUIC passthrough mode remain outside the supported topology documented for `0.1.x`.
 
 ## Session Resumption Guidance
 

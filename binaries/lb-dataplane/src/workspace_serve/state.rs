@@ -115,11 +115,22 @@ struct WorkspaceServeState {
     last_reload_duration_ms: AtomicU64,
     last_successful_reload_duration_ms: AtomicU64,
     last_failed_reload_duration_ms: AtomicU64,
+    reload_drained_listener_count: AtomicU64,
+    reload_completed_drain_count: AtomicU64,
+    reload_drain_timeout_count: AtomicU64,
+    restart_requests: AtomicU64,
+    restart_success_count: AtomicU64,
+    restart_failure_count: AtomicU64,
+    last_restart_duration_ms: AtomicU64,
+    last_successful_restart_duration_ms: AtomicU64,
+    last_failed_restart_duration_ms: AtomicU64,
     reload_health: AtomicUsize,
     admin_audit_sequence: AtomicU64,
     admin_audit_capacity: AtomicUsize,
     last_reload_outcome_code: Mutex<String>,
     last_reload_result: Mutex<String>,
+    last_restart_outcome_code: Mutex<String>,
+    last_restart_result: Mutex<String>,
     recent_admin_audit: Mutex<VecDeque<AdminAuditEvent>>,
     http_cache_scopes: RwLock<BTreeMap<String, HttpCacheScopeRuntime>>,
     control_plane_journal: Mutex<ControlPlaneJournalRuntime>,
@@ -142,11 +153,22 @@ impl WorkspaceServeState {
             last_reload_duration_ms: AtomicU64::new(0),
             last_successful_reload_duration_ms: AtomicU64::new(0),
             last_failed_reload_duration_ms: AtomicU64::new(0),
+            reload_drained_listener_count: AtomicU64::new(0),
+            reload_completed_drain_count: AtomicU64::new(0),
+            reload_drain_timeout_count: AtomicU64::new(0),
+            restart_requests: AtomicU64::new(0),
+            restart_success_count: AtomicU64::new(0),
+            restart_failure_count: AtomicU64::new(0),
+            last_restart_duration_ms: AtomicU64::new(0),
+            last_successful_restart_duration_ms: AtomicU64::new(0),
+            last_failed_restart_duration_ms: AtomicU64::new(0),
             reload_health: AtomicUsize::new(reload_health_index(ReloadHealthState::NotRequested)),
             admin_audit_sequence: AtomicU64::new(1),
             admin_audit_capacity: AtomicUsize::new(ADMIN_AUDIT_DEFAULT_CAPACITY),
             last_reload_outcome_code: Mutex::new(String::from("not_requested")),
             last_reload_result: Mutex::new(String::from("not requested")),
+            last_restart_outcome_code: Mutex::new(String::from("not_requested")),
+            last_restart_result: Mutex::new(String::from("not requested")),
             recent_admin_audit: Mutex::new(VecDeque::new()),
             http_cache_scopes: RwLock::new(BTreeMap::new()),
             control_plane_journal: Mutex::new(ControlPlaneJournalRuntime::new(&config_path)),
@@ -166,6 +188,8 @@ impl WorkspaceServeState {
         let admin_auth_json = supervisor.admin_auth_status().await.to_json();
         let last_reload_outcome_code = self.last_reload_outcome_code.lock().await.clone();
         let last_reload_result = self.last_reload_result.lock().await.clone();
+        let last_restart_outcome_code = self.last_restart_outcome_code.lock().await.clone();
+        let last_restart_result = self.last_restart_result.lock().await.clone();
         let reload_health = self.reload_health();
         let readiness = evaluate_workspace_readiness(&listener_statuses, reload_health);
         let listeners_json =
@@ -199,10 +223,21 @@ impl WorkspaceServeState {
                 "  \"reload_last_duration_ms\": {},\n",
                 "  \"reload_last_success_duration_ms\": {},\n",
                 "  \"reload_last_failure_duration_ms\": {},\n",
+                "  \"reload_drained_listener_count\": {},\n",
+                "  \"reload_completed_drain_count\": {},\n",
+                "  \"reload_drain_timeout_count\": {},\n",
+                "  \"restart_requests\": {},\n",
+                "  \"restart_success_count\": {},\n",
+                "  \"restart_failure_count\": {},\n",
+                "  \"restart_last_duration_ms\": {},\n",
+                "  \"restart_last_success_duration_ms\": {},\n",
+                "  \"restart_last_failure_duration_ms\": {},\n",
                 "  \"reload_health\": \"{}\",\n",
                 "  \"last_reload_outcome_code\": \"{}\",\n",
+                "  \"last_restart_outcome_code\": \"{}\",\n",
                 "  \"admin_audit_events\": {},\n",
                 "  \"last_reload_result\": \"{}\",\n",
+                "  \"last_restart_result\": \"{}\",\n",
                 "  \"admin_auth\": {},\n",
                 "  \"control_plane_journal\": {},\n",
                 "  \"readiness\": {},\n",
@@ -223,10 +258,21 @@ impl WorkspaceServeState {
             self.last_reload_duration_ms.load(Ordering::SeqCst),
             self.last_successful_reload_duration_ms.load(Ordering::SeqCst),
             self.last_failed_reload_duration_ms.load(Ordering::SeqCst),
+            self.reload_drained_listener_count.load(Ordering::SeqCst),
+            self.reload_completed_drain_count.load(Ordering::SeqCst),
+            self.reload_drain_timeout_count.load(Ordering::SeqCst),
+            self.restart_requests.load(Ordering::SeqCst),
+            self.restart_success_count.load(Ordering::SeqCst),
+            self.restart_failure_count.load(Ordering::SeqCst),
+            self.last_restart_duration_ms.load(Ordering::SeqCst),
+            self.last_successful_restart_duration_ms.load(Ordering::SeqCst),
+            self.last_failed_restart_duration_ms.load(Ordering::SeqCst),
             reload_health_name(reload_health),
             crate::escape_json_string(&last_reload_outcome_code),
+            crate::escape_json_string(&last_restart_outcome_code),
             self.recent_admin_audit.lock().await.len(),
             crate::escape_json_string(&last_reload_result),
+            crate::escape_json_string(&last_restart_result),
             admin_auth_json,
             control_plane_journal_json,
             readiness.to_json(),
@@ -255,6 +301,24 @@ impl WorkspaceServeState {
             self.last_successful_reload_duration_ms.store(duration_ms, Ordering::SeqCst);
         } else {
             self.last_failed_reload_duration_ms.store(duration_ms, Ordering::SeqCst);
+        }
+    }
+
+    fn record_reload_drain_outcome(&self, outcome: &ReloadApplyOutcome) {
+        self.reload_drained_listener_count
+            .fetch_add(outcome.drained_listener_count as u64, Ordering::SeqCst);
+        self.reload_completed_drain_count
+            .fetch_add(outcome.completed_drain_count as u64, Ordering::SeqCst);
+        self.reload_drain_timeout_count
+            .fetch_add(outcome.drain_timeout_count as u64, Ordering::SeqCst);
+    }
+
+    fn record_restart_duration(&self, duration_ms: u64, succeeded: bool) {
+        self.last_restart_duration_ms.store(duration_ms, Ordering::SeqCst);
+        if succeeded {
+            self.last_successful_restart_duration_ms.store(duration_ms, Ordering::SeqCst);
+        } else {
+            self.last_failed_restart_duration_ms.store(duration_ms, Ordering::SeqCst);
         }
     }
 

@@ -45,7 +45,21 @@ fn shadow_http2_request_selected(
     mirror_policy: &lb_config_model::TrafficMirrorPolicyConfig,
     request: &Request<RecvStream>,
 ) -> bool {
+    if !mirror_method_allowed(mirror_policy, request.method().as_str()) {
+        return false;
+    }
     fault_injection_http2_action_selected("mirror", mirror_policy.percentage, request)
+}
+
+fn mirror_method_allowed(
+    mirror_policy: &lb_config_model::TrafficMirrorPolicyConfig,
+    method: &str,
+) -> bool {
+    mirror_policy.methods.is_empty()
+        || mirror_policy
+            .methods
+            .iter()
+            .any(|allowed| allowed.eq_ignore_ascii_case(method))
 }
 
 

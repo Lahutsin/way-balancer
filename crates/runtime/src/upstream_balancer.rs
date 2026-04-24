@@ -245,6 +245,10 @@ impl SelectedRouteBackend {
     pub fn note_passive_failure(&self) -> Result<EndpointHealthSnapshot, UpstreamHealthError> {
         self.pool.note_passive_failure(&self.endpoint_id)
     }
+
+    pub fn health_snapshot(&self) -> Result<EndpointHealthSnapshot, UpstreamHealthError> {
+        self.pool.endpoint_health(&self.endpoint_id)
+    }
 }
 
 impl RouteBackendPool {
@@ -302,6 +306,21 @@ impl RouteBackendPool {
         self.select_backend(request_hash).map(SelectedRouteBackend::into_upstream)
     }
 
+    /// Selects an upstream target for a request hash and overrides transport selection.
+    pub fn select_upstream_with_transport(
+        &self,
+        request_hash: u64,
+        transport: lb_net_core::UpstreamTransport,
+    ) -> Result<lb_net_core::UpstreamTarget, UpstreamSelectionError> {
+        self.select_upstream_with_context_and_transport(
+            &SelectionContext {
+                request_hash,
+                ..SelectionContext::default()
+            },
+            transport,
+        )
+    }
+
     /// Selects a route backend for a request hash using the configured policy.
     pub fn select_backend(
         &self,
@@ -319,6 +338,18 @@ impl RouteBackendPool {
         context: &SelectionContext,
     ) -> Result<lb_net_core::UpstreamTarget, UpstreamSelectionError> {
         self.select_backend_with_context(context).map(SelectedRouteBackend::into_upstream)
+    }
+
+    /// Selects an upstream target using full selection context and explicit transport.
+    pub fn select_upstream_with_context_and_transport(
+        &self,
+        context: &SelectionContext,
+        transport: lb_net_core::UpstreamTransport,
+    ) -> Result<lb_net_core::UpstreamTarget, UpstreamSelectionError> {
+        self.select_upstream_with_context(context).map(|mut upstream| {
+            upstream.transport = transport;
+            upstream
+        })
     }
 
     /// Selects a route backend using the configured policy and full selection context.
@@ -410,6 +441,22 @@ impl RouteBackendPool {
             RouteBackendPoolInner::Weighted { destinations, .. } => {
                 note_endpoint_across_weighted_destinations(destinations, endpoint_id, |pool, endpoint_id| {
                     pool.note_passive_failure(endpoint_id)
+                })
+            }
+        }
+    }
+
+    pub fn endpoint_health(
+        &self,
+        endpoint_id: &lb_net_core::UpstreamEndpointId,
+    ) -> Result<EndpointHealthSnapshot, UpstreamHealthError> {
+        match self.inner.as_ref() {
+            RouteBackendPoolInner::Single { cluster_name, registry, .. } => {
+                registry.endpoint_health(cluster_name, endpoint_id)
+            }
+            RouteBackendPoolInner::Weighted { destinations, .. } => {
+                note_endpoint_across_weighted_destinations(destinations, endpoint_id, |pool, endpoint_id| {
+                    pool.endpoint_health(endpoint_id)
                 })
             }
         }
@@ -853,6 +900,11 @@ mod tests {
                 recovery_success_threshold: 1,
                 ejection_duration: Duration::from_secs(30),
                 warmup_duration: Duration::ZERO,
+                consecutive_passive_failure_ejection_threshold: 5,
+                outlier_window_size: 20,
+                success_rate_ejection_threshold_percent: 50,
+                cluster_ejection_budget_percent: 50,
+                slow_start_min_weight_percent: 10,
             },
         )?;
         let canary_endpoint_id = canary.active_probe_targets()?[0].endpoint_id.clone();
@@ -883,6 +935,22 @@ mod tests {
             Err(crate::UpstreamHealthError::EndpointNotTracked { cluster, endpoint_id: id })
                 if cluster.as_str() == "weighted-destinations" && id == endpoint_id
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn select_upstream_with_transport_overrides_default_transport(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let pool = single_endpoint_pool(
+            "stable",
+            "a",
+            9000,
+            crate::EndpointHealthPolicy::default(),
+        )?;
+
+        let selected = pool.select_upstream_with_transport(7, lb_net_core::UpstreamTransport::Http3)?;
+
+        assert_eq!(selected.transport, lb_net_core::UpstreamTransport::Http3);
         Ok(())
     }
 }

@@ -38,6 +38,18 @@ pub struct Http1ProxyConfig {
     /// Optional destination-specific policy runtime keyed by route label then upstream cluster.
     pub route_destination_policies:
         BTreeMap<String, BTreeMap<String, RouteDestinationPolicyRuntime>>,
+    /// Optional destination-specific JWT auth policy keyed by route label then upstream cluster.
+    pub route_destination_jwt_auth_policies:
+        BTreeMap<String, BTreeMap<String, crate::JwtAuthPolicyRuntime>>,
+    /// Optional destination-specific external auth policy keyed by route label then upstream cluster.
+    pub route_destination_external_auth_policies:
+        BTreeMap<String, BTreeMap<String, crate::ExternalAuthPolicyRuntime>>,
+    /// Optional destination-specific authorization policy keyed by route label then upstream cluster.
+    pub route_destination_authorization_policies:
+        BTreeMap<String, BTreeMap<String, crate::AuthorizationPolicyRuntime>>,
+    /// Optional destination-specific upstream identity policy keyed by route label then upstream cluster.
+    pub route_destination_upstream_identity_policies:
+        BTreeMap<String, BTreeMap<String, crate::UpstreamIdentityPolicyRuntime>>,
     /// Effective backend-policy diagnostics keyed by route label.
     pub route_backend_policy_diagnostics:
         BTreeMap<String, Vec<crate::EffectiveRouteDestinationPolicy>>,
@@ -48,6 +60,8 @@ pub struct Http1ProxyConfig {
         BTreeMap<String, Vec<lb_config_model::UpgradeProtocolConfig>>,
     /// Optional upgrade telemetry handle and scope.
     pub upgrade_telemetry: Option<HttpUpgradeTelemetryConfig>,
+    /// Optional request-flow telemetry handle and scope.
+    pub request_telemetry: Option<HttpRequestTelemetryConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,6 +89,12 @@ pub struct HttpCacheTelemetryConfig {
 
 #[derive(Debug, Clone)]
 pub struct HttpUpgradeTelemetryConfig {
+    pub scope: String,
+    pub telemetry: Arc<RuntimeTelemetry>,
+}
+
+#[derive(Debug, Clone)]
+pub struct HttpRequestTelemetryConfig {
     pub scope: String,
     pub telemetry: Arc<RuntimeTelemetry>,
 }
@@ -134,10 +154,15 @@ impl Http1ProxyConfig {
             listener_response_transform: None,
             route_response_transforms: BTreeMap::new(),
             route_destination_policies: BTreeMap::new(),
+            route_destination_jwt_auth_policies: BTreeMap::new(),
+            route_destination_external_auth_policies: BTreeMap::new(),
+            route_destination_authorization_policies: BTreeMap::new(),
+            route_destination_upstream_identity_policies: BTreeMap::new(),
             route_backend_policy_diagnostics: BTreeMap::new(),
             listener_upgrade_protocols: Vec::new(),
             route_upgrade_protocols: BTreeMap::new(),
             upgrade_telemetry: None,
+            request_telemetry: None,
         }
     }
 
@@ -254,6 +279,50 @@ impl Http1ProxyConfig {
     }
 
     #[must_use]
+    pub fn with_route_destination_jwt_auth_policies(
+        mut self,
+        policies: impl IntoIterator<
+            Item = (String, BTreeMap<String, crate::JwtAuthPolicyRuntime>),
+        >,
+    ) -> Self {
+        self.route_destination_jwt_auth_policies = policies.into_iter().collect();
+        self
+    }
+
+    #[must_use]
+    pub fn with_route_destination_external_auth_policies(
+        mut self,
+        policies: impl IntoIterator<
+            Item = (String, BTreeMap<String, crate::ExternalAuthPolicyRuntime>),
+        >,
+    ) -> Self {
+        self.route_destination_external_auth_policies = policies.into_iter().collect();
+        self
+    }
+
+    #[must_use]
+    pub fn with_route_destination_authorization_policies(
+        mut self,
+        policies: impl IntoIterator<
+            Item = (String, BTreeMap<String, crate::AuthorizationPolicyRuntime>),
+        >,
+    ) -> Self {
+        self.route_destination_authorization_policies = policies.into_iter().collect();
+        self
+    }
+
+    #[must_use]
+    pub fn with_route_destination_upstream_identity_policies(
+        mut self,
+        policies: impl IntoIterator<
+            Item = (String, BTreeMap<String, crate::UpstreamIdentityPolicyRuntime>),
+        >,
+    ) -> Self {
+        self.route_destination_upstream_identity_policies = policies.into_iter().collect();
+        self
+    }
+
+    #[must_use]
     pub fn with_upgrade_policies(
         mut self,
         listener_upgrade_protocols: impl IntoIterator<Item = lb_config_model::UpgradeProtocolConfig>,
@@ -273,6 +342,19 @@ impl Http1ProxyConfig {
         telemetry: Arc<RuntimeTelemetry>,
     ) -> Self {
         self.upgrade_telemetry = Some(HttpUpgradeTelemetryConfig {
+            scope: scope.into(),
+            telemetry,
+        });
+        self
+    }
+
+    #[must_use]
+    pub fn with_request_telemetry(
+        mut self,
+        scope: impl Into<String>,
+        telemetry: Arc<RuntimeTelemetry>,
+    ) -> Self {
+        self.request_telemetry = Some(HttpRequestTelemetryConfig {
             scope: scope.into(),
             telemetry,
         });

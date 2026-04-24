@@ -11,6 +11,58 @@ fn route_destination_policy_runtime<'a>(
         .and_then(|policies| policies.get(&route_backend.cluster_name().to_string()))
 }
 
+fn route_destination_jwt_auth_policy_runtime<'a>(
+    config: &'a Http2ProxyConfig,
+    route: Option<&lb_proto_http::RouteMatch>,
+    selected_upstream: &SelectedUpstream,
+) -> Option<&'a crate::JwtAuthPolicyRuntime> {
+    let route = route?;
+    let route_backend = selected_upstream.route_backend.as_ref()?;
+    config
+        .route_destination_jwt_auth_policies
+        .get(&route.label)
+        .and_then(|policies| policies.get(route_backend.cluster_name().as_str()))
+}
+
+fn route_destination_external_auth_policy_runtime<'a>(
+    config: &'a Http2ProxyConfig,
+    route: Option<&lb_proto_http::RouteMatch>,
+    selected_upstream: &SelectedUpstream,
+) -> Option<&'a crate::ExternalAuthPolicyRuntime> {
+    let route = route?;
+    let route_backend = selected_upstream.route_backend.as_ref()?;
+    config
+        .route_destination_external_auth_policies
+        .get(&route.label)
+        .and_then(|policies| policies.get(route_backend.cluster_name().as_str()))
+}
+
+fn route_destination_authorization_policy_runtime<'a>(
+    config: &'a Http2ProxyConfig,
+    route: Option<&lb_proto_http::RouteMatch>,
+    selected_upstream: &SelectedUpstream,
+) -> Option<&'a crate::AuthorizationPolicyRuntime> {
+    let route = route?;
+    let route_backend = selected_upstream.route_backend.as_ref()?;
+    config
+        .route_destination_authorization_policies
+        .get(&route.label)
+        .and_then(|policies| policies.get(route_backend.cluster_name().as_str()))
+}
+
+fn route_destination_upstream_identity_policy_runtime<'a>(
+    config: &'a Http2ProxyConfig,
+    route: Option<&lb_proto_http::RouteMatch>,
+    selected_upstream: &SelectedUpstream,
+) -> Option<&'a crate::UpstreamIdentityPolicyRuntime> {
+    let route = route?;
+    let route_backend = selected_upstream.route_backend.as_ref()?;
+    config
+        .route_destination_upstream_identity_policies
+        .get(&route.label)
+        .and_then(|policies| policies.get(route_backend.cluster_name().as_str()))
+}
+
 
 fn destination_failure_manager(
     destination_policy: Option<&crate::RouteDestinationPolicyRuntime>,
@@ -115,15 +167,70 @@ fn record_destination_success(destination_policy: Option<&crate::RouteDestinatio
 fn allow_destination_retry(
     destination_policy: Option<&crate::RouteDestinationPolicyRuntime>,
     class: crate::UpstreamFailureClass,
+    selected_upstream: Option<&SelectedUpstream>,
+    request_telemetry: Option<&HttpRequestTelemetryConfig>,
+    route: Option<&str>,
+    destination: Option<&str>,
 ) -> bool {
     let Some(policy) = destination_policy else {
         return true;
     };
+    if selected_upstream
+        .and_then(|selected| selected.route_backend.as_ref())
+        .and_then(|route_backend| route_backend.health_snapshot().ok())
+        .is_some_and(|snapshot| matches!(snapshot.status, crate::EndpointHealthStatus::Ejected))
+    {
+        if let Some(request_telemetry) = request_telemetry {
+            let _ = request_telemetry.telemetry.record_decision_trace(
+                &request_telemetry.scope,
+                lb_observability::DecisionTraceKind::Retry,
+                "rejected",
+                route,
+                destination,
+                Some("outlier_ejection"),
+                None,
+                "retry denied because destination endpoint is ejected",
+            );
+        }
+        return false;
+    }
+    if policy.enforce_circuit_breaker
+        && destination_failure_manager(Some(policy))
+            .is_some_and(|manager| !manager.allow_request(failure_policy_now()))
+    {
+        if let Some(request_telemetry) = request_telemetry {
+            let _ = request_telemetry.telemetry.record_decision_trace(
+                &request_telemetry.scope,
+                lb_observability::DecisionTraceKind::Retry,
+                "rejected",
+                route,
+                destination,
+                Some("circuit_breaker"),
+                None,
+                "retry denied because destination circuit breaker is open",
+            );
+        }
+        return false;
+    }
     if !policy.enforce_retry_budget {
         return true;
     }
-    destination_failure_manager(Some(policy))
-        .is_some_and(|manager| manager.allow_retry(failure_policy_now(), class).allowed)
+    let allowed = destination_failure_manager(Some(policy)).is_some_and(|manager| {
+        manager.allow_retry(failure_policy_now(), class).allowed
+    });
+    if let Some(request_telemetry) = request_telemetry {
+        let _ = request_telemetry.telemetry.record_decision_trace(
+            &request_telemetry.scope,
+            lb_observability::DecisionTraceKind::Retry,
+            if allowed { "allowed" } else { "rejected" },
+            route,
+            destination,
+            Some("retry_budget"),
+            None,
+            &format!("retry budget evaluated for {class:?}"),
+        );
+    }
+    allowed
 }
 
 fn classify_http2_response_failure(status: StatusCode) -> Option<crate::UpstreamFailureClass> {
@@ -136,13 +243,34 @@ fn classify_http2_response_failure(status: StatusCode) -> Option<crate::Upstream
     }
 }
 
-fn classify_grpc_response_failure(status: u16) -> Option<crate::UpstreamFailureClass> {
-    match status {
-        4 => Some(crate::UpstreamFailureClass::Timeout),
-        8 => Some(crate::UpstreamFailureClass::Overloaded),
-        13 | 14 => Some(crate::UpstreamFailureClass::Temporary),
-        _ => None,
+fn grpc_failure_policy_for_destination<'a>(
+    config: &'a Http2ProxyConfig,
+    route: Option<&lb_proto_http::RouteMatch>,
+    selected_upstream: &SelectedUpstream,
+) -> Option<&'a crate::GrpcFailurePolicy> {
+    let route = route?;
+    let route_backend = selected_upstream.route_backend.as_ref()?;
+    config
+        .route_destination_grpc_policies
+        .get(&route.label)
+        .and_then(|policies| policies.get(&route_backend.cluster_name().to_string()))
+}
+
+fn classify_grpc_response_failure_with_policy(
+    policy: Option<&crate::GrpcFailurePolicy>,
+    status: u16,
+) -> Option<crate::UpstreamFailureClass> {
+    let policy = policy.cloned().unwrap_or_default();
+    if policy.timeout_statuses.contains(&status) {
+        return Some(crate::UpstreamFailureClass::Timeout);
     }
+    if policy.overloaded_statuses.contains(&status) {
+        return Some(crate::UpstreamFailureClass::Overloaded);
+    }
+    if policy.retryable_statuses.contains(&status) {
+        return Some(crate::UpstreamFailureClass::Temporary);
+    }
+    None
 }
 
 fn grpc_payload_has_at_most_one_message(payload: &[u8]) -> bool {
@@ -167,6 +295,7 @@ fn grpc_payload_has_at_most_one_message(payload: &[u8]) -> bool {
 }
 
 fn enforce_destination_local_limits(
+    config: &Http2ProxyConfig,
     destination_policy: Option<&crate::RouteDestinationPolicyRuntime>,
     route: Option<&lb_proto_http::RouteMatch>,
     selected_upstream: &SelectedUpstream,
@@ -190,7 +319,21 @@ fn enforce_destination_local_limits(
     for limiter in &destination_policy.rate_limiters {
         match limiter.check(now, &context) {
             Ok(decision) if decision.allowed => {}
-            Ok(_) | Err(_) => return Err(StatusCode::TOO_MANY_REQUESTS),
+            Ok(_) | Err(_) => {
+                if let Some(request_telemetry) = config.request_telemetry.as_ref() {
+                    let _ = request_telemetry.telemetry.record_decision_trace(
+                        &request_telemetry.scope,
+                        lb_observability::DecisionTraceKind::PolicyEnforcement,
+                        "rejected",
+                        route.map(|value| value.label.as_str()),
+                        Some(selected_destination_label(selected_upstream)),
+                        Some("rate_limiter"),
+                        None,
+                        "destination rate limiter rejected stream",
+                    );
+                }
+                return Err(StatusCode::TOO_MANY_REQUESTS);
+            }
         }
     }
 
@@ -198,7 +341,21 @@ fn enforce_destination_local_limits(
     for limiter in &destination_policy.concurrency_limiters {
         match limiter.try_acquire(&context) {
             Ok(lease) => leases.push(lease),
-            Err(_) => return Err(StatusCode::SERVICE_UNAVAILABLE),
+            Err(_) => {
+                if let Some(request_telemetry) = config.request_telemetry.as_ref() {
+                    let _ = request_telemetry.telemetry.record_decision_trace(
+                        &request_telemetry.scope,
+                        lb_observability::DecisionTraceKind::PolicyEnforcement,
+                        "rejected",
+                        route.map(|value| value.label.as_str()),
+                        Some(selected_destination_label(selected_upstream)),
+                        Some("concurrency_limiter"),
+                        None,
+                        "destination concurrency limiter rejected stream",
+                    );
+                }
+                return Err(StatusCode::SERVICE_UNAVAILABLE);
+            }
         }
     }
 

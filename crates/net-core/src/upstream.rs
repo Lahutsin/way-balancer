@@ -254,6 +254,25 @@ impl UpstreamCluster {
     pub fn endpoint(&self, endpoint_id: &UpstreamEndpointId) -> Option<&UpstreamEndpoint> {
         self.endpoints.iter().find(|endpoint| endpoint.id() == endpoint_id)
     }
+
+    /// Updates endpoint readiness state in place and returns true when changed.
+    #[must_use]
+    pub fn set_endpoint_state(
+        &mut self,
+        endpoint_id: &UpstreamEndpointId,
+        state: EndpointState,
+    ) -> bool {
+        let Some(index) = self.endpoints.iter().position(|endpoint| endpoint.id() == endpoint_id)
+        else {
+            return false;
+        };
+        if self.endpoints[index].state() == state {
+            return false;
+        }
+        let updated = self.endpoints[index].with_state(state);
+        self.endpoints[index] = updated;
+        true
+    }
 }
 
 /// Validation failures for the upstream model.

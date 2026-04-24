@@ -6,7 +6,12 @@ mod cache;
 mod cache_transport;
 mod control;
 mod fleet;
+mod fleet_gate;
+mod fleet_status;
+mod fleet_staged;
+mod listener_canary;
 mod mtls;
+mod promotion;
 mod rollout;
 
 use serde::{Deserialize, Serialize};
@@ -35,22 +40,48 @@ pub use cache_transport::{
 pub use control::{
     InvalidPublishRequest, PublishConflict, PublishEvent, PublishEventKind, PublishResponse,
     PublishResponseKind, PublishedSnapshotRecord, PublishedSnapshotSummary, SnapshotBackupBundle,
-    SnapshotBackupError, SnapshotControlService, SnapshotLookupError, SnapshotPublicationError,
-    SnapshotPublishRequest, SnapshotRegistryDurableEnvelope, SnapshotRegistryDurableState,
-    SnapshotRegistryMetrics, SnapshotRegistryRetentionPolicy, SnapshotRegistryStateError,
-    SnapshotRestoreError,
+    SnapshotBackupError, SnapshotControlService, SnapshotDiffPreview, SnapshotDiffPreviewError,
+    SnapshotImpactAnalysis, SnapshotImpactSeverity, SnapshotLookupError,
+    SnapshotPublicationError, SnapshotPublishRequest, SnapshotRegistryDurableEnvelope,
+    SnapshotRegistryDurableState, SnapshotRegistryMetrics, SnapshotRegistryRetentionPolicy,
+    SnapshotRegistryStateError, SnapshotResourceImpactSummary, SnapshotRestoreError,
 };
 pub use fleet::{
-    FleetConsistencyMode, FleetConvergenceReport, FleetConvergenceState,
+    FleetAbortReason, FleetAbortRollbackDecision, FleetAutoRollbackMode,
+    FleetAutoRollbackOutcome, FleetConsistencyMode, FleetConvergenceReport,
+    FleetConvergenceState,
     FleetNodeActionOutcome, FleetNodeActionResult, FleetNodeBackend, FleetNodeBackendError,
     FleetNodeConvergenceState, FleetNodeRuntimeStatus, FleetNodeStatus,
-    FleetRecommendedAction, FleetRollbackRequest, FleetRolloutCoordinator,
+    FleetRecommendedAction, FleetRollbackPolicyConfig, FleetRollbackRequest,
+    FleetRolloutCoordinator,
     FleetRolloutError, FleetRolloutHistoryEntry, FleetRolloutMetrics, FleetRolloutRequest,
     FleetRolloutResponse, FleetRolloutStrategy, InvalidFleetRequest,
+};
+pub use fleet_gate::{
+    collect_wave_health_signals, evaluate_wave_gate, evaluate_wave_gate_with_policy,
+    FleetNodeHealthSignal, FleetWaveGateEvaluation, FleetWaveGateVerdict,
+};
+pub use fleet_status::{
+    render_staged_status_surface, FleetNodeStatusSurface, FleetStagedRolloutState,
+    FleetStagedStatusSurface, FleetWaveStatusState, FleetWaveStatusSurface,
+};
+pub use fleet_staged::{
+    plan_staged_rollout, FleetHealthGateMode, FleetHealthGatePolicy,
+    FleetRolloutWaveDefinition, FleetStagedRolloutPlan, FleetStagedRolloutRequest,
+    InvalidFleetStagedRolloutRequest,
+};
+pub use listener_canary::{
+    ListenerCanaryApplyRequest, ListenerCanaryApplyResponse, ListenerCanaryCoordinator,
+    ListenerCanaryError, ListenerCanaryMetrics,
 };
 pub use mtls::{
     PrivilegedChannelAuthenticator, PrivilegedChannelIdentity, PrivilegedChannelMtlsConfig,
     PrivilegedChannelMtlsError, PrivilegedMtlsMetrics,
+};
+pub use promotion::{
+    PromotionApplyRequest, PromotionApplyResponse, PromotionCoordinator, PromotionError,
+    PromotionExecutionStrategy, PromotionMetrics, PromotionPreviewRequest,
+    PromotionPreviewResponse,
 };
 pub use rollout::{
     InvalidRolloutRequest, RollbackRequest, RolloutActionKind, RolloutCoordinator, RolloutError,
@@ -205,10 +236,168 @@ pub struct AdminSupportBundle {
     pub bundle: lb_observability::SupportBundle,
 }
 
+/// Admin-exported decision-trace event payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminDecisionTraceEvent {
+    pub event_code: String,
+    pub scope: String,
+    pub result: String,
+    pub reason: String,
+    pub route: String,
+    pub destination: String,
+    pub policy: String,
+    pub discovery: String,
+    pub detail: String,
+}
+
+/// Machine-readable dashboard summary for route/policy decision diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminDecisionDiagnosticsDashboard {
+    pub total_decision_events: usize,
+    pub by_event_code: Vec<AdminDecisionBreakdownEntry>,
+    pub by_route: Vec<AdminDecisionBreakdownEntry>,
+    pub by_policy: Vec<AdminDecisionBreakdownEntry>,
+    pub by_result: Vec<AdminDecisionBreakdownEntry>,
+    pub failure_reasons: Vec<AdminDecisionBreakdownEntry>,
+    pub recent_failures: Vec<AdminDecisionFailureSample>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminDecisionBreakdownEntry {
+    pub key: String,
+    pub count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminDecisionFailureSample {
+    pub event_code: String,
+    pub route: String,
+    pub policy: String,
+    pub result: String,
+    pub reason: String,
+    pub detail: String,
+}
+
+/// Exports runtime decision-trace events for admin surfaces.
+#[must_use]
+pub fn export_decision_trace_events(
+    diagnostics: &lb_observability::RuntimeDiagnostics,
+) -> Vec<AdminDecisionTraceEvent> {
+    diagnostics
+        .events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.code,
+                lb_observability::TelemetryEventCode::DecisionRouteSelected
+                    | lb_observability::TelemetryEventCode::DecisionRetryEvaluated
+                    | lb_observability::TelemetryEventCode::DecisionHealthEjection
+                    | lb_observability::TelemetryEventCode::DecisionPolicyEnforced
+                    | lb_observability::TelemetryEventCode::DecisionDiscoveryUpdated
+                    | lb_observability::TelemetryEventCode::DecisionRolloutUpdated
+            )
+        })
+        .map(|event| {
+            let label_value = |key: lb_observability::TelemetryLabelKey| {
+                event
+                    .labels
+                    .iter()
+                    .find(|label| label.key == key)
+                    .map_or_else(|| String::from("none"), |label| label.value.clone())
+            };
+
+            AdminDecisionTraceEvent {
+                event_code: event.code.as_str().to_string(),
+                scope: event.scope.clone(),
+                result: label_value(lb_observability::TelemetryLabelKey::Result),
+                reason: label_value(lb_observability::TelemetryLabelKey::Reason),
+                route: label_value(lb_observability::TelemetryLabelKey::Route),
+                destination: label_value(lb_observability::TelemetryLabelKey::Destination),
+                policy: label_value(lb_observability::TelemetryLabelKey::Policy),
+                discovery: label_value(lb_observability::TelemetryLabelKey::Discovery),
+                detail: event.detail.clone(),
+            }
+        })
+        .collect()
+}
+
+/// Renders machine-readable dashboard aggregates for operator-facing decision diagnostics.
+#[must_use]
+pub fn render_decision_diagnostics_dashboard(
+    diagnostics: &lb_observability::RuntimeDiagnostics,
+) -> AdminDecisionDiagnosticsDashboard {
+    let decision_events = export_decision_trace_events(diagnostics);
+
+    let mut by_event_code = std::collections::BTreeMap::<String, u64>::new();
+    let mut by_route = std::collections::BTreeMap::<String, u64>::new();
+    let mut by_policy = std::collections::BTreeMap::<String, u64>::new();
+    let mut by_result = std::collections::BTreeMap::<String, u64>::new();
+    let mut failure_reasons = std::collections::BTreeMap::<String, u64>::new();
+    let mut recent_failures = Vec::new();
+
+    for event in &decision_events {
+        increment_bucket(&mut by_event_code, &event.event_code);
+        increment_bucket(&mut by_route, &event.route);
+        increment_bucket(&mut by_policy, &event.policy);
+        increment_bucket(&mut by_result, &event.result);
+
+        if is_decision_failure(&event.result) {
+            let reason_key = if event.reason == "none" {
+                String::from("unspecified")
+            } else {
+                event.reason.clone()
+            };
+            increment_bucket(&mut failure_reasons, &reason_key);
+            if recent_failures.len() < 10 {
+                recent_failures.push(AdminDecisionFailureSample {
+                    event_code: event.event_code.clone(),
+                    route: event.route.clone(),
+                    policy: event.policy.clone(),
+                    result: event.result.clone(),
+                    reason: reason_key,
+                    detail: event.detail.clone(),
+                });
+            }
+        }
+    }
+
+    AdminDecisionDiagnosticsDashboard {
+        total_decision_events: decision_events.len(),
+        by_event_code: map_to_breakdown(by_event_code),
+        by_route: map_to_breakdown(by_route),
+        by_policy: map_to_breakdown(by_policy),
+        by_result: map_to_breakdown(by_result),
+        failure_reasons: map_to_breakdown(failure_reasons),
+        recent_failures,
+    }
+}
+
+fn increment_bucket(map: &mut std::collections::BTreeMap<String, u64>, key: &str) {
+    let entry = map.entry(key.to_string()).or_insert(0);
+    *entry = entry.saturating_add(1);
+}
+
+fn map_to_breakdown(
+    map: std::collections::BTreeMap<String, u64>,
+) -> Vec<AdminDecisionBreakdownEntry> {
+    map.into_iter()
+        .map(|(key, count)| AdminDecisionBreakdownEntry { key, count })
+        .collect()
+}
+
+fn is_decision_failure(result: &str) -> bool {
+    matches!(
+        result,
+        "failed" | "rejected" | "denied" | "blocked" | "timeout" | "error"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        versioned_admin_target, AdminApiErrorCode, AdminStatus, SupportBundleService,
+        export_decision_trace_events, render_decision_diagnostics_dashboard,
+        versioned_admin_target, AdminApiErrorCode, AdminStatus,
+        SupportBundleService,
         VersionedAdminApiError, VersionedAdminApiErrorEnvelope,
         VersionedAdminApiSuccessEnvelope,
     };
@@ -283,6 +472,145 @@ mod tests {
         assert_eq!(body["status"], "error");
         assert_eq!(body["error"]["code"], "unsupported_api_version");
         assert_eq!(body["error"]["retryable"], false);
+        Ok(())
+    }
+
+    #[test]
+    fn exports_decision_trace_events_from_runtime_diagnostics(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let decision_events = vec![
+            lb_observability::TelemetryEvent::new(
+                lb_observability::TelemetryEventCode::DecisionRouteSelected,
+                "http1-proxy",
+                "route selected",
+                vec![
+                    lb_observability::TelemetryLabel::new(
+                        lb_observability::TelemetryLabelKey::Result,
+                        "selected",
+                    ),
+                    lb_observability::TelemetryLabel::new(
+                        lb_observability::TelemetryLabelKey::Route,
+                        "route.api",
+                    ),
+                    lb_observability::TelemetryLabel::new(
+                        lb_observability::TelemetryLabelKey::Destination,
+                        "cluster.api",
+                    ),
+                ],
+            ),
+            lb_observability::TelemetryEvent::new(
+                lb_observability::TelemetryEventCode::DecisionRetryEvaluated,
+                "http1-proxy",
+                "retry rejected",
+                vec![
+                    lb_observability::TelemetryLabel::new(
+                        lb_observability::TelemetryLabelKey::Result,
+                        "rejected",
+                    ),
+                    lb_observability::TelemetryLabel::new(
+                        lb_observability::TelemetryLabelKey::Route,
+                        "route.api",
+                    ),
+                    lb_observability::TelemetryLabel::new(
+                        lb_observability::TelemetryLabelKey::Destination,
+                        "cluster.api",
+                    ),
+                    lb_observability::TelemetryLabel::new(
+                        lb_observability::TelemetryLabelKey::Policy,
+                        "retry_budget",
+                    ),
+                    lb_observability::TelemetryLabel::new(
+                        lb_observability::TelemetryLabelKey::Reason,
+                        "budget_exhausted",
+                    ),
+                ],
+            ),
+        ];
+
+        let diagnostics = lb_observability::SupportBundleBuilder::new(lb_observability::RedactionEngine)
+            .collect_runtime_diagnostics(
+                lb_observability::DiagnosticsLimits::default(),
+                lb_observability::RuntimeDiagnosticsInput {
+                    metrics_text: Some(String::new()),
+                    logs: Some(Vec::new()),
+                    events: Some(decision_events),
+                    cache_diagnostics_text: Some(String::new()),
+                },
+            );
+
+        let decision_events = export_decision_trace_events(&diagnostics);
+        assert_eq!(decision_events.len(), 2);
+        assert_eq!(decision_events[0].event_code, "decision.route.selected");
+        assert_eq!(decision_events[0].route, "route.api");
+        assert_eq!(decision_events[1].event_code, "decision.retry.evaluated");
+        assert_eq!(decision_events[1].reason, "budget_exhausted");
+        assert_eq!(decision_events[1].policy, "retry_budget");
+        Ok(())
+    }
+
+    #[test]
+    fn renders_machine_readable_decision_dashboard_summary(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let decision_events = vec![
+            lb_observability::TelemetryEvent::new(
+                lb_observability::TelemetryEventCode::DecisionRouteSelected,
+                "http1-proxy",
+                "route selected",
+                vec![
+                    lb_observability::TelemetryLabel::new(
+                        lb_observability::TelemetryLabelKey::Result,
+                        "selected",
+                    ),
+                    lb_observability::TelemetryLabel::new(
+                        lb_observability::TelemetryLabelKey::Route,
+                        "route.api",
+                    ),
+                ],
+            ),
+            lb_observability::TelemetryEvent::new(
+                lb_observability::TelemetryEventCode::DecisionPolicyEnforced,
+                "http1-proxy",
+                "policy rejected",
+                vec![
+                    lb_observability::TelemetryLabel::new(
+                        lb_observability::TelemetryLabelKey::Result,
+                        "rejected",
+                    ),
+                    lb_observability::TelemetryLabel::new(
+                        lb_observability::TelemetryLabelKey::Route,
+                        "route.api",
+                    ),
+                    lb_observability::TelemetryLabel::new(
+                        lb_observability::TelemetryLabelKey::Policy,
+                        "authz",
+                    ),
+                    lb_observability::TelemetryLabel::new(
+                        lb_observability::TelemetryLabelKey::Reason,
+                        "policy_denied",
+                    ),
+                ],
+            ),
+        ];
+
+        let diagnostics = lb_observability::SupportBundleBuilder::new(lb_observability::RedactionEngine)
+            .collect_runtime_diagnostics(
+                lb_observability::DiagnosticsLimits::default(),
+                lb_observability::RuntimeDiagnosticsInput {
+                    metrics_text: Some(String::new()),
+                    logs: Some(Vec::new()),
+                    events: Some(decision_events),
+                    cache_diagnostics_text: Some(String::new()),
+                },
+            );
+
+        let dashboard = render_decision_diagnostics_dashboard(&diagnostics);
+        assert_eq!(dashboard.total_decision_events, 2);
+        assert!(dashboard
+            .failure_reasons
+            .iter()
+            .any(|entry| entry.key == "policy_denied" && entry.count == 1));
+        assert_eq!(dashboard.recent_failures.len(), 1);
+        assert_eq!(dashboard.recent_failures[0].policy, "authz");
         Ok(())
     }
 }

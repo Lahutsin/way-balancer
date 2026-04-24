@@ -15,8 +15,10 @@
 4. Roll out the candidate through `RolloutCoordinator`.
 5. Confirm dataplane activation succeeded and the active digest matches the published digest.
 6. For config-driven listener changes, inspect `GET /status` until each affected listener reports `replacement.state = stable` and no unexpected `draining` entries remain.
-7. Record the upgrade outcome in release evidence.
-8. For active-active fleets, use `FleetRolloutCoordinator` and do not declare success until the fleet convergence report is `converged`.
+7. Confirm bounded drain accounting fields progressed as expected: `reload_drained_listener_count`, `reload_completed_drain_count`, and `reload_drain_timeout_count`.
+8. For explicit warm restart operations (`POST /restart`), validate `last_restart_outcome_code` and restart counters in `GET /status` (`restart_requests`, `restart_success_count`, `restart_failure_count`, `restart_last_duration_ms`).
+9. Record the upgrade outcome in release evidence.
+10. For active-active fleets, use `FleetRolloutCoordinator` and do not declare success until the fleet convergence report is `converged`.
 
 ## Rollback Flow
 
@@ -43,6 +45,17 @@ If snapshot publication state itself must survive process restart before rollout
 - If the fleet report reaches `degraded`, remediate unreachable or failed nodes before continuing wider rollout.
 - If the fleet report reaches `diverged`, prefer a fleet rollback instead of waiting indefinitely.
 
+### Staged Wave Gates and Abort/Rollback Policy
+
+- For staged fleet upgrades, define wave topology with `FleetStagedRolloutPlan` and require full node-to-wave coverage before execution.
+- Treat `required` gate mode as hard policy: if wave gate verdict is `failed` or a `pending` gate reaches timeout, abort the rollout.
+- If automatic rollback policy is enabled, execute fleet rollback immediately after abort and verify `FleetAutoRollbackOutcome.succeeded`.
+- Validate rich staged status after each wave using `FleetStagedStatusSurface`:
+	- wave states (`passed`, `failed`, `aborted`, `blocked`)
+	- node wave mapping and gate signal projection
+	- fleet staged state (`progressing`, `aborted`, `rolled_back`, `converged`, `degraded`)
+- For `best_effort` gates, treat `passed + degraded=true` as success-with-risk and require explicit operator acknowledgment before continuing broad rollout.
+
 ## Validation Hooks
 
 - Upgrade and rollback smoke coverage: `cargo test -p lb-test-support --test upgrade_rollback_smoke`.
@@ -61,6 +74,7 @@ If snapshot publication state itself must survive process restart before rollout
 - Activation failures keep the previous last-known-good snapshot available for rollback.
 - Supported listener replacements stay rollback-safe because failed replacement startup preserves the prior active listener and surfaces the failure in `GET /status` and `GET /audit`.
 - A reload that ends with `reload_applied_overlap_drain_timeout` should be treated as degraded success: the new listener stayed active, but the old draining listener exceeded its configured drain timeout and requires follow-up.
+- Replacement listeners are pre-warmed before old listeners receive drain signals, so bounded drain starts only after new listeners are ready to serve.
 - Any accepted dependency advisory or tooling gap must be recorded in the release evidence package.
 
 ## Release Gate Reference

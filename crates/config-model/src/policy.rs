@@ -3,7 +3,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
     BrownoutFeatureConfig, CircuitBreakerPolicyConfig, LocalConcurrencyLimitPolicyConfig,
     LocalRateLimitPolicyConfig, OverloadResponsePolicyConfig, RetryBudgetPolicyConfig,
-    TimeoutHierarchyConfig,
+    TimeoutHierarchyConfig, AuthorizationPolicyConfig, ExternalAuthPolicyConfig,
+    JwtAuthPolicyConfig, RequestClassificationPolicyConfig, UpstreamIdentityPolicyConfig,
 };
 
 /// Named policy resources referenced by listeners, routes, and upstreams.
@@ -32,6 +33,17 @@ pub struct PolicyResourcesConfig {
     pub traffic_mirrors: Vec<NamedTrafficMirrorPolicyConfig>,
     /// Reusable fault injection policies.
     pub fault_injections: Vec<NamedFaultInjectionPolicyConfig>,
+    /// Reusable JWT auth policies.
+    pub jwt_auth_policies: Vec<NamedJwtAuthPolicyConfig>,
+    /// Reusable external auth policies.
+    pub external_auth_policies: Vec<NamedExternalAuthPolicyConfig>,
+    /// Reusable authorization policies.
+    pub authorization_policies: Vec<NamedAuthorizationPolicyConfig>,
+    /// Reusable upstream identity policies.
+    pub upstream_identity_policies: Vec<NamedUpstreamIdentityPolicyConfig>,
+    /// Reusable request classification policies.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub request_classification_policies: Vec<NamedRequestClassificationPolicyConfig>,
 }
 
 /// Reference set that attaches named policy resources to another resource.
@@ -60,6 +72,17 @@ pub struct PolicyBindingConfig {
     pub traffic_mirror: Option<String>,
     /// Referenced fault injection policy name.
     pub fault_injection: Option<String>,
+    /// Referenced JWT auth policy name.
+    pub jwt_auth_policy: Option<String>,
+    /// Referenced external auth policy name.
+    pub external_auth_policy: Option<String>,
+    /// Referenced request authorization policy name.
+    pub authorization_policy: Option<String>,
+    /// Referenced upstream identity policy name.
+    pub upstream_identity_policy: Option<String>,
+    /// Referenced request classification policy name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_classification_policy: Option<String>,
 }
 
 impl PolicyBindingConfig {
@@ -87,11 +110,18 @@ pub struct TrafficMirrorPolicyConfig {
     pub percentage: u8,
     /// Target upstream cluster that receives mirrored traffic.
     pub target_upstream_cluster: String,
+    /// Optional HTTP method allow-list for mirroring.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub methods: Vec<String>,
 }
 
 impl Default for TrafficMirrorPolicyConfig {
     fn default() -> Self {
-        Self { percentage: 100, target_upstream_cluster: String::new() }
+        Self {
+            percentage: 100,
+            target_upstream_cluster: String::new(),
+            methods: Vec::new(),
+        }
     }
 }
 
@@ -458,6 +488,56 @@ pub struct NamedFaultInjectionPolicyConfig {
     pub spec: FaultInjectionPolicyConfig,
 }
 
+/// Named JWT auth policy resource.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NamedJwtAuthPolicyConfig {
+    /// Stable policy name.
+    pub name: String,
+    /// Policy specification.
+    pub spec: JwtAuthPolicyConfig,
+}
+
+/// Named external auth policy resource.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NamedExternalAuthPolicyConfig {
+    /// Stable policy name.
+    pub name: String,
+    /// Policy specification.
+    pub spec: ExternalAuthPolicyConfig,
+}
+
+/// Named request authorization policy resource.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NamedAuthorizationPolicyConfig {
+    /// Stable policy name.
+    pub name: String,
+    /// Policy specification.
+    pub spec: AuthorizationPolicyConfig,
+}
+
+/// Named upstream identity policy resource.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NamedUpstreamIdentityPolicyConfig {
+    /// Stable policy name.
+    pub name: String,
+    /// Policy specification.
+    pub spec: UpstreamIdentityPolicyConfig,
+}
+
+/// Named request classification policy resource.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NamedRequestClassificationPolicyConfig {
+    /// Stable policy name.
+    pub name: String,
+    /// Policy specification.
+    pub spec: RequestClassificationPolicyConfig,
+}
+
 /// Named brownout feature placeholder for future standalone resource extraction.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -474,12 +554,21 @@ mod tests {
         HeaderMutationConfig, HostileEdgeHandshakeGuardConfig, HostileEdgeProtectionPolicyConfig,
         HostileEdgeSourceQuotaConfig, HttpCachePolicyConfig, NamedHostileEdgeProtectionPolicyConfig,
         NamedHttpCachePolicyConfig, NamedRetryBudgetPolicyConfig, NamedTrafficMirrorPolicyConfig,
-        NamedTransformPolicyConfig, PathRewriteTransformConfig, PolicyBindingConfig,
+        NamedTransformPolicyConfig, NamedAuthorizationPolicyConfig,
+        NamedExternalAuthPolicyConfig, NamedJwtAuthPolicyConfig,
+        NamedRequestClassificationPolicyConfig, NamedUpstreamIdentityPolicyConfig,
+        PathRewriteTransformConfig, PolicyBindingConfig,
         PolicyResourcesConfig, RequestTransformConfig, ResponseTransformConfig,
         TrafficMirrorPolicyConfig, TransformPolicyConfig, FaultInjectionPolicyConfig,
         FaultInjectionDelayConfig, FaultInjectionAbortConfig, NamedFaultInjectionPolicyConfig,
     };
-    use crate::RetryBudgetPolicyConfig;
+    use crate::{
+        AuthorizationPolicyConfig, ExternalAuthPolicyConfig, JwtAuthPolicyConfig,
+        RequestClassificationContextConfig, RequestClassificationPolicyConfig,
+        RequestClassificationSignalWeightsConfig, RequestClassifierSensitivityConfig,
+        RetryBudgetPolicyConfig,
+        UpstreamIdentityPolicyConfig,
+    };
 
     #[test]
     fn policy_resources_and_bindings_are_constructible() {
@@ -529,6 +618,7 @@ mod tests {
                 spec: TrafficMirrorPolicyConfig {
                     percentage: 20,
                     target_upstream_cluster: String::from("payments-shadow"),
+                    methods: Vec::new(),
                 },
             }],
             fault_injections: vec![NamedFaultInjectionPolicyConfig {
@@ -544,6 +634,34 @@ mod tests {
                     }),
                 },
             }],
+            jwt_auth_policies: vec![NamedJwtAuthPolicyConfig {
+                name: String::from("issuer-default"),
+                spec: JwtAuthPolicyConfig::default(),
+            }],
+            external_auth_policies: vec![NamedExternalAuthPolicyConfig {
+                name: String::from("authz-service"),
+                spec: ExternalAuthPolicyConfig::default(),
+            }],
+            authorization_policies: vec![NamedAuthorizationPolicyConfig {
+                name: String::from("rbac-default"),
+                spec: AuthorizationPolicyConfig::default(),
+            }],
+            upstream_identity_policies: vec![NamedUpstreamIdentityPolicyConfig {
+                name: String::from("spiffe-default"),
+                spec: UpstreamIdentityPolicyConfig::default(),
+            }],
+            request_classification_policies: vec![NamedRequestClassificationPolicyConfig {
+                name: String::from("waf-baseline"),
+                spec: RequestClassificationPolicyConfig {
+                    sensitivity: RequestClassifierSensitivityConfig::Medium,
+                    challenge_threshold: 55,
+                    block_threshold: 80,
+                    signal_weights: RequestClassificationSignalWeightsConfig::default(),
+                    context: RequestClassificationContextConfig::default(),
+                    header_scoring: crate::HeaderAnomalyScoringConfig::default(),
+                    body_scoring: crate::BodyInspectionScoringConfig::default(),
+                },
+            }],
             ..PolicyResourcesConfig::default()
         };
         let binding = PolicyBindingConfig {
@@ -553,6 +671,11 @@ mod tests {
             transform_policy: Some(String::from("api-transform")),
             traffic_mirror: Some(String::from("shadow-payments")),
             fault_injection: Some(String::from("canary-chaos")),
+            jwt_auth_policy: Some(String::from("issuer-default")),
+            external_auth_policy: Some(String::from("authz-service")),
+            authorization_policy: Some(String::from("rbac-default")),
+            upstream_identity_policy: Some(String::from("spiffe-default")),
+            request_classification_policy: Some(String::from("waf-baseline")),
             ..PolicyBindingConfig::default()
         };
 
@@ -562,11 +685,21 @@ mod tests {
         assert_eq!(resources.transforms.len(), 1);
         assert_eq!(resources.traffic_mirrors.len(), 1);
         assert_eq!(resources.fault_injections.len(), 1);
+        assert_eq!(resources.jwt_auth_policies.len(), 1);
+        assert_eq!(resources.external_auth_policies.len(), 1);
+        assert_eq!(resources.authorization_policies.len(), 1);
+        assert_eq!(resources.upstream_identity_policies.len(), 1);
+        assert_eq!(resources.request_classification_policies.len(), 1);
         assert_eq!(binding.hostile_edge_protection.as_deref(), Some("edge-default"));
         assert_eq!(binding.retry_budget.as_deref(), Some("standard"));
         assert_eq!(binding.cache_policy.as_deref(), Some("public-cache"));
         assert_eq!(binding.transform_policy.as_deref(), Some("api-transform"));
         assert_eq!(binding.traffic_mirror.as_deref(), Some("shadow-payments"));
         assert_eq!(binding.fault_injection.as_deref(), Some("canary-chaos"));
+        assert_eq!(binding.jwt_auth_policy.as_deref(), Some("issuer-default"));
+        assert_eq!(binding.external_auth_policy.as_deref(), Some("authz-service"));
+        assert_eq!(binding.authorization_policy.as_deref(), Some("rbac-default"));
+        assert_eq!(binding.upstream_identity_policy.as_deref(), Some("spiffe-default"));
+        assert_eq!(binding.request_classification_policy.as_deref(), Some("waf-baseline"));
     }
 }

@@ -8,9 +8,9 @@ pub use controller_pipeline::{
     GatewayControllerPipeline, GatewaySnapshotCandidate, PublishedGatewaySnapshot,
 };
 pub use endpoint_slices::{
-    DiscoveryApiVersion, EndpointAddressType, EndpointSliceApplyError, EndpointSliceConditions,
-    EndpointSliceController, EndpointSliceEndpoint, EndpointSliceResource, EndpointSliceStats,
-    EndpointSliceUpdateOutcome,
+    DiscoveryApiVersion, DiscoverySnapshotBuildError, EndpointAddressType,
+    EndpointSliceApplyError, EndpointSliceConditions, EndpointSliceController,
+    EndpointSliceEndpoint, EndpointSliceResource, EndpointSliceStats, EndpointSliceUpdateOutcome,
 };
 pub use operator::{
     ConditionStatus, InMemoryReconcileBackend, KubernetesOperatorReconciler, OperatorState,
@@ -608,6 +608,7 @@ pub fn translate_gateway_api(
             );
             upstreams.entry(cluster_name.clone()).or_insert_with(|| UpstreamClusterConfig {
                 name: cluster_name.clone(),
+                transport: lb_config_model::UpstreamTransportConfig::Http1,
                 endpoints: service
                     .endpoints
                     .iter()
@@ -615,6 +616,7 @@ pub fn translate_gateway_api(
                         UpstreamEndpointConfig::foundation(endpoint.id.clone(), endpoint.address)
                     })
                     .collect(),
+                discovery: None,
                 traffic_policy: UpstreamTrafficPolicyConfig::default(),
                 policies: PolicyBindingConfig::default(),
             });
@@ -912,7 +914,11 @@ mod tests {
             "        \"cache_policy\": null,\n",
             "        \"transform_policy\": null,\n",
             "        \"traffic_mirror\": null,\n",
-            "        \"fault_injection\": null\n",
+            "        \"fault_injection\": null,\n",
+            "        \"jwt_auth_policy\": null,\n",
+            "        \"external_auth_policy\": null,\n",
+            "        \"authorization_policy\": null,\n",
+            "        \"upstream_identity_policy\": null\n",
             "      }\n",
             "    }\n",
             "  ],\n",
@@ -935,13 +941,18 @@ mod tests {
             "        \"cache_policy\": null,\n",
             "        \"transform_policy\": null,\n",
             "        \"traffic_mirror\": null,\n",
-            "        \"fault_injection\": null\n",
+            "        \"fault_injection\": null,\n",
+            "        \"jwt_auth_policy\": null,\n",
+            "        \"external_auth_policy\": null,\n",
+            "        \"authorization_policy\": null,\n",
+            "        \"upstream_identity_policy\": null\n",
             "      }\n",
             "    }\n",
             "  ],\n",
             "  \"upstream_clusters\": [\n",
             "    {\n",
             "      \"name\": \"edge.payments.8080\",\n",
+            "      \"transport\": \"http1\",\n",
             "      \"endpoints\": [\n",
             "        {\n",
             "          \"id\": \"payments-a\",\n",
@@ -976,7 +987,11 @@ mod tests {
             "        \"cache_policy\": null,\n",
             "        \"transform_policy\": null,\n",
             "        \"traffic_mirror\": null,\n",
-            "        \"fault_injection\": null\n",
+            "        \"fault_injection\": null,\n",
+            "        \"jwt_auth_policy\": null,\n",
+            "        \"external_auth_policy\": null,\n",
+            "        \"authorization_policy\": null,\n",
+            "        \"upstream_identity_policy\": null\n",
             "      }\n",
             "    }\n",
             "  ],\n",
@@ -991,7 +1006,11 @@ mod tests {
             "    \"http_caches\": [],\n",
             "    \"transforms\": [],\n",
             "    \"traffic_mirrors\": [],\n",
-            "    \"fault_injections\": []\n",
+            "    \"fault_injections\": [],\n",
+            "    \"jwt_auth_policies\": [],\n",
+            "    \"external_auth_policies\": [],\n",
+            "    \"authorization_policies\": [],\n",
+            "    \"upstream_identity_policies\": []\n",
             "  }\n",
             "}"
         );

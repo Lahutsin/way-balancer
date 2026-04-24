@@ -60,7 +60,52 @@ struct ReloadAuditPlan {
 
 #[derive(Debug, Clone, Default)]
 struct ReloadApplyOutcome {
+    drained_listener_count: usize,
+    completed_drain_count: usize,
+    drain_timeout_count: usize,
     drain_timed_out_replacements: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct WarmRestartApplyOutcome {
+    restarted_listener_count: usize,
+    completed_drain_count: usize,
+    drain_timeout_count: usize,
+    drain_timed_out_replacements: Vec<String>,
+}
+
+impl WarmRestartApplyOutcome {
+    fn timed_out_during_drain(&self) -> bool {
+        self.drain_timeout_count > 0 || !self.drain_timed_out_replacements.is_empty()
+    }
+}
+
+impl From<ReloadApplyOutcome> for WarmRestartApplyOutcome {
+    fn from(value: ReloadApplyOutcome) -> Self {
+        Self {
+            restarted_listener_count: value.drained_listener_count,
+            completed_drain_count: value.completed_drain_count,
+            drain_timeout_count: value.drain_timeout_count,
+            drain_timed_out_replacements: value.drain_timed_out_replacements,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApplyMode {
+    Reload,
+    WarmRestart,
+}
+
+impl ApplyMode {
+    const fn force_replace_matching(self) -> bool {
+        matches!(self, Self::WarmRestart)
+    }
+
+    const fn force_replace_listener(self, current: &CurrentListenerIdentity) -> bool {
+        self.force_replace_matching()
+            && matches!(current.class, lb_config_model::ListenerClassConfig::Public)
+    }
 }
 
 impl ReloadApplyOutcome {
@@ -79,11 +124,18 @@ impl ReloadApplyOutcome {
     fn generic_success_detail(&self) -> String {
         if self.timed_out_during_drain() {
             format!(
-                "configuration applied; drain timeout expired for: {}",
+                "configuration applied; drained_listeners={} completed_drains={} drain_timeouts={} (timed out replacements: {})",
+                self.drained_listener_count,
+                self.completed_drain_count,
+                self.drain_timeout_count,
                 self.drain_timed_out_replacements.join(", ")
             )
         } else {
-            String::from("configuration applied")
+            format!(
+                "configuration applied; drained_listeners={} completed_drains={} drain_timeouts=0",
+                self.drained_listener_count,
+                self.completed_drain_count
+            )
         }
     }
 }
@@ -106,6 +158,37 @@ impl ReloadAuditPlan {
                 current_identities,
                 candidate_listeners,
             ),
+        }
+    }
+
+    fn from_restart_candidate(
+        current_identities: &BTreeMap<String, CurrentListenerIdentity>,
+        candidate_listeners: &BTreeMap<String, CompiledServeListener>,
+    ) -> Self {
+        let mut supported_replacements = Vec::new();
+        let mut blocked_replacements = Vec::new();
+        for (name, spec) in candidate_listeners {
+            let Some(current) = current_identities.get(name) else {
+                continue;
+            };
+            if !matches!(current.class, lb_config_model::ListenerClassConfig::Public) {
+                continue;
+            }
+            if current.can_stage_replacement(spec) {
+                supported_replacements.push(name.clone());
+            } else {
+                blocked_replacements.push(name.clone());
+            }
+        }
+
+        Self {
+            expected_completion_within_ms: supported_replacements
+                .iter()
+                .filter_map(|listener_name| candidate_listeners.get(listener_name))
+                .map(|listener| listener.drain_timeout().as_millis().try_into().unwrap_or(u64::MAX))
+                .max(),
+            supported_replacements,
+            blocked_replacements,
         }
     }
 
@@ -138,16 +221,25 @@ impl ReloadAuditPlan {
     fn success_detail(&self, outcome: &ReloadApplyOutcome) -> String {
         if outcome.timed_out_during_drain() {
             format!(
-                "configuration applied; replacement stayed active but drain timeout expired for: {}",
-                outcome.drain_timed_out_replacements.join(", ")
+                "configuration applied; replacement stayed active but drain timeout expired for: {} (drained_listeners={} completed_drains={} drain_timeouts={})",
+                outcome.drain_timed_out_replacements.join(", "),
+                outcome.drained_listener_count,
+                outcome.completed_drain_count,
+                outcome.drain_timeout_count,
             )
         } else if !self.supported_replacements.is_empty() {
             format!(
-                "configuration applied; overlap-and-drain replacement completed for: {}",
-                self.supported_replacements.join(", ")
+                "configuration applied; overlap-and-drain replacement completed for: {} (drained_listeners={} completed_drains={} drain_timeouts=0)",
+                self.supported_replacements.join(", "),
+                outcome.drained_listener_count,
+                outcome.completed_drain_count,
             )
         } else {
-            String::from("configuration applied")
+            format!(
+                "configuration applied; drained_listeners={} completed_drains={} drain_timeouts=0",
+                outcome.drained_listener_count,
+                outcome.completed_drain_count
+            )
         }
     }
 
@@ -184,6 +276,79 @@ impl ReloadAuditPlan {
             "reload_failed_rollback_preserved"
         } else {
             "reload_failed_apply"
+        }
+    }
+
+    fn restart_start_detail(&self) -> String {
+        if !self.blocked_replacements.is_empty() {
+            format!(
+                "warm restart started; replacement cannot be staged safely for: {}",
+                self.blocked_replacements.join(", ")
+            )
+        } else if !self.supported_replacements.is_empty() {
+            format!(
+                "warm restart started; overlap-and-drain restart planned for: {}",
+                self.supported_replacements.join(", ")
+            )
+        } else {
+            String::from("warm restart started; no replacement-capable listeners found")
+        }
+    }
+
+    fn restart_start_code(&self) -> &'static str {
+        if !self.blocked_replacements.is_empty() {
+            "restart_started_blocked"
+        } else if !self.supported_replacements.is_empty() {
+            "restart_started_overlap_drain"
+        } else {
+            "restart_started_noop"
+        }
+    }
+
+    fn restart_success_code(&self, outcome: &WarmRestartApplyOutcome) -> &'static str {
+        if outcome.timed_out_during_drain() {
+            "restart_applied_overlap_drain_timeout"
+        } else if outcome.restarted_listener_count > 0 {
+            "restart_applied_overlap_drain"
+        } else {
+            "restart_applied_noop"
+        }
+    }
+
+    fn restart_success_detail(&self, outcome: &WarmRestartApplyOutcome) -> String {
+        if outcome.timed_out_during_drain() {
+            format!(
+                "warm restart applied with drain timeout; restarted_listeners={} completed_drains={} drain_timeouts={} timed_out_listeners={}",
+                outcome.restarted_listener_count,
+                outcome.completed_drain_count,
+                outcome.drain_timeout_count,
+                outcome.drain_timed_out_replacements.join(", ")
+            )
+        } else {
+            format!(
+                "warm restart applied; restarted_listeners={} completed_drains={} drain_timeouts=0",
+                outcome.restarted_listener_count,
+                outcome.completed_drain_count
+            )
+        }
+    }
+
+    fn restart_failure_code(&self) -> &'static str {
+        if !self.blocked_replacements.is_empty() {
+            "restart_failed_blocked"
+        } else {
+            "restart_failed_apply"
+        }
+    }
+
+    fn restart_failure_detail(&self, error: &dyn std::fmt::Display) -> String {
+        if !self.blocked_replacements.is_empty() {
+            format!(
+                "warm restart failed: {error}; replacement cannot be staged for: {}",
+                self.blocked_replacements.join(", ")
+            )
+        } else {
+            format!("warm restart failed: {error}")
         }
     }
 }
@@ -370,6 +535,7 @@ impl ServeSupervisor {
             match &result {
                 Ok(outcome) => {
                     self.shared.state.reload_success_count.fetch_add(1, Ordering::SeqCst);
+                    self.shared.state.record_reload_drain_outcome(outcome);
                     self.shared
                         .state
                         .reload_health
@@ -483,9 +649,87 @@ impl ServeSupervisor {
         Ok(ReloadAuditPlan::from_candidate(&current_identities, &candidate.listeners))
     }
 
+    async fn describe_restart_audit_plan(&self) -> Result<ReloadAuditPlan, DynError> {
+        let current_identities = {
+            let inner = self.shared.inner.lock().await;
+            inner
+                .listeners
+                .iter()
+                .map(|(name, listener)| (name.clone(), listener.current_identity()))
+                .collect::<BTreeMap<_, _>>()
+        };
+        let candidate = compile_workspace_runtime_with_telemetry(
+            &self.shared.config_path,
+            Some(&self.shared.state.telemetry),
+        )?;
+        Ok(ReloadAuditPlan::from_restart_candidate(
+            &current_identities,
+            &candidate.listeners,
+        ))
+    }
+
+    fn warm_restart(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<WarmRestartApplyOutcome, DynError>> + Send + '_>> {
+        Box::pin(async move {
+            let _guard = self.shared.reload_guard.lock().await;
+            self.shared.state.restart_requests.fetch_add(1, Ordering::SeqCst);
+            let started_at = Instant::now();
+
+            let compiled = compile_workspace_runtime_with_telemetry(
+                &self.shared.config_path,
+                Some(&self.shared.state.telemetry),
+            )?;
+            let current_identities = {
+                let inner = self.shared.inner.lock().await;
+                inner
+                    .listeners
+                    .iter()
+                    .map(|(name, listener)| (name.clone(), listener.current_identity()))
+                    .collect::<BTreeMap<_, _>>()
+            };
+            let restart_plan =
+                ReloadAuditPlan::from_restart_candidate(&current_identities, &compiled.listeners);
+            let result = self
+                .apply_compiled_runtime_with_mode(compiled, ApplyMode::WarmRestart)
+                .await
+                .map(WarmRestartApplyOutcome::from);
+            let duration_ms = elapsed_millis_at_least_one(started_at.elapsed());
+            self.shared.state.record_restart_duration(duration_ms, result.is_ok());
+
+            match &result {
+                Ok(outcome) => {
+                    self.shared.state.restart_success_count.fetch_add(1, Ordering::SeqCst);
+                    *self.shared.state.last_restart_outcome_code.lock().await =
+                        String::from(restart_plan.restart_success_code(outcome));
+                    *self.shared.state.last_restart_result.lock().await =
+                        restart_plan.restart_success_detail(outcome);
+                }
+                Err(error) => {
+                    self.shared.state.restart_failure_count.fetch_add(1, Ordering::SeqCst);
+                    *self.shared.state.last_restart_outcome_code.lock().await =
+                        String::from(restart_plan.restart_failure_code());
+                    *self.shared.state.last_restart_result.lock().await =
+                        restart_plan.restart_failure_detail(error);
+                }
+            }
+
+            result
+        })
+    }
+
     async fn apply_compiled_runtime(
         &self,
         compiled: CompiledWorkspaceRuntime,
+    ) -> Result<ReloadApplyOutcome, DynError> {
+        self.apply_compiled_runtime_with_mode(compiled, ApplyMode::Reload)
+            .await
+    }
+
+    async fn apply_compiled_runtime_with_mode(
+        &self,
+        compiled: CompiledWorkspaceRuntime,
+        mode: ApplyMode,
     ) -> Result<ReloadApplyOutcome, DynError> {
         let CompiledWorkspaceRuntime { source_label, snapshot, listeners, http_cache_scopes } =
             compiled;
@@ -513,6 +757,20 @@ impl ServeSupervisor {
         let mut start_specs = Vec::new();
         for (name, spec) in &listeners {
             match current_identities.get(name) {
+                Some(current)
+                    if mode.force_replace_listener(current) && current.can_stage_replacement(spec) =>
+                {
+                    start_specs.push((name.clone(), spec.clone()));
+                }
+                Some(current)
+                    if mode.force_replace_listener(current) && !current.can_stage_replacement(spec) =>
+                {
+                    return Err(format!(
+                        "warm restart cannot stage replacement for listener {name} on {}",
+                        current.local_addr
+                    )
+                    .into());
+                }
                 Some(current) if current.matches_spec(spec) => {}
                 Some(current) if current.can_stage_replacement(spec) => {
                     start_specs.push((name.clone(), spec.clone()));
@@ -552,6 +810,9 @@ impl ServeSupervisor {
                 }
             }
         }
+        for (_, listener) in &started {
+            listener.prewarm().await;
+        }
 
         let mut retired = Vec::new();
         {
@@ -559,7 +820,10 @@ impl ServeSupervisor {
 
             for (name, spec) in &listeners {
                 if let Some(slot) = inner.listeners.get_mut(name) {
-                    if slot.can_update_in_place(spec) {
+                    if (!mode.force_replace_matching()
+                        || matches!(slot.active.class, lb_config_model::ListenerClassConfig::Admin))
+                        && slot.can_update_in_place(spec)
+                    {
                         slot.apply_update(spec).await?;
                     }
                 }
@@ -592,7 +856,16 @@ impl ServeSupervisor {
 
         let mut outcome = ReloadApplyOutcome::default();
         for retired_listener in retired {
+            outcome.drained_listener_count = outcome.drained_listener_count.saturating_add(1);
             let drain_outcome = retired_listener.listener.shutdown().await?;
+            match drain_outcome {
+                ListenerDrainOutcome::Completed => {
+                    outcome.completed_drain_count = outcome.completed_drain_count.saturating_add(1);
+                }
+                ListenerDrainOutcome::TimedOut => {
+                    outcome.drain_timeout_count = outcome.drain_timeout_count.saturating_add(1);
+                }
+            }
             if let Some(slot_name) = retired_listener.slot_name {
                 let mut inner = self.shared.inner.lock().await;
                 if let Some(slot) = inner.listeners.get_mut(&slot_name) {
@@ -714,6 +987,16 @@ impl ServeSupervisor {
 }
 
 impl ManagedServeListener {
+    async fn prewarm(&self) {
+        match &self.kind {
+            ManagedListenerKind::Public { shared_proxy } => {
+                let mut proxy = shared_proxy.write().await;
+                prewarm_proxy_route_backends(&mut proxy);
+            }
+            ManagedListenerKind::Admin { .. } => {}
+        }
+    }
+
     async fn apply_update(&mut self, spec: &CompiledServeListener) -> Result<(), DynError> {
         self.drain_timeout = spec.drain_timeout();
         self.admission_limit.store(spec.max_connections(), Ordering::SeqCst);
@@ -752,6 +1035,24 @@ impl ManagedServeListener {
             probe_task.await.map_err(|error| io::Error::other(error.to_string()))?;
         }
         Ok(outcome)
+    }
+}
+
+fn prewarm_proxy_route_backends(proxy: &mut ManagedProxyConfig) {
+    fn prewarm_route_pools(pools: &BTreeMap<String, lb_runtime::RouteBackendPool>) {
+        for pool in pools.values() {
+            pool.advance_time(ROUTE_BACKEND_WARMUP_DURATION);
+        }
+    }
+
+    match proxy {
+        ManagedProxyConfig::Http1(config) => prewarm_route_pools(&config.route_backend_pools),
+        ManagedProxyConfig::Http2(config) => prewarm_route_pools(&config.route_backend_pools),
+        ManagedProxyConfig::Https(config) => {
+            prewarm_route_pools(&config.http1.route_backend_pools);
+            prewarm_route_pools(&config.http2.route_backend_pools);
+        }
+        ManagedProxyConfig::Http3(config) => prewarm_route_pools(&config.http1.route_backend_pools),
     }
 }
 

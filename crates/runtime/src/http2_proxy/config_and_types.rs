@@ -4,6 +4,12 @@ struct BufferedStreamPayload {
     trailers: Option<http::HeaderMap>,
 }
 
+#[derive(Debug, Clone)]
+pub struct HttpRequestTelemetryConfig {
+    pub scope: String,
+    pub telemetry: Arc<crate::RuntimeTelemetry>,
+}
+
 /// Runtime configuration for a bounded HTTP/2 proxy connection.
 #[derive(Debug, Clone)]
 pub struct Http2ProxyConfig {
@@ -42,9 +48,28 @@ pub struct Http2ProxyConfig {
     /// Optional destination-specific policy runtime keyed by route label then upstream cluster.
     pub route_destination_policies:
         BTreeMap<String, BTreeMap<String, crate::http1_proxy::RouteDestinationPolicyRuntime>>,
+    /// Optional destination-specific JWT auth policy keyed by route label then upstream cluster.
+    pub route_destination_jwt_auth_policies:
+        BTreeMap<String, BTreeMap<String, crate::JwtAuthPolicyRuntime>>,
+    /// Optional destination-specific external auth policy keyed by route label then upstream cluster.
+    pub route_destination_external_auth_policies:
+        BTreeMap<String, BTreeMap<String, crate::ExternalAuthPolicyRuntime>>,
+    /// Optional destination-specific authorization policy keyed by route label then upstream cluster.
+    pub route_destination_authorization_policies:
+        BTreeMap<String, BTreeMap<String, crate::AuthorizationPolicyRuntime>>,
+    /// Optional destination-specific upstream identity policy keyed by route label then upstream cluster.
+    pub route_destination_upstream_identity_policies:
+        BTreeMap<String, BTreeMap<String, crate::UpstreamIdentityPolicyRuntime>>,
     /// Effective backend-policy diagnostics keyed by route label.
     pub route_backend_policy_diagnostics:
         BTreeMap<String, Vec<crate::EffectiveRouteDestinationPolicy>>,
+    /// Optional request-flow telemetry handle and scope.
+    pub request_telemetry: Option<HttpRequestTelemetryConfig>,
+    /// Optional hedging policy for replay-safe retry dispatch.
+    pub request_hedging_policy: Option<crate::RequestHedgingPolicy>,
+    /// Optional gRPC failure classification policy keyed by route then destination.
+    pub route_destination_grpc_policies:
+        BTreeMap<String, BTreeMap<String, crate::GrpcFailurePolicy>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,7 +100,14 @@ impl Http2ProxyConfig {
             listener_response_transform: None,
             route_response_transforms: BTreeMap::new(),
             route_destination_policies: BTreeMap::new(),
+            route_destination_jwt_auth_policies: BTreeMap::new(),
+            route_destination_external_auth_policies: BTreeMap::new(),
+            route_destination_authorization_policies: BTreeMap::new(),
+            route_destination_upstream_identity_policies: BTreeMap::new(),
             route_backend_policy_diagnostics: BTreeMap::new(),
+            request_telemetry: None,
+            request_hedging_policy: None,
+            route_destination_grpc_policies: BTreeMap::new(),
         }
     }
 
@@ -183,6 +215,79 @@ impl Http2ProxyConfig {
         >,
     ) -> Self {
         self.route_destination_policies = policies.into_iter().collect();
+        self
+    }
+
+    #[must_use]
+    pub fn with_route_destination_jwt_auth_policies(
+        mut self,
+        policies: impl IntoIterator<Item = (String, BTreeMap<String, crate::JwtAuthPolicyRuntime>)>,
+    ) -> Self {
+        self.route_destination_jwt_auth_policies = policies.into_iter().collect();
+        self
+    }
+
+    #[must_use]
+    pub fn with_route_destination_external_auth_policies(
+        mut self,
+        policies: impl IntoIterator<
+            Item = (String, BTreeMap<String, crate::ExternalAuthPolicyRuntime>),
+        >,
+    ) -> Self {
+        self.route_destination_external_auth_policies = policies.into_iter().collect();
+        self
+    }
+
+    #[must_use]
+    pub fn with_route_destination_authorization_policies(
+        mut self,
+        policies: impl IntoIterator<
+            Item = (String, BTreeMap<String, crate::AuthorizationPolicyRuntime>),
+        >,
+    ) -> Self {
+        self.route_destination_authorization_policies = policies.into_iter().collect();
+        self
+    }
+
+    #[must_use]
+    pub fn with_route_destination_upstream_identity_policies(
+        mut self,
+        policies: impl IntoIterator<
+            Item = (String, BTreeMap<String, crate::UpstreamIdentityPolicyRuntime>),
+        >,
+    ) -> Self {
+        self.route_destination_upstream_identity_policies = policies.into_iter().collect();
+        self
+    }
+
+    #[must_use]
+    pub fn with_request_telemetry(
+        mut self,
+        scope: impl Into<String>,
+        telemetry: Arc<crate::RuntimeTelemetry>,
+    ) -> Self {
+        self.request_telemetry = Some(HttpRequestTelemetryConfig {
+            scope: scope.into(),
+            telemetry,
+        });
+        self
+    }
+
+    #[must_use]
+    pub fn with_request_hedging_policy(
+        mut self,
+        policy: crate::RequestHedgingPolicy,
+    ) -> Self {
+        self.request_hedging_policy = Some(policy);
+        self
+    }
+
+    #[must_use]
+    pub fn with_route_destination_grpc_policies(
+        mut self,
+        policies: impl IntoIterator<Item = (String, BTreeMap<String, crate::GrpcFailurePolicy>)>,
+    ) -> Self {
+        self.route_destination_grpc_policies = policies.into_iter().collect();
         self
     }
 }
