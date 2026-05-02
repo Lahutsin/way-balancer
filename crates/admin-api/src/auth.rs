@@ -99,6 +99,7 @@ pub enum InvalidAdminCredential {
     EmptyPrincipal,
     PrincipalTooLong,
     EmptySecret,
+    SecretHasSurroundingWhitespace,
     SecretTooLong,
     DuplicateSecret,
 }
@@ -116,6 +117,9 @@ impl std::fmt::Display for InvalidAdminCredential {
                 formatter.write_str("credential principal exceeds max length")
             }
             Self::EmptySecret => formatter.write_str("credential secret must not be empty"),
+            Self::SecretHasSurroundingWhitespace => {
+                formatter.write_str("credential secret must not have leading or trailing whitespace")
+            }
             Self::SecretTooLong => formatter.write_str("credential secret exceeds max length"),
             Self::DuplicateSecret => formatter.write_str("credential secret is duplicated"),
         }
@@ -501,6 +505,9 @@ fn validate_credentials(credentials: &[AdminCredential]) -> Result<(), InvalidAd
         if credential.secret.trim().is_empty() {
             return Err(InvalidAdminCredential::EmptySecret);
         }
+        if credential.secret != credential.secret.trim() {
+            return Err(InvalidAdminCredential::SecretHasSurroundingWhitespace);
+        }
         if credential.secret.len() > MAX_SECRET_LEN {
             return Err(InvalidAdminCredential::SecretTooLong);
         }
@@ -743,12 +750,22 @@ mod tests {
             secret: String::from("secret"),
             role: AdminRole::Viewer,
         }]);
+        let spaced_secret = AdminAuthService::from_credentials(vec![AdminCredential {
+            token_id: String::from("id-2"),
+            principal: String::from("user-2"),
+            secret: String::from("secret-with-space "),
+            role: AdminRole::Viewer,
+        }]);
 
         assert!(matches!(
             duplicate_token,
             Err(super::InvalidAdminCredential::DuplicateTokenId(token)) if token == "dup"
         ));
         assert!(matches!(empty_principal, Err(super::InvalidAdminCredential::EmptyPrincipal)));
+        assert!(matches!(
+            spaced_secret,
+            Err(super::InvalidAdminCredential::SecretHasSurroundingWhitespace)
+        ));
     }
 
     #[test]

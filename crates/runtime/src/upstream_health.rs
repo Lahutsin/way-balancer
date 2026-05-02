@@ -1,13 +1,40 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, RwLock};
+use std::sync::{Mutex, MutexGuard, Once, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Duration;
 
 use crate::upstream_balancer::EndpointSelectionCandidate;
 use crate::{EndpointRegistry, EndpointRegistryError};
 
 const MAX_HEALTH_EVENTS: usize = 64;
+static POISONED_LOCK_LOG_ONCE: Once = Once::new();
+
+fn log_poisoned_lock(lock_name: &str) {
+    POISONED_LOCK_LOG_ONCE.call_once(|| {
+        tracing::error!(lock_name, "upstream health lock poisoned; recovering state");
+    });
+}
+
+fn recover_poisoned_lock<T>(lock_name: &str, poisoned: PoisonError<T>) -> T {
+    log_poisoned_lock(lock_name);
+    poisoned.into_inner()
+}
+
+fn read_lock_or_recover<'a, T>(lock: &'a RwLock<T>, lock_name: &str) -> RwLockReadGuard<'a, T> {
+    lock.read().unwrap_or_else(|poisoned| recover_poisoned_lock(lock_name, poisoned))
+}
+
+fn write_lock_or_recover<'a, T>(
+    lock: &'a RwLock<T>,
+    lock_name: &str,
+) -> RwLockWriteGuard<'a, T> {
+    lock.write().unwrap_or_else(|poisoned| recover_poisoned_lock(lock_name, poisoned))
+}
+
+fn mutex_lock_or_recover<'a, T>(lock: &'a Mutex<T>, lock_name: &str) -> MutexGuard<'a, T> {
+    lock.lock().unwrap_or_else(|poisoned| recover_poisoned_lock(lock_name, poisoned))
+}
 
 /// Configurable thresholds for endpoint health transitions.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -333,11 +360,11 @@ impl UpstreamHealthRegistry {
         &self,
         cluster: lb_net_core::UpstreamCluster,
     ) -> Result<(), UpstreamHealthError> {
-        let _topology = self.topology.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _topology = write_lock_or_recover(&self.topology, "upstream_health.topology");
         let cluster_name = cluster.name().clone();
         let endpoints = cluster.endpoints().to_vec();
         self.registry.insert_cluster(cluster)?;
-        let mut records = self.records.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut records = write_lock_or_recover(&self.records, "upstream_health.records");
         for endpoint in &endpoints {
             let key =
                 EndpointKey { cluster: cluster_name.clone(), endpoint_id: endpoint.id().clone() };
@@ -361,10 +388,10 @@ impl UpstreamHealthRegistry {
         &self,
         cluster_name: &lb_net_core::UpstreamClusterName,
     ) -> Option<lb_net_core::UpstreamCluster> {
-        let _topology = self.topology.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _topology = write_lock_or_recover(&self.topology, "upstream_health.topology");
         let removed = self.registry.remove_cluster(cluster_name);
         if removed.is_some() {
-            let mut records = self.records.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut records = write_lock_or_recover(&self.records, "upstream_health.records");
             records.retain(|key, _| &key.cluster != cluster_name);
         }
         removed
@@ -376,11 +403,11 @@ impl UpstreamHealthRegistry {
         cluster_name: &lb_net_core::UpstreamClusterName,
         endpoint: lb_net_core::UpstreamEndpoint,
     ) -> Result<(), UpstreamHealthError> {
-        let _topology = self.topology.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _topology = write_lock_or_recover(&self.topology, "upstream_health.topology");
         let endpoint_id = endpoint.id().clone();
         let record = EndpointHealthRecord::new(&endpoint, &self.policy);
         self.registry.insert_endpoint(cluster_name, endpoint)?;
-        let mut records = self.records.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut records = write_lock_or_recover(&self.records, "upstream_health.records");
         records.insert(
             EndpointKey { cluster: cluster_name.clone(), endpoint_id: endpoint_id.clone() },
             record,
@@ -402,9 +429,9 @@ impl UpstreamHealthRegistry {
         cluster_name: &lb_net_core::UpstreamClusterName,
         endpoint_id: &lb_net_core::UpstreamEndpointId,
     ) -> Result<lb_net_core::UpstreamEndpoint, UpstreamHealthError> {
-        let _topology = self.topology.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _topology = write_lock_or_recover(&self.topology, "upstream_health.topology");
         let endpoint = self.registry.remove_endpoint(cluster_name, endpoint_id)?;
-        let mut records = self.records.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut records = write_lock_or_recover(&self.records, "upstream_health.records");
         let _ = records.remove(&EndpointKey {
             cluster: cluster_name.clone(),
             endpoint_id: endpoint_id.clone(),
@@ -419,7 +446,7 @@ impl UpstreamHealthRegistry {
         endpoint_id: &lb_net_core::UpstreamEndpointId,
         state: lb_net_core::EndpointState,
     ) -> Result<(), UpstreamHealthError> {
-        let _topology = self.topology.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _topology = write_lock_or_recover(&self.topology, "upstream_health.topology");
         self.registry.set_endpoint_state(cluster_name, endpoint_id, state)?;
         Ok(())
     }
@@ -501,7 +528,7 @@ impl UpstreamHealthRegistry {
         let mut state_changes = 0_u64;
         let mut ejection_expirations = Vec::new();
         let mut warmup_completions = Vec::new();
-        let mut records = self.records.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut records = write_lock_or_recover(&self.records, "upstream_health.records");
         for (key, record) in records.iter_mut() {
             if matches!(record.status, EndpointHealthStatus::Ejected) {
                 if elapsed >= record.remaining_ejection {
@@ -559,7 +586,7 @@ impl UpstreamHealthRegistry {
         &self,
         cluster_name: &lb_net_core::UpstreamClusterName,
     ) -> Result<lb_net_core::UpstreamClusterState, UpstreamHealthError> {
-        let _topology = self.topology.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _topology = read_lock_or_recover(&self.topology, "upstream_health.topology");
         let cluster = self.registry.cluster(cluster_name).ok_or_else(|| {
             UpstreamHealthError::Registry(EndpointRegistryError::ClusterNotFound(
                 cluster_name.clone(),
@@ -570,7 +597,7 @@ impl UpstreamHealthRegistry {
             return Ok(lb_net_core::UpstreamClusterState::Empty);
         }
 
-        let records = self.records.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let records = read_lock_or_recover(&self.records, "upstream_health.records");
         let mut ready_endpoints = 0_usize;
         for endpoint in cluster.endpoints() {
             let key =
@@ -597,7 +624,7 @@ impl UpstreamHealthRegistry {
         cluster_name: &lb_net_core::UpstreamClusterName,
         endpoint_id: &lb_net_core::UpstreamEndpointId,
     ) -> Result<EndpointHealthSnapshot, UpstreamHealthError> {
-        let _topology = self.topology.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _topology = read_lock_or_recover(&self.topology, "upstream_health.topology");
         let cluster = self.registry.cluster(cluster_name).ok_or_else(|| {
             UpstreamHealthError::Registry(EndpointRegistryError::ClusterNotFound(
                 cluster_name.clone(),
@@ -609,7 +636,7 @@ impl UpstreamHealthRegistry {
                 endpoint_id: endpoint_id.clone(),
             });
         }
-        let records = self.records.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let records = read_lock_or_recover(&self.records, "upstream_health.records");
         let record = records
             .get(&EndpointKey { cluster: cluster_name.clone(), endpoint_id: endpoint_id.clone() })
             .ok_or_else(|| UpstreamHealthError::InconsistentState {
@@ -625,13 +652,13 @@ impl UpstreamHealthRegistry {
         cluster_name: &lb_net_core::UpstreamClusterName,
         include_unhealthy: bool,
     ) -> Result<Vec<EndpointSelectionCandidate>, UpstreamHealthError> {
-        let _topology = self.topology.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _topology = read_lock_or_recover(&self.topology, "upstream_health.topology");
         let cluster = self.registry.cluster(cluster_name).ok_or_else(|| {
             UpstreamHealthError::Registry(EndpointRegistryError::ClusterNotFound(
                 cluster_name.clone(),
             ))
         })?;
-        let records = self.records.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let records = read_lock_or_recover(&self.records, "upstream_health.records");
         let mut candidates = Vec::new();
 
         for endpoint in cluster.endpoints() {
@@ -667,19 +694,14 @@ impl UpstreamHealthRegistry {
     /// Returns the current health metrics snapshot.
     #[must_use]
     pub fn metrics(&self) -> UpstreamHealthMetrics {
-        let records = self.records.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let records = read_lock_or_recover(&self.records, "upstream_health.records");
         self.metrics.snapshot(&records)
     }
 
     /// Returns recent bounded health events.
     #[must_use]
     pub fn recent_events(&self) -> Vec<lb_observability::UpstreamHealthEvent> {
-        self.events
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .iter()
-            .cloned()
-            .collect()
+        mutex_lock_or_recover(&self.events, "upstream_health.events").iter().cloned().collect()
     }
 
     fn apply_signal(
@@ -688,8 +710,8 @@ impl UpstreamHealthRegistry {
         endpoint_id: &lb_net_core::UpstreamEndpointId,
         signal: HealthSignal,
     ) -> Result<EndpointHealthSnapshot, UpstreamHealthError> {
-        let _topology = self.topology.read().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut records = self.records.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _topology = read_lock_or_recover(&self.topology, "upstream_health.topology");
+        let mut records = write_lock_or_recover(&self.records, "upstream_health.records");
         let key = EndpointKey { cluster: cluster_name.clone(), endpoint_id: endpoint_id.clone() };
         let previous_status;
         {
@@ -785,7 +807,7 @@ impl UpstreamHealthRegistry {
         endpoint_id: &lb_net_core::UpstreamEndpointId,
         detail: impl Into<String>,
     ) {
-        let mut events = self.events.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut events = mutex_lock_or_recover(&self.events, "upstream_health.events");
         if events.len() == MAX_HEALTH_EVENTS {
             let _ = events.pop_front();
         }

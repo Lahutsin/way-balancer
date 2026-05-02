@@ -67,6 +67,8 @@ pub struct HttpCachePeerConfig {
     pub actor: String,
     pub secret_env: String,
     pub tls_ca_cert_env: Option<String>,
+    pub tls_server_name: Option<String>,
+    pub tls_cert_pin_sha256_env: Option<String>,
     pub invalidation_path: String,
     pub connect_timeout: Duration,
     pub response_timeout: Duration,
@@ -86,15 +88,32 @@ impl HttpCachePeerConfig {
             actor: actor.into(),
             secret_env: secret_env.into(),
             tls_ca_cert_env: None,
+            tls_server_name: None,
+            tls_cert_pin_sha256_env: None,
             invalidation_path: String::from(DEFAULT_INVALIDATION_PATH),
-            connect_timeout: Duration::from_millis(500),
-            response_timeout: Duration::from_millis(1000),
+            connect_timeout: Duration::from_secs(2),
+            response_timeout: Duration::from_secs(5),
         }
     }
 
     #[must_use]
     pub fn with_tls_ca_cert_env(mut self, tls_ca_cert_env: impl Into<String>) -> Self {
         self.tls_ca_cert_env = Some(tls_ca_cert_env.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_tls_server_name(mut self, tls_server_name: impl Into<String>) -> Self {
+        self.tls_server_name = Some(tls_server_name.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_tls_cert_pin_sha256_env(
+        mut self,
+        tls_cert_pin_sha256_env: impl Into<String>,
+    ) -> Self {
+        self.tls_cert_pin_sha256_env = Some(tls_cert_pin_sha256_env.into());
         self
     }
 
@@ -141,6 +160,28 @@ impl HttpCachePeerConfig {
         if self.tls_ca_cert_env.as_deref().is_some_and(|value| value.trim().is_empty()) {
             return Err(InvalidHttpCachePeerConfig::EmptyTlsCaCertEnv);
         }
+        if matches!(parsed_origin.scheme, PeerOriginScheme::Https)
+            && self
+                .tls_server_name
+                .as_deref()
+                .is_some_and(|value| value.trim().is_empty())
+        {
+            return Err(InvalidHttpCachePeerConfig::EmptyTlsServerName);
+        }
+        if matches!(parsed_origin.scheme, PeerOriginScheme::Https)
+            && self.tls_server_name.as_deref().is_some_and(|value| {
+                ServerName::try_from(value.trim()).is_err()
+            })
+        {
+            return Err(InvalidHttpCachePeerConfig::InvalidTlsServerName);
+        }
+        if self
+            .tls_cert_pin_sha256_env
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            return Err(InvalidHttpCachePeerConfig::EmptyTlsCertPinSha256Env);
+        }
         if self.actor.contains(['\r', '\n', '\0'])
             || self.invalidation_path.contains(['\r', '\n', '\0'])
         {
@@ -183,6 +224,9 @@ pub enum InvalidHttpCachePeerConfig {
     EmptySecretEnv,
     MissingTlsCaCertEnv,
     EmptyTlsCaCertEnv,
+    EmptyTlsServerName,
+    InvalidTlsServerName,
+    EmptyTlsCertPinSha256Env,
     EmptyInvalidationPath,
     InvalidInvalidationPath,
     ZeroConnectTimeout,
@@ -212,6 +256,13 @@ impl fmt::Display for InvalidHttpCachePeerConfig {
             ),
             Self::EmptyTlsCaCertEnv => formatter.write_str(
                 "cache peer tls_ca_cert_env must not be empty when configured",
+            ),
+            Self::EmptyTlsServerName => formatter
+                .write_str("cache peer tls_server_name must not be empty when configured"),
+            Self::InvalidTlsServerName => formatter
+                .write_str("cache peer tls_server_name must be a valid DNS name or IP address"),
+            Self::EmptyTlsCertPinSha256Env => formatter.write_str(
+                "cache peer tls_cert_pin_sha256_env must not be empty when configured",
             ),
             Self::EmptyInvalidationPath => {
                 formatter.write_str("cache peer invalidation path must not be empty")
@@ -536,7 +587,7 @@ fn publish_to_https_peer(
 
     let client_config =
         ClientConfig::builder().with_root_certificates(root_store).with_no_client_auth();
-    let server_name = ServerName::IpAddress(origin.socket_addr.ip().into());
+    let server_name = resolve_tls_server_name(peer, origin)?;
 
     let stream = TcpStream::connect_timeout(&origin.socket_addr, peer.connect_timeout)
         .map_err(|error| format!("connect {}: {error}", peer.node_id))?;
@@ -553,9 +604,61 @@ fn publish_to_https_peer(
     tls_stream
         .write_all(request_bytes)
         .map_err(|error| format!("write https request {}: {error}", peer.node_id))?;
+    verify_tls_peer_pin(peer, &tls_stream.conn)?;
 
     let response = read_peer_response(&mut tls_stream, &peer.node_id)?;
     parse_peer_response(&response).map_err(|error| format!("{} response: {error}", peer.node_id))
+}
+
+fn resolve_tls_server_name(
+    peer: &HttpCachePeerConfig,
+    origin: &ParsedPeerOrigin,
+) -> Result<ServerName<'static>, String> {
+    if let Some(server_name) = peer.tls_server_name.as_deref() {
+        return ServerName::try_from(server_name.trim())
+            .map(|parsed| parsed.to_owned())
+            .map_err(|error| {
+                format!(
+                    "invalid tls_server_name for peer {}: {error}",
+                    peer.node_id
+                )
+            });
+    }
+    Ok(ServerName::IpAddress(origin.socket_addr.ip().into()))
+}
+
+fn verify_tls_peer_pin(peer: &HttpCachePeerConfig, connection: &ClientConnection) -> Result<(), String> {
+    let Some(pin_env) = peer.tls_cert_pin_sha256_env.as_deref() else {
+        return Ok(());
+    };
+    let expected_pin = std::env::var(pin_env)
+        .map_err(|_| format!("tls cert pin env {} is not configured", pin_env))?;
+    let expected_pin = decode_sha256_pin_hex(expected_pin.trim())
+        .map_err(|error| format!("invalid tls cert pin in {pin_env}: {error}"))?;
+    let peer_certs = connection
+        .peer_certificates()
+        .ok_or_else(|| format!("missing peer certificates for {}", peer.node_id))?;
+    let leaf_cert = peer_certs
+        .first()
+        .ok_or_else(|| format!("missing leaf certificate for {}", peer.node_id))?;
+    let digest = Sha256::digest(leaf_cert.as_ref());
+    if digest.as_slice() != expected_pin.as_slice() {
+        return Err(format!("tls certificate pin mismatch for {}", peer.node_id));
+    }
+    Ok(())
+}
+
+fn decode_sha256_pin_hex(pin_hex: &str) -> Result<[u8; 32], String> {
+    if pin_hex.len() != 64 {
+        return Err(String::from("expected 64 hex characters"));
+    }
+    let mut decoded = [0_u8; 32];
+    for (index, pair) in pin_hex.as_bytes().chunks_exact(2).enumerate() {
+        let hex_pair = std::str::from_utf8(pair).map_err(|_| String::from("hex must be UTF-8"))?;
+        decoded[index] =
+            u8::from_str_radix(hex_pair, 16).map_err(|_| String::from("hex contains invalid digit"))?;
+    }
+    Ok(decoded)
 }
 
 fn read_peer_response(stream: &mut impl Read, node_id: &str) -> Result<Vec<u8>, String> {
@@ -881,5 +984,43 @@ mod tests {
         )]);
 
         assert!(matches!(result, Err(InvalidHttpCachePeerConfig::InvalidOrigin)));
+    }
+
+    #[test]
+    fn peer_config_rejects_invalid_tls_server_name() {
+        let result = HttpCachePeerTransport::new([
+            HttpCachePeerConfig::new(
+                "node-b",
+                "https://127.0.0.1:8443",
+                "peer-a",
+                "LB_CACHE_TEST_SECRET",
+            )
+            .with_tls_ca_cert_env("LB_CACHE_TEST_CA")
+            .with_tls_server_name("bad name"),
+        ]);
+
+        assert!(matches!(
+            result,
+            Err(InvalidHttpCachePeerConfig::InvalidTlsServerName)
+        ));
+    }
+
+    #[test]
+    fn peer_config_rejects_empty_tls_cert_pin_env() {
+        let result = HttpCachePeerTransport::new([
+            HttpCachePeerConfig::new(
+                "node-b",
+                "https://127.0.0.1:8443",
+                "peer-a",
+                "LB_CACHE_TEST_SECRET",
+            )
+            .with_tls_ca_cert_env("LB_CACHE_TEST_CA")
+            .with_tls_cert_pin_sha256_env("   "),
+        ]);
+
+        assert!(matches!(
+            result,
+            Err(InvalidHttpCachePeerConfig::EmptyTlsCertPinSha256Env)
+        ));
     }
 }
