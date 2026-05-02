@@ -128,10 +128,11 @@ impl HttpCachePeerConfig {
         }
         let parsed_origin = parse_peer_origin(&self.origin)
             .map_err(|_| InvalidHttpCachePeerConfig::InvalidOrigin)?;
-        if matches!(parsed_origin.scheme, PeerOriginScheme::Http)
-            && !parsed_origin.socket_addr.ip().is_loopback()
-        {
-            return Err(InvalidHttpCachePeerConfig::InsecureHttpOrigin);
+        if !parsed_origin.socket_addr.ip().is_loopback() {
+            return Err(match parsed_origin.scheme {
+                PeerOriginScheme::Http => InvalidHttpCachePeerConfig::InsecureHttpOrigin,
+                PeerOriginScheme::Https => InvalidHttpCachePeerConfig::InsecureHttpsOrigin,
+            });
         }
         if matches!(parsed_origin.scheme, PeerOriginScheme::Https) && self.tls_ca_cert_env.is_none()
         {
@@ -140,7 +141,8 @@ impl HttpCachePeerConfig {
         if self.tls_ca_cert_env.as_deref().is_some_and(|value| value.trim().is_empty()) {
             return Err(InvalidHttpCachePeerConfig::EmptyTlsCaCertEnv);
         }
-        if self.actor.trim().contains(['\r', '\n']) || self.invalidation_path.contains(['\r', '\n'])
+        if self.actor.contains(['\r', '\n', '\0'])
+            || self.invalidation_path.contains(['\r', '\n', '\0'])
         {
             return Err(InvalidHttpCachePeerConfig::InvalidOrigin);
         }
@@ -176,6 +178,7 @@ pub enum InvalidHttpCachePeerConfig {
     EmptyOrigin,
     InvalidOrigin,
     InsecureHttpOrigin,
+    InsecureHttpsOrigin,
     EmptyActor,
     EmptySecretEnv,
     MissingTlsCaCertEnv,
@@ -200,6 +203,8 @@ impl fmt::Display for InvalidHttpCachePeerConfig {
             Self::InsecureHttpOrigin => formatter.write_str(
                 "cache peer http origins must target loopback; use https:// for remote peers",
             ),
+            Self::InsecureHttpsOrigin => formatter
+                .write_str("cache peer https origins must target loopback"),
             Self::EmptyActor => formatter.write_str("cache peer actor must not be empty"),
             Self::EmptySecretEnv => formatter.write_str("cache peer secret_env must not be empty"),
             Self::MissingTlsCaCertEnv => formatter.write_str(
@@ -846,5 +851,35 @@ mod tests {
         )]);
 
         assert!(matches!(result, Err(InvalidHttpCachePeerConfig::MissingTlsCaCertEnv)));
+    }
+
+    #[test]
+    fn peer_config_rejects_remote_https_origin_even_with_tls_ca() {
+        let result = HttpCachePeerTransport::new([
+            HttpCachePeerConfig::new(
+                "node-b",
+                "https://198.51.100.10:8443",
+                "peer-a",
+                "LB_CACHE_TEST_SECRET",
+            )
+            .with_tls_ca_cert_env("LB_CACHE_TEST_CA"),
+        ]);
+
+        assert!(matches!(
+            result,
+            Err(InvalidHttpCachePeerConfig::InsecureHttpsOrigin)
+        ));
+    }
+
+    #[test]
+    fn peer_config_rejects_actor_with_crlf_suffix() {
+        let result = HttpCachePeerTransport::new([HttpCachePeerConfig::new(
+            "node-b",
+            "http://127.0.0.1:8443",
+            "peer-a\r\n",
+            "LB_CACHE_TEST_SECRET",
+        )]);
+
+        assert!(matches!(result, Err(InvalidHttpCachePeerConfig::InvalidOrigin)));
     }
 }

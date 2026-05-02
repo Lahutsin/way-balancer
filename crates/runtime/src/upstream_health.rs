@@ -737,7 +737,10 @@ impl UpstreamHealthRegistry {
         if needs_budget_cap {
             let record = records
                 .get_mut(&key)
-                .expect("tracked endpoint record must remain available during signal application");
+                .ok_or_else(|| UpstreamHealthError::InconsistentState {
+                    cluster: cluster_name.clone(),
+                    endpoint_id: endpoint_id.clone(),
+                })?;
             // Cluster budget is exhausted; cap this endpoint at unhealthy for now.
             record.status = EndpointHealthStatus::Unhealthy;
             record.remaining_ejection = Duration::ZERO;
@@ -746,7 +749,10 @@ impl UpstreamHealthRegistry {
 
         let current_status = records
             .get(&key)
-            .expect("tracked endpoint record must remain available during signal application")
+            .ok_or_else(|| UpstreamHealthError::InconsistentState {
+                cluster: cluster_name.clone(),
+                endpoint_id: endpoint_id.clone(),
+            })?
             .status;
         let state_changed = previous_status != current_status;
         if state_changed {
@@ -757,7 +763,10 @@ impl UpstreamHealthRegistry {
         }
         let snapshot = records
             .get(&key)
-            .expect("tracked endpoint record must remain available during signal application")
+            .ok_or_else(|| UpstreamHealthError::InconsistentState {
+                cluster: cluster_name.clone(),
+                endpoint_id: endpoint_id.clone(),
+            })?
             .snapshot(&self.policy);
         drop(records);
 
@@ -1064,6 +1073,32 @@ mod tests {
         assert!(matches!(
             registry.selection_candidates(&cluster_name, false),
             Err(UpstreamHealthError::InconsistentState { cluster, endpoint_id: id })
+                if cluster == cluster_name && id == endpoint_id
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn apply_signal_reports_missing_record_as_error(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let registry = UpstreamHealthRegistry::new(EndpointHealthPolicy::default());
+        let cluster_name = lb_net_core::UpstreamClusterName::new("payments")?;
+        let endpoint_id = lb_net_core::UpstreamEndpointId::new("a")?;
+        registry.insert_cluster(lb_net_core::UpstreamCluster::new(
+            cluster_name.clone(),
+            vec![endpoint(endpoint_id.as_str(), 8080, 3)?],
+        )?)?;
+
+        let mut records = registry.records.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+        records.remove(&EndpointKey {
+            cluster: cluster_name.clone(),
+            endpoint_id: endpoint_id.clone(),
+        });
+        drop(records);
+
+        assert!(matches!(
+            registry.note_active_failure(&cluster_name, &endpoint_id),
+            Err(UpstreamHealthError::EndpointNotTracked { cluster, endpoint_id: id })
                 if cluster == cluster_name && id == endpoint_id
         ));
         Ok(())
