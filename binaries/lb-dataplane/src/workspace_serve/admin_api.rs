@@ -208,7 +208,6 @@ fn json_body_to_value(body: &str) -> io::Result<serde_json::Value> {
     serde_json::from_str(body).map_err(|error| io::Error::other(error.to_string()))
 }
 
-
 async fn handle_workspace_admin_connection<S>(
     mut stream: S,
     peer_addr: SocketAddr,
@@ -700,7 +699,8 @@ where
                         if api_mode.uses_versioned_contract() {
                             let last_restart_outcome_code =
                                 state.last_restart_outcome_code.lock().await.clone();
-                            let last_restart_result = state.last_restart_result.lock().await.clone();
+                            let last_restart_result =
+                                state.last_restart_result.lock().await.clone();
                             write_versioned_admin_success(
                                 &mut stream,
                                 "200 OK",
@@ -958,3 +958,351 @@ fn admin_source_allowed(source_ip: IpAddr, policy: &CompiledAdminPolicy) -> bool
         || policy.allowed_source_cidrs.iter().any(|cidr| cidr.contains(&source_ip))
 }
 
+#[cfg(test)]
+mod admin_api_tests {
+    use super::{
+        admin_audit_code, admin_source_allowed, classify_admin_request_action,
+        compile_admin_policy, handle_workspace_admin_connection, negotiate_admin_api_request,
+        versioned_admin_response_headers, write_versioned_admin_error,
+        write_versioned_admin_success, AdminApiRequestMode, AdminPermission, AdminRateLimitState,
+        AdminReplayState, AdminRequestAction, AdminRuntimeHandles, CompiledAdminPolicy,
+        ServeSupervisor, ServeSupervisorInner, ServeSupervisorShared, WorkspaceServeState,
+    };
+    use crate::{DemoHeader, DemoRequestHead};
+    use std::fs;
+    use std::io;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::sync::atomic::Ordering;
+    use std::sync::{Arc, Mutex as StdMutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::{Mutex, RwLock};
+
+    const TEST_SECRET_ENV: &str = "LB_TEST_ADMIN_API_SECRET_COVERAGE";
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static TEST_JOURNAL_COUNTER: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    struct JournalCleanup(String);
+
+    impl Drop for JournalCleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(format!("{}.control-plane.json", self.0));
+        }
+    }
+
+    fn request(target: &str, version: Option<&str>) -> DemoRequestHead {
+        let mut headers = Vec::new();
+        if let Some(version) = version {
+            headers.push(DemoHeader {
+                name: String::from("x-lb-admin-api-version"),
+                value: String::from(version),
+            });
+        }
+        DemoRequestHead {
+            method: String::from("GET"),
+            target: String::from(target),
+            headers,
+            authorization_bearer: None,
+        }
+    }
+
+    fn test_admin_policy() -> CompiledAdminPolicy {
+        let mut listener = lb_config_model::ListenerResourceConfig::foundation(
+            "admin-test",
+            lb_config_model::ListenerClassConfig::Admin,
+            0,
+        );
+        let mut config = serde_json::to_value(&listener).unwrap();
+        config["admin"]["auth"] = serde_json::to_value(&listener.admin.auth).unwrap();
+        config["admin"]["auth"]["secret_env"] = serde_json::json!(TEST_SECRET_ENV);
+        listener = serde_json::from_value(config).unwrap();
+        compile_admin_policy(&listener).unwrap()
+    }
+
+    fn test_setup(
+    ) -> (Arc<WorkspaceServeState>, AdminRuntimeHandles, ServeSupervisor, JournalCleanup) {
+        let config_path = format!(
+            "target/admin-api-coverage-{}-{}",
+            std::process::id(),
+            TEST_JOURNAL_COUNTER.fetch_add(1, Ordering::Relaxed)
+        );
+        let cleanup = JournalCleanup(config_path.clone());
+        let state = Arc::new(WorkspaceServeState::new(config_path.clone()).unwrap());
+        let runtime = AdminRuntimeHandles {
+            shared_policy: Arc::new(RwLock::new(test_admin_policy())),
+            shared_tls: Arc::new(RwLock::new(None)),
+            rate_limit_state: Arc::new(StdMutex::new(AdminRateLimitState::default())),
+            replay_state: Arc::new(StdMutex::new(AdminReplayState::default())),
+        };
+        let supervisor = ServeSupervisor {
+            shared: Arc::new(ServeSupervisorShared {
+                config_path,
+                admin_secret: Arc::new(String::new()),
+                state: Arc::clone(&state),
+                reload_guard: Mutex::new(()),
+                inner: Mutex::new(ServeSupervisorInner::default()),
+            }),
+        };
+        (state, runtime, supervisor, cleanup)
+    }
+
+    async fn send_admin_request(
+        target: &str,
+        headers: &str,
+        body: &[u8],
+        state: Arc<WorkspaceServeState>,
+        runtime: AdminRuntimeHandles,
+        supervisor: ServeSupervisor,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let (mut client, server) = tokio::io::duplex(8192);
+        let request = format!(
+            "GET {target} HTTP/1.1\r\nHost: localhost\r\n{headers}Content-Length: {}\r\n\r\n",
+            body.len()
+        );
+        client.write_all(request.as_bytes()).await?;
+        client.write_all(body).await?;
+        client.shutdown().await?;
+        handle_workspace_admin_connection(
+            server,
+            SocketAddr::from(([127, 0, 0, 1], 12345)),
+            String::from("admin-test"),
+            Arc::clone(&state),
+            runtime,
+            Arc::new(String::new()),
+            supervisor,
+        )
+        .await?;
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await?;
+        assert!(state.admin_requests.load(Ordering::SeqCst) > 0);
+        Ok(String::from_utf8(response)?)
+    }
+
+    #[test]
+    fn api_version_negotiation_canonicalizes_targets_and_rejects_conflicts() {
+        assert_eq!(
+            negotiate_admin_api_request(&request("/healthz", None)),
+            AdminApiRequestMode::Legacy { canonical_target: String::from("/healthz") }
+        );
+        assert_eq!(
+            negotiate_admin_api_request(&request("/v1/status", None)),
+            AdminApiRequestMode::V1 { canonical_target: String::from("/status") }
+        );
+        assert_eq!(
+            negotiate_admin_api_request(&request("/status", Some(" 1 "))),
+            AdminApiRequestMode::V1 { canonical_target: String::from("/status") }
+        );
+        assert_eq!(
+            negotiate_admin_api_request(&request("/v1/status", Some("V1"))),
+            AdminApiRequestMode::V1 { canonical_target: String::from("/status") }
+        );
+        let unsupported = negotiate_admin_api_request(&request("/v2/status", None));
+        assert!(matches!(
+            unsupported,
+            AdminApiRequestMode::UnsupportedVersion {
+                requested_version,
+                canonical_target,
+                ..
+            } if requested_version == "v2" && canonical_target == "/status"
+        ));
+        let conflict = negotiate_admin_api_request(&request("/v1/status", Some("v2")));
+        assert!(matches!(conflict, AdminApiRequestMode::UnsupportedVersion { .. }));
+        assert_eq!(
+            negotiate_admin_api_request(&request("/status", Some(" "))),
+            AdminApiRequestMode::Legacy { canonical_target: String::from("/status") }
+        );
+    }
+
+    #[test]
+    fn actions_permissions_audit_codes_and_source_allow_lists_are_consistent() {
+        for (method, path, expected) in [
+            ("GET", "/healthz", AdminRequestAction::Healthz),
+            ("GET", "/readyz", AdminRequestAction::Readyz),
+            ("GET", "/status", AdminRequestAction::Status),
+            ("GET", "/validate", AdminRequestAction::Validate),
+            ("GET", "/audit", AdminRequestAction::Audit),
+            ("POST", "/reload", AdminRequestAction::Reload),
+            ("POST", "/restart", AdminRequestAction::Restart),
+            ("POST", "/cache/purge", AdminRequestAction::CachePurge),
+            ("POST", "/cache/invalidate", AdminRequestAction::CacheInvalidate),
+        ] {
+            assert!(
+                std::mem::discriminant(&classify_admin_request_action(method, path))
+                    == std::mem::discriminant(&expected)
+            );
+        }
+        assert_eq!(classify_admin_request_action("DELETE", "/status").as_str(), "unknown");
+        assert_eq!(
+            classify_admin_request_action("GET", "/audit").permission(),
+            AdminPermission::Audit
+        );
+        assert_eq!(
+            classify_admin_request_action("POST", "/reload").permission(),
+            AdminPermission::Write
+        );
+        assert_eq!(
+            classify_admin_request_action("GET", "/status").permission(),
+            AdminPermission::Read
+        );
+        assert_eq!(admin_audit_code("reload", "failed"), "reload_failed");
+        let mut policy = test_admin_policy();
+        assert!(admin_source_allowed(IpAddr::V4(Ipv4Addr::LOCALHOST), &policy));
+        policy.allowed_source_cidrs.push("10.0.0.0/8".parse().unwrap());
+        assert!(!admin_source_allowed(IpAddr::V4(Ipv4Addr::LOCALHOST), &policy));
+        assert!(admin_source_allowed("10.1.2.3".parse().unwrap(), &policy));
+    }
+
+    #[tokio::test]
+    async fn versioned_envelopes_include_contract_and_request_metadata(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (mut success_reader, mut success_stream) = tokio::io::duplex(4096);
+        write_versioned_admin_success(
+            &mut success_stream,
+            "200 OK",
+            &["Cache-Control: no-store"],
+            "request-7",
+            serde_json::json!({"status": "ok"}),
+        )
+        .await?;
+        drop(success_stream);
+        let mut success_bytes = Vec::new();
+        success_reader.read_to_end(&mut success_bytes).await?;
+        let success = String::from_utf8(success_bytes)?;
+        assert!(success.contains("X-LB-Admin-Api-Version: v1"));
+        assert!(success.contains("Cache-Control: no-store"));
+        assert!(success.contains("\"request_id\":\"request-7\""));
+        assert_eq!(versioned_admin_response_headers(&[]), ["X-LB-Admin-Api-Version: v1"]);
+
+        let (mut error_reader, mut error_stream) = tokio::io::duplex(4096);
+        write_versioned_admin_error(
+            &mut error_stream,
+            "400 Bad Request",
+            &[],
+            "request-8",
+            lb_admin_api::AdminApiErrorCode::ValidationFailed,
+            "invalid request",
+            false,
+        )
+        .await?;
+        drop(error_stream);
+        let mut error_bytes = Vec::new();
+        error_reader.read_to_end(&mut error_bytes).await?;
+        let error = String::from_utf8(error_bytes)?;
+        assert!(error.contains("400 Bad Request"));
+        assert!(error.contains("\"request_id\":\"request-8\""));
+        assert!(error.contains("invalid request"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_connection_handles_legacy_versioned_and_unsupported_health_requests(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let _env_guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var(TEST_SECRET_ENV, "api-secret");
+        let (state, runtime, supervisor, _cleanup) = test_setup();
+        let response = send_admin_request(
+            "/healthz",
+            "Authorization: Bearer api-secret\r\n",
+            b"",
+            Arc::clone(&state),
+            runtime.clone(),
+            supervisor.clone(),
+        )
+        .await?;
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(response.ends_with("ok\n"));
+
+        let response = send_admin_request(
+            "/v1/healthz",
+            "Authorization: Bearer api-secret\r\n",
+            b"",
+            Arc::clone(&state),
+            runtime.clone(),
+            supervisor.clone(),
+        )
+        .await?;
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(response.contains("X-LB-Admin-Api-Version: v1"));
+        assert!(response.contains("\"live\":true"));
+
+        let response = send_admin_request(
+            "/v2/healthz",
+            "Authorization: Bearer api-secret\r\n",
+            b"",
+            Arc::clone(&state),
+            runtime.clone(),
+            supervisor.clone(),
+        )
+        .await?;
+        assert!(response.starts_with("HTTP/1.1 406 Not Acceptable"), "{response:?}");
+        assert!(response.contains("unsupported admin api version v2"));
+
+        let response = send_admin_request(
+            "/missing",
+            "Authorization: Bearer api-secret\r\n",
+            b"",
+            state,
+            runtime,
+            supervisor,
+        )
+        .await?;
+        assert!(response.starts_with("HTTP/1.1 404 Not Found"));
+        std::env::remove_var(TEST_SECRET_ENV);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_connection_rejects_denied_sources_and_missing_credentials(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let _env_guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var(TEST_SECRET_ENV, "api-secret");
+        let (state, runtime, supervisor, _cleanup) = test_setup();
+        runtime.shared_policy.write().await.allowed_source_cidrs = vec!["10.0.0.0/8".parse()?];
+        let response = send_admin_request(
+            "/healthz",
+            "Authorization: Bearer api-secret\r\n",
+            b"",
+            Arc::clone(&state),
+            runtime.clone(),
+            supervisor.clone(),
+        )
+        .await?;
+        assert!(response.starts_with("HTTP/1.1 403 Forbidden"));
+        assert!(response.contains("admin source not allowed"));
+
+        runtime.shared_policy.write().await.allowed_source_cidrs.clear();
+        let response = send_admin_request("/healthz", "", b"", state, runtime, supervisor).await?;
+        assert!(response.starts_with("HTTP/1.1 401 Unauthorized"));
+        std::env::remove_var(TEST_SECRET_ENV);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_connection_ignores_clients_that_disconnect_before_sending_a_request(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (state, runtime, supervisor, _cleanup) = test_setup();
+        let (client, server) = tokio::io::duplex(64);
+        drop(client);
+        handle_workspace_admin_connection(
+            server,
+            SocketAddr::from(([127, 0, 0, 1], 12345)),
+            String::from("admin-test"),
+            Arc::clone(&state),
+            runtime,
+            Arc::new(String::new()),
+            supervisor,
+        )
+        .await?;
+        assert_eq!(state.admin_requests.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_admin_json_is_reported_without_panicking() {
+        assert_eq!(
+            super::json_body_to_value(r#"{"ready":true}"#).unwrap()["ready"],
+            serde_json::Value::Bool(true)
+        );
+        assert_eq!(super::json_body_to_value("{").unwrap_err().kind(), io::ErrorKind::Other);
+    }
+}

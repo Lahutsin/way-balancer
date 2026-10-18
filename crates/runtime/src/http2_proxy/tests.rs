@@ -9,19 +9,20 @@ mod tests {
     use ipnet::IpNet;
 
     use super::{
-        anonymous_source_blocked, error_is_upstream_passive_failure,
+        anonymous_source_blocked, cookie_value_from_header, error_is_upstream_passive_failure,
         classify_grpc_response_failure_with_policy,
-        grpc_payload_has_at_most_one_message, header_value,
+        grpc_payload_has_at_most_one_message, header_value, request_affinity_key,
         record_query_probe, record_unmatched_route, resolve_effective_client_ip,
         resolve_stream_upstream, route_enumeration_source_blocked, select_http2_route_upstream,
-        selection_context_for_request, should_skip_http2_header, stable_request_hash,
-        Http2ProxyConfig, Http2ProxyError, Http2RouteUpstream, MetricsState,
+        sanitize_http2_trailers, selection_context_for_request, should_skip_http2_header,
+        stable_request_hash, Http2ConnectionMetrics, Http2ProxyConfig, Http2ProxyError,
+        Http2RouteUpstream, MetricsState,
         RequestUpstreamResolution, StreamForwardError, StreamIdlePhase,
     };
     use crate::{
-        AnonymousSourceFilterPolicy, ProtocolAnomalyCategory, RouteEnumerationProtectionPolicy,
-        SlowClientStage, SourceAggregation, TrustedClientIpPolicy,
-        GrpcFailurePolicy,
+        AffinityFallbackPolicy, AffinityPolicy, AnonymousSourceFilterPolicy,
+        ProtocolAnomalyCategory, RouteEnumerationProtectionPolicy, SlowClientStage,
+        SourceAggregation, TrustedClientIpPolicy, GrpcFailurePolicy,
     };
 
     fn localhost_socket(port: u16) -> SocketAddr {
@@ -40,6 +41,118 @@ mod tests {
         assert!(connect.to_string().contains("failed to connect HTTP/2 upstream"));
         assert!(std::error::Error::source(&connect).is_some());
         assert_eq!(handshake.anomaly_category(), Some(ProtocolAnomalyCategory::MalformedPreface));
+    }
+
+    #[tokio::test]
+    async fn http2_error_variants_report_sources_and_anomalies_consistently() {
+        let target = localhost_socket(8080);
+        let task = tokio::spawn(std::future::pending::<()>());
+        task.abort();
+        let task_error = task.await.expect_err("aborted task has a join error");
+        let errors = [
+            (
+                Http2ProxyError::ConnectTimeout { target },
+                "timed out connecting HTTP/2 upstream",
+                false,
+                None,
+            ),
+            (
+                Http2ProxyError::Connect {
+                    target,
+                    source: io::Error::other("connection refused"),
+                },
+                "failed to connect HTTP/2 upstream",
+                true,
+                None,
+            ),
+            (
+                Http2ProxyError::DownstreamHandshake(h2::Error::from(
+                    h2::Reason::PROTOCOL_ERROR,
+                )),
+                "downstream HTTP/2 handshake failed",
+                true,
+                Some(ProtocolAnomalyCategory::MalformedPreface),
+            ),
+            (
+                Http2ProxyError::UpstreamHandshake(h2::Error::from(h2::Reason::PROTOCOL_ERROR)),
+                "upstream HTTP/2 handshake failed",
+                true,
+                None,
+            ),
+            (
+                Http2ProxyError::DownstreamConnection(h2::Error::from(
+                    h2::Reason::PROTOCOL_ERROR,
+                )),
+                "downstream HTTP/2 connection failed",
+                true,
+                Some(ProtocolAnomalyCategory::MalformedPreface),
+            ),
+            (
+                Http2ProxyError::StreamTask(task_error),
+                "HTTP/2 stream task failed",
+                true,
+                None,
+            ),
+        ];
+        for (error, display, has_source, anomaly) in errors {
+            assert!(error.to_string().contains(display));
+            assert_eq!(std::error::Error::source(&error).is_some(), has_source);
+            assert_eq!(error.anomaly_category(), anomaly);
+        }
+    }
+
+    #[test]
+    fn affinity_keys_trim_headers_and_parse_cookie_pairs_across_headers() {
+        let mut headers = HeaderMap::new();
+        headers.append(http::header::COOKIE, HeaderValue::from_static("other=x; session = "));
+        headers.append(
+            http::header::COOKIE,
+            HeaderValue::from_static(" theme=dark ; session = session-42 "),
+        );
+        headers.insert("x-user", HeaderValue::from_static(" user-7 "));
+        let header_policy = AffinityPolicy::HeaderHash {
+            header_name: String::from("x-user"),
+            fallback: AffinityFallbackPolicy::BalanceHealthy,
+        };
+        let cookie_policy = AffinityPolicy::CookieHash {
+            cookie_name: String::from("session"),
+            fallback: AffinityFallbackPolicy::BalanceHealthy,
+        };
+        assert_eq!(request_affinity_key(&headers, Some(&header_policy)).as_deref(), Some("user-7"));
+        assert_eq!(
+            request_affinity_key(&headers, Some(&cookie_policy)).as_deref(),
+            Some("session-42")
+        );
+        assert_eq!(request_affinity_key(&headers, None), None);
+        assert_eq!(cookie_value_from_header("sid=one; sid=two", "sid"), Some("one"));
+        assert_eq!(cookie_value_from_header("session=; other=value", "session"), None);
+        assert_eq!(cookie_value_from_header("not-session=wrong", "session"), None);
+    }
+
+    #[test]
+    fn connection_report_metrics_default_to_empty_counts() {
+        let metrics = Http2ConnectionMetrics::default();
+        assert_eq!(metrics.active_streams, 0);
+        assert_eq!(metrics.peak_active_streams, 0);
+        assert_eq!(metrics.request_count, 0);
+        assert!(metrics.grpc_service_counts.is_empty());
+        assert!(metrics.response_status_counts.is_empty());
+    }
+
+    #[test]
+    fn http2_trailer_sanitization_preserves_end_to_end_fields_only() {
+        let mut trailers = HeaderMap::new();
+        trailers.insert("x-checksum", HeaderValue::from_static("abc123"));
+        trailers.insert(http::header::CONTENT_LENGTH, HeaderValue::from_static("42"));
+        trailers.insert(http::header::TRAILER, HeaderValue::from_static("x-checksum"));
+        trailers.insert(http::header::HOST, HeaderValue::from_static("example.test"));
+        trailers.insert(http::header::TE, HeaderValue::from_static("gzip"));
+        let sanitized = sanitize_http2_trailers(trailers);
+        assert_eq!(sanitized.get("x-checksum").and_then(|value| value.to_str().ok()), Some("abc123"));
+        assert!(!sanitized.contains_key(http::header::CONTENT_LENGTH));
+        assert!(!sanitized.contains_key(http::header::TRAILER));
+        assert!(!sanitized.contains_key(http::header::HOST));
+        assert!(!sanitized.contains_key(http::header::TE));
     }
 
     #[test]
@@ -278,5 +391,9 @@ mod tests {
         assert!(!error_is_upstream_passive_failure(&StreamForwardError::UpstreamGracefulDrain));
         assert!(!error_is_upstream_passive_failure(&StreamForwardError::InvalidRequest));
         assert!(!error_is_upstream_passive_failure(&StreamForwardError::RequestBodyLimitExceeded));
+        assert!(!error_is_upstream_passive_failure(&StreamForwardError::ResponseBody));
+        assert!(!error_is_upstream_passive_failure(&StreamForwardError::IdleTimeout(
+            StreamIdlePhase::RequestBody,
+        )));
     }
 }

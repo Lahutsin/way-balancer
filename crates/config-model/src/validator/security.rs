@@ -107,3 +107,83 @@ fn validate_anonymous_source_filter(
     }
 }
 
+#[cfg(test)]
+mod security_coverage_regressions {
+    use super::{ValidationCode, ValidationReport, validate_security};
+    use crate::{ArtifactVerificationMode, TrustedArtifactSignerConfig, WorkspaceConfig};
+
+    #[test]
+    fn reports_invalid_security_acknowledgements_signers_and_cidrs() {
+        let mut config = WorkspaceConfig::foundation();
+        config.security.insecure_dev_mode.enabled = true;
+        config.security.insecure_dev_mode.acknowledgement = Some(String::from(" "));
+        config.security.artifact_verification.trusted_signers = vec![
+            TrustedArtifactSignerConfig {
+                identity: String::new(),
+                public_key_ed25519: String::from("bad"),
+            },
+            TrustedArtifactSignerConfig {
+                identity: String::new(),
+                public_key_ed25519: String::from(
+                    "1111111111111111111111111111111111111111111111111111111111111111",
+                ),
+            },
+            TrustedArtifactSignerConfig {
+                identity: String::from("x".repeat(129)),
+                public_key_ed25519: String::from("A".repeat(64)),
+            },
+        ];
+        config.security.trusted_client_ip.trusted_proxy_cidrs =
+            vec![String::from("10.0.0.0/8"), String::from("invalid")];
+        config.security.anonymous_source_filter.deny_cidrs = vec![String::from("invalid")];
+        config.security.anonymous_source_filter.vpn_cidrs = vec![String::from("invalid")];
+        config.security.anonymous_source_filter.proxy_cidrs = vec![String::from("invalid")];
+        config.security.anonymous_source_filter.socks_cidrs = vec![String::from("invalid")];
+        config.security.anonymous_source_filter.tor_exit_cidrs = vec![String::from("invalid")];
+        let mut report = ValidationReport::default();
+        validate_security(&config, &mut report);
+        for path in [
+            "security.insecure_dev_mode.acknowledgement",
+            "security.artifact_verification.trusted_signers",
+            "security.artifact_verification.trusted_signers[0].public_key_ed25519",
+            "security.artifact_verification.trusted_signers[2].identity",
+            "security.artifact_verification.trusted_signers[2].public_key_ed25519",
+            "security.trusted_client_ip.trusted_proxy_cidrs[1]",
+            "security.anonymous_source_filter.deny_cidrs[0]",
+            "security.anonymous_source_filter.vpn_cidrs[0]",
+            "security.anonymous_source_filter.proxy_cidrs[0]",
+            "security.anonymous_source_filter.socks_cidrs[0]",
+            "security.anonymous_source_filter.tor_exit_cidrs[0]",
+        ] {
+            assert!(report.errors.iter().any(|error| error.path == path), "missing {path}");
+        }
+        assert!(
+            report.errors.iter().any(|error| error.code == ValidationCode::InvalidSecurityDefaults
+                && error.message.contains("repeat identities"))
+        );
+    }
+
+    #[test]
+    fn applies_insecure_gate_and_accepts_valid_signers_and_cidrs() {
+        let mut config = WorkspaceConfig::foundation();
+        config.security.artifact_verification.mode = ArtifactVerificationMode::Disabled;
+        let mut gated = ValidationReport::default();
+        validate_security(&config, &mut gated);
+        assert_eq!(gated.errors.len(), 1);
+        assert_eq!(gated.errors[0].code, ValidationCode::InsecureModeGated);
+        config.security.insecure_dev_mode.enabled = true;
+        config.security.insecure_dev_mode.acknowledgement = Some(String::from("testing"));
+        config.security.artifact_verification.trusted_signers =
+            vec![TrustedArtifactSignerConfig::new(
+                "release",
+                "1111111111111111111111111111111111111111111111111111111111111111",
+            )];
+        config.security.trusted_client_ip.trusted_proxy_cidrs =
+            vec![String::from("192.0.2.0/24"), String::from("2001:db8::/32")];
+        config.security.anonymous_source_filter.deny_cidrs =
+            vec![String::from("198.51.100.0/24"), String::from("2001:db8:1::/48")];
+        let mut valid = ValidationReport::default();
+        validate_security(&config, &mut valid);
+        assert!(valid.is_empty(), "{}", valid.operator_summary());
+    }
+}

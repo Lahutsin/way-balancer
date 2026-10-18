@@ -73,9 +73,7 @@ fn enforce_destination_local_limits(
     let Some(destination_policy) = destination_policy else {
         return Ok(Vec::new());
     };
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or(Duration::ZERO);
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO);
     let context = crate::LimitContext {
         source_ip: Some(effective_client_ip),
         route_name: request.route.as_ref().map(|route| route.label.clone()),
@@ -141,9 +139,7 @@ fn destination_failure_manager(
 }
 
 fn failure_policy_now() -> Duration {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or(Duration::ZERO)
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO)
 }
 
 fn effective_destination_upstream_timeouts(
@@ -285,9 +281,8 @@ fn allow_destination_retry(
     if !policy.enforce_retry_budget {
         return true;
     }
-    let allowed = destination_failure_manager(Some(policy)).is_some_and(|manager| {
-        manager.allow_retry(failure_policy_now(), class).allowed
-    });
+    let allowed = destination_failure_manager(Some(policy))
+        .is_some_and(|manager| manager.allow_retry(failure_policy_now(), class).allowed);
     if let Some(request_telemetry) = request_telemetry {
         let _ = request_telemetry.telemetry.record_decision_trace(
             &request_telemetry.scope,
@@ -310,5 +305,66 @@ fn classify_http1_response_failure(status: u16) -> Option<crate::UpstreamFailure
         501 | 505 => Some(crate::UpstreamFailureClass::Permanent),
         500..=599 => Some(crate::UpstreamFailureClass::Temporary),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod destination_policy_coverage_tests {
+    use std::time::{Duration, Instant};
+
+    use super::*;
+
+    #[test]
+    fn timeout_helpers_leave_unconfigured_destinations_unchanged() {
+        let base = lb_net_core::ConnectionTimeouts::default();
+        assert_eq!(effective_destination_upstream_timeouts(&base, None), base);
+        let policy = RouteDestinationPolicyRuntime::default();
+        assert_eq!(effective_destination_upstream_timeouts(&base, Some(&policy)), base);
+
+        assert_eq!(
+            bounded_dispatch_timeout(
+                None,
+                crate::TimeoutCategory::Connect,
+                Duration::from_secs(5),
+                Instant::now(),
+                Instant::now()
+            ),
+            Ok((Duration::from_secs(5), crate::TimeoutCategory::Connect))
+        );
+        assert_eq!(
+            bounded_dispatch_timeout(
+                Some(&policy),
+                crate::TimeoutCategory::Attempt,
+                Duration::from_secs(3),
+                Instant::now(),
+                Instant::now()
+            ),
+            Ok((Duration::from_secs(3), crate::TimeoutCategory::Attempt))
+        );
+        record_destination_timeout(None, crate::TimeoutCategory::Request);
+        record_destination_failure(None, crate::UpstreamFailureClass::Temporary);
+        record_destination_success(None);
+    }
+
+    #[test]
+    fn response_status_classification_covers_all_failure_classes() {
+        assert_eq!(classify_http1_response_failure(200), None);
+        assert_eq!(
+            classify_http1_response_failure(500),
+            Some(crate::UpstreamFailureClass::Temporary)
+        );
+        assert_eq!(
+            classify_http1_response_failure(501),
+            Some(crate::UpstreamFailureClass::Permanent)
+        );
+        assert_eq!(
+            classify_http1_response_failure(503),
+            Some(crate::UpstreamFailureClass::Overloaded)
+        );
+        assert_eq!(
+            classify_http1_response_failure(599),
+            Some(crate::UpstreamFailureClass::Temporary)
+        );
+        assert_eq!(classify_http1_response_failure(600), None);
     }
 }

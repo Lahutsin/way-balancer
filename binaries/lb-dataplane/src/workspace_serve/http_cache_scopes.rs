@@ -131,7 +131,6 @@ async fn handle_admin_cache_invalidate(
     })
 }
 
-
 fn resolve_listener_http_cache_policy(
     config: &lb_config_model::WorkspaceConfig,
     listener: &lb_config_model::ListenerResourceConfig,
@@ -205,4 +204,64 @@ fn build_http_cache_store(
     })
     .map(Arc::new)
     .map_err(to_dyn_error)
+}
+
+#[cfg(test)]
+mod http_cache_scope_tests {
+    use super::{
+        handle_admin_cache_invalidate, handle_admin_cache_purge,
+        resolve_listener_http_cache_policy, WorkspaceServeState,
+    };
+
+    #[tokio::test]
+    async fn cache_admin_handlers_report_invalid_bodies_and_missing_scopes() {
+        let state = WorkspaceServeState::new(String::from("unused-test-config")).unwrap();
+        let error = handle_admin_cache_purge(&state, b"{").await.err().unwrap();
+        assert!(error.starts_with("invalid cache purge request body:"));
+        let purge = serde_json::json!({
+            "scope": "missing",
+            "target": {"type": "path_prefix", "path_prefix": "/assets"},
+        });
+        assert_eq!(
+            handle_admin_cache_purge(&state, &serde_json::to_vec(&purge).unwrap())
+                .await
+                .err()
+                .unwrap(),
+            "unknown cache scope missing"
+        );
+
+        let error = handle_admin_cache_invalidate(&state, b"{}").await.err().unwrap();
+        assert!(error.starts_with("invalid cache invalidation event body:"));
+        let event = serde_json::json!({
+            "event_id": "event-1",
+            "scope": "missing",
+            "issuer": "peer-a",
+            "target": {"PathPrefix": "/assets"},
+            "occurred_at_unix_ms": 1,
+        });
+        assert_eq!(
+            handle_admin_cache_invalidate(&state, &serde_json::to_vec(&event).unwrap())
+                .await
+                .err()
+                .unwrap(),
+            "unknown cache scope missing"
+        );
+    }
+
+    #[test]
+    fn cache_policy_resolution_handles_absence_and_bad_listener_binding() {
+        let config = lb_config_model::WorkspaceConfig::foundation();
+        let listener = lb_config_model::ListenerResourceConfig::foundation(
+            "public",
+            lb_config_model::ListenerClassConfig::Public,
+            8080,
+        );
+        assert!(resolve_listener_http_cache_policy(&config, &listener).unwrap().is_none());
+
+        let mut listener = listener;
+        listener.policies.cache_policy = Some(String::from("not-defined"));
+        let error =
+            resolve_listener_http_cache_policy(&config, &listener).err().unwrap().to_string();
+        assert!(error.contains("references unknown http cache policy not-defined"));
+    }
 }

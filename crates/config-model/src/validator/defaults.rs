@@ -41,3 +41,29 @@ fn validate_defaults(config: &WorkspaceConfig, report: &mut ValidationReport) {
     }
 }
 
+#[cfg(test)]
+mod defaults_coverage_regressions {
+    use super::{ValidationCode, ValidationReport, validate_defaults};
+    use crate::WorkspaceConfig;
+
+    #[test]
+    fn reports_each_group_with_zero_limits_and_accepts_foundation_values() {
+        let mut config = WorkspaceConfig::foundation();
+        config.defaults.listener.max_connections = 0;
+        config.defaults.http.http1.max_head_bytes = 0;
+        config.defaults.http.http2.max_concurrent_streams = 0;
+        let mut report = ValidationReport::default();
+        validate_defaults(&config, &mut report);
+        assert_eq!(report.errors.len(), 3);
+        for code in [
+            ValidationCode::InvalidListenerDefaults,
+            ValidationCode::InvalidHttp1Defaults,
+            ValidationCode::InvalidHttp2Defaults,
+        ] {
+            assert!(report.errors.iter().any(|error| error.code == code));
+        }
+        let mut valid = ValidationReport::default();
+        validate_defaults(&WorkspaceConfig::foundation(), &mut valid);
+        assert!(valid.is_empty());
+    }
+}

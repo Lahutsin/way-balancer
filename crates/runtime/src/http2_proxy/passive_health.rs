@@ -44,3 +44,29 @@ fn error_is_upstream_passive_failure(error: &StreamForwardError) -> bool {
     )
 }
 
+#[cfg(test)]
+mod passive_health_coverage_tests {
+    use super::*;
+
+    #[test]
+    fn passive_health_feedback_ignores_static_upstreams_and_classifies_failures() {
+        let target =
+            lb_net_core::UpstreamTarget::new("static", "127.0.0.1:8080".parse().expect("address"));
+        let config = Http2ProxyConfig::new(target.clone());
+        let static_upstream = SelectedUpstream { target, route_backend: None };
+
+        record_passive_health_result(&config, &static_upstream, None, &Ok(200));
+        assert!(!error_is_upstream_passive_failure(&StreamForwardError::RequestBody));
+        for error in [
+            StreamForwardError::UpstreamReady,
+            StreamForwardError::UpstreamRequest,
+            StreamForwardError::UpstreamResponse,
+            StreamForwardError::IdleTimeout(StreamIdlePhase::UpstreamResponse),
+        ] {
+            assert!(error_is_upstream_passive_failure(&error));
+        }
+        assert!(!error_is_upstream_passive_failure(&StreamForwardError::IdleTimeout(
+            StreamIdlePhase::RequestBody,
+        )));
+    }
+}

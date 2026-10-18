@@ -1228,3 +1228,718 @@ async fn dispatch_retry_response_attempt(
     Ok(response)
 }
 
+#[cfg(test)]
+mod retry_dispatch_coverage_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn spawn_external_auth_service(
+        body: &'static str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut request = Vec::new();
+            loop {
+                let mut chunk = [0_u8; 1024];
+                let read = stream.read(&mut chunk).await.expect("read external auth request");
+                assert_ne!(read, 0, "external auth request ended before its body");
+                request.extend_from_slice(&chunk[..read]);
+
+                let Some(head_end) =
+                    request.windows(4).position(|window| window == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let headers = std::str::from_utf8(&request[..head_end])
+                    .expect("external auth request headers are ASCII");
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().expect("valid content length"))
+                    })
+                    .expect("external auth request has content length");
+                if request.len() >= head_end + 4 + content_length {
+                    break;
+                }
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.expect("write external auth response");
+            stream.shutdown().await.expect("close external auth connection");
+        });
+        Ok(format!("http://{address}/authz"))
+    }
+
+    async fn spawn_upstream(
+        respond_to_requests: bool,
+    ) -> Result<SocketAddr, Box<dyn std::error::Error>> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(mut connection) = h2::server::handshake(stream).await else {
+                return;
+            };
+            if respond_to_requests {
+                while let Some(Ok((_, mut respond))) = connection.accept().await {
+                    let Ok(response) = Response::builder().status(StatusCode::OK).body(()) else {
+                        return;
+                    };
+                    if let Ok(mut send) = respond.send_response(response, false) {
+                        let _ = send.send_data(Bytes::from_static(b"upstream"), true);
+                    }
+                }
+            } else if let Some(Ok((_, respond))) = connection.accept().await {
+                let _respond = respond;
+                std::future::pending::<()>().await;
+            }
+        });
+        Ok(address)
+    }
+
+    async fn spawn_empty_status_upstream(
+        status: StatusCode,
+        grpc_status: Option<&'static str>,
+    ) -> Result<SocketAddr, Box<dyn std::error::Error>> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(mut connection) = h2::server::handshake(stream).await else {
+                return;
+            };
+            while let Some(Ok((_, mut respond))) = connection.accept().await {
+                let mut response_builder = Response::builder().status(status);
+                if let Some(grpc_status) = grpc_status {
+                    response_builder = response_builder
+                        .header("content-type", "application/grpc")
+                        .header("grpc-status", grpc_status);
+                }
+                let Ok(response) = response_builder.body(()) else {
+                    return;
+                };
+                if respond.send_response(response, true).is_err() {
+                    return;
+                }
+            }
+        });
+        Ok(address)
+    }
+
+    async fn spawn_grpc_retry_upstream(
+        retry_response_body: &'static [u8],
+    ) -> Result<(SocketAddr, std::sync::Arc<std::sync::atomic::AtomicUsize>), Box<dyn std::error::Error>> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed_attempts = attempts.clone();
+        tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(mut connection) = h2::server::handshake(stream).await else {
+                return;
+            };
+            let mut attempt = 0;
+            while let Some(Ok((_, mut respond))) = connection.accept().await {
+                observed_attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let mut builder = Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/grpc");
+                if attempt > 0 {
+                    builder = builder.header("grpc-status", "0");
+                }
+                let Ok(response) = builder.body(()) else {
+                    return;
+                };
+                let Ok(mut send) = respond.send_response(response, false) else {
+                    return;
+                };
+                if attempt == 0 {
+                    let mut trailers = http::HeaderMap::new();
+                    trailers.insert("grpc-status", http::HeaderValue::from_static("14"));
+                    if send.send_trailers(trailers).is_err() {
+                        return;
+                    }
+                } else if send
+                    .send_data(Bytes::from_static(retry_response_body), true)
+                    .is_err()
+                {
+                    return;
+                }
+                attempt += 1;
+            }
+        });
+        Ok((address, attempts))
+    }
+
+    fn template() -> Result<UpstreamRequestTemplate, http::uri::InvalidUri> {
+        Ok(UpstreamRequestTemplate {
+            method: http::Method::GET,
+            uri: "http://127.0.0.1/retry".parse()?,
+            headers: Vec::new(),
+        })
+    }
+
+    async fn dispatch(
+        address: SocketAddr,
+        hedging_policy: Option<crate::RequestHedgingPolicy>,
+    ) -> Result<(Response<RecvStream>, crate::HedgeOutcome), StreamForwardError> {
+        dispatch_with_timeouts(
+            address,
+            hedging_policy,
+            lb_net_core::ConnectionTimeouts::default(),
+        )
+        .await
+    }
+
+    async fn dispatch_with_timeouts(
+        address: SocketAddr,
+        hedging_policy: Option<crate::RequestHedgingPolicy>,
+        effective_timeouts: lb_net_core::ConnectionTimeouts,
+    ) -> Result<(Response<RecvStream>, crate::HedgeOutcome), StreamForwardError> {
+        let target = lb_net_core::UpstreamTarget::new("retry-target", address);
+        let now = Instant::now();
+        dispatch_retry_response_with_optional_hedge(
+            UpstreamClientRegistry::default(),
+            target,
+            effective_timeouts,
+            None,
+            template().expect("valid URI"),
+            now,
+            now,
+            hedging_policy,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn retries_dispatch_with_and_without_optional_hedging(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let address = spawn_upstream(true).await?;
+        let (response, outcome) = dispatch(address, None).await.expect("retry succeeds");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!outcome.hedge_launched);
+        assert_eq!(outcome.winner_attempt, 1);
+
+        let address = spawn_upstream(true).await?;
+        let (response, outcome) = dispatch(
+            address,
+            Some(crate::RequestHedgingPolicy {
+                hedge_delay: Duration::from_secs(1),
+                max_attempts: 2,
+            }),
+        )
+        .await
+        .expect("hedged retry succeeds");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!outcome.hedge_launched);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn retry_dispatch_reports_upstream_connection_failure(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        drop(listener);
+        assert!(matches!(dispatch(address, None).await, Err(StreamForwardError::UpstreamResponse)));
+
+        let address = spawn_upstream(false).await?;
+        let timeouts = lb_net_core::ConnectionTimeouts {
+            connect_timeout: Duration::from_secs(1),
+            preface_timeout: Duration::from_millis(100),
+            idle_timeout: Duration::from_millis(25),
+        };
+        assert!(matches!(
+            dispatch_with_timeouts(address, None, timeouts).await,
+            Err(StreamForwardError::IdleTimeout(StreamIdlePhase::UpstreamResponse))
+        ));
+        Ok(())
+    }
+
+    async fn run_stream(
+        config: &Http2ProxyConfig,
+        path: &str,
+        headers: &[(&str, &str)],
+    ) -> Result<(StatusCode, Result<(), StreamForwardError>), Box<dyn std::error::Error>> {
+        run_stream_with_body(config, path, headers, Bytes::new()).await
+    }
+
+    async fn run_stream_with_body(
+        config: &Http2ProxyConfig,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: Bytes,
+    ) -> Result<(StatusCode, Result<(), StreamForwardError>), Box<dyn std::error::Error>> {
+        let (response, result) =
+            run_stream_with_body_result(config, path, headers, body).await?;
+        Ok((response?, result))
+    }
+
+    async fn run_stream_with_body_result(
+        config: &Http2ProxyConfig,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: Bytes,
+    ) -> Result<
+        (
+            Result<StatusCode, h2::Error>,
+            Result<(), StreamForwardError>,
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (server, client) =
+            tokio::join!(h2::server::handshake(server_io), h2::client::handshake(client_io));
+        let mut server = server?;
+        let (mut client, client_connection) = client?;
+        tokio::spawn(async move {
+            let _ = client_connection.await;
+        });
+
+        let is_grpc = headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("content-type") && value.starts_with("application/grpc")
+        });
+        let mut request = Request::builder()
+            .method(if is_grpc { "POST" } else { "GET" })
+            .uri(format!("https://example.test{path}"))
+            .body(())?;
+        for (name, value) in headers {
+            request.headers_mut().insert(
+                http::header::HeaderName::from_bytes(name.as_bytes())?,
+                http::HeaderValue::from_str(value)?,
+            );
+        }
+        let (response, mut request_body) = client.send_request(request, false)?;
+        let (request, mut respond) = time::timeout(Duration::from_secs(1), server.accept())
+            .await?
+            .ok_or("HTTP/2 request was not accepted")??;
+        tokio::spawn(async move {
+            while let Some(result) = server.accept().await {
+                if result.is_err() {
+                    break;
+                }
+            }
+        });
+        let body_sender = tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            request_body.send_data(body, true)
+        });
+        assert!(!request.body().is_end_stream(), "request body should still be open");
+
+        let result = proxy_one_http2_stream(
+            request,
+            &mut respond,
+            "127.0.0.1:40000".parse()?,
+            UpstreamClientRegistry::default(),
+            &MetricsState::new(),
+            config,
+        )
+        .await;
+        body_sender.await??;
+        let response = time::timeout(Duration::from_secs(1), response).await?;
+        Ok((response.map(|response| response.status()), result))
+    }
+
+    #[tokio::test]
+    async fn request_policy_rejections_return_specific_local_statuses(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let upstream = lb_net_core::UpstreamTarget::new(
+            "blocked",
+            "127.0.0.1:1".parse()?,
+        );
+        let trusted = Http2ProxyConfig::new(upstream.clone()).with_trusted_client_ip(
+            crate::TrustedClientIpPolicy {
+                enabled: true,
+                trusted_proxy_cidrs: vec!["127.0.0.0/8".parse()?],
+            },
+        );
+        let (status, result) =
+            run_stream(&trusted, "/", &[("forwarded", "for=not-an-ip")]).await?;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(result.is_ok());
+
+        let anonymous = Http2ProxyConfig::new(upstream.clone()).with_anonymous_source_filter(
+            crate::AnonymousSourceFilterPolicy {
+                enabled: true,
+                deny_cidrs: vec!["127.0.0.0/8".parse()?],
+                deny_vpn: false,
+                deny_proxy: false,
+                deny_socks: false,
+                deny_tor: false,
+                vpn_cidrs: Vec::new(),
+                proxy_cidrs: Vec::new(),
+                socks_cidrs: Vec::new(),
+                tor_exit_cidrs: Vec::new(),
+            },
+        );
+        let (status, result) = run_stream(&anonymous, "/", &[]).await?;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(result.is_ok());
+
+        let mut unmatched = Http2ProxyConfig::new(upstream.clone()).with_route_upstreams([
+            Http2RouteUpstream { route_label: String::from("known"), upstream: upstream.clone() },
+        ]);
+        unmatched.reject_unmatched_routes = true;
+        let (status, result) = run_stream(&unmatched, "/unmatched", &[]).await?;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(result.is_ok());
+
+        let (status, result) = run_stream(&Http2ProxyConfig::new(upstream), "/", &[]).await?;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(matches!(result, Err(StreamForwardError::UpstreamRequest)));
+
+        let invalid_transform = lb_config_model::RequestTransformConfig {
+            path_rewrite: None,
+            host_rewrite: None,
+            header_mutations: vec![lb_config_model::HeaderMutationConfig::Set {
+                name: String::from("invalid header"),
+                value: String::from("value"),
+            }],
+        };
+        let config = Http2ProxyConfig::new(lb_net_core::UpstreamTarget::new(
+            "transform",
+            "127.0.0.1:1".parse()?,
+        ))
+        .with_request_transforms(Some(invalid_transform), []);
+        let (status, result) = run_stream(&config, "/", &[]).await?;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(result.is_ok());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn forwards_stream_request_and_response_bodies() -> Result<(), Box<dyn std::error::Error>> {
+        let address = spawn_upstream(true).await?;
+        let config =
+            Http2ProxyConfig::new(lb_net_core::UpstreamTarget::new("body-upstream", address));
+        let (status, result) = run_stream_with_body(
+            &config,
+            "/body",
+            &[],
+            Bytes::from_static(b"request"),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "proxy result: {result:?}");
+        assert!(result.is_ok());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn forwards_empty_http_errors_without_opening_a_response_body(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let address =
+            spawn_empty_status_upstream(StatusCode::SERVICE_UNAVAILABLE, None).await?;
+        let config =
+            Http2ProxyConfig::new(lb_net_core::UpstreamTarget::new("empty-error", address));
+        let (status, result) = run_stream(&config, "/empty-error", &[]).await?;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(result.is_ok());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn records_grpc_status_from_an_empty_response_header(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let address = spawn_empty_status_upstream(StatusCode::OK, Some("0")).await?;
+        let config = Http2ProxyConfig::new(lb_net_core::UpstreamTarget::new(
+            "empty-grpc",
+            address,
+        ));
+        let (status, result) = run_stream(
+            &config,
+            "/grpc.health.v1.Health/Check",
+            &[("content-type", "application/grpc")],
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK);
+        assert!(result.is_ok());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn classifies_grpc_streams_and_proxies_the_response(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let address = spawn_upstream(true).await?;
+        let config =
+            Http2ProxyConfig::new(lb_net_core::UpstreamTarget::new("grpc-upstream", address));
+        let (status, result) = run_stream(
+            &config,
+            "/grpc.health.v1.Health/Check",
+            &[("content-type", "application/grpc")],
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "proxy result: {result:?}");
+        assert!(result.is_ok());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn retries_unary_grpc_responses_with_retryable_statuses(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let response_body = &[0, 0, 0, 0, 0];
+        let (address, attempts) = spawn_grpc_retry_upstream(response_body).await?;
+        let config =
+            Http2ProxyConfig::new(lb_net_core::UpstreamTarget::new("grpc-retry", address));
+        let (status, result) = run_stream(
+            &config,
+            "/grpc.health.v1.Health/Check",
+            &[("content-type", "application/grpc")],
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "proxy result: {result:?}");
+        assert!(result.is_ok());
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::Relaxed), 2);
+
+        let (address, attempts) = spawn_grpc_retry_upstream(response_body).await?;
+        let mut limited =
+            Http2ProxyConfig::new(lb_net_core::UpstreamTarget::new("grpc-retry-limited", address));
+        limited.limits.max_body_bytes = 1;
+        let (status, result) = run_stream(
+            &limited,
+            "/grpc.health.v1.Health/Check",
+            &[("content-type", "application/grpc")],
+        )
+        .await?;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(result.is_ok());
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::Relaxed), 2);
+
+        let (address, attempts) = spawn_grpc_retry_upstream(response_body).await?;
+        let config =
+            Http2ProxyConfig::new(lb_net_core::UpstreamTarget::new("grpc-stream", address));
+        let multi_message_request =
+            Bytes::from_static(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let (status, result) = run_stream_with_body(
+            &config,
+            "/grpc.health.v1.Health/Check",
+            &[("content-type", "application/grpc")],
+            multi_message_request,
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK);
+        assert!(result.is_ok());
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::Relaxed), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn request_limits_and_upstream_timeouts_are_reported(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let address = spawn_upstream(true).await?;
+        let mut limited =
+            Http2ProxyConfig::new(lb_net_core::UpstreamTarget::new("limited", address));
+        limited.limits.max_body_bytes = 1;
+        let (status, result) = run_stream_with_body(
+            &limited,
+            "/limited",
+            &[],
+            Bytes::from_static(b"request"),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(result.is_ok());
+
+        let address = spawn_upstream(true).await?;
+        let mut response_limited =
+            Http2ProxyConfig::new(lb_net_core::UpstreamTarget::new("response-limited", address));
+        response_limited.limits.max_body_bytes = 1;
+        let (response, result) =
+            run_stream_with_body_result(&response_limited, "/response-limited", &[], Bytes::new())
+                .await?;
+        assert_eq!(response.unwrap_err().reason(), Some(Reason::ENHANCE_YOUR_CALM));
+        assert!(result.is_ok());
+
+        let address = spawn_upstream(false).await?;
+        let mut slow =
+            Http2ProxyConfig::new(lb_net_core::UpstreamTarget::new("slow", address));
+        slow.timeouts.idle_timeout = Duration::from_millis(1);
+        let (status, result) = run_stream(&slow, "/slow", &[]).await?;
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+        assert!(matches!(
+            result,
+            Err(StreamForwardError::IdleTimeout(StreamIdlePhase::UpstreamResponse))
+        ));
+
+        let target =
+            lb_net_core::UpstreamTarget::new("connect-timeout", "127.0.0.1:1".parse()?);
+        let mut connect_timeout = Http2ProxyConfig::new(target);
+        connect_timeout.timeouts.connect_timeout = Duration::ZERO;
+        let (status, result) = run_stream(&connect_timeout, "/timeout", &[]).await?;
+        match status {
+            StatusCode::BAD_GATEWAY => {
+                assert!(matches!(result, Err(StreamForwardError::UpstreamRequest)));
+            }
+            StatusCode::GATEWAY_TIMEOUT => {
+                assert!(matches!(
+                    result,
+                    Err(StreamForwardError::IdleTimeout(StreamIdlePhase::UpstreamResponse))
+                ));
+            }
+            status => panic!("unexpected connect failure status: {status}"),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn route_authentication_failures_map_to_local_http2_responses(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let route_label = String::from("secure-api");
+        let cluster_name = String::from("secure-cluster");
+        let pool = crate::RouteBackendPool::from_cluster(
+            lb_net_core::UpstreamCluster::new(
+                lb_net_core::UpstreamClusterName::new(cluster_name.clone())?,
+                vec![lb_net_core::UpstreamEndpoint::new(
+                    lb_net_core::UpstreamEndpointId::new("secure-endpoint")?,
+                    "127.0.0.1:1".parse()?,
+                    lb_net_core::EndpointState::Ready,
+                    lb_net_core::EndpointMetadata { zone: None, locality: None, weight: 1 },
+                )?],
+            )?,
+            crate::EndpointHealthPolicy::default(),
+            crate::UpstreamSelectionPolicy::default(),
+        )?;
+        let upstream = pool.select_upstream(0)?;
+        let route_config = |target: lb_net_core::UpstreamTarget| {
+            let mut config = Http2ProxyConfig::new(target)
+                .with_route_backend_pools([(route_label.clone(), pool.clone())]);
+            config.routes = vec![lb_proto_http::RoutePrefixRule::new(&route_label, "/")];
+            config
+        };
+
+        let jwt = crate::JwtAuthPolicyRuntime::from_config(
+            &lb_config_model::JwtAuthPolicyConfig {
+                issuers: vec![String::from("https://issuer.example")],
+                audiences: vec![String::from("edge-api")],
+                jwks: Some(lb_config_model::JwtJwksSourceConfig::Inline {
+                    jwks_json: String::from(
+                        r#"{"keys":[{"kty":"oct","k":"c2VjcmV0","alg":"HS256","kid":"key"}]}"#,
+                    ),
+                }),
+                required_claims: Vec::new(),
+                clock_skew_secs: 30,
+            },
+        )?;
+        let jwt_config = route_config(upstream.clone())
+            .with_route_destination_jwt_auth_policies([(
+                route_label.clone(),
+                BTreeMap::from([(cluster_name.clone(), jwt)]),
+            )]);
+        let (status, result) = run_stream(&jwt_config, "/secure", &[]).await?;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(result.is_ok());
+
+        let external = crate::ExternalAuthPolicyRuntime::from_config(
+            &lb_config_model::ExternalAuthPolicyConfig {
+                endpoint: String::from("http://127.0.0.1:9/authz"),
+                protocol: lb_config_model::ExternalAuthProtocolConfig::Http,
+                timeout_ms: 1_000,
+                fail_open: false,
+                include_headers: Vec::new(),
+                context_mappings: Vec::new(),
+            },
+        )?;
+        let external_config = route_config(upstream.clone())
+            .with_route_destination_external_auth_policies([(
+                route_label.clone(),
+                BTreeMap::from([(cluster_name.clone(), external)]),
+            )]);
+        let (status, result) = run_stream(&external_config, "/secure", &[]).await?;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(result.is_ok());
+
+        for (body, expected_status) in [
+            (r#"{"allow":false}"#, StatusCode::FORBIDDEN),
+            ("not-json", StatusCode::BAD_GATEWAY),
+        ] {
+            let endpoint = spawn_external_auth_service(body).await?;
+            let external = crate::ExternalAuthPolicyRuntime::from_config(
+                &lb_config_model::ExternalAuthPolicyConfig {
+                    endpoint,
+                    protocol: lb_config_model::ExternalAuthProtocolConfig::Http,
+                    timeout_ms: 1_000,
+                    fail_open: false,
+                    include_headers: Vec::new(),
+                    context_mappings: Vec::new(),
+                },
+            )?;
+            let config = route_config(upstream.clone())
+                .with_route_destination_external_auth_policies([(
+                    route_label.clone(),
+                    BTreeMap::from([(cluster_name.clone(), external)]),
+                )]);
+            let (status, result) = run_stream(&config, "/secure", &[]).await?;
+            assert_eq!(status, expected_status);
+            assert!(result.is_ok());
+        }
+
+        let authorization = crate::AuthorizationPolicyRuntime::from_config(
+            &lb_config_model::AuthorizationPolicyConfig {
+                rules: Vec::new(),
+                default_decision: lb_config_model::AuthorizationDecisionConfig::Deny,
+            },
+        );
+        let authorization_config = route_config(upstream.clone())
+            .with_route_destination_authorization_policies([(
+                route_label.clone(),
+                BTreeMap::from([(cluster_name.clone(), authorization)]),
+            )]);
+        let (status, result) = run_stream(&authorization_config, "/secure", &[]).await?;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(result.is_ok());
+
+        let certified = rcgen::generate_simple_self_signed(vec![String::from("localhost")])?;
+        let identity = crate::UpstreamIdentityPolicyRuntime::from_config(
+            &lb_config_model::UpstreamIdentityPolicyConfig {
+                mode: lb_config_model::UpstreamIdentityModeConfig::Spiffe,
+                trust_bundle: lb_config_model::IdentityTrustBundleSourceConfig::InlinePem {
+                    pem: certified.cert.pem(),
+                },
+                allowed_spiffe_ids: Vec::new(),
+                allowed_trust_domains: Vec::new(),
+            },
+        )?;
+        let identity_config = route_config(upstream)
+            .with_route_destination_upstream_identity_policies([(
+                route_label.clone(),
+                BTreeMap::from([(cluster_name.clone(), identity)]),
+            )]);
+        let (status, result) = run_stream(&identity_config, "/secure", &[]).await?;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(result.is_ok());
+
+        let invalid_destination_transform = crate::http1_proxy::RouteDestinationPolicyRuntime {
+            request_transform: Some(lb_config_model::RequestTransformConfig {
+                path_rewrite: None,
+                host_rewrite: None,
+                header_mutations: vec![lb_config_model::HeaderMutationConfig::Set {
+                    name: String::from("invalid header"),
+                    value: String::from("value"),
+                }],
+            }),
+            ..crate::http1_proxy::RouteDestinationPolicyRuntime::default()
+        };
+        let transform_config = route_config(pool.select_upstream(0)?)
+            .with_route_destination_policies([(
+                route_label,
+                BTreeMap::from([(cluster_name, invalid_destination_transform)]),
+            )]);
+        let (status, result) = run_stream(&transform_config, "/secure", &[]).await?;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(result.is_ok());
+        Ok(())
+    }
+}

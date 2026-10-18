@@ -31,7 +31,7 @@ use lb_runtime::{
     ProtocolAnomalyCategory, RequestHedgingPolicy, RetryBudgetPolicy, RouteBackendPool,
     RouteDestinationPolicyRuntime, RouteEnumerationProtectionPolicy, RuntimeTelemetry,
     SourceAggregation, TimeoutCategory, TimeoutHierarchy, TrustedClientIpPolicy,
-    UpstreamSelectionPolicy, WeightedRouteDestination,
+    UpstreamIdentityPolicyRuntime, UpstreamSelectionPolicy, WeightedRouteDestination,
 };
 use serde::{Deserialize, Serialize};
 use tokio::net::{TcpListener, TcpStream};
@@ -797,6 +797,47 @@ async fn authorization_policy_accepts_http2_stream_with_matching_headers(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn missing_http2_upstream_identity_is_rejected_before_dispatch(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let upstream_addr = reserve_unused_addr().await?;
+    let pool = route_backend_pool(
+        "frontend-primary",
+        vec![("primary-a", upstream_addr, 1, None, None)],
+        EndpointHealthPolicy::default(),
+        UpstreamSelectionPolicy::default(),
+    )?;
+    let certified = rcgen::generate_simple_self_signed(vec![String::from("localhost")])?;
+    let identity_policy = UpstreamIdentityPolicyRuntime::from_config(
+        &lb_config_model::UpstreamIdentityPolicyConfig {
+            mode: lb_config_model::UpstreamIdentityModeConfig::Spiffe,
+            trust_bundle: lb_config_model::IdentityTrustBundleSourceConfig::InlinePem {
+                pem: certified.cert.pem(),
+            },
+            allowed_spiffe_ids: Vec::new(),
+            allowed_trust_domains: Vec::new(),
+        },
+    )?;
+    let mut config = proxy_config(upstream_addr)
+        .with_route_backend_pools([(String::from("api"), pool)])
+        .with_route_destination_upstream_identity_policies([(
+            String::from("api"),
+            std::collections::BTreeMap::from([(String::from("frontend-primary"), identity_policy)]),
+        )]);
+    config.routes = vec![lb_proto_http::RoutePrefixRule::new("api", "/")];
+    let (proxy_addr, report_rx) = spawn_one_shot_http2_proxy_listener(config).await?;
+
+    let mut client = connect_h2_client(proxy_addr).await?;
+    let response = send_h2_request(&mut client, "/secure", None).await?;
+    let received = receive_h2_response(response).await?;
+    assert_eq!(received.0, StatusCode::SERVICE_UNAVAILABLE);
+    drop(client);
+
+    let report = receive_proxy_result(report_rx).await?;
+    assert_eq!(report.metrics.response_status_counts.get(&503), Some(&1));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn delays_http2_request_before_primary_upstream_dispatch(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (upstream_addr, capture_rx) = spawn_request_capture_h2_upstream().await?;
@@ -919,6 +960,61 @@ async fn aborts_http2_request_locally_without_contacting_primary_upstream(
     assert_eq!(report.metrics.fault_injection_delay_count, 0);
     assert_eq!(report.metrics.fault_injection_abort_count, 1);
     assert_eq!(report.metrics.response_status_counts.get(&503), Some(&1));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn zero_percent_http2_fault_does_not_abort_request_with_host_header(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (upstream_addr, capture_rx) = spawn_request_capture_h2_upstream().await?;
+    let pool = route_backend_pool(
+        "frontend-primary",
+        vec![("primary-a", upstream_addr, 1, None, None)],
+        EndpointHealthPolicy::default(),
+        UpstreamSelectionPolicy::default(),
+    )?;
+    let mut config = proxy_config(upstream_addr)
+        .with_route_backend_pools([(String::from("api"), pool)])
+        .with_route_destination_policies([(
+            String::from("api"),
+            std::collections::BTreeMap::from([(
+                String::from("frontend-primary"),
+                RouteDestinationPolicyRuntime {
+                    request_transform: None,
+                    response_transform: None,
+                    traffic_mirror: None,
+                    fault_injection: Some(FaultInjectionPolicyConfig {
+                        delay: None,
+                        abort: Some(FaultInjectionAbortConfig { percentage: 0, http_status: 503 }),
+                    }),
+                    rate_limiters: Vec::new(),
+                    concurrency_limiters: Vec::new(),
+                    failure_manager: None,
+                    enforce_retry_budget: false,
+                    enforce_timeout_hierarchy: false,
+                    enforce_circuit_breaker: false,
+                },
+            )]),
+        )]);
+    config.routes = vec![lb_proto_http::RoutePrefixRule::new("api", "/api")];
+    let (proxy_addr, report_rx) = spawn_one_shot_http2_proxy_listener(config).await?;
+
+    let mut client = connect_h2_client(proxy_addr).await?;
+    let response = send_h2_request_with_headers(
+        &mut client,
+        "/api/orders",
+        None,
+        &[("host", "orders.example")],
+    )
+    .await?;
+    assert_eq!(receive_h2_response(response).await?.0, StatusCode::OK);
+    drop(client);
+
+    let capture = time::timeout(Duration::from_secs(2), capture_rx).await??;
+    assert_eq!(capture.path_and_query, "/api/orders");
+    let report = receive_proxy_result(report_rx).await?;
+    assert_eq!(report.metrics.fault_injection_abort_count, 0);
+    assert_eq!(report.metrics.response_status_counts.get(&200), Some(&1));
     Ok(())
 }
 

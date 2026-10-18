@@ -212,7 +212,6 @@ fn proxy_preface_timeout(proxy: &ManagedProxyConfig) -> Duration {
     }
 }
 
-
 async fn run_public_listener_loop(
     listener: TcpListener,
     listener_name: String,
@@ -604,7 +603,6 @@ async fn handle_workspace_admin_tls_connection(
     .await
 }
 
-
 fn try_acquire_listener_slot(
     counters: &ListenerRuntimeCounters,
     admission_limit: &AtomicUsize,
@@ -644,7 +642,6 @@ async fn write_overload_response(stream: &mut TcpStream) -> io::Result<()> {
     stream.shutdown().await
 }
 
-
 async fn proxy_https_connection(
     stream: TcpStream,
     peer_addr: SocketAddr,
@@ -681,3 +678,60 @@ async fn proxy_https_connection(
     }
 }
 
+#[cfg(test)]
+mod listener_runtime_tests {
+    use super::{
+        backoff_after_accept_error, proxy_preface_timeout, try_acquire_listener_slot,
+        ListenerRuntimeCounters, ManagedProxyConfig,
+    };
+    use lb_net_core::UpstreamTarget;
+    use lb_runtime::{Http1ProxyConfig, Http2ProxyConfig};
+    use std::io;
+    use std::net::SocketAddr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn listener_slots_follow_live_capacity_and_release_after_completion() {
+        let counters = ListenerRuntimeCounters::new();
+        let limit = AtomicUsize::new(2);
+        assert!(try_acquire_listener_slot(&counters, &limit));
+        assert!(try_acquire_listener_slot(&counters, &limit));
+        assert_eq!(counters.active_connections.load(Ordering::SeqCst), 2);
+        assert!(!try_acquire_listener_slot(&counters, &limit));
+
+        counters.active_connections.fetch_sub(1, Ordering::SeqCst);
+        assert!(try_acquire_listener_slot(&counters, &limit));
+        assert_eq!(counters.active_connections.load(Ordering::SeqCst), 2);
+        limit.store(1, Ordering::SeqCst);
+        assert!(!try_acquire_listener_slot(&counters, &limit));
+
+        counters.active_connections.store(0, Ordering::SeqCst);
+        assert!(try_acquire_listener_slot(&counters, &limit));
+    }
+
+    #[test]
+    fn preface_deadlines_are_taken_from_each_tcp_proxy_protocol() {
+        let upstream =
+            UpstreamTarget::new("test-upstream", SocketAddr::from(([127, 0, 0, 1], 8080)));
+        let mut http1 = Http1ProxyConfig::new(upstream.clone());
+        http1.timeouts.preface_timeout = Duration::from_millis(17);
+        let mut http2 = Http2ProxyConfig::new(upstream);
+        http2.timeouts.preface_timeout = Duration::from_millis(29);
+        assert_eq!(
+            proxy_preface_timeout(&ManagedProxyConfig::Http1(http1)),
+            Duration::from_millis(17)
+        );
+        assert_eq!(
+            proxy_preface_timeout(&ManagedProxyConfig::Http2(http2)),
+            Duration::from_millis(29)
+        );
+    }
+
+    #[tokio::test]
+    async fn transient_accept_errors_back_off_instead_of_spinning() {
+        let started = Instant::now();
+        backoff_after_accept_error("test-listener", &io::Error::other("temporary")).await;
+        assert!(started.elapsed() >= Duration::from_millis(50));
+    }
+}

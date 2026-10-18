@@ -318,3 +318,278 @@ async fn discard_recv_stream_body(
     Ok(())
 }
 
+#[cfg(test)]
+mod body_relay_coverage_tests {
+    use super::*;
+
+    async fn incoming_stream(
+        body: Bytes,
+        trailers: Option<http::HeaderMap>,
+    ) -> Result<RecvStream, Box<dyn std::error::Error>> {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (server, client) =
+            tokio::join!(h2::server::handshake(server_io), h2::client::handshake(client_io));
+        let mut server = server?;
+        let (mut client, client_connection) = client?;
+        tokio::spawn(async move {
+            let _ = client_connection.await;
+        });
+
+        let request = Request::builder().method("POST").uri("https://example.test/body").body(())?;
+        let (response, mut send) = client.send_request(request, false)?;
+        tokio::spawn(async move {
+            let _ = response.await;
+        });
+        if let Some(trailers) = trailers {
+            send.send_data(body, false)?;
+            send.send_trailers(trailers)?;
+        } else {
+            send.send_data(body, true)?;
+        }
+
+        let (request, respond) = time::timeout(Duration::from_secs(1), server.accept())
+            .await?
+            .ok_or("HTTP/2 request was not accepted")??;
+        tokio::spawn(async move {
+            let _respond = respond;
+            while let Some(result) = server.accept().await {
+                if result.is_err() {
+                    break;
+                }
+            }
+        });
+        Ok(request.into_body())
+    }
+
+    async fn outgoing_stream(
+    ) -> Result<(SendStream<Bytes>, RecvStream), Box<dyn std::error::Error>> {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (server, client) =
+            tokio::join!(h2::server::handshake(server_io), h2::client::handshake(client_io));
+        let mut server = server?;
+        let (mut client, client_connection) = client?;
+        tokio::spawn(async move {
+            let _ = client_connection.await;
+        });
+
+        let request = Request::builder().method("POST").uri("https://example.test/body").body(())?;
+        let (response, send) = client.send_request(request, false)?;
+        tokio::spawn(async move {
+            let _ = response.await;
+        });
+        let (request, respond) = time::timeout(Duration::from_secs(1), server.accept())
+            .await?
+            .ok_or("HTTP/2 request was not accepted")??;
+        tokio::spawn(async move {
+            let _respond = respond;
+            while let Some(result) = server.accept().await {
+                if result.is_err() {
+                    break;
+                }
+            }
+        });
+        Ok((send, request.into_body()))
+    }
+
+    #[tokio::test]
+    async fn relays_payload_and_sanitized_trailers() -> Result<(), Box<dyn std::error::Error>> {
+        let mut trailers = http::HeaderMap::new();
+        trailers.insert("x-checksum", http::HeaderValue::from_static("abc"));
+        trailers.insert(http::header::CONTENT_LENGTH, http::HeaderValue::from_static("4"));
+        let incoming =
+            incoming_stream(Bytes::from_static(b"body"), Some(trailers)).await?;
+        let (mut send, mut received) = outgoing_stream().await?;
+
+        let forwarded = relay_recv_body_to_send_stream(
+            incoming,
+            &mut send,
+            8,
+            Duration::from_secs(1),
+            StreamBodyDirection::Request,
+        )
+        .await
+        .expect("request body relays")
+        .expect("trailers are relayed");
+        assert_eq!(forwarded.get("x-checksum").and_then(|value| value.to_str().ok()), Some("abc"));
+        assert!(!forwarded.contains_key(http::header::CONTENT_LENGTH));
+
+        let mut body = Vec::new();
+        while let Some(chunk) = received.data().await {
+            let chunk = chunk?;
+            received.flow_control().release_capacity(chunk.len())?;
+            body.extend_from_slice(&chunk);
+        }
+        assert_eq!(body, b"body");
+        let received_trailers = received.trailers().await?.expect("trailers arrive downstream");
+        assert_eq!(
+            received_trailers.get("x-checksum").and_then(|value| value.to_str().ok()),
+            Some("abc")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn relay_enforces_body_limit_and_buffer_reader_handles_empty_body(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let incoming = incoming_stream(Bytes::from_static(b"too large"), None).await?;
+        let (mut send, _) = outgoing_stream().await?;
+        assert!(matches!(
+            relay_recv_body_to_send_stream(
+                incoming,
+                &mut send,
+                1,
+                Duration::from_secs(1),
+                StreamBodyDirection::Request,
+            )
+            .await,
+            Err(StreamForwardError::RequestBodyLimitExceeded)
+        ));
+
+        let empty = incoming_stream(Bytes::new(), None).await?;
+        let payload = read_recv_body_to_buffer(
+            empty,
+            1,
+            Duration::from_secs(1),
+            StreamBodyDirection::Response,
+        )
+        .await
+        .expect("empty response body is buffered");
+        assert!(payload.body.is_empty());
+        assert!(payload.trailers.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn buffers_and_replays_response_body_and_discards_unused_body(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut trailers = http::HeaderMap::new();
+        trailers.insert("x-checksum", http::HeaderValue::from_static("buffered"));
+        let incoming =
+            incoming_stream(Bytes::from_static(b"buffered"), Some(trailers)).await?;
+        let (mut send, mut received) = outgoing_stream().await?;
+        let payload = relay_recv_body_to_send_stream_buffered(
+            incoming,
+            &mut send,
+            32,
+            Duration::from_secs(1),
+            StreamBodyDirection::Response,
+        )
+        .await
+        .expect("response is buffered");
+        assert_eq!(payload.body, Bytes::from_static(b"buffered"));
+        let mut body = Vec::new();
+        while let Some(chunk) = received.data().await {
+            let chunk = chunk?;
+            received.flow_control().release_capacity(chunk.len())?;
+            body.extend_from_slice(&chunk);
+        }
+        assert_eq!(body, b"buffered");
+        let received_trailers = received.trailers().await?.expect("trailers are preserved");
+        assert_eq!(
+            received_trailers.get("x-checksum").and_then(|value| value.to_str().ok()),
+            Some("buffered")
+        );
+
+        let mut trailers = http::HeaderMap::new();
+        trailers.insert("x-checksum", http::HeaderValue::from_static("buffered"));
+        let incoming =
+            incoming_stream(Bytes::from_static(b"buffered"), Some(trailers)).await?;
+        let (mut send, mut received) = outgoing_stream().await?;
+        let payload = read_recv_body_to_buffer(
+            incoming,
+            32,
+            Duration::from_secs(1),
+            StreamBodyDirection::Response,
+        )
+        .await
+        .expect("response payload is buffered without forwarding");
+        send_buffered_stream_payload(
+            &mut send,
+            &payload,
+            Duration::from_secs(1),
+            StreamBodyDirection::Response,
+        )
+        .await
+        .expect("buffered response is forwarded");
+        let mut body = Vec::new();
+        while let Some(chunk) = received.data().await {
+            let chunk = chunk?;
+            received.flow_control().release_capacity(chunk.len())?;
+            body.extend_from_slice(&chunk);
+        }
+        assert_eq!(body, b"buffered");
+        assert!(received.trailers().await?.is_some());
+
+        let unused = incoming_stream(Bytes::from_static(b"discard"), None).await?;
+        discard_recv_stream_body(unused, Duration::from_secs(1))
+            .await
+            .expect("unused body is drained");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn relays_empty_and_multi_frame_bodies() -> Result<(), Box<dyn std::error::Error>> {
+        let (mut send, mut received) = outgoing_stream().await?;
+        send_buffered_stream_payload(
+            &mut send,
+            &BufferedStreamPayload::default(),
+            Duration::from_secs(1),
+            StreamBodyDirection::Request,
+        )
+        .await
+        .expect("empty buffered body ends the stream");
+        let mut buffered_body = Vec::new();
+        while let Some(chunk) = received.data().await {
+            let chunk = chunk?;
+            received.flow_control().release_capacity(chunk.len())?;
+            buffered_body.extend_from_slice(&chunk);
+        }
+        assert!(buffered_body.is_empty());
+        assert!(received.trailers().await?.is_none());
+
+        let empty = incoming_stream(Bytes::new(), None).await?;
+        let (mut send, mut received) = outgoing_stream().await?;
+        assert!(
+            relay_recv_body_to_send_stream(
+                empty,
+                &mut send,
+                32 * 1024,
+                Duration::from_secs(1),
+                StreamBodyDirection::Response,
+            )
+            .await
+            .expect("empty response relays")
+            .is_none()
+        );
+        let mut empty_body = Vec::new();
+        while let Some(chunk) = received.data().await {
+            let chunk = chunk?;
+            received.flow_control().release_capacity(chunk.len())?;
+            empty_body.extend_from_slice(&chunk);
+        }
+        assert!(empty_body.is_empty());
+        assert!(received.trailers().await?.is_none());
+
+        let body = Bytes::from(vec![b'x'; 20 * 1024]);
+        let incoming = incoming_stream(body.clone(), None).await?;
+        let (mut send, mut received) = outgoing_stream().await?;
+        relay_recv_body_to_send_stream(
+            incoming,
+            &mut send,
+            32 * 1024,
+            Duration::from_secs(1),
+            StreamBodyDirection::Response,
+        )
+        .await
+        .expect("multi-frame body relays");
+        let mut received_body = Vec::new();
+        while let Some(chunk) = received.data().await {
+            let chunk = chunk?;
+            received.flow_control().release_capacity(chunk.len())?;
+            received_body.extend_from_slice(&chunk);
+        }
+        assert_eq!(received_body, body);
+        assert!(received.trailers().await?.is_none());
+        Ok(())
+    }
+}

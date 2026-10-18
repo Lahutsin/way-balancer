@@ -63,10 +63,8 @@ fn compile_http1_route_backends(
                     pool
                 }
             };
-            route_destinations.push(lb_runtime::WeightedRouteDestination {
-                weight: destination.weight,
-                pool,
-            });
+            route_destinations
+                .push(lb_runtime::WeightedRouteDestination { weight: destination.weight, pool });
         }
 
         let route_backend_pool = if route_destinations.len() == 1 {
@@ -150,10 +148,8 @@ fn compile_http2_route_backends(
                     pool
                 }
             };
-            route_destinations.push(lb_runtime::WeightedRouteDestination {
-                weight: destination.weight,
-                pool,
-            });
+            route_destinations
+                .push(lb_runtime::WeightedRouteDestination { weight: destination.weight, pool });
         }
 
         let route_backend_pool = if route_destinations.len() == 1 {
@@ -296,3 +292,38 @@ fn default_route_enumeration_policy() -> lb_runtime::RouteEnumerationProtectionP
     }
 }
 
+#[cfg(test)]
+mod compile_routes_tests {
+    use super::{
+        compile_http1_route_backends, compile_http2_route_backends,
+        default_route_enumeration_policy,
+    };
+    use std::time::Duration;
+
+    #[test]
+    fn rejects_public_listeners_without_configured_routes_for_http1_and_http2() {
+        let config = lb_config_model::WorkspaceConfig::foundation();
+        let listener = lb_config_model::ListenerResourceConfig::foundation(
+            "empty-public",
+            lb_config_model::ListenerClassConfig::Public,
+            8080,
+        );
+        for error in [
+            compile_http1_route_backends(&config, &listener, &[]).err().unwrap(),
+            compile_http2_route_backends(&config, &listener, &[]).err().unwrap(),
+        ] {
+            assert!(error
+                .to_string()
+                .contains("public listener empty-public must reference at least one route"));
+        }
+    }
+
+    #[test]
+    fn default_route_enumeration_policy_keeps_finite_per_source_limits() {
+        let policy = default_route_enumeration_policy();
+        assert_eq!(policy.evaluation_window, Duration::from_secs(30));
+        assert_eq!(policy.max_unmatched_route_events, 3);
+        assert_eq!(policy.max_distinct_query_signatures_per_route, 6);
+        assert_eq!(policy.max_tracked_sources, 4096);
+    }
+}

@@ -511,3 +511,92 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod coverage_regressions {
+    use super::{EndpointStateConfig, UpstreamTransportConfig, WorkspaceConfigError};
+
+    #[test]
+    fn maps_every_endpoint_state_and_transport_variant() {
+        for (value, expected) in [
+            (UpstreamTransportConfig::Http1, lb_net_core::UpstreamTransport::Http1),
+            (UpstreamTransportConfig::Http2, lb_net_core::UpstreamTransport::Http2),
+            (UpstreamTransportConfig::Http3, lb_net_core::UpstreamTransport::Http3),
+        ] {
+            assert_eq!(lb_net_core::UpstreamTransport::from(value), expected);
+        }
+        for (value, expected) in [
+            (EndpointStateConfig::Ready, lb_net_core::EndpointState::Ready),
+            (EndpointStateConfig::Draining, lb_net_core::EndpointState::Draining),
+            (EndpointStateConfig::Unavailable, lb_net_core::EndpointState::Unavailable),
+        ] {
+            assert_eq!(lb_net_core::EndpointState::from(value), expected);
+        }
+    }
+
+    #[test]
+    fn preserves_simple_error_messages_and_nested_sources() {
+        let errors = [
+            (
+                WorkspaceConfigError::DuplicateListenerName(String::from("admin")),
+                "duplicate listener name admin",
+            ),
+            (
+                WorkspaceConfigError::DuplicateClusterName(String::from("payments")),
+                "duplicate upstream cluster name payments",
+            ),
+            (
+                WorkspaceConfigError::DuplicateRouteName(String::from("api")),
+                "duplicate route name api",
+            ),
+            (WorkspaceConfigError::EmptyRouteName, "route name must not be empty"),
+            (
+                WorkspaceConfigError::EmptyRoutePrefix(String::from("api")),
+                "route api must declare a non-empty path prefix",
+            ),
+            (
+                WorkspaceConfigError::InvalidRouteHostname(String::from("api")),
+                "route api must declare only valid hostnames",
+            ),
+            (
+                WorkspaceConfigError::InvalidRouteMethod(String::from("api")),
+                "route api must declare only valid HTTP methods",
+            ),
+            (
+                WorkspaceConfigError::InvalidRouteHeader(String::from("api")),
+                "route api must declare only valid header matchers",
+            ),
+            (
+                WorkspaceConfigError::InvalidRouteQuery(String::from("api")),
+                "route api must declare only valid query matchers",
+            ),
+            (
+                WorkspaceConfigError::InvalidRouteContentType(String::from("api")),
+                "route api must declare only valid content types",
+            ),
+            (
+                WorkspaceConfigError::InvalidRouteGrpcService(String::from("api")),
+                "route api must declare only valid gRPC service matchers",
+            ),
+            (
+                WorkspaceConfigError::InvalidRouteGrpcMethod(String::from("api")),
+                "route api must declare only valid gRPC method matchers",
+            ),
+            (
+                WorkspaceConfigError::InvalidRouteSourceCidr(String::from("api")),
+                "route api must declare only valid source CIDRs",
+            ),
+        ];
+        for (error, expected) in errors {
+            assert_eq!(error.to_string(), expected);
+            assert!(std::error::Error::source(&error).is_none());
+        }
+        let listener_error =
+            lb_net_core::ListenerConfig::foundation_local("", lb_net_core::ListenerClass::Public)
+                .validate()
+                .unwrap_err();
+        let wrapped = WorkspaceConfigError::InvalidListenerConfig(listener_error);
+        assert!(wrapped.to_string().contains("invalid listener config"));
+        assert!(std::error::Error::source(&wrapped).is_some());
+    }
+}

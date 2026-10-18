@@ -106,9 +106,7 @@ impl fmt::Display for Http1ProxyError {
             Self::ResponseIo(source) => {
                 write!(formatter, "HTTP/1.1 downstream write failed: {source}")
             }
-            Self::UpstreamGracefulDrain => {
-                formatter.write_str("upstream is gracefully draining")
-            }
+            Self::UpstreamGracefulDrain => formatter.write_str("upstream is gracefully draining"),
         }
     }
 }
@@ -145,5 +143,93 @@ impl Http1ProxyError {
             Self::IdleTimeout("request body") => Some(SlowClientStage::RequestBody),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod errors_and_reports_tests {
+    use std::error::Error;
+    use std::io;
+
+    use super::Http1ProxyError;
+    use crate::{ProtocolAnomalyCategory, SlowClientStage};
+
+    #[test]
+    fn proxy_errors_keep_direction_source_and_stable_classification() {
+        let target = "127.0.0.1:8080".parse().expect("socket address");
+        let cases = [
+            (
+                Http1ProxyError::ConnectTimeout { target },
+                "timed out connecting HTTP/1.1 upstream",
+                false,
+            ),
+            (
+                Http1ProxyError::Connect { target, source: io::Error::other("connect") },
+                "failed to connect HTTP/1.1 upstream",
+                true,
+            ),
+            (
+                Http1ProxyError::ParseRequest(lb_proto_http::Http1ParseError::HeadTooLarge),
+                "downstream HTTP/1.1 request failed",
+                true,
+            ),
+            (
+                Http1ProxyError::ParseResponse(lb_proto_http::Http1ParseError::IncompleteHead),
+                "upstream HTTP/1.1 response failed",
+                true,
+            ),
+            (
+                Http1ProxyError::BodyLimitExceeded("response body"),
+                "body limit exceeded for response body",
+                false,
+            ),
+            (
+                Http1ProxyError::IdleTimeout("request head"),
+                "idle timeout exceeded for request head",
+                false,
+            ),
+            (Http1ProxyError::RequestIo(io::Error::other("write")), "upstream write failed", true),
+            (
+                Http1ProxyError::ResponseIo(io::Error::other("write")),
+                "downstream write failed",
+                true,
+            ),
+            (Http1ProxyError::UpstreamGracefulDrain, "upstream is gracefully draining", false),
+        ];
+
+        for (error, message, has_source) in cases {
+            assert!(error.to_string().contains(message), "{error}");
+            assert_eq!(error.source().is_some(), has_source, "{error}");
+        }
+    }
+
+    #[test]
+    fn proxy_error_anomalies_and_slow_client_stages_are_precise() {
+        assert_eq!(
+            Http1ProxyError::ParseRequest(lb_proto_http::Http1ParseError::TooManyHeaders)
+                .anomaly_category(),
+            Some(ProtocolAnomalyCategory::HeaderCountLimitExceeded)
+        );
+        assert_eq!(
+            Http1ProxyError::ParseRequest(lb_proto_http::Http1ParseError::Io(io::Error::other(
+                "read"
+            )))
+            .anomaly_category(),
+            None
+        );
+        assert_eq!(
+            Http1ProxyError::BodyLimitExceeded("request body").anomaly_category(),
+            Some(ProtocolAnomalyCategory::BodySizeLimitExceeded)
+        );
+        assert_eq!(Http1ProxyError::BodyLimitExceeded("response body").anomaly_category(), None);
+        assert_eq!(
+            Http1ProxyError::IdleTimeout("request head").slow_client_stage(),
+            Some(SlowClientStage::RequestHead)
+        );
+        assert_eq!(
+            Http1ProxyError::IdleTimeout("request body").slow_client_stage(),
+            Some(SlowClientStage::RequestBody)
+        );
+        assert_eq!(Http1ProxyError::IdleTimeout("response head").slow_client_stage(), None);
     }
 }

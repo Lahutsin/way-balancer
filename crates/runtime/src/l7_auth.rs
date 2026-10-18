@@ -910,8 +910,33 @@ mod tests {
         let address = listener.local_addr()?;
         tokio::spawn(async move {
             if let Ok((mut socket, _)) = listener.accept().await {
-                let mut buffer = [0_u8; 4096];
-                let _ = socket.read(&mut buffer).await;
+                let mut request = Vec::new();
+                loop {
+                    let mut buffer = [0_u8; 4096];
+                    let read = socket.read(&mut buffer).await.expect("read auth request");
+                    assert_ne!(read, 0, "auth request ended before its body");
+                    request.extend_from_slice(&buffer[..read]);
+
+                    let Some(head_end) =
+                        request.windows(4).position(|window| window == b"\r\n\r\n")
+                    else {
+                        continue;
+                    };
+                    let headers = std::str::from_utf8(&request[..head_end])
+                        .expect("auth request headers are valid ASCII");
+                    let body_len = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length").then(|| {
+                                value.trim().parse::<usize>().expect("valid content length")
+                            })
+                        })
+                        .expect("auth request has content length");
+                    if request.len() >= head_end + 4 + body_len {
+                        break;
+                    }
+                }
                 let head = format!(
                     "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
                     body.len()

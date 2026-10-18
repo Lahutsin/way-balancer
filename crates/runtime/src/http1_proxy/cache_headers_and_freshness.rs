@@ -346,3 +346,168 @@ fn to_cache_headers(headers: &[lb_proto_http::HttpHeader]) -> Option<Vec<HttpCac
         })
         .collect()
 }
+
+#[cfg(test)]
+mod cache_headers_coverage_tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    fn header(name: &str, value: &str) -> lb_proto_http::HttpHeader {
+        lb_proto_http::HttpHeader { name: name.to_owned(), value: value.to_owned() }
+    }
+
+    fn entry() -> HttpCacheEntry {
+        HttpCacheEntry {
+            metadata: HttpCacheMetadata {
+                status: StatusCode::OK,
+                stored_at: Duration::ZERO,
+                fresh_until: Duration::from_secs(1),
+                stale_while_revalidate_until: None,
+                stale_if_error_until: None,
+                etag: Some(HeaderValue::from_static("\"v1\"")),
+                last_modified: Some(HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT")),
+            },
+            headers: Vec::new(),
+            body: bytes::Bytes::from_static(b"cached"),
+        }
+    }
+
+    #[test]
+    fn cache_control_and_date_metadata_produce_bounded_freshness() {
+        let policy = lb_config_model::HttpCachePolicyConfig::default();
+        let windows =
+            derive_freshness_windows_from_origin(&policy, &[]).expect("default freshness");
+        assert_eq!(windows.fresh_for, Duration::from_secs(policy.default_ttl_secs));
+
+        let windows = derive_freshness_windows_from_origin(
+            &policy,
+            &[header("Cache-Control", "max-age=120, s-maxage=90"), header("Age", "20")],
+        )
+        .expect("valid shared cache freshness");
+        assert_eq!(windows.fresh_for, Duration::from_secs(70));
+
+        let expires = derive_freshness_windows_from_origin(
+            &policy,
+            &[
+                header("expires", "Wed, 21 Oct 2015 07:30:00 GMT"),
+                header("date", "Wed, 21 Oct 2015 07:28:00 GMT"),
+                header("age", "30"),
+            ],
+        )
+        .expect("valid date freshness");
+        assert_eq!(expires.fresh_for, Duration::from_secs(90));
+        assert!(derive_freshness_windows_from_origin(&policy, &[header("expires", "not-a-date")])
+            .is_none());
+        assert!(derive_freshness_windows_from_origin(
+            &policy,
+            &[header("age", "invalid"), header("cache-control", "max-age=10")]
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn cache_control_pragma_vary_and_header_parsers_fail_closed() {
+        let policy = lb_config_model::HttpCachePolicyConfig::default();
+        for directive in ["no-store", "private", "no-cache"] {
+            assert!(derive_freshness_windows_from_origin(
+                &policy,
+                &[header("cache-control", directive)]
+            )
+            .is_none());
+        }
+        assert!(derive_freshness_windows_from_origin(&policy, &[header("pragma", "no-cache")])
+            .is_none());
+        assert!(parse_cache_control(&[header("cache-control", "max-age")]).is_none());
+        assert!(parse_cache_control(&[header("cache-control", "max-age=invalid")]).is_none());
+        assert!(parse_cache_control(&[header("cache-control", "max-age=\"12\"")]).is_some());
+        assert_eq!(parse_cache_delta("\"12\""), Some(12));
+        assert_eq!(parse_cache_delta("-1"), None);
+        assert_eq!(header_value(&[], "age"), None);
+        assert_eq!(header_value(&[header("age", " 3 ")], "age"), Some("3"));
+        assert_eq!(header_value(&[header("age", "1"), header("age", "2")], "age"), None);
+        assert!(has_pragma_no_cache(&[header("Pragma", "no-cache")]));
+        assert!(!has_pragma_no_cache(&[header("Pragma", "no-cache, no-store")]));
+        assert!(response_has_unsafe_vary(&[header("vary", "*")]));
+        assert!(response_has_unsafe_vary(&[header("vary", "Accept, Authorization")]));
+        assert!(response_has_unsafe_vary(&[header("vary", "Accept,")]));
+        assert!(!response_has_unsafe_vary(&[header("vary", "Accept-Encoding")]));
+        assert!(is_disallowed_cache_vary_header("X-Forwarded-For"));
+    }
+
+    #[test]
+    fn validators_methods_statuses_and_telemetry_inputs_are_handled() {
+        let policy = lb_config_model::HttpCachePolicyConfig::default();
+        assert!(request_method_is_cache_lookup_eligible(&policy, "get"));
+        assert!(request_method_is_cache_lookup_eligible(&policy, "HEAD"));
+        assert!(!request_method_is_cache_lookup_eligible(&policy, "POST"));
+
+        let response = lb_proto_http::Http1ResponseHead {
+            version: lb_proto_http::SupportedHttpVersion::Http1,
+            status: 200,
+            reason: String::new(),
+            headers: Vec::new(),
+            body_kind: lb_proto_http::BodyKind::None,
+            keep_alive: true,
+        };
+        assert!(response_is_cacheable(&policy, &response, &[]));
+        assert!(!response_is_cacheable(
+            &policy,
+            &lb_proto_http::Http1ResponseHead { status: 400, ..response.clone() },
+            &[]
+        ));
+        assert!(!response_is_cacheable(
+            &policy,
+            &response,
+            &[header("set-cookie", "session=secret")]
+        ));
+        assert!(response_header_value(&[header("ETag", "\"v1\"")], "etag").is_some());
+        assert!(response_header_value(&[header("etag", "bad\nvalue")], "etag").is_none());
+        assert!(to_cache_headers(&[header("content-type", "text/plain")]).is_some());
+        assert!(to_cache_headers(&[header("bad header", "value")]).is_none());
+        assert!(to_cache_headers(&[header("x-test", "bad\nvalue")]).is_none());
+
+        let stale = entry();
+        assert!(should_revalidate_entry(&policy, &stale));
+        let conditional = append_conditional_revalidation_headers(Vec::new(), Some(&stale));
+        assert_eq!(conditional.len(), 2);
+        assert_eq!(conditional[0].name, "if-none-match");
+        assert_eq!(conditional[1].name, "if-modified-since");
+        assert!(append_conditional_revalidation_headers(Vec::new(), None).is_empty());
+        let refreshed = refresh_revalidated_entry(
+            Some(&policy),
+            &stale,
+            &[header("cache-control", "max-age=20")],
+            Duration::from_secs(5),
+        )
+        .expect("revalidated metadata");
+        assert_eq!(refreshed.metadata.etag, stale.metadata.etag);
+        assert_eq!(refreshed.metadata.last_modified, stale.metadata.last_modified);
+        assert!(refresh_revalidated_entry(None, &stale, &[], Duration::ZERO).is_none());
+        assert!(derive_cache_metadata(
+            &lb_config_model::HttpCachePolicyConfig {
+                honor_cache_control: false,
+                default_ttl_secs: 0,
+                stale_while_revalidate_secs: 0,
+                stale_if_error_secs: 0,
+                ..policy
+            },
+            &[],
+            StatusCode::OK,
+            Duration::ZERO
+        )
+        .is_none());
+
+        assert_eq!(duration_if_non_zero(0), None);
+        assert_eq!(duration_if_non_zero(2), Some(Duration::from_secs(2)));
+        assert!(is_stale_if_error_response_status(500));
+        assert!(is_stale_if_error_response_status(599));
+        assert!(!is_stale_if_error_response_status(600));
+        assert!(error_allows_stale_if_error(&Http1ProxyError::UpstreamGracefulDrain));
+        assert!(error_allows_stale_if_error(&Http1ProxyError::IdleTimeout("request body")));
+        assert!(!error_allows_stale_if_error(&Http1ProxyError::IdleTimeout("request head")));
+
+        record_cache_request_telemetry(None, HttpCacheRequestOutcome::Bypass, "test", "disabled");
+        record_cache_revalidation_telemetry(None, HttpCacheRevalidationResult::Failed, "disabled");
+    }
+}

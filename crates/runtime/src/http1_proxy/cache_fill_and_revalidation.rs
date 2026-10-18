@@ -93,8 +93,11 @@ where
         };
 
         let body_kind = lb_proto_http::BodyKind::ContentLength(h3_response.body.len() as u64);
-        let mut normalized_response_headers =
-            lb_proto_http::normalize_response_headers(&h3_response.headers, request.keep_alive, &body_kind);
+        let mut normalized_response_headers = lb_proto_http::normalize_response_headers(
+            &h3_response.headers,
+            request.keep_alive,
+            &body_kind,
+        );
         if !normalized_response_headers
             .iter()
             .any(|header| header.name.eq_ignore_ascii_case("content-length"))
@@ -105,7 +108,10 @@ where
             });
         }
         if let Some(transform) = response_transform {
-            apply_http1_header_mutations(&mut normalized_response_headers, &transform.header_mutations);
+            apply_http1_header_mutations(
+                &mut normalized_response_headers,
+                &transform.header_mutations,
+            );
         }
         let response_head = lb_proto_http::encode_response_head(
             lb_proto_http::SupportedHttpVersion::Http1,
@@ -115,17 +121,11 @@ where
         );
         downstream.write_all(&response_head).await.map_err(Http1ProxyError::ResponseIo)?;
         if !h3_response.body.is_empty() {
-            downstream
-                .write_all(&h3_response.body)
-                .await
-                .map_err(Http1ProxyError::ResponseIo)?;
+            downstream.write_all(&h3_response.body).await.map_err(Http1ProxyError::ResponseIo)?;
         }
 
         metrics.request_count += 1;
-        *metrics
-            .response_status_counts
-            .entry(h3_response.status)
-            .or_insert(0) += 1;
+        *metrics.response_status_counts.entry(h3_response.status).or_insert(0) += 1;
         match classify_http1_response_failure(h3_response.status) {
             Some(class) => record_destination_failure(destination_policy, class),
             None => record_destination_success(destination_policy),
@@ -176,7 +176,10 @@ where
                 record_destination_timeout(destination_policy, crate::TimeoutCategory::Connect);
             }
             Http1ProxyError::Connect { .. } => {
-                record_destination_failure(destination_policy, crate::UpstreamFailureClass::Connect);
+                record_destination_failure(
+                    destination_policy,
+                    crate::UpstreamFailureClass::Connect,
+                );
             }
             _ => {}
         })?;
@@ -210,7 +213,10 @@ where
             );
             if let Err(source) = upstream_stream.write_all(&request_head).await {
                 drop_upstream_connection(upstream, last_upstream_activity, upstream_connected_at);
-                record_destination_failure(destination_policy, crate::UpstreamFailureClass::Connect);
+                record_destination_failure(
+                    destination_policy,
+                    crate::UpstreamFailureClass::Connect,
+                );
                 if retry_stale_reuse
                     && allow_destination_retry(
                         destination_policy,
@@ -409,9 +415,7 @@ where
                     .await
                     {
                         let reason = match &error {
-                            Http1ProxyError::IdleTimeout("upgrade tunnel") => {
-                                "tunnel_idle_timeout"
-                            }
+                            Http1ProxyError::IdleTimeout("upgrade tunnel") => "tunnel_idle_timeout",
                             _ => "tunnel_io",
                         };
                         record_upgrade_telemetry(
@@ -542,10 +546,15 @@ where
                     break Ok(upstream_response_status);
                 }
             } else {
-                if request.http10 && lb_proto_http::has_non_chunked_transfer_coding(&response.headers)
+                if request.http10
+                    && lb_proto_http::has_non_chunked_transfer_coding(&response.headers)
                 {
                     // HTTP/1.0 has no transfer codings; such a body cannot be delivered intact.
-                    drop_upstream_connection(upstream, last_upstream_activity, upstream_connected_at);
+                    drop_upstream_connection(
+                        upstream,
+                        last_upstream_activity,
+                        upstream_connected_at,
+                    );
                     break Err(Http1ProxyError::ParseResponse(
                         lb_proto_http::Http1ParseError::Invalid(
                             "unsupported response transfer coding for HTTP/1.0 client",
@@ -599,9 +608,7 @@ where
                             now,
                         )
                         .await
-                        .map_err(|error| {
-                            response_started_error(error, stale_fallback.is_some())
-                        })?;
+                        .map_err(|error| response_started_error(error, stale_fallback.is_some()))?;
                         body_relayed = fill.body_relayed;
                         if let Some(entry) = fill.entry {
                             if response_cache.store.insert(now, cache_lookup_key, entry).is_ok() {
@@ -845,5 +852,130 @@ where
         }
     };
 
-    Ok(CacheFillAttempt { entry: Some(HttpCacheEntry { metadata, headers, body }), body_relayed: true })
+    Ok(CacheFillAttempt {
+        entry: Some(HttpCacheEntry { metadata, headers, body }),
+        body_relayed: true,
+    })
+}
+
+#[cfg(test)]
+mod cache_fill_coverage_tests {
+    use std::io;
+
+    use super::*;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpListener;
+
+    fn entry() -> HttpCacheEntry {
+        HttpCacheEntry {
+            metadata: HttpCacheMetadata {
+                status: StatusCode::OK,
+                stored_at: Duration::ZERO,
+                fresh_until: Duration::from_secs(10),
+                stale_while_revalidate_until: None,
+                stale_if_error_until: None,
+                etag: None,
+                last_modified: None,
+            },
+            headers: vec![HttpCacheHeader::new(
+                HeaderName::from_static("content-type"),
+                HeaderValue::from_static("text/plain"),
+            )],
+            body: bytes::Bytes::from_static(b"cached body"),
+        }
+    }
+
+    #[test]
+    fn skipped_attempt_and_started_response_error_have_explicit_semantics() {
+        let skipped = CacheFillAttempt::skipped();
+        assert!(skipped.entry.is_none());
+        assert!(!skipped.body_relayed);
+        assert!(matches!(
+            response_started_error(Http1ProxyError::UpstreamGracefulDrain, true),
+            Http1ProxyError::ResponseIo(error) if error.kind() == io::ErrorKind::InvalidData
+        ));
+        assert!(matches!(
+            response_started_error(Http1ProxyError::UpstreamGracefulDrain, false),
+            Http1ProxyError::UpstreamGracefulDrain
+        ));
+    }
+
+    #[tokio::test]
+    async fn cached_head_is_bodyless_and_cached_get_writes_body(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cached = entry();
+        let (mut writer, mut reader) = tokio::io::duplex(256);
+        write_cached_response(&mut writer, "HEAD", false, &cached, None).await?;
+        drop(writer);
+        let mut output = Vec::new();
+        reader.read_to_end(&mut output).await?;
+        let output = String::from_utf8(output)?;
+        assert!(output.contains("connection: close\r\n"));
+        assert!(output.ends_with("\r\n\r\n"));
+        assert!(!output.contains("cached body"));
+
+        let (mut writer, mut reader) = tokio::io::duplex(256);
+        write_cached_response(&mut writer, "GET", true, &cached, None).await?;
+        drop(writer);
+        let mut output = Vec::new();
+        reader.read_to_end(&mut output).await?;
+        assert!(output.ends_with(b"\r\n\r\ncached body"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cache_fill_skips_non_get_and_non_cacheable_responses(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let mut upstream = TcpStream::connect(address).await?;
+        let (_accepted, _) = listener.accept().await?;
+        let mut upstream_buffer = Vec::new();
+        let (mut downstream, _reader) = tokio::io::duplex(128);
+        let config = Http1ProxyConfig::new(lb_net_core::UpstreamTarget::new("cache", address));
+        let cache = Http1ResponseCacheConfig::new(
+            lb_config_model::HttpCachePolicyConfig::default(),
+            Arc::new(HttpCacheStore::new(crate::HttpCacheStoreConfig {
+                max_entries: 4,
+                max_bytes: 4 * 1024,
+                max_object_bytes: 1024,
+            })?),
+        );
+        let response = lb_proto_http::Http1ResponseHead {
+            version: lb_proto_http::SupportedHttpVersion::Http1,
+            status: StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+            reason: String::from("Internal Server Error"),
+            headers: Vec::new(),
+            body_kind: lb_proto_http::BodyKind::None,
+            keep_alive: false,
+        };
+        let request = |method: &str| lb_proto_http::Http1RequestHead {
+            method: method.to_string(),
+            target: String::from("/"),
+            version: lb_proto_http::SupportedHttpVersion::Http1,
+            headers: Vec::new(),
+            body_kind: lb_proto_http::BodyKind::None,
+            keep_alive: true,
+            route: None,
+            http10: false,
+        };
+
+        for method in ["POST", "GET"] {
+            let attempt = build_cacheable_response_entry(
+                &cache,
+                &request(method),
+                &response,
+                &[],
+                &mut upstream,
+                &mut upstream_buffer,
+                &mut downstream,
+                &config,
+                Duration::ZERO,
+            )
+            .await?;
+            assert!(attempt.entry.is_none());
+            assert!(!attempt.body_relayed);
+        }
+        Ok(())
+    }
 }

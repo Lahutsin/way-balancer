@@ -160,3 +160,115 @@ fn validate_admin_permissions(
     }
 }
 
+#[cfg(test)]
+mod admin_coverage_regressions {
+    use super::{
+        ValidationCode, ValidationReport, listener_protocol_name, validate_admin_listener_policy,
+        validate_admin_permissions,
+    };
+    use crate::{
+        AdminAuthPolicyConfig, AdminAuthorizationScopeConfig, AdminOperatorConfig,
+        ListenerClassConfig, ListenerProtocolConfig, ListenerResourceConfig,
+    };
+
+    #[test]
+    fn rejects_admin_settings_on_public_listeners_and_checks_bearer_policy() {
+        let mut public =
+            ListenerResourceConfig::foundation("public", ListenerClassConfig::Public, 8080);
+        public.admin.allowed_source_cidrs.push(String::from("invalid"));
+        let mut report = ValidationReport::default();
+        validate_admin_listener_policy(&public, "listeners[0]", false, &mut report);
+        assert_eq!(report.errors.len(), 1);
+        assert_eq!(report.errors[0].path, "listeners[0].admin");
+
+        let mut listener =
+            ListenerResourceConfig::foundation("admin", ListenerClassConfig::Admin, 8443);
+        listener.admin.allowed_source_cidrs =
+            vec![String::from("127.0.0.1/32"), String::from("bad-cidr")];
+        listener.admin.rate_limit.requests_per_minute = 0;
+        listener.admin.audit.max_retained_events = 0;
+        listener.admin.auth = AdminAuthPolicyConfig::Bearer {
+            secret_env: String::from(" "),
+            permissions: vec![
+                AdminAuthorizationScopeConfig::Read,
+                AdminAuthorizationScopeConfig::Read,
+            ],
+        };
+        let mut report = ValidationReport::default();
+        validate_admin_listener_policy(&listener, "listeners[0]", false, &mut report);
+        for path in [
+            "listeners[0].admin.allowed_source_cidrs[1]",
+            "listeners[0].admin.rate_limit",
+            "listeners[0].admin.audit.max_retained_events",
+            "listeners[0].admin.auth.secret_env",
+        ] {
+            assert!(report.errors.iter().any(|error| error.path == path), "missing {path}");
+        }
+        assert!(report.errors.iter().any(|error| error.message.contains("repeat scope read")));
+    }
+
+    #[test]
+    fn validates_signed_headers_http_exposure_and_permission_scopes() {
+        let mut listener =
+            ListenerResourceConfig::foundation("admin", ListenerClassConfig::Admin, 8080);
+        listener.bind_address = "0.0.0.0:8080".parse().expect("socket address");
+        listener.protocol = ListenerProtocolConfig::Http1;
+        listener.admin.rate_limit.burst = 0;
+        listener.admin.auth = AdminAuthPolicyConfig::SignedHeaders {
+            operators: vec![
+                AdminOperatorConfig {
+                    id: String::from("operator"),
+                    secret_env: String::new(),
+                    permissions: Vec::new(),
+                },
+                AdminOperatorConfig {
+                    id: String::from(" operator "),
+                    secret_env: String::from("SECRET"),
+                    permissions: vec![
+                        AdminAuthorizationScopeConfig::Audit,
+                        AdminAuthorizationScopeConfig::Write,
+                    ],
+                },
+                AdminOperatorConfig {
+                    id: String::new(),
+                    secret_env: String::from("SECRET"),
+                    permissions: vec![AdminAuthorizationScopeConfig::Write],
+                },
+            ],
+            max_clock_skew_secs: 0,
+            nonce_ttl_secs: 30,
+        };
+        let mut report = ValidationReport::default();
+        validate_admin_listener_policy(&listener, "listeners[0]", false, &mut report);
+        for path in [
+            "listeners[0].protocol",
+            "listeners[0].admin.rate_limit",
+            "listeners[0].admin.auth",
+            "listeners[0].admin.auth.operators[0].permissions",
+            "listeners[0].admin.auth.operators[1].id",
+            "listeners[0].admin.auth.operators[2].id",
+        ] {
+            assert!(report.errors.iter().any(|error| error.path == path), "missing {path}");
+        }
+        assert!(
+            report.errors.iter().any(|error| error.code == ValidationCode::DuplicateResourceName)
+        );
+        let mut insecure = ValidationReport::default();
+        validate_admin_listener_policy(&listener, "listeners[0]", true, &mut insecure);
+        assert!(!insecure.errors.iter().any(|error| error.path == "listeners[0].protocol"));
+        for (protocol, name) in [
+            (ListenerProtocolConfig::Tcp, "tcp"),
+            (ListenerProtocolConfig::Http1, "http1"),
+            (ListenerProtocolConfig::Https, "https"),
+            (ListenerProtocolConfig::Http2, "http2"),
+            (ListenerProtocolConfig::Http3, "http3"),
+            (ListenerProtocolConfig::Auto, "auto"),
+        ] {
+            assert_eq!(listener_protocol_name(protocol), name);
+        }
+        let mut empty = ValidationReport::default();
+        validate_admin_permissions(&[], "permissions", &mut empty);
+        assert_eq!(empty.errors.len(), 1);
+        assert_eq!(empty.errors[0].code, ValidationCode::InvalidListenerField);
+    }
+}

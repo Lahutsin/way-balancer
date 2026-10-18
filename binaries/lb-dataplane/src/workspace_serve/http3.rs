@@ -131,7 +131,9 @@ async fn handle_http3_connecting(
     let remote_addr = connection.remote_address();
     let _source_lease = {
         let protection = abuse_protection.read().await;
-        protection.try_acquire_source(remote_addr).map_err(|reason| io::Error::other(reason.detail()))?
+        protection
+            .try_acquire_source(remote_addr)
+            .map_err(|reason| io::Error::other(reason.detail()))?
     };
     let mut h3_conn = h3::server::builder()
         .build(H3Connection::new(connection))
@@ -167,12 +169,8 @@ async fn handle_http3_request(
             })
         })
         .collect::<Vec<_>>();
-    let target = request
-        .uri()
-        .path_and_query()
-        .map(|value| value.as_str())
-        .unwrap_or("/")
-        .to_string();
+    let target =
+        request.uri().path_and_query().map(|value| value.as_str()).unwrap_or("/").to_string();
     let route_input = lb_proto_http::RouteMatchInput {
         target: target.clone(),
         host: request.uri().authority().map(|authority| authority.as_str().to_string()),
@@ -258,7 +256,9 @@ async fn handle_http3_request(
     };
 
     let mut response_builder = http1::Response::builder().status(response.head.status);
-    for header in response.head.headers.iter().filter(|header| !is_http3_forbidden_header(&header.name)) {
+    for header in
+        response.head.headers.iter().filter(|header| !is_http3_forbidden_header(&header.name))
+    {
         response_builder = response_builder.header(&header.name, &header.value);
     }
     let response_head = response_builder.body(()).map_err(|error| {
@@ -297,4 +297,137 @@ async fn send_http3_local_response(
     let response = http1::Response::builder().status(status).body(()).map_err(io::Error::other)?;
     stream.send_response(response).await.map_err(io::Error::other)?;
     stream.finish().await.map_err(io::Error::other)
+}
+
+#[cfg(test)]
+mod http3_tests {
+    use super::{
+        build_listener_abuse_protection_state, build_quic_server_config, is_http3_forbidden_header,
+        run_public_http3_listener_loop, ListenerDrainOutcome, ListenerRuntimeCounters,
+        ManagedHttp3ProxyConfig, ManagedProxyConfig, WorkspaceServeState,
+    };
+    use std::io;
+    use std::net::SocketAddr;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::{Arc, Mutex as StdMutex};
+    use tokio::net::UdpSocket;
+    use tokio::sync::{watch, RwLock};
+
+    #[test]
+    fn filters_connection_specific_fields_but_keeps_end_to_end_headers() {
+        for name in
+            ["connection", "Keep-Alive", "PROXY-CONNECTION", "transfer-encoding", "Upgrade", "TE"]
+        {
+            assert!(is_http3_forbidden_header(name));
+        }
+        for name in ["content-type", "cache-control", "x-request-id"] {
+            assert!(!is_http3_forbidden_header(name));
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_tcp_proxy_configuration_before_marking_http3_listener_ready() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let state = Arc::new(WorkspaceServeState::new(String::from("unused-test-config")).unwrap());
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let counters = Arc::new(ListenerRuntimeCounters::new());
+        let error = run_public_http3_listener_loop(
+            socket,
+            String::from("test"),
+            ManagedProxyConfig::Http1(lb_runtime::Http1ProxyConfig::new(
+                lb_net_core::UpstreamTarget::new(
+                    "test-upstream",
+                    SocketAddr::from(([127, 0, 0, 1], 8080)),
+                ),
+            )),
+            Arc::new(AtomicUsize::new(1)),
+            Arc::new(StdMutex::new(None)),
+            Arc::new(RwLock::new(build_listener_abuse_protection_state(None))),
+            counters,
+            state,
+            shutdown_rx,
+            std::time::Duration::from_secs(1),
+            ready_tx,
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(error.to_string().contains("requires http3 proxy config"));
+        assert!(ready_rx.await.is_err());
+    }
+
+    #[tokio::test]
+    async fn http3_listener_signals_ready_and_drains_cleanly_on_shutdown(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        super::ensure_rustls_crypto_provider();
+        let certified = rcgen::generate_simple_self_signed(vec![String::from("localhost")])?;
+        let cert_der = certified.cert.der().to_vec();
+        let cert = rustls::pki_types::CertificateDer::from(cert_der.clone());
+        let key =
+            rustls::pki_types::PrivateKeyDer::Pkcs8(certified.key_pair.serialize_der().into());
+        let mut tls =
+            rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+                .with_no_client_auth()
+                .with_single_cert(vec![cert], key)?;
+        tls.alpn_protocols = vec![b"h3".to_vec()];
+        let quic_server_config = Arc::new(build_quic_server_config(Arc::new(tls)).unwrap());
+        let proxy = ManagedProxyConfig::Http3(ManagedHttp3ProxyConfig {
+            http1: lb_runtime::Http1ProxyConfig::new(lb_net_core::UpstreamTarget::new(
+                "test-upstream",
+                {
+                    let unused = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+                    unused.local_addr()?
+                },
+            )),
+            quic_server_config,
+        });
+        let socket = UdpSocket::bind("127.0.0.1:0").await?;
+        let server_addr = socket.local_addr()?;
+        let state = Arc::new(WorkspaceServeState::new(String::from("unused-test-config")).unwrap());
+        let counters = Arc::new(ListenerRuntimeCounters::new());
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(run_public_http3_listener_loop(
+            socket,
+            String::from("http3-test"),
+            proxy,
+            Arc::new(AtomicUsize::new(4)),
+            Arc::new(StdMutex::new(None)),
+            Arc::new(RwLock::new(build_listener_abuse_protection_state(None))),
+            Arc::clone(&counters),
+            state,
+            shutdown_rx,
+            std::time::Duration::from_secs(1),
+            ready_tx,
+        ));
+        ready_rx.await?;
+
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.add(rustls::pki_types::CertificateDer::from(cert_der))?;
+        let mut client_tls =
+            rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+                .with_root_certificates(root_store)
+                .with_no_client_auth();
+        client_tls.alpn_protocols = vec![b"h3".to_vec()];
+        let quic_client_config =
+            quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(client_tls))?;
+        let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse()?)?;
+        endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(quic_client_config)));
+        let connection = endpoint.connect(server_addr, "localhost")?.await?;
+        let (_driver, mut send_request) =
+            h3::client::new(h3_quinn::Connection::new(connection)).await?;
+        let request = http1::Request::builder().method("GET").uri("https://localhost/").body(())?;
+        let mut request_stream = send_request.send_request(request).await?;
+        request_stream.finish().await?;
+        let response = request_stream.recv_response().await?;
+        assert_eq!(response.status(), http1::StatusCode::BAD_GATEWAY);
+        endpoint.close(0u32.into(), b"test complete");
+
+        shutdown_tx.send(true)?;
+        assert_eq!(task.await??, ListenerDrainOutcome::Completed);
+        assert_eq!(*counters.state.read().await, "stopped");
+        Ok(())
+    }
 }

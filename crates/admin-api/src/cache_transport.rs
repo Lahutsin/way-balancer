@@ -775,8 +775,10 @@ mod tests {
     };
 
     use super::{
-        HttpCachePeerConfig, HttpCachePeerDeliveryResult, HttpCachePeerRetryPolicy,
-        HttpCachePeerTransport, InvalidHttpCachePeerConfig,
+        decode_sha256_pin_hex, parse_peer_origin, parse_peer_response, read_peer_response,
+        sign_http_cache_peer_request, HttpCachePeerConfig, HttpCachePeerDeliveryResult,
+        HttpCachePeerRetryPolicy, HttpCachePeerTransport, InvalidHttpCachePeerConfig,
+        PeerOriginScheme,
     };
 
     fn spawn_peer_server(
@@ -999,5 +1001,91 @@ mod tests {
         .with_tls_cert_pin_sha256_env("   ")]);
 
         assert!(matches!(result, Err(InvalidHttpCachePeerConfig::EmptyTlsCertPinSha256Env)));
+    }
+
+    #[test]
+    fn peer_origin_pin_response_and_signature_helpers_cover_valid_and_invalid_inputs(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let http_origin = parse_peer_origin("http://127.0.0.1:9900")?;
+        assert_eq!(http_origin.scheme, PeerOriginScheme::Http);
+        assert_eq!(http_origin.authority, "127.0.0.1:9900");
+        let https_origin = parse_peer_origin("https://[::1]:9901")?;
+        assert_eq!(https_origin.scheme, PeerOriginScheme::Https);
+        assert!(parse_peer_origin("ftp://127.0.0.1:21").is_err());
+        assert!(parse_peer_origin("http://").is_err());
+        assert!(parse_peer_origin("http://127.0.0.1:9900/path").is_err());
+        assert!(parse_peer_origin("http://localhost:9900").is_err());
+
+        assert_eq!(decode_sha256_pin_hex(&"ab".repeat(32))?, [0xab; 32]);
+        assert!(decode_sha256_pin_hex("abc").is_err());
+        assert!(decode_sha256_pin_hex(&"gg".repeat(32)).is_err());
+        assert!(decode_sha256_pin_hex(&format!("{}é", "00".repeat(31))).is_err());
+
+        let response = parse_peer_response(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 90\r\n\r\n{\"result\":\"applied\",\"event_id\":\"evt\",\"scope\":\"cache\",\"purged_entries\":2,\"occurred_at_unix_ms\":100}",
+        )?;
+        assert_eq!(response.event_id, "evt");
+        assert_eq!(response.purged_entries, 2);
+        assert!(parse_peer_response(b"HTTP/1.1 200 OK\r\n\r\n{}").is_err());
+        assert!(parse_peer_response(b"HTTP/1.1 503 Unavailable\r\n\r\n{}").is_err());
+        assert!(parse_peer_response(b"HTTP/1.1 nope OK\r\n\r\n{}").is_err());
+        assert!(parse_peer_response(b"HTTP/1.1 200 OK").is_err());
+
+        let signature = sign_http_cache_peer_request(
+            &"s".repeat(80),
+            "operator",
+            "POST",
+            "/cache/invalidate",
+            100,
+            "nonce",
+            b"body",
+        );
+        assert_eq!(signature.len(), 64);
+        assert_ne!(
+            signature,
+            sign_http_cache_peer_request(
+                "short-secret",
+                "operator",
+                "POST",
+                "/cache/invalidate",
+                100,
+                "nonce",
+                b"body"
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn peer_response_reader_handles_close_reset_and_read_failure() {
+        let mut cursor = std::io::Cursor::new(b"HTTP/1.1 200 OK".to_vec());
+        assert_eq!(
+            read_peer_response(&mut cursor, "node-a").expect("read response"),
+            b"HTTP/1.1 200 OK"
+        );
+
+        struct ResetAfterData(bool);
+        impl Read for ResetAfterData {
+            fn read(&mut self, bytes: &mut [u8]) -> Result<usize, std::io::Error> {
+                if self.0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionReset,
+                        "peer reset after payload",
+                    ));
+                }
+                self.0 = true;
+                bytes[0] = b'x';
+                Ok(1)
+            }
+        }
+        assert_eq!(read_peer_response(&mut ResetAfterData(false), "node-b").unwrap(), b"x");
+
+        struct FailingReader;
+        impl Read for FailingReader {
+            fn read(&mut self, _: &mut [u8]) -> Result<usize, std::io::Error> {
+                Err(std::io::Error::other("read failed"))
+            }
+        }
+        assert!(read_peer_response(&mut FailingReader, "node-c").is_err());
     }
 }

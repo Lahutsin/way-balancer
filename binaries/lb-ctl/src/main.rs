@@ -69,7 +69,10 @@ fn parse_cli_command_from_args(args: &[String]) -> Result<CliCommand, String> {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli_command = parse_cli_command_from_args(&std::env::args().collect::<Vec<_>>())
         .map_err(|error| format!("invalid lb-ctl command: {error}"))?;
+    run_command(cli_command)
+}
 
+fn run_command(cli_command: CliCommand) -> Result<(), Box<dyn std::error::Error>> {
     let signer = control_plane_signer()?;
     let trusted_signer = signer.trusted_signer();
     let admin_secret = required_env("LB_CTL_ADMIN_SECRET")?;
@@ -280,6 +283,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::{parse_cli_command_from_args, CliCommand};
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn configure_control_plane_environment() {
+        std::env::set_var("LB_CTL_ADMIN_SECRET", "viewer-secret");
+        std::env::set_var("LB_CTL_OPERATOR_SECRET", "operator-secret");
+        std::env::set_var(
+            "LB_CONTROL_PLANE_SIGNING_KEY_ED25519",
+            lb_test_support::TEST_SIGNING_KEY_ED25519,
+        );
+    }
 
     #[test]
     fn parse_preview_command_with_defaults() -> Result<(), Box<dyn std::error::Error>> {
@@ -316,13 +331,63 @@ mod tests {
     }
 
     #[test]
-    fn binary_smoke_runs_successfully() -> Result<(), Box<dyn std::error::Error>> {
-        std::env::set_var("LB_CTL_ADMIN_SECRET", "viewer-secret");
-        std::env::set_var("LB_CTL_OPERATOR_SECRET", "operator-secret");
-        std::env::set_var(
-            "LB_CONTROL_PLANE_SIGNING_KEY_ED25519",
-            lb_test_support::TEST_SIGNING_KEY_ED25519,
+    fn cli_parser_reports_missing_values_and_unknown_options() {
+        assert_eq!(parse_cli_command_from_args(&[]).unwrap(), CliCommand::Demo);
+        assert_eq!(
+            parse_cli_command_from_args(&[String::from("lb-ctl"), String::from("--help")]).unwrap(),
+            CliCommand::Demo
         );
-        super::main()
+        assert_eq!(
+            parse_cli_command_from_args(&[
+                String::from("lb-ctl"),
+                String::from("preview"),
+                String::from("--candidate"),
+            ])
+            .unwrap_err(),
+            "--candidate requires a value"
+        );
+        assert_eq!(
+            parse_cli_command_from_args(&[
+                String::from("lb-ctl"),
+                String::from("apply"),
+                String::from("--baseline"),
+            ])
+            .unwrap_err(),
+            "--baseline requires a value"
+        );
+        assert!(parse_cli_command_from_args(&[
+            String::from("lb-ctl"),
+            String::from("preview"),
+            String::from("--unknown"),
+        ])
+        .unwrap_err()
+        .contains("unsupported argument"));
+        assert!(parse_cli_command_from_args(&[String::from("lb-ctl"), String::from("invalid")])
+            .unwrap_err()
+            .contains("unknown command"));
+    }
+
+    #[test]
+    fn preview_and_apply_commands_execute_the_promotion_flows(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let _guard = ENV_LOCK.lock().unwrap();
+        configure_control_plane_environment();
+        super::run_command(CliCommand::Preview {
+            candidate_version: String::from("canary-v2"),
+            baseline_version: Some(String::from("stable-v1")),
+        })?;
+        super::run_command(CliCommand::Apply {
+            candidate_version: String::from("canary-v2"),
+            baseline_version: Some(String::from("stable-v1")),
+            allow_staged_apply: true,
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn binary_smoke_runs_successfully() -> Result<(), Box<dyn std::error::Error>> {
+        let _guard = ENV_LOCK.lock().unwrap();
+        configure_control_plane_environment();
+        super::run_command(CliCommand::Demo)
     }
 }

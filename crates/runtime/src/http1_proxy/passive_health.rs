@@ -16,7 +16,8 @@ fn record_passive_health_result(
         _ => return,
     };
 
-    if let (Some(request_telemetry), Ok(snapshot)) = (config.request_telemetry.as_ref(), &feedback_result)
+    if let (Some(request_telemetry), Ok(snapshot)) =
+        (config.request_telemetry.as_ref(), &feedback_result)
     {
         if matches!(snapshot.status, crate::EndpointHealthStatus::Ejected) {
             let _ = request_telemetry.telemetry.record_decision_trace(
@@ -45,3 +46,32 @@ fn error_is_upstream_passive_failure(error: &Http1ProxyError) -> bool {
     )
 }
 
+#[cfg(test)]
+mod passive_health_tests {
+    use std::io;
+
+    use super::error_is_upstream_passive_failure;
+    use super::Http1ProxyError;
+
+    #[test]
+    fn passive_health_only_counts_upstream_failures() {
+        let target = "127.0.0.1:8080".parse().expect("valid upstream");
+        for error in [
+            Http1ProxyError::ConnectTimeout { target },
+            Http1ProxyError::Connect { target, source: io::Error::other("connect") },
+            Http1ProxyError::RequestIo(io::Error::other("request write")),
+            Http1ProxyError::ParseResponse(lb_proto_http::Http1ParseError::IncompleteHead),
+            Http1ProxyError::IdleTimeout("response head"),
+        ] {
+            assert!(error_is_upstream_passive_failure(&error));
+        }
+        for error in [
+            Http1ProxyError::ParseRequest(lb_proto_http::Http1ParseError::IncompleteHead),
+            Http1ProxyError::BodyLimitExceeded("request body"),
+            Http1ProxyError::IdleTimeout("request head"),
+            Http1ProxyError::UpstreamGracefulDrain,
+        ] {
+            assert!(!error_is_upstream_passive_failure(&error));
+        }
+    }
+}

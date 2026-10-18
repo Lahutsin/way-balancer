@@ -440,3 +440,212 @@ fn admin_permission_name(permission: AdminPermission) -> &'static str {
     }
 }
 
+#[cfg(test)]
+mod admin_auth_tests {
+    use super::{
+        admin_auth_error_contract, admin_permission_name, authenticate_admin_request,
+        inspect_secret_material, request_body_digest, resolve_secret_material, sign_admin_request,
+        AdminPermission, AdminReplayState, AdminRequestAction, CompiledAdminAuthPolicy,
+        CompiledAdminOperator, CompiledAdminPolicy, CompiledAdminRateLimit,
+    };
+    use crate::{DemoHeader, DemoRequestHead};
+    use std::collections::BTreeMap;
+    use std::fs;
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::Mutex;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    const SECRET_ENV: &str = "LB_TEST_ADMIN_AUTH_SECRET_COVERAGE";
+
+    fn policy(permissions: &[AdminPermission]) -> CompiledAdminPolicy {
+        CompiledAdminPolicy {
+            auth: CompiledAdminAuthPolicy::SignedHeaders {
+                operators: BTreeMap::from([(
+                    String::from("operator"),
+                    CompiledAdminOperator {
+                        secret_env: String::from(SECRET_ENV),
+                        permissions: permissions.iter().copied().collect(),
+                    },
+                )]),
+                max_clock_skew: Duration::from_secs(30),
+                nonce_ttl: Duration::from_secs(60),
+            },
+            allowed_source_cidrs: Vec::new(),
+            rate_limit: CompiledAdminRateLimit { requests_per_minute: 60, burst: 2 },
+            audit_capacity: 10,
+        }
+    }
+
+    fn request(nonce: &str, timestamp: u64, body: &[u8]) -> DemoRequestHead {
+        let method = String::from("GET");
+        let target = String::from("/healthz");
+        let signature = sign_admin_request(
+            "coverage-secret",
+            "operator",
+            &method,
+            &target,
+            timestamp,
+            nonce,
+            body,
+        );
+        DemoRequestHead {
+            method,
+            target,
+            headers: vec![
+                DemoHeader {
+                    name: String::from("x-lb-admin-actor"),
+                    value: String::from("operator"),
+                },
+                DemoHeader {
+                    name: String::from("x-lb-admin-timestamp"),
+                    value: timestamp.to_string(),
+                },
+                DemoHeader { name: String::from("x-lb-admin-nonce"), value: String::from(nonce) },
+                DemoHeader { name: String::from("x-lb-admin-signature"), value: signature },
+            ],
+            authorization_bearer: None,
+        }
+    }
+
+    #[test]
+    fn signed_requests_are_authenticated_once_and_reject_replays() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var(SECRET_ENV, "coverage-secret");
+        let body = br#"{"probe":true}"#;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let request = request("nonce-1", now, body);
+        let replay_state = std::sync::Mutex::new(AdminReplayState::default());
+        let authenticated = authenticate_admin_request(
+            &request,
+            body,
+            AdminRequestAction::Healthz,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            &policy(&[AdminPermission::Read]),
+            &replay_state,
+            "",
+            "request-1",
+        )
+        .ok()
+        .unwrap();
+        assert_eq!(authenticated.actor, "operator");
+        assert_eq!(authenticated.request_id, "request-1");
+        assert_eq!(authenticated.auth_mode, "signed_headers");
+
+        let replay = authenticate_admin_request(
+            &request,
+            body,
+            AdminRequestAction::Healthz,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            &policy(&[AdminPermission::Read]),
+            &replay_state,
+            "",
+            "request-2",
+        )
+        .err()
+        .unwrap();
+        assert_eq!(replay.status, "409 Conflict");
+        assert_eq!(
+            admin_auth_error_contract(&replay).0,
+            lb_admin_api::AdminApiErrorCode::ReplayRejected
+        );
+
+        let mut bad_signature = request;
+        bad_signature
+            .headers
+            .iter_mut()
+            .find(|header| header.name == "x-lb-admin-signature")
+            .unwrap()
+            .value
+            .push('0');
+        let failure = authenticate_admin_request(
+            &bad_signature,
+            body,
+            AdminRequestAction::Healthz,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            &policy(&[AdminPermission::Read]),
+            &std::sync::Mutex::new(AdminReplayState::default()),
+            "",
+            "request-3",
+        )
+        .err()
+        .unwrap();
+        assert_eq!(failure.status, "401 Unauthorized");
+        std::env::remove_var(SECRET_ENV);
+    }
+
+    #[test]
+    fn signed_auth_enforces_clock_skew_and_action_permissions() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var(SECRET_ENV, "coverage-secret");
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let stale = request("stale", now.saturating_sub(120), b"");
+        let failure = authenticate_admin_request(
+            &stale,
+            b"",
+            AdminRequestAction::Healthz,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            &policy(&[AdminPermission::Read]),
+            &std::sync::Mutex::new(AdminReplayState::default()),
+            "",
+            "stale",
+        )
+        .err()
+        .unwrap();
+        assert_eq!(failure.outcome, "rejected");
+
+        let write_request = request("write", now, b"");
+        let failure = authenticate_admin_request(
+            &write_request,
+            b"",
+            AdminRequestAction::Reload,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            &policy(&[AdminPermission::Read]),
+            &std::sync::Mutex::new(AdminReplayState::default()),
+            "",
+            "denied",
+        )
+        .err()
+        .unwrap();
+        assert_eq!(failure.status, "403 Forbidden");
+        std::env::remove_var(SECRET_ENV);
+    }
+
+    #[test]
+    fn secret_material_prefers_rotatable_files_and_accepts_environment_fallback() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let file_env = format!("{SECRET_ENV}_FILE");
+        std::env::remove_var(&file_env);
+        std::env::remove_var(SECRET_ENV);
+        assert_eq!(resolve_secret_material(SECRET_ENV, "").err().unwrap().state, "missing");
+
+        std::env::set_var(SECRET_ENV, "from-env");
+        let env_secret = resolve_secret_material(SECRET_ENV, "").ok().unwrap();
+        assert_eq!(env_secret.value, "from-env");
+        assert!(!env_secret.supports_rotation_without_reload);
+
+        let path = format!("target/admin-auth-secret-{}.txt", std::process::id());
+        fs::create_dir_all("target").unwrap();
+        fs::write(&path, "from-file\r\n").unwrap();
+        std::env::set_var(&file_env, &path);
+        let file_secret = resolve_secret_material(SECRET_ENV, "").ok().unwrap();
+        assert_eq!(file_secret.value, "from-file");
+        assert!(file_secret.supports_rotation_without_reload);
+        assert!(inspect_secret_material(SECRET_ENV, "").healthy);
+        fs::remove_file(path).unwrap();
+        std::env::remove_var(&file_env);
+        std::env::remove_var(SECRET_ENV);
+    }
+
+    #[test]
+    fn request_signatures_and_permission_labels_are_stable() {
+        assert_eq!(
+            request_body_digest(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(admin_permission_name(AdminPermission::Read), "read");
+        assert_eq!(admin_permission_name(AdminPermission::Audit), "audit");
+        assert_eq!(admin_permission_name(AdminPermission::Write), "write");
+        assert_eq!(sign_admin_request(&"k".repeat(80), "a", "GET", "/", 0, "n", b"").len(), 64);
+    }
+}

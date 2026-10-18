@@ -283,4 +283,62 @@ mod tests {
         let error = plan_staged_rollout(request).expect_err("zero timeout must fail");
         assert!(error.to_string().contains("timeout_ms must be greater than zero"));
     }
+
+    #[test]
+    fn staged_plan_rejects_each_invalid_wave_shape_and_gate_boundary() {
+        let mut cases = Vec::new();
+
+        let mut invalid = request();
+        invalid.waves.clear();
+        cases.push((invalid, "at least one wave"));
+
+        let mut invalid = request();
+        invalid.waves[0].wave_id = String::from("  ");
+        cases.push((invalid, "wave_id must not be empty"));
+
+        let mut invalid = request();
+        invalid.waves[0].wave_id = "x".repeat(65);
+        cases.push((invalid, "wave_id exceeds max length"));
+
+        let mut invalid = request();
+        invalid.waves[1].wave_id = invalid.waves[0].wave_id.clone();
+        cases.push((invalid, "duplicate wave_id"));
+
+        let mut invalid = request();
+        invalid.waves[0].node_ids.clear();
+        cases.push((invalid, "must include at least one node"));
+
+        let mut invalid = request();
+        invalid.waves[0].max_parallel = 0;
+        cases.push((invalid, "max_parallel must be greater than zero"));
+
+        let mut invalid = request();
+        invalid.waves[0].max_parallel = 2;
+        cases.push((invalid, "max_parallel exceeds number of nodes"));
+
+        let mut invalid = request();
+        invalid.waves[0].gate_policy.evaluation_window_ms = 0;
+        cases.push((invalid, "evaluation_window_ms must be greater than zero"));
+
+        let mut invalid = request();
+        invalid.waves[0].gate_policy.min_ready_percent = 0;
+        cases.push((invalid, "min_ready_percent must be in 1..=100"));
+
+        let mut invalid = request();
+        invalid.waves[0].gate_policy.min_ready_percent = 101;
+        cases.push((invalid, "min_ready_percent must be in 1..=100"));
+
+        let mut invalid = request();
+        invalid.waves[0].gate_policy.max_error_percent = 101;
+        cases.push((invalid, "max_error_percent must be in 0..=100"));
+
+        let mut invalid = request();
+        invalid.waves[0].node_ids[0] = String::from("unknown-node");
+        cases.push((invalid, "references unknown node"));
+
+        for (invalid, expected) in cases {
+            let error = plan_staged_rollout(invalid).expect_err("invalid wave must be rejected");
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+    }
 }

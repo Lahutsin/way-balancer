@@ -116,7 +116,77 @@ impl LifecycleStateMachine {
 
 #[cfg(test)]
 mod tests {
-    use super::{LifecycleState, LifecycleStateMachine};
+    use super::{LifecycleState, LifecycleStateMachine, LifecycleTransitionError};
+
+    #[test]
+    fn state_names_and_transition_errors_are_stable() {
+        let states = [
+            (LifecycleState::Warming, "warming"),
+            (LifecycleState::Active, "active"),
+            (LifecycleState::Draining, "draining"),
+            (LifecycleState::Drained, "drained"),
+            (LifecycleState::Removed, "removed"),
+        ];
+        for (state, name) in states {
+            assert_eq!(state.as_str(), name);
+        }
+
+        let error = LifecycleTransitionError { from: LifecycleState::Drained, action: "activate" };
+        assert_eq!(
+            error.to_string(),
+            "invalid lifecycle transition: action activate is not allowed from drained"
+        );
+        assert!(std::error::Error::source(&error).is_none());
+    }
+
+    #[test]
+    fn transitions_are_idempotent_only_after_their_target_state() {
+        let mut active = LifecycleStateMachine::new_active();
+        active.activate().expect("activating active resource is idempotent");
+        let mut draining = LifecycleStateMachine::new_active();
+        draining.start_draining().expect("start draining");
+        draining.start_draining().expect("starting draining twice is idempotent");
+        let mut drained = LifecycleStateMachine::new_active();
+        drained.start_draining().expect("start draining");
+        drained.mark_drained().expect("mark drained");
+        drained.mark_drained().expect("marking drained twice is idempotent");
+        let mut removed = LifecycleStateMachine::new_active();
+        removed.start_draining().expect("start draining");
+        removed.mark_drained().expect("mark drained");
+        removed.mark_removed().expect("mark removed");
+        removed.mark_removed().expect("marking removed twice is idempotent");
+        assert_eq!(removed.state(), LifecycleState::Removed);
+    }
+
+    #[test]
+    fn invalid_transitions_preserve_the_state_and_name_the_action() {
+        let cases = [
+            (LifecycleState::Draining, "activate"),
+            (LifecycleState::Drained, "activate"),
+            (LifecycleState::Removed, "activate"),
+            (LifecycleState::Drained, "start_draining"),
+            (LifecycleState::Removed, "start_draining"),
+            (LifecycleState::Warming, "mark_drained"),
+            (LifecycleState::Active, "mark_drained"),
+            (LifecycleState::Removed, "mark_drained"),
+            (LifecycleState::Warming, "mark_removed"),
+            (LifecycleState::Active, "mark_removed"),
+            (LifecycleState::Draining, "mark_removed"),
+        ];
+        for (state, action) in cases {
+            let mut machine = LifecycleStateMachine { state };
+            let error = match action {
+                "activate" => machine.activate().expect_err("transition is invalid"),
+                "start_draining" => machine.start_draining().expect_err("transition is invalid"),
+                "mark_drained" => machine.mark_drained().expect_err("transition is invalid"),
+                "mark_removed" => machine.mark_removed().expect_err("transition is invalid"),
+                _ => unreachable!(),
+            };
+            assert_eq!(machine.state(), state);
+            assert_eq!(error.from, state);
+            assert_eq!(error.action, action);
+        }
+    }
 
     #[test]
     fn machine_follows_expected_happy_path() -> Result<(), Box<dyn std::error::Error>> {

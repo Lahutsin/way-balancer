@@ -137,18 +137,12 @@ fn validate_discovery_source(
     report: &mut ValidationReport,
 ) {
     match discovery {
-        crate::DiscoverySourceConfig::DnsAaaa {
-            hostname,
-            port,
-            ..
-        } => {
+        crate::DiscoverySourceConfig::DnsAaaa { hostname, port, .. } => {
             if hostname.trim().is_empty() {
                 report.errors.push(ValidationError::schema(
                     ValidationCode::InvalidUpstreamField,
                     format!("{base_path}.discovery.hostname"),
-                    format!(
-                        "upstream cluster {cluster_name} must use a non-empty DNS hostname"
-                    ),
+                    format!("upstream cluster {cluster_name} must use a non-empty DNS hostname"),
                 ));
             }
             if *port == 0 {
@@ -164,9 +158,7 @@ fn validate_discovery_source(
                 report.errors.push(ValidationError::schema(
                     ValidationCode::InvalidUpstreamField,
                     format!("{base_path}.discovery.service"),
-                    format!(
-                        "upstream cluster {cluster_name} must use a non-empty DNS SRV service"
-                    ),
+                    format!("upstream cluster {cluster_name} must use a non-empty DNS SRV service"),
                 ));
             }
         }
@@ -239,3 +231,146 @@ fn is_valid_affinity_token(value: &str) -> bool {
         })
 }
 
+#[cfg(test)]
+mod upstreams_coverage_regressions {
+    use super::{
+        PolicyRegistry, ValidationCode, ValidationReport, is_valid_affinity_token,
+        validate_upstream_cluster,
+    };
+    use crate::{
+        AffinityPolicyConfig, DiscoverySourceConfig, PolicyResourcesConfig, UpstreamClusterConfig,
+        UpstreamEndpointConfig, UpstreamTrafficPolicyConfig, UpstreamTransportConfig,
+    };
+    use std::collections::BTreeSet;
+
+    fn cluster(name: &str) -> UpstreamClusterConfig {
+        UpstreamClusterConfig {
+            name: String::from(name),
+            transport: UpstreamTransportConfig::Http1,
+            endpoints: Vec::new(),
+            discovery: None,
+            traffic_policy: UpstreamTrafficPolicyConfig::default(),
+            policies: crate::PolicyBindingConfig::default(),
+        }
+    }
+
+    fn validate(config: &UpstreamClusterConfig) -> ValidationReport {
+        let mut report = ValidationReport::default();
+        let registry =
+            PolicyRegistry::new(&PolicyResourcesConfig::default(), &BTreeSet::new(), &mut report);
+        validate_upstream_cluster(config, 0, &registry, &mut report);
+        report
+    }
+
+    #[test]
+    fn validates_static_endpoints_and_affinity_tokens() -> Result<(), Box<dyn std::error::Error>> {
+        let address = "127.0.0.1:9000".parse()?;
+        let mut config = cluster(" ");
+        let mut blank = UpstreamEndpointConfig::foundation("", address);
+        blank.weight = 0;
+        blank.zone = Some(String::from(" "));
+        blank.locality = Some(String::new());
+        config.endpoints = vec![
+            blank,
+            UpstreamEndpointConfig::foundation("id", address),
+            UpstreamEndpointConfig::foundation(" id ", address),
+        ];
+        config.traffic_policy.affinity = Some(AffinityPolicyConfig::HeaderHash {
+            header_name: String::from("bad header"),
+            fallback: Default::default(),
+        });
+        let report = validate(&config);
+        for (code, path) in [
+            (ValidationCode::EmptyResourceName, "upstream_clusters[0].name"),
+            (ValidationCode::InvalidUpstreamField, "upstream_clusters[0].endpoints[0].id"),
+            (ValidationCode::InvalidUpstreamField, "upstream_clusters[0].endpoints[0].weight"),
+            (ValidationCode::InvalidUpstreamField, "upstream_clusters[0].endpoints[0].zone"),
+            (ValidationCode::InvalidUpstreamField, "upstream_clusters[0].endpoints[0].locality"),
+            (ValidationCode::DuplicateResourceName, "upstream_clusters[0].endpoints[2].id"),
+            (
+                ValidationCode::InvalidUpstreamField,
+                "upstream_clusters[0].traffic_policy.affinity.header_name",
+            ),
+        ] {
+            assert!(
+                report.errors.iter().any(|error| error.code == code && error.path == path),
+                "missing {path}"
+            );
+        }
+        for token in ["x-session", "X_COOKIE", "!#$%&'*+-.^_`|~012AZaz"] {
+            assert!(is_valid_affinity_token(token));
+        }
+        for token in ["", " leading", "trailing ", "with space", "bad/name"] {
+            assert!(!is_valid_affinity_token(token));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn validates_missing_and_mixed_discovery_configurations()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert!(
+            validate(&cluster("missing"))
+                .errors
+                .iter()
+                .any(|error| error.path == "upstream_clusters[0].endpoints")
+        );
+        let mut mixed = cluster("mixed");
+        mixed
+            .endpoints
+            .push(UpstreamEndpointConfig::foundation("static", "127.0.0.1:9000".parse()?));
+        mixed.discovery = Some(DiscoverySourceConfig::DnsSrv {
+            service: String::from("payments"),
+            min_refresh_secs: 1,
+        });
+        assert!(
+            validate(&mixed)
+                .errors
+                .iter()
+                .any(|error| error.path == "upstream_clusters[0].discovery")
+        );
+        for source in [
+            DiscoverySourceConfig::DnsAaaa {
+                hostname: String::from(" "),
+                port: 0,
+                min_refresh_secs: 1,
+            },
+            DiscoverySourceConfig::DnsSrv { service: String::new(), min_refresh_secs: 1 },
+            DiscoverySourceConfig::KubernetesEndpointSlice {
+                namespace: String::from(" "),
+                service: String::new(),
+            },
+            DiscoverySourceConfig::ConsulLike {
+                service: String::from(" "),
+                datacenter: Some(String::from(" ")),
+            },
+        ] {
+            let mut config = cluster("discovery");
+            config.discovery = Some(source);
+            assert!(
+                validate(&config)
+                    .errors
+                    .iter()
+                    .any(|error| error.code == ValidationCode::InvalidUpstreamField
+                        && error.path.starts_with("upstream_clusters[0].discovery."))
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_invalid_cookie_affinity_token() {
+        let mut config = cluster("cookie");
+        config.traffic_policy.affinity = Some(AffinityPolicyConfig::CookieHash {
+            cookie_name: String::from("bad;cookie"),
+            fallback: Default::default(),
+        });
+        assert!(
+            validate(&config)
+                .errors
+                .iter()
+                .any(|error| error.path
+                    == "upstream_clusters[0].traffic_policy.affinity.cookie_name")
+        );
+    }
+}
