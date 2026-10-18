@@ -224,10 +224,13 @@ impl ManagedListenerSlot {
             && self.active.bind_mode == spec.bind_mode()
     }
 
-    async fn apply_update(&mut self, spec: &CompiledServeListener) -> Result<(), DynError> {
-        self.active.apply_update(spec).await?;
+    async fn apply_update(
+        &mut self,
+        spec: &CompiledServeListener,
+        overload_runtime: Option<ListenerOverloadRuntime>,
+    ) {
+        self.active.apply_update(spec, overload_runtime).await;
         self.lifecycle.apply_in_place(ListenerIdentity::from_spec(spec));
-        Ok(())
     }
 
     fn activate_replacement(

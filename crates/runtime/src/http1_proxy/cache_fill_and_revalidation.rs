@@ -46,18 +46,16 @@ where
             &request.body_kind,
         );
 
-        let mut request_body_writer = VecAsyncWriter::default();
-        relay_body(
+        // HTTP/3 carries its own framing, so the HTTP/1.1 chunked encoding must be removed.
+        let request_body = collect_decoded_body(
             downstream,
             downstream_buffer,
-            &mut request_body_writer,
             &request.body_kind,
             config.limits.max_body_bytes,
             effective_timeouts.idle_timeout,
             RelayDirection::Request,
         )
         .await?;
-        let request_body = request_body_writer.into_inner();
 
         let h3_response = match crate::http3_upstream::dispatch_http3_upstream_request(
             selected_upstream,
@@ -68,6 +66,7 @@ where
             effective_client_ip,
             effective_timeouts.connect_timeout,
             effective_timeouts.idle_timeout,
+            config.limits.max_body_bytes,
         )
         .await
         {
@@ -354,9 +353,12 @@ where
                 }
             };
 
+            // Connection management is hop-by-hop: the downstream `connection` header is
+            // derived from the downstream request, never from the upstream response, and
+            // must not leak into cache entries.
             let normalized_response_headers = lb_proto_http::normalize_response_headers(
                 &response.headers,
-                response.keep_alive,
+                true,
                 &response.body_kind,
             );
             let mut normalized_response_headers = normalized_response_headers;
@@ -540,12 +542,39 @@ where
                     break Ok(upstream_response_status);
                 }
             } else {
+                if request.http10 && lb_proto_http::has_non_chunked_transfer_coding(&response.headers)
+                {
+                    // HTTP/1.0 has no transfer codings; such a body cannot be delivered intact.
+                    drop_upstream_connection(upstream, last_upstream_activity, upstream_connected_at);
+                    break Err(Http1ProxyError::ParseResponse(
+                        lb_proto_http::Http1ParseError::Invalid(
+                            "unsupported response transfer coding for HTTP/1.0 client",
+                        ),
+                    ));
+                }
                 let mut downstream_response_headers = normalized_response_headers.clone();
                 if let Some(transform) = response_transform {
                     apply_http1_header_mutations(
                         &mut downstream_response_headers,
                         &transform.header_mutations,
                     );
+                }
+                let reframe_for_http10 = request.http10
+                    && matches!(
+                        response.body_kind,
+                        lb_proto_http::BodyKind::Chunked | lb_proto_http::BodyKind::CloseDelimited
+                    );
+                if reframe_for_http10 {
+                    downstream_response_headers.retain(|header| {
+                        !header.name.eq_ignore_ascii_case("transfer-encoding")
+                            && !header.name.eq_ignore_ascii_case("trailer")
+                    });
+                }
+                if !request.keep_alive {
+                    downstream_response_headers.push(lb_proto_http::HttpHeader {
+                        name: String::from("connection"),
+                        value: String::from("close"),
+                    });
                 }
                 let response_head = lb_proto_http::encode_response_head(
                     response.version,
@@ -555,10 +584,10 @@ where
                 );
                 downstream.write_all(&response_head).await.map_err(Http1ProxyError::ResponseIo)?;
 
-                let mut filled_cache = false;
+                let mut body_relayed = false;
                 if let Some(response_cache) = config.response_cache.as_ref() {
                     if let Some(cache_lookup_key) = cache_lookup_key {
-                        if let Some(entry) = build_cacheable_response_entry(
+                        let fill = build_cacheable_response_entry(
                             response_cache,
                             request,
                             &response,
@@ -569,8 +598,12 @@ where
                             config,
                             now,
                         )
-                        .await?
-                        {
+                        .await
+                        .map_err(|error| {
+                            response_started_error(error, stale_fallback.is_some())
+                        })?;
+                        body_relayed = fill.body_relayed;
+                        if let Some(entry) = fill.entry {
                             if response_cache.store.insert(now, cache_lookup_key, entry).is_ok() {
                                 metrics.cache_fill_count += 1;
                                 record_cache_request_telemetry(
@@ -590,7 +623,6 @@ where
                                         "origin returned replacement response for revalidation",
                                     );
                                 }
-                                filled_cache = true;
                             } else {
                                 metrics.cache_bypass_count += 1;
                                 record_cache_request_telemetry(
@@ -603,7 +635,7 @@ where
                         }
                     }
                 }
-                if !filled_cache {
+                if !body_relayed {
                     let (response_body_timeout, response_body_timeout_category) =
                         match bounded_dispatch_timeout(
                             destination_policy,
@@ -614,34 +646,40 @@ where
                         ) {
                             Ok(value) => value,
                             Err(category) => {
+                                // The response head was already sent downstream, so a local
+                                // 504 would corrupt the stream; abort the exchange instead.
                                 record_destination_timeout(destination_policy, category);
-                                write_local_response(
-                                    downstream,
-                                    request.keep_alive,
-                                    StatusCode::GATEWAY_TIMEOUT,
-                                    "route destination timed out\n",
-                                )
-                                .await
-                                .map_err(Http1ProxyError::ResponseIo)?;
-                                metrics.request_count += 1;
-                                *metrics
-                                    .response_status_counts
-                                    .entry(StatusCode::GATEWAY_TIMEOUT.as_u16())
-                                    .or_insert(0) += 1;
-                                break Ok(StatusCode::GATEWAY_TIMEOUT.as_u16());
+                                drop_upstream_connection(
+                                    upstream,
+                                    last_upstream_activity,
+                                    upstream_connected_at,
+                                );
+                                break Err(Http1ProxyError::IdleTimeout("response body"));
                             }
                         };
-                    relay_body(
-                        upstream_stream,
-                        upstream_buffer,
-                        downstream,
-                        &response.body_kind,
-                        config.limits.max_body_bytes,
-                        response_body_timeout,
-                        RelayDirection::Response,
-                    )
-                    .await
-                    .map_err(|error| {
+                    let relayed = if reframe_for_http10 {
+                        relay_response_body_for_http10(
+                            upstream_stream,
+                            upstream_buffer,
+                            downstream,
+                            &response.body_kind,
+                            config.limits.max_body_bytes,
+                            response_body_timeout,
+                        )
+                        .await
+                    } else {
+                        relay_body(
+                            upstream_stream,
+                            upstream_buffer,
+                            downstream,
+                            &response.body_kind,
+                            config.limits.max_body_bytes,
+                            response_body_timeout,
+                            RelayDirection::Response,
+                        )
+                        .await
+                    };
+                    relayed.map_err(|error| {
                         if matches!(error, Http1ProxyError::IdleTimeout(_)) {
                             record_destination_timeout(
                                 destination_policy,
@@ -653,7 +691,7 @@ where
                                 crate::UpstreamFailureClass::Temporary,
                             );
                         }
-                        error
+                        response_started_error(error, stale_fallback.is_some())
                     })?;
                 }
 
@@ -678,6 +716,20 @@ where
                 break Ok(upstream_response_status);
             }
         }
+    }
+}
+
+/// Once a response head has been streamed downstream, a stale cached response can no longer
+/// be substituted. Re-label errors that would otherwise trigger `stale-if-error` so the
+/// connection is aborted instead of emitting a second response on the same stream.
+fn response_started_error(error: Http1ProxyError, stale_fallback_armed: bool) -> Http1ProxyError {
+    if stale_fallback_armed && error_allows_stale_if_error(&error) {
+        Http1ProxyError::ResponseIo(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            error.to_string(),
+        ))
+    } else {
+        error
     }
 }
 
@@ -725,6 +777,18 @@ where
     Ok(())
 }
 
+struct CacheFillAttempt {
+    entry: Option<HttpCacheEntry>,
+    /// Whether the response body was already relayed downstream while collecting it.
+    body_relayed: bool,
+}
+
+impl CacheFillAttempt {
+    const fn skipped() -> Self {
+        Self { entry: None, body_relayed: false }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn build_cacheable_response_entry<W>(
     response_cache: &Http1ResponseCacheConfig,
@@ -736,37 +800,35 @@ async fn build_cacheable_response_entry<W>(
     downstream: &mut W,
     config: &Http1ProxyConfig,
     now: Duration,
-) -> Result<Option<HttpCacheEntry>, Http1ProxyError>
+) -> Result<CacheFillAttempt, Http1ProxyError>
 where
     W: AsyncWrite + Unpin,
 {
     if !request.method.eq_ignore_ascii_case("GET")
         || !response_is_cacheable(&response_cache.policy, response, normalized_response_headers)
     {
-        return Ok(None);
+        return Ok(CacheFillAttempt::skipped());
     }
 
-    let status = StatusCode::from_u16(response.status).map_err(|_| {
-        parse_side_error(
-            RelayDirection::Response,
-            lb_proto_http::Http1ParseError::Invalid("invalid status code"),
-        )
-    })?;
-    let metadata = match derive_cache_metadata(
-        &response_cache.policy,
-        normalized_response_headers,
-        status,
-        now,
-    ) {
-        Some(metadata) => metadata,
-        None => return Ok(None),
+    let Ok(status) = StatusCode::from_u16(response.status) else {
+        return Ok(CacheFillAttempt::skipped());
+    };
+    let Some(metadata) =
+        derive_cache_metadata(&response_cache.policy, normalized_response_headers, status, now)
+    else {
+        return Ok(CacheFillAttempt::skipped());
+    };
+    let Some(headers) = to_cache_headers(normalized_response_headers) else {
+        return Ok(CacheFillAttempt::skipped());
     };
 
     let body = match response.body_kind {
         lb_proto_http::BodyKind::None => bytes::Bytes::new(),
         lb_proto_http::BodyKind::ContentLength(length) => {
-            if length > response_cache.policy.max_object_bytes {
-                return Ok(None);
+            if length > response_cache.policy.max_object_bytes
+                || length > config.limits.max_body_bytes
+            {
+                return Ok(CacheFillAttempt::skipped());
             }
             relay_content_length_collect(
                 upstream,
@@ -778,14 +840,10 @@ where
             )
             .await?
         }
-        lb_proto_http::BodyKind::Chunked => return Ok(None),
+        lb_proto_http::BodyKind::Chunked | lb_proto_http::BodyKind::CloseDelimited => {
+            return Ok(CacheFillAttempt::skipped());
+        }
     };
 
-    let headers = match to_cache_headers(normalized_response_headers) {
-        Some(headers) => headers,
-        None => return Ok(None),
-    };
-
-    Ok(Some(HttpCacheEntry { metadata, headers, body }))
+    Ok(CacheFillAttempt { entry: Some(HttpCacheEntry { metadata, headers, body }), body_relayed: true })
 }
-

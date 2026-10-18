@@ -379,6 +379,11 @@ pub enum BodyKind {
     ContentLength(u64),
     /// Chunked transfer encoding is used.
     Chunked,
+    /// Response body is delimited by the upstream closing the connection (RFC 9112 §6.3).
+    ///
+    /// Only produced for responses. Proxies re-frame this body as chunked for HTTP/1.1
+    /// downstreams and never reuse the upstream connection afterwards.
+    CloseDelimited,
 }
 
 /// Parsed HTTP/1.1 request head.
@@ -398,6 +403,11 @@ pub struct Http1RequestHead {
     pub keep_alive: bool,
     /// Placeholder route match for future extensibility.
     pub route: Option<RouteMatch>,
+    /// Whether the downstream spoke HTTP/1.0.
+    ///
+    /// HTTP/1.0 clients are served as non-persistent connections and cannot receive
+    /// chunked bodies, so responses to them are de-framed and terminated by closing.
+    pub http10: bool,
 }
 
 /// Parsed HTTP/1.1 response head.
@@ -536,16 +546,35 @@ where
         request.method.ok_or(Http1ParseError::Invalid("missing request method"))?.to_string();
     let target =
         request.path.ok_or(Http1ParseError::Invalid("missing request target"))?.to_string();
-    let version = parse_version(request.version)?;
-    let headers = owned_headers(request.headers)?;
+    let http10 = request.version == Some(0);
+    let version =
+        if http10 { SupportedHttpVersion::Http1 } else { parse_version(request.version)? };
+    let mut headers = owned_headers(request.headers)?;
     validate_http1_request_hardening(&headers)
         .map_err(|error| Http1ParseError::Invalid(hardening_message(error)))?;
+    // RFC 9112 §3.2.2: for absolute-form targets the proxy must ignore the received Host and
+    // replace it with the target authority, otherwise routing/authorization (Host) and the
+    // upstream (target) can disagree about which virtual host is addressed.
+    if let Some(authority) = absolute_form_authority(&target)? {
+        for header in headers.iter_mut().filter(|header| header.name == "host") {
+            header.value = authority.to_string();
+        }
+    }
     let body_kind = detect_request_body_kind(&headers)?;
-    let keep_alive = detect_keep_alive(&headers, version);
+    let keep_alive = !http10 && detect_keep_alive(&headers, version);
     let route = match_route(&target, extract_host_header(&headers), Some(&method), routes);
     buffer.drain(..consumed);
 
-    Ok(Some(Http1RequestHead { method, target, version, headers, body_kind, keep_alive, route }))
+    Ok(Some(Http1RequestHead {
+        method,
+        target,
+        version,
+        headers,
+        body_kind,
+        keep_alive,
+        route,
+        http10,
+    }))
 }
 
 /// Reads and parses a bounded HTTP/1.1 response head.
@@ -570,11 +599,21 @@ where
         httparse::Status::Partial => return Err(Http1ParseError::IncompleteHead),
     };
 
-    let version = parse_version(response.version)?;
+    // HTTP/1.0 origins are accepted on the upstream side; the proxy always speaks
+    // HTTP/1.1 downstream, so the response is surfaced as HTTP/1.1.
+    let is_http10 = response.version == Some(0);
+    let version =
+        if is_http10 { SupportedHttpVersion::Http1 } else { parse_version(response.version)? };
     let status = response.code.ok_or(Http1ParseError::Invalid("missing status code"))?;
     let headers = owned_headers(response.headers)?;
     let body_kind = detect_response_body_kind(&headers, status, request_method)?;
-    let keep_alive = detect_keep_alive(&headers, version);
+    let keep_alive = if is_http10 {
+        header_value_contains_token(&headers, "connection", "keep-alive")
+            && !header_value_contains_token(&headers, "connection", "close")
+    } else {
+        detect_keep_alive(&headers, version)
+    } && !matches!(body_kind, BodyKind::CloseDelimited)
+        && !response_has_conflicting_framing(&headers);
     let reason = response.reason.unwrap_or("").to_string();
     buffer.drain(..consumed);
 
@@ -609,6 +648,18 @@ pub fn normalize_response_headers(
     body_kind: &BodyKind,
 ) -> Vec<HttpHeader> {
     let mut normalized = filter_headers(headers, body_kind, true);
+    if matches!(body_kind, BodyKind::CloseDelimited) {
+        // Preserve any non-chunked codings (e.g. `gzip`) and add our own chunked framing last.
+        let mut codings: Vec<&str> = transfer_coding_tokens(headers)
+            .into_iter()
+            .filter(|token| !token.eq_ignore_ascii_case("chunked"))
+            .collect();
+        codings.push("chunked");
+        normalized.push(HttpHeader {
+            name: String::from("transfer-encoding"),
+            value: codings.join(", "),
+        });
+    }
     if !keep_alive {
         normalized
             .push(HttpHeader { name: String::from("connection"), value: String::from("close") });
@@ -712,8 +763,28 @@ fn owned_headers(headers: &[httparse::Header<'_>]) -> Result<Vec<HttpHeader>, Ht
         .collect()
 }
 
+fn absolute_form_authority(target: &str) -> Result<Option<&str>, Http1ParseError> {
+    // Origin-form targets may legitimately contain `://` (for example `?next=https://...`).
+    if target.starts_with('/') {
+        return Ok(None);
+    }
+    let Some(scheme_end) = target.find("://") else {
+        return Ok(None);
+    };
+    let scheme = &target[..scheme_end];
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return Err(Http1ParseError::Invalid("unsupported absolute-form request target"));
+    }
+    let remainder = &target[scheme_end + 3..];
+    let authority = &remainder[..remainder.find(['/', '?']).unwrap_or(remainder.len())];
+    if canonicalize_host(authority).is_err() {
+        return Err(Http1ParseError::Invalid("invalid absolute-form request authority"));
+    }
+    Ok(Some(authority))
+}
+
 fn detect_request_body_kind(headers: &[HttpHeader]) -> Result<BodyKind, Http1ParseError> {
-    detect_body_kind(headers, false, None)
+    detect_body_kind(headers)
 }
 
 fn detect_response_body_kind(
@@ -725,14 +796,52 @@ fn detect_response_body_kind(
         return Ok(BodyKind::None);
     }
 
-    detect_body_kind(headers, true, Some(status))
+    let transfer_codings = transfer_coding_tokens(headers);
+    if !transfer_codings.is_empty() {
+        // RFC 9112 §6.3: chunked must be the final coding; otherwise the body runs until close.
+        return Ok(
+            if transfer_codings.last().is_some_and(|token| token.eq_ignore_ascii_case("chunked")) {
+                BodyKind::Chunked
+            } else {
+                BodyKind::CloseDelimited
+            },
+        );
+    }
+
+    match detect_body_kind(headers)? {
+        BodyKind::None
+            if !headers.iter().any(|header| header.name.eq_ignore_ascii_case("content-length")) =>
+        {
+            Ok(BodyKind::CloseDelimited)
+        }
+        other => Ok(other),
+    }
 }
 
-fn detect_body_kind(
-    headers: &[HttpHeader],
-    _is_response: bool,
-    _status: Option<u16>,
-) -> Result<BodyKind, Http1ParseError> {
+/// Whether a message applies transfer codings other than `chunked` (for example `gzip`).
+///
+/// Such bodies cannot be de-framed into plain payload bytes by the proxy.
+#[must_use]
+pub fn has_non_chunked_transfer_coding(headers: &[HttpHeader]) -> bool {
+    transfer_coding_tokens(headers).iter().any(|token| !token.eq_ignore_ascii_case("chunked"))
+}
+
+fn transfer_coding_tokens(headers: &[HttpHeader]) -> Vec<&str> {
+    headers
+        .iter()
+        .filter(|header| header.name.eq_ignore_ascii_case("transfer-encoding"))
+        .flat_map(|header| header.value.split(','))
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .collect()
+}
+
+fn response_has_conflicting_framing(headers: &[HttpHeader]) -> bool {
+    headers.iter().any(|header| header.name.eq_ignore_ascii_case("transfer-encoding"))
+        && headers.iter().any(|header| header.name.eq_ignore_ascii_case("content-length"))
+}
+
+fn detect_body_kind(headers: &[HttpHeader]) -> Result<BodyKind, Http1ParseError> {
     if header_value_contains_token(headers, "transfer-encoding", "chunked") {
         return Ok(BodyKind::Chunked);
     }
@@ -753,6 +862,11 @@ fn detect_body_kind(
         }
     }
 
+    // `u64::from_str` accepts a leading `+`, which other HTTP parsers reject; only bare
+    // digits are valid per RFC 9110 §8.6 and anything else is a request-smuggling vector.
+    if first.is_empty() || !first.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(Http1ParseError::Invalid("invalid content-length header"));
+    }
     let content_length = first
         .parse::<u64>()
         .map_err(|_| Http1ParseError::Invalid("invalid content-length header"))?;
@@ -915,7 +1029,8 @@ pub fn canonicalize_request_target(
         return Err(RequestTargetError::FragmentNotAllowed);
     }
 
-    let (authority, path_and_query) = if let Some(scheme_end) = target.find("://") {
+    let absolute_scheme_end = if target.starts_with('/') { None } else { target.find("://") };
+    let (authority, path_and_query) = if let Some(scheme_end) = absolute_scheme_end {
         let scheme = &target[..scheme_end];
         if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
             return Err(RequestTargetError::UnsupportedForm);
@@ -1233,7 +1348,7 @@ fn default_reason(status: u16) -> &'static str {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+#[allow(clippy::expect_used, clippy::panic)]
 mod tests {
     use super::{
         canonicalize_host, canonicalize_query_match_name, canonicalize_query_match_value,
@@ -1621,5 +1736,156 @@ mod tests {
         );
         assert_eq!(canonicalize_host("bad/host"), Err(RequestTargetError::InvalidAuthority));
         assert_eq!(canonicalize_host("bad host"), Err(RequestTargetError::InvalidAuthority));
+    }
+    async fn parse_response(raw: &[u8], method: &str) -> super::Http1ResponseHead {
+        let mut reader = raw;
+        let mut buffer = Vec::new();
+        match super::read_response_head(&mut reader, &mut buffer, &Http1Limits::default(), method)
+            .await
+        {
+            Ok(head) => head,
+            Err(error) => panic!("response should parse: {error}"),
+        }
+    }
+
+    async fn parse_request(raw: &[u8]) -> Result<super::Http1RequestHead, super::Http1ParseError> {
+        let mut reader = raw;
+        let mut buffer = Vec::new();
+        super::read_request_head(&mut reader, &mut buffer, &Http1Limits::default(), &[])
+            .await
+            .and_then(|head| head.ok_or(super::Http1ParseError::IncompleteHead))
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn response_without_length_is_close_delimited_and_not_reusable() {
+        let head =
+            parse_response(b"HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\n\r\n", "GET").await;
+        assert_eq!(head.body_kind, BodyKind::CloseDelimited);
+        assert!(!head.keep_alive);
+
+        let normalized = super::normalize_response_headers(&head.headers, true, &head.body_kind);
+        assert!(normalized
+            .iter()
+            .any(|header| header.name == "transfer-encoding" && header.value == "chunked"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn response_with_non_chunked_final_coding_is_close_delimited() {
+        let head =
+            parse_response(b"HTTP/1.1 200 OK\r\ntransfer-encoding: gzip\r\n\r\n", "GET").await;
+        assert_eq!(head.body_kind, BodyKind::CloseDelimited);
+        assert!(!head.keep_alive);
+
+        let head =
+            parse_response(b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked, gzip\r\n\r\n", "GET")
+                .await;
+        assert_eq!(head.body_kind, BodyKind::CloseDelimited);
+
+        let head =
+            parse_response(b"HTTP/1.1 200 OK\r\ntransfer-encoding: gzip, chunked\r\n\r\n", "GET")
+                .await;
+        assert_eq!(head.body_kind, BodyKind::Chunked);
+        assert!(head.keep_alive);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn response_with_both_te_and_content_length_is_chunked_and_not_reused() {
+        let head = parse_response(
+            b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\ncontent-length: 5\r\n\r\n",
+            "GET",
+        )
+        .await;
+        assert_eq!(head.body_kind, BodyKind::Chunked);
+        assert!(!head.keep_alive);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn bodyless_responses_stay_bodyless() {
+        let head = parse_response(b"HTTP/1.1 204 No Content\r\n\r\n", "GET").await;
+        assert_eq!(head.body_kind, BodyKind::None);
+        assert!(head.keep_alive);
+        let head = parse_response(b"HTTP/1.1 200 OK\r\n\r\n", "HEAD").await;
+        assert_eq!(head.body_kind, BodyKind::None);
+        let head = parse_response(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n", "GET").await;
+        assert_eq!(head.body_kind, BodyKind::None);
+        assert!(head.keep_alive);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn http10_upstream_responses_are_accepted_with_http10_persistence_rules() {
+        let head = parse_response(b"HTTP/1.0 200 OK\r\ncontent-length: 2\r\n\r\nok", "GET").await;
+        assert_eq!(head.version, SupportedHttpVersion::Http1);
+        assert_eq!(head.body_kind, BodyKind::ContentLength(2));
+        assert!(!head.keep_alive);
+
+        let head = parse_response(
+            b"HTTP/1.0 200 OK\r\nconnection: keep-alive\r\ncontent-length: 2\r\n\r\nok",
+            "GET",
+        )
+        .await;
+        assert!(head.keep_alive);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn absolute_form_target_authority_overrides_host_header() {
+        let head = parse_request(
+            b"GET http://internal.example/admin HTTP/1.1\r\nhost: public.example\r\n\r\n",
+        )
+        .await
+        .expect("absolute-form request should parse");
+        assert_eq!(super::extract_host_header(&head.headers), Some("internal.example"));
+
+        for target in ["ftp://internal.example/", "http://user@internal.example/", "http:///x"] {
+            let raw = format!("GET {target} HTTP/1.1\r\nhost: public.example\r\n\r\n");
+            assert!(parse_request(raw.as_bytes()).await.is_err(), "accepted {target}");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn origin_form_targets_may_contain_scheme_separators() {
+        let head = parse_request(
+            b"GET /login?redirect=https://app.example/home HTTP/1.1\r\nhost: a\r\n\r\n",
+        )
+        .await
+        .expect("origin-form request with embedded URL should parse");
+        assert_eq!(super::extract_host_header(&head.headers), Some("a"));
+        let canonical = canonicalize_request_target("/proxy/http://x/y")
+            .expect("origin-form target should canonicalize");
+        assert_eq!(canonical.authority, None);
+        assert_eq!(canonical.path, "/proxy/http://x/y");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn close_delimited_responses_keep_their_transfer_codings() {
+        let head =
+            parse_response(b"HTTP/1.1 200 OK\r\ntransfer-encoding: gzip\r\n\r\n", "GET").await;
+        assert!(super::has_non_chunked_transfer_coding(&head.headers));
+        let normalized = super::normalize_response_headers(&head.headers, true, &head.body_kind);
+        let codings: Vec<_> = normalized
+            .iter()
+            .filter(|header| header.name == "transfer-encoding")
+            .map(|header| header.value.as_str())
+            .collect();
+        assert_eq!(codings, vec!["gzip, chunked"]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn http10_requests_are_accepted_as_non_persistent() {
+        let head = parse_request(b"GET / HTTP/1.0\r\nhost: a\r\nconnection: keep-alive\r\n\r\n")
+            .await
+            .expect("HTTP/1.0 request should parse");
+        assert!(head.http10);
+        assert!(!head.keep_alive);
+        assert_eq!(head.version, SupportedHttpVersion::Http1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn signed_or_non_numeric_content_length_is_rejected() {
+        for value in ["+5", "-5", "5 5", "0x5", ""] {
+            let raw = format!("POST / HTTP/1.1\r\nhost: a\r\ncontent-length: {value}\r\n\r\n");
+            assert!(parse_request(raw.as_bytes()).await.is_err(), "accepted {value:?}");
+        }
+        let head = parse_request(b"POST / HTTP/1.1\r\nhost: a\r\ncontent-length: 05\r\n\r\n").await;
+        assert!(matches!(head.map(|head| head.body_kind), Ok(BodyKind::ContentLength(5))));
     }
 }

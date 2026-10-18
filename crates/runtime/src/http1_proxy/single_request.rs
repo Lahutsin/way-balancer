@@ -107,6 +107,7 @@ pub async fn proxy_http1_request_with_downstream_addr(
             effective_client_ip,
             effective_timeouts.connect_timeout,
             effective_timeouts.idle_timeout,
+            config.limits.max_body_bytes,
         )
         .await
         {
@@ -125,7 +126,7 @@ pub async fn proxy_http1_request_with_downstream_addr(
 
         let body_kind = lb_proto_http::BodyKind::ContentLength(h3_response.body.len() as u64);
         let mut normalized_response_headers =
-            lb_proto_http::normalize_response_headers(&h3_response.headers, false, &body_kind);
+            lb_proto_http::normalize_response_headers(&h3_response.headers, true, &body_kind);
         if !normalized_response_headers
             .iter()
             .any(|header| header.name.eq_ignore_ascii_case("content-length"))
@@ -199,11 +200,17 @@ pub async fn proxy_http1_request_with_downstream_addr(
     .map_err(|_| Http1ProxyError::IdleTimeout("response head"))?
     .map_err(Http1ProxyError::ParseResponse)?;
 
-    let mut body_writer = VecAsyncWriter::default();
-    relay_body(
+    // The caller receives a fully buffered body, so transfer framing is removed and the
+    // response is surfaced with an explicit content-length. Codings such as `gzip` applied
+    // as transfer codings cannot be removed and are rejected instead of corrupting the body.
+    if lb_proto_http::has_non_chunked_transfer_coding(&response.headers) {
+        return Err(Http1ProxyError::ParseResponse(lb_proto_http::Http1ParseError::Invalid(
+            "unsupported response transfer coding",
+        )));
+    }
+    let body = collect_decoded_body(
         &mut stream,
         &mut upstream_buffer,
-        &mut body_writer,
         &response.body_kind,
         config.limits.max_body_bytes,
         effective_timeouts.idle_timeout,
@@ -213,9 +220,16 @@ pub async fn proxy_http1_request_with_downstream_addr(
 
     let mut normalized_response_headers = lb_proto_http::normalize_response_headers(
         &response.headers,
-        false,
+        true,
         &response.body_kind,
     );
+    let body_kind = match response.body_kind {
+        lb_proto_http::BodyKind::None => lb_proto_http::BodyKind::None,
+        _ => {
+            reframe_buffered_headers(&mut normalized_response_headers, body.len());
+            lb_proto_http::BodyKind::ContentLength(body.len() as u64)
+        }
+    };
     if let Some(transform) = response_transform {
         apply_http1_header_mutations(&mut normalized_response_headers, &transform.header_mutations);
     }
@@ -230,10 +244,10 @@ pub async fn proxy_http1_request_with_downstream_addr(
             status: response.status,
             reason: response.reason,
             headers: normalized_response_headers,
-            body_kind: response.body_kind,
+            body_kind,
             keep_alive: false,
         },
-        body: body_writer.into_inner(),
+        body,
     })
 }
 

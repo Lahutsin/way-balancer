@@ -99,6 +99,7 @@ async fn run_public_http3_listener_loop(
                     state.sync_listener_abuse_snapshot(&listener_name, &abuse_protection).await;
                 });
             }
+            Some(_) = tasks.join_next(), if !tasks.is_empty() => {}
         }
     }
 
@@ -181,8 +182,34 @@ async fn handle_http3_request(
     };
     let route = lb_proto_http::match_route_request_with_context(&route_input, &proxy.http1.routes);
 
+    // HTTP/1.1 upstreams require Host; HTTP/3 carries it in the :authority pseudo-header.
+    if !headers.iter().any(|header| header.name.eq_ignore_ascii_case("host")) {
+        if let Some(authority) = request.uri().authority() {
+            headers.push(lb_proto_http::HttpHeader {
+                name: String::from("host"),
+                value: authority.as_str().to_string(),
+            });
+        }
+    }
+
+    let max_body_bytes = proxy.http1.limits.max_body_bytes;
+    let idle_timeout = proxy.http1.timeouts.idle_timeout;
     let mut request_body = Vec::new();
-    while let Some(mut chunk) = stream.recv_data().await.map_err(io::Error::other)? {
+    loop {
+        let chunk = match time::timeout(idle_timeout, stream.recv_data()).await {
+            Ok(chunk) => chunk.map_err(io::Error::other)?,
+            Err(_) => {
+                state.record_http3_request(listener_name, "failed", "request_body_timeout");
+                return send_http3_local_response(stream, http1::StatusCode::REQUEST_TIMEOUT).await;
+            }
+        };
+        let Some(mut chunk) = chunk else {
+            break;
+        };
+        if (request_body.len() as u64).saturating_add(chunk.remaining() as u64) > max_body_bytes {
+            state.record_http3_request(listener_name, "failed", "request_body_too_large");
+            return send_http3_local_response(stream, http1::StatusCode::PAYLOAD_TOO_LARGE).await;
+        }
         let chunk_bytes = chunk.copy_to_bytes(chunk.remaining());
         request_body.extend_from_slice(&chunk_bytes);
     }
@@ -209,14 +236,18 @@ async fn handle_http3_request(
             },
             keep_alive: false,
             route,
+            http10: false,
         },
         &request_body,
     )
-    .await
-    .map_err(|error| {
-        state.record_http3_request(listener_name, "failed", "bridge_failed");
-        io::Error::other(error)
-    })?;
+    .await;
+    let response = match response {
+        Ok(response) => response,
+        Err(_) => {
+            state.record_http3_request(listener_name, "failed", "bridge_failed");
+            return send_http3_local_response(stream, http1::StatusCode::BAD_GATEWAY).await;
+        }
+    };
 
     let status_reason = match response.head.status / 100 {
         2 => "2xx",
@@ -227,7 +258,7 @@ async fn handle_http3_request(
     };
 
     let mut response_builder = http1::Response::builder().status(response.head.status);
-    for header in &response.head.headers {
+    for header in response.head.headers.iter().filter(|header| !is_http3_forbidden_header(&header.name)) {
         response_builder = response_builder.header(&header.name, &header.value);
     }
     let response_head = response_builder.body(()).map_err(|error| {
@@ -252,3 +283,18 @@ async fn handle_http3_request(
     Ok(())
 }
 
+/// Connection-specific fields are malformed in HTTP/3 (RFC 9114 §4.2).
+fn is_http3_forbidden_header(name: &str) -> bool {
+    ["connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade", "te"]
+        .iter()
+        .any(|forbidden| name.eq_ignore_ascii_case(forbidden))
+}
+
+async fn send_http3_local_response(
+    stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    status: http1::StatusCode,
+) -> io::Result<()> {
+    let response = http1::Response::builder().status(status).body(()).map_err(io::Error::other)?;
+    stream.send_response(response).await.map_err(io::Error::other)?;
+    stream.finish().await.map_err(io::Error::other)
+}

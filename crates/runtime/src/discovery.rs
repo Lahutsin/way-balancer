@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -14,6 +14,15 @@ pub enum DiscoveryProviderKind {
 }
 
 impl DiscoveryProviderKind {
+    /// Whether snapshot generations from this provider only ever increase per source.
+    ///
+    /// Kubernetes EndpointSlice snapshots aggregate per-slice `metadata.generation` values,
+    /// which can go down when slices are deleted or recreated, so they cannot be ordered.
+    #[must_use]
+    pub const fn has_monotonic_generations(self) -> bool {
+        !matches!(self, Self::KubernetesEndpointSlice)
+    }
+
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -153,6 +162,8 @@ pub struct DiscoveryReconcileOutcome {
     pub lifecycle_draining: usize,
     pub lifecycle_drained: usize,
     pub lifecycle_removed: usize,
+    /// Snapshot was ignored because an equal-or-newer generation was already applied.
+    pub stale_generation_rejected: bool,
 }
 
 #[derive(Debug)]
@@ -187,6 +198,21 @@ impl From<UpstreamHealthError> for DiscoveryReconcileError {
     }
 }
 
+/// Treats "already gone" as success: the cluster or endpoint may have been removed by config.
+fn ignore_missing_endpoint<T>(
+    result: Result<T, UpstreamHealthError>,
+) -> Result<(), UpstreamHealthError> {
+    match result {
+        Ok(_)
+        | Err(UpstreamHealthError::EndpointNotTracked { .. })
+        | Err(UpstreamHealthError::Registry(
+            crate::EndpointRegistryError::EndpointNotFound { .. }
+            | crate::EndpointRegistryError::ClusterNotFound(_),
+        )) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct DrainingEndpointKey {
     cluster_name: lb_net_core::UpstreamClusterName,
@@ -201,6 +227,7 @@ pub struct DiscoveryMembershipReconciler {
         BTreeMap<DiscoverySourceId, BTreeMap<lb_net_core::UpstreamEndpointId, DiscoveryEndpoint>>,
     draining_deadlines: BTreeMap<DrainingEndpointKey, Duration>,
     endpoint_lifecycle: BTreeMap<DrainingEndpointKey, LifecycleStateMachine>,
+    applied_generations: BTreeMap<DiscoverySourceId, u64>,
     telemetry_scope: Option<String>,
     telemetry: Option<std::sync::Arc<RuntimeTelemetry>>,
 }
@@ -214,6 +241,7 @@ impl DiscoveryMembershipReconciler {
             active_endpoints_by_source: BTreeMap::new(),
             draining_deadlines: BTreeMap::new(),
             endpoint_lifecycle: BTreeMap::new(),
+            applied_generations: BTreeMap::new(),
             telemetry_scope: None,
             telemetry: None,
         }
@@ -238,71 +266,107 @@ impl DiscoveryMembershipReconciler {
         let mut outcome = DiscoveryReconcileOutcome::default();
         let source = snapshot.source.clone();
         let cluster_name = source.cluster_name.clone();
+
+        // Out-of-order delivery must never resurrect endpoints removed by a newer generation.
+        if let Some(applied) = self
+            .applied_generations
+            .get(&source)
+            .filter(|_| source.provider.has_monotonic_generations())
+        {
+            if snapshot.generation < *applied {
+                outcome.stale_generation_rejected = true;
+                self.emit_discovery_event(
+                    lb_observability::DecisionTraceKind::DiscoveryUpdate,
+                    "rejected",
+                    &cluster_name,
+                    &format!(
+                        "source {} ignored stale generation {} (applied generation {applied})",
+                        source.source_name, snapshot.generation
+                    ),
+                );
+                return Ok(outcome);
+            }
+        }
+
+        // Validate every endpoint before touching the registry so a bad entry cannot leave a
+        // half-applied topology behind.
+        let mut next_endpoints = BTreeMap::new();
+        for endpoint in &snapshot.endpoints {
+            let upstream_endpoint = endpoint
+                .into_upstream_endpoint(lb_net_core::EndpointState::Ready)
+                .map_err(DiscoveryReconcileError::InvalidEndpoint)?;
+            next_endpoints
+                .insert(endpoint.endpoint_id.clone(), (endpoint.clone(), upstream_endpoint));
+        }
+
+        let previous = self.active_endpoints_by_source.get(&source).cloned().unwrap_or_default();
         let mut activated_endpoint_ids = Vec::new();
         let mut draining_endpoint_ids = Vec::new();
-        let next_endpoints = snapshot
-            .endpoints
-            .iter()
-            .cloned()
-            .map(|endpoint| (endpoint.endpoint_id.clone(), endpoint))
-            .collect::<BTreeMap<_, _>>();
 
-        let applied_endpoint_count = {
-            let previous = self.active_endpoints_by_source.entry(source.clone()).or_default();
+        for (endpoint_id, (endpoint, upstream_endpoint)) in &next_endpoints {
+            if previous.get(endpoint_id) == Some(endpoint) {
+                continue;
+            }
+            let key = Self::endpoint_key(&cluster_name, endpoint_id);
+            let was_draining = self.draining_deadlines.remove(&key).is_some();
+            let other_definition = self.other_source_definition(&source, endpoint_id);
+            let in_registry =
+                was_draining || previous.contains_key(endpoint_id) || other_definition.is_some();
 
-            for (endpoint_id, endpoint) in &next_endpoints {
-                match previous.get(endpoint_id) {
-                    Some(current) if current == endpoint => {}
-                    Some(_) => {
-                        registry.remove_endpoint(&cluster_name, endpoint_id)?;
-                        let refreshed = endpoint
-                            .into_upstream_endpoint(lb_net_core::EndpointState::Ready)
-                            .map_err(DiscoveryReconcileError::InvalidEndpoint)?;
-                        registry.insert_endpoint(&cluster_name, refreshed)?;
-                        self.draining_deadlines.remove(&DrainingEndpointKey {
-                            cluster_name: cluster_name.clone(),
-                            endpoint_id: endpoint_id.clone(),
-                        });
-                        activated_endpoint_ids.push(endpoint_id.clone());
-                        outcome.updated += 1;
-                    }
-                    None => {
-                        let inserted = endpoint
-                            .into_upstream_endpoint(lb_net_core::EndpointState::Ready)
-                            .map_err(DiscoveryReconcileError::InvalidEndpoint)?;
-                        registry.insert_endpoint(&cluster_name, inserted)?;
-                        self.draining_deadlines.remove(&DrainingEndpointKey {
-                            cluster_name: cluster_name.clone(),
-                            endpoint_id: endpoint_id.clone(),
-                        });
-                        activated_endpoint_ids.push(endpoint_id.clone());
-                        outcome.inserted += 1;
-                    }
+            if other_definition == Some(endpoint)
+                && !was_draining
+                && !previous.contains_key(endpoint_id)
+            {
+                // Another source already installed an identical endpoint; only track membership.
+            } else {
+                if in_registry {
+                    ignore_missing_endpoint(registry.remove_endpoint(&cluster_name, endpoint_id))?;
                 }
+                registry.insert_endpoint(&cluster_name, upstream_endpoint.clone())?;
+                activated_endpoint_ids.push(endpoint_id.clone());
             }
-
-            let next_ids = next_endpoints.keys().cloned().collect::<BTreeSet<_>>();
-            let previous_ids = previous.keys().cloned().collect::<BTreeSet<_>>();
-            for removed_id in previous_ids.difference(&next_ids) {
-                registry.set_endpoint_state(
-                    &cluster_name,
-                    removed_id,
-                    lb_net_core::EndpointState::Draining,
-                )?;
-                self.draining_deadlines.insert(
-                    DrainingEndpointKey {
-                        cluster_name: cluster_name.clone(),
-                        endpoint_id: removed_id.clone(),
-                    },
-                    self.now.saturating_add(self.drain_grace),
-                );
-                draining_endpoint_ids.push(removed_id.clone());
-                outcome.marked_draining += 1;
+            if previous.contains_key(endpoint_id) {
+                outcome.updated += 1;
+            } else {
+                outcome.inserted += 1;
             }
+        }
 
-            *previous = next_endpoints;
-            previous.len()
-        };
+        for (removed_id, removed) in
+            previous.iter().filter(|(id, _)| !next_endpoints.contains_key(*id))
+        {
+            if let Some(other) = self.other_source_definition(&source, removed_id) {
+                // Still advertised by another source: keep it, adopting that source's definition.
+                if other != removed {
+                    let adopted = other
+                        .into_upstream_endpoint(lb_net_core::EndpointState::Ready)
+                        .map_err(DiscoveryReconcileError::InvalidEndpoint)?;
+                    ignore_missing_endpoint(registry.remove_endpoint(&cluster_name, removed_id))?;
+                    registry.insert_endpoint(&cluster_name, adopted)?;
+                    activated_endpoint_ids.push(removed_id.clone());
+                }
+                continue;
+            }
+            ignore_missing_endpoint(registry.set_endpoint_state(
+                &cluster_name,
+                removed_id,
+                lb_net_core::EndpointState::Draining,
+            ))?;
+            self.draining_deadlines.insert(
+                Self::endpoint_key(&cluster_name, removed_id),
+                self.now.saturating_add(self.drain_grace),
+            );
+            draining_endpoint_ids.push(removed_id.clone());
+            outcome.marked_draining += 1;
+        }
+
+        let applied_endpoint_count = next_endpoints.len();
+        self.active_endpoints_by_source.insert(
+            source.clone(),
+            next_endpoints.into_iter().map(|(id, (endpoint, _))| (id, endpoint)).collect(),
+        );
+        self.applied_generations.insert(source.clone(), snapshot.generation);
+
         for endpoint_id in &activated_endpoint_ids {
             self.record_endpoint_activated(&cluster_name, endpoint_id, &mut outcome);
         }
@@ -326,6 +390,18 @@ impl DiscoveryMembershipReconciler {
         Ok(outcome)
     }
 
+    /// Returns the endpoint definition advertised by a different source for the same cluster.
+    fn other_source_definition(
+        &self,
+        source: &DiscoverySourceId,
+        endpoint_id: &lb_net_core::UpstreamEndpointId,
+    ) -> Option<&DiscoveryEndpoint> {
+        self.active_endpoints_by_source
+            .iter()
+            .filter(|(other, _)| *other != source && other.cluster_name == source.cluster_name)
+            .find_map(|(_, endpoints)| endpoints.get(endpoint_id))
+    }
+
     pub fn advance_time(
         &mut self,
         registry: &UpstreamHealthRegistry,
@@ -341,9 +417,10 @@ impl DiscoveryMembershipReconciler {
             .collect::<Vec<_>>();
 
         for key in expired {
-            self.record_endpoint_drained(&key, &mut outcome);
-            registry.remove_endpoint(&key.cluster_name, &key.endpoint_id)?;
+            // Forget the deadline first so a failed removal is not retried forever.
             self.draining_deadlines.remove(&key);
+            self.record_endpoint_drained(&key, &mut outcome);
+            ignore_missing_endpoint(registry.remove_endpoint(&key.cluster_name, &key.endpoint_id))?;
             self.record_endpoint_removed(&key, &mut outcome);
             outcome.removed_after_drain += 1;
             self.emit_discovery_event(
@@ -550,6 +627,149 @@ mod tests {
                     crate::EndpointRegistryError::ClusterNotFound(_)
                 ))
         ));
+        Ok(())
+    }
+
+    fn snapshot_from(
+        source_name: &str,
+        generation: u64,
+        endpoints: Vec<DiscoveryEndpoint>,
+    ) -> Result<DiscoverySnapshot, Box<dyn std::error::Error>> {
+        let mut snapshot = snapshot(generation, endpoints)?;
+        snapshot.source.source_name = source_name.to_string();
+        Ok(snapshot)
+    }
+
+    fn candidate_ids(
+        registry: &UpstreamHealthRegistry,
+    ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        Ok(registry
+            .selection_candidates(&cluster_name()?, true)?
+            .into_iter()
+            .map(|candidate| candidate.endpoint_id.as_str().to_string())
+            .collect())
+    }
+
+    #[test]
+    fn reconciler_ignores_out_of_order_generations() -> Result<(), Box<dyn std::error::Error>> {
+        let registry = registry()?;
+        let mut reconciler = DiscoveryMembershipReconciler::new(Duration::from_secs(5));
+        reconciler
+            .reconcile_snapshot(&registry, snapshot(2, vec![endpoint("payments-a", 8080)?])?)?;
+
+        let stale = reconciler.reconcile_snapshot(
+            &registry,
+            snapshot(1, vec![endpoint("payments-a", 8080)?, endpoint("payments-old", 8081)?])?,
+        )?;
+        assert!(stale.stale_generation_rejected);
+        assert_eq!(stale.inserted, 0);
+        assert_eq!(candidate_ids(&registry)?, vec![String::from("payments-a")]);
+        Ok(())
+    }
+
+    #[test]
+    fn reconciler_accepts_lower_endpoint_slice_generations(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let registry = registry()?;
+        let mut reconciler = DiscoveryMembershipReconciler::new(Duration::from_secs(5));
+        let mut first =
+            snapshot(7, vec![endpoint("payments-a", 8080)?, endpoint("payments-b", 8081)?])?;
+        first.source.provider = DiscoveryProviderKind::KubernetesEndpointSlice;
+        reconciler.reconcile_snapshot(&registry, first)?;
+
+        let mut shrunk = snapshot(2, vec![endpoint("payments-b", 8081)?])?;
+        shrunk.source.provider = DiscoveryProviderKind::KubernetesEndpointSlice;
+        let applied = reconciler.reconcile_snapshot(&registry, shrunk)?;
+        assert!(!applied.stale_generation_rejected);
+        assert_eq!(applied.marked_draining, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn reconciler_reinstalls_definition_when_sources_converge(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let registry = registry()?;
+        let mut reconciler = DiscoveryMembershipReconciler::new(Duration::from_secs(5));
+        reconciler.reconcile_snapshot(
+            &registry,
+            snapshot_from("consul", 1, vec![endpoint("payments-a", 8080)?])?,
+        )?;
+        reconciler.reconcile_snapshot(
+            &registry,
+            snapshot_from("dns", 1, vec![endpoint("payments-a", 9090)?])?,
+        )?;
+        reconciler.reconcile_snapshot(
+            &registry,
+            snapshot_from("dns", 2, vec![endpoint("payments-a", 8080)?])?,
+        )?;
+
+        let cluster_name = cluster_name()?;
+        let endpoint_id = lb_net_core::UpstreamEndpointId::new("payments-a".to_string())?;
+        let candidate = registry
+            .selection_candidates(&cluster_name, true)?
+            .into_iter()
+            .find(|candidate| candidate.endpoint_id == endpoint_id)
+            .ok_or("endpoint missing")?;
+        assert_eq!(candidate.address.port(), 8080);
+        Ok(())
+    }
+
+    #[test]
+    fn reconciler_rejects_invalid_snapshot_without_partial_mutation(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let registry = registry()?;
+        let mut reconciler = DiscoveryMembershipReconciler::new(Duration::from_secs(5));
+        reconciler
+            .reconcile_snapshot(&registry, snapshot(1, vec![endpoint("payments-a", 8080)?])?)?;
+
+        let mut invalid = endpoint("payments-z", 8090)?;
+        invalid.weight = 0;
+        let result = reconciler.reconcile_snapshot(
+            &registry,
+            snapshot(2, vec![endpoint("payments-b", 8081)?, invalid])?,
+        );
+        assert!(result.is_err());
+        assert_eq!(candidate_ids(&registry)?, vec![String::from("payments-a")]);
+        Ok(())
+    }
+
+    #[test]
+    fn reconciler_keeps_endpoints_advertised_by_another_source(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let registry = registry()?;
+        let mut reconciler = DiscoveryMembershipReconciler::new(Duration::from_secs(5));
+        reconciler.reconcile_snapshot(
+            &registry,
+            snapshot_from("dns", 1, vec![endpoint("payments-a", 8080)?])?,
+        )?;
+        reconciler.reconcile_snapshot(
+            &registry,
+            snapshot_from("consul", 1, vec![endpoint("payments-a", 8080)?])?,
+        )?;
+
+        let removed =
+            reconciler.reconcile_snapshot(&registry, snapshot_from("dns", 2, Vec::new())?)?;
+        assert_eq!(removed.marked_draining, 0);
+        reconciler.advance_time(&registry, Duration::from_secs(10))?;
+        assert_eq!(candidate_ids(&registry)?, vec![String::from("payments-a")]);
+        Ok(())
+    }
+
+    #[test]
+    fn reconciler_readds_endpoint_that_flapped_during_drain(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let registry = registry()?;
+        let mut reconciler = DiscoveryMembershipReconciler::new(Duration::from_secs(5));
+        reconciler
+            .reconcile_snapshot(&registry, snapshot(1, vec![endpoint("payments-a", 8080)?])?)?;
+        reconciler.reconcile_snapshot(&registry, snapshot(2, Vec::new())?)?;
+        let readded = reconciler
+            .reconcile_snapshot(&registry, snapshot(3, vec![endpoint("payments-a", 8080)?])?)?;
+        assert_eq!(readded.inserted, 1);
+
+        let drained = reconciler.advance_time(&registry, Duration::from_secs(10))?;
+        assert_eq!(drained.removed_after_drain, 0);
+        assert_eq!(candidate_ids(&registry)?, vec![String::from("payments-a")]);
         Ok(())
     }
 

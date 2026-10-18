@@ -818,14 +818,33 @@ impl ServeSupervisor {
         {
             let mut inner = self.shared.inner.lock().await;
 
+            // Build every fallible piece first so a failure leaves all listeners untouched and
+            // the freshly started replacements are shut down instead of leaking.
+            let mut prepared_updates = Vec::new();
             for (name, spec) in &listeners {
-                if let Some(slot) = inner.listeners.get_mut(name) {
+                if let Some(slot) = inner.listeners.get(name) {
                     if (!mode.force_replace_matching()
                         || matches!(slot.active.class, lb_config_model::ListenerClassConfig::Admin))
                         && slot.can_update_in_place(spec)
                     {
-                        slot.apply_update(spec).await?;
+                        match build_listener_overload_runtime(spec.overload_policy()) {
+                            Ok(overload_runtime) => {
+                                prepared_updates.push((name, spec, overload_runtime));
+                            }
+                            Err(error) => {
+                                drop(inner);
+                                for (_started_name, listener) in started {
+                                    let _ = listener.shutdown().await;
+                                }
+                                return Err(error);
+                            }
+                        }
                     }
+                }
+            }
+            for (name, spec, overload_runtime) in prepared_updates {
+                if let Some(slot) = inner.listeners.get_mut(name) {
+                    slot.apply_update(spec, overload_runtime).await;
                 }
             }
 
@@ -997,28 +1016,37 @@ impl ManagedServeListener {
         }
     }
 
-    async fn apply_update(&mut self, spec: &CompiledServeListener) -> Result<(), DynError> {
+    /// Applies an in-place update. Must only be called with a prepared overload runtime so
+    /// that the update itself cannot fail half-way.
+    async fn apply_update(
+        &mut self,
+        spec: &CompiledServeListener,
+        overload_runtime: Option<ListenerOverloadRuntime>,
+    ) {
         self.drain_timeout = spec.drain_timeout();
         self.admission_limit.store(spec.max_connections(), Ordering::SeqCst);
         *self.overload_runtime.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
-            build_listener_overload_runtime(spec.overload_policy())?;
+            overload_runtime;
         *self.abuse_policy.write().await = spec.abuse_protection_policy().cloned();
         *self.abuse_protection.write().await =
             build_listener_abuse_protection_state(spec.abuse_protection_policy());
-        if let (
-            ManagedListenerKind::Public { shared_proxy },
-            CompiledServeListener::Public { proxy, .. },
-        ) = (&self.kind, spec)
-        {
-            *shared_proxy.write().await = proxy.clone();
-        } else if let (
-            ManagedListenerKind::Admin { runtime, .. },
-            CompiledServeListener::Admin { admin_policy, .. },
-        ) = (&self.kind, spec)
-        {
-            *runtime.shared_policy.write().await = admin_policy.clone();
+        match (&mut self.kind, spec) {
+            (
+                ManagedListenerKind::Public { shared_proxy },
+                CompiledServeListener::Public { proxy, .. },
+            ) => {
+                *shared_proxy.write().await = proxy.clone();
+            }
+            (
+                ManagedListenerKind::Admin { runtime, tls_status },
+                CompiledServeListener::Admin { admin_policy, tls, .. },
+            ) => {
+                *runtime.shared_policy.write().await = admin_policy.clone();
+                *runtime.shared_tls.write().await = tls.clone();
+                *tls_status = tls.as_ref().map(|config| config.tls_status.clone());
+            }
+            _ => {}
         }
-        Ok(())
     }
 
     async fn shutdown(self) -> io::Result<ListenerDrainOutcome> {

@@ -110,6 +110,76 @@ async fn tls_passthrough_is_classified() -> Result<(), Box<dyn std::error::Error
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn large_segmented_client_hello_is_classified_and_forwarded(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let upstream_addr = spawn_collect_then_reply_server().await?;
+    let (proxy_addr, result_rx) =
+        spawn_one_shot_proxy_listener(proxy_config(upstream_addr)).await?;
+
+    // Post-quantum key shares push real ClientHellos well beyond 1 KiB.
+    let hello = build_client_hello_with_padding(Some("pq.example.com"), 1800);
+    let mut client = TcpStream::connect(proxy_addr).await?;
+    client.write_all(&hello[..700]).await?;
+    client.flush().await?;
+    time::sleep(Duration::from_millis(30)).await;
+    client.write_all(&hello[700..]).await?;
+    client.shutdown().await?;
+    let mut echoed = Vec::new();
+    client.read_to_end(&mut echoed).await?;
+    assert_eq!(echoed, hello, "the inspected preface must be replayed to the upstream intact");
+
+    let report = receive_proxy_result(result_rx).await?;
+    let Some(TlsClientHelloClassification::ClientHello(metadata)) =
+        report.context.metadata.tls_classification.clone()
+    else {
+        return Err(format!(
+            "unexpected classification: {:?}",
+            report.context.metadata.tls_classification
+        )
+        .into());
+    };
+    assert_eq!(metadata.server_name.as_deref(), Some("pq.example.com"));
+    assert_eq!(report.downstream_to_upstream_bytes, hello.len() as u64);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_way_transfer_is_not_cut_by_idle_timeout_of_quiet_direction(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let upstream_addr = listener.local_addr()?;
+    tokio::spawn(async move {
+        if let Ok((mut stream, _)) = listener.accept().await {
+            for _ in 0..8 {
+                if stream.write_all(b"tick").await.is_err() {
+                    return;
+                }
+                time::sleep(Duration::from_millis(40)).await;
+            }
+            let _ = stream.shutdown().await;
+        }
+    });
+    let mut config = proxy_config(upstream_addr);
+    config.inspect_tls_client_hello = false;
+    config.timeouts = ConnectionTimeouts {
+        connect_timeout: Duration::from_secs(1),
+        preface_timeout: Duration::from_millis(100),
+        idle_timeout: Duration::from_millis(150),
+    };
+    let (proxy_addr, result_rx) = spawn_one_shot_proxy_listener(config).await?;
+
+    let mut client = TcpStream::connect(proxy_addr).await?;
+    let mut received = Vec::new();
+    client.read_to_end(&mut received).await?;
+    assert_eq!(received.len(), 32);
+    drop(client);
+
+    let report = receive_proxy_result(result_rx).await?;
+    assert_eq!(report.upstream_to_downstream_bytes, 32);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn connection_churn_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
     for _ in 0..12 {
         let upstream_addr = spawn_echo_server().await?;
@@ -224,6 +294,10 @@ fn unused_local_address() -> io::Result<SocketAddr> {
 }
 
 fn build_client_hello(server_name: Option<&str>) -> Vec<u8> {
+    build_client_hello_with_padding(server_name, 0)
+}
+
+fn build_client_hello_with_padding(server_name: Option<&str>, padding: usize) -> Vec<u8> {
     let mut hello = Vec::new();
     hello.extend_from_slice(&[0x03, 0x03]);
     hello.extend_from_slice(&[0_u8; 32]);
@@ -248,6 +322,12 @@ fn build_client_hello(server_name: Option<&str>) -> Vec<u8> {
         let extension_len = u16::try_from(server_name_extension.len()).unwrap_or(u16::MAX);
         extensions.extend_from_slice(&extension_len.to_be_bytes());
         extensions.extend_from_slice(&server_name_extension);
+    }
+
+    if padding > 0 {
+        extensions.extend_from_slice(&0x0015_u16.to_be_bytes());
+        extensions.extend_from_slice(&u16::try_from(padding).unwrap_or(u16::MAX).to_be_bytes());
+        extensions.extend(std::iter::repeat(0_u8).take(padding));
     }
 
     let extensions_len = u16::try_from(extensions.len()).unwrap_or(u16::MAX);

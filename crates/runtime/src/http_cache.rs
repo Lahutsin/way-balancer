@@ -119,7 +119,7 @@ impl HttpCacheMetadata {
     /// Returns the freshness state of the object at the provided time.
     #[must_use]
     pub fn freshness(&self, now: Duration) -> Option<HttpCacheFreshness> {
-        if now > self.expires_at() {
+        if now >= self.expires_at() {
             None
         } else if self.is_fresh(now) {
             Some(HttpCacheFreshness::Fresh)
@@ -145,19 +145,20 @@ impl HttpCacheMetadata {
     /// Whether the object is fresh at the provided time.
     #[must_use]
     pub fn is_fresh(&self, now: Duration) -> bool {
-        now <= self.fresh_until
+        // RFC 9111 §4.2: fresh only while the freshness lifetime exceeds the current age.
+        now < self.fresh_until
     }
 
     /// Whether stale-while-revalidate service is still allowed.
     #[must_use]
     pub fn allows_stale_while_revalidate(&self, now: Duration) -> bool {
-        self.stale_while_revalidate_until.is_some_and(|deadline| now <= deadline)
+        self.stale_while_revalidate_until.is_some_and(|deadline| now < deadline)
     }
 
     /// Whether stale-if-error service is still allowed.
     #[must_use]
     pub fn allows_stale_if_error(&self, now: Duration) -> bool {
-        self.stale_if_error_until.is_some_and(|deadline| now <= deadline)
+        self.stale_if_error_until.is_some_and(|deadline| now < deadline)
     }
 
     fn validate(&self) -> Result<(), HttpCacheStoreError> {
@@ -665,7 +666,8 @@ pub struct HttpCacheStore {
     eviction_count: AtomicU64,
     expiration_count: AtomicU64,
     rejected_insert_count: AtomicU64,
-    applied_invalidations: Mutex<VecDeque<String>>,
+    /// Recently applied invalidations keyed by `(issuer, event_id)`.
+    applied_invalidations: Mutex<VecDeque<(String, String)>>,
 }
 
 impl HttpCacheStore {
@@ -807,7 +809,10 @@ impl HttpCacheStore {
 
         let mut applied =
             self.applied_invalidations.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        if applied.iter().any(|event_id| event_id == &event.event_id) {
+        if applied
+            .iter()
+            .any(|(issuer, event_id)| issuer == &event.issuer && event_id == &event.event_id)
+        {
             return Ok(HttpCacheInvalidationApplyResult::Duplicate);
         }
 
@@ -823,7 +828,7 @@ impl HttpCacheStore {
             }
         };
 
-        applied.push_back(event.event_id.clone());
+        applied.push_back((event.issuer.clone(), event.event_id.clone()));
         while applied.len() > 256 {
             let _ = applied.pop_front();
         }
@@ -837,7 +842,7 @@ impl HttpCacheStore {
         let keys_to_remove: Vec<_> = state
             .entries
             .iter()
-            .filter(|(_, record)| now > record.entry.metadata.expires_at())
+            .filter(|(_, record)| now >= record.entry.metadata.expires_at())
             .map(|(key, _)| key.clone())
             .collect();
 
@@ -1167,6 +1172,24 @@ mod tests {
         HTTP_CACHE_INVALIDATION_MAX_ISSUER_LEN, HTTP_CACHE_INVALIDATION_MAX_PATH_PREFIX_LEN,
         HTTP_CACHE_INVALIDATION_MAX_SCOPE_LEN,
     };
+
+    #[test]
+    fn freshness_deadlines_are_exclusive() {
+        let metadata = entry("body", Duration::from_secs(10), Duration::from_secs(20)).metadata;
+        assert_eq!(metadata.freshness(Duration::from_secs(19)), Some(HttpCacheFreshness::Fresh));
+        assert_eq!(
+            metadata.freshness(Duration::from_secs(20)),
+            Some(HttpCacheFreshness::StaleWhileRevalidate)
+        );
+        assert_eq!(
+            metadata.freshness(Duration::from_secs(30)),
+            Some(HttpCacheFreshness::StaleIfError)
+        );
+        assert_eq!(metadata.freshness(Duration::from_secs(40)), None);
+
+        let max_age_zero = entry("body", Duration::from_secs(10), Duration::from_secs(10)).metadata;
+        assert!(!max_age_zero.is_fresh(Duration::from_secs(10)));
+    }
 
     fn key(value: &str) -> Result<HttpCacheKey, HttpCacheStoreError> {
         HttpCacheKey::new(Bytes::copy_from_slice(value.as_bytes()))

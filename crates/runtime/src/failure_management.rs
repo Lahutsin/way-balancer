@@ -237,6 +237,9 @@ struct CircuitBreakerRecord {
     consecutive_failures: u32,
     half_open_successes: u32,
     opened_at: Duration,
+    /// Probes admitted in the current half-open window.
+    half_open_admitted: u32,
+    half_open_window_started: Duration,
 }
 
 #[derive(Debug)]
@@ -263,6 +266,8 @@ impl CircuitBreaker {
                 consecutive_failures: 0,
                 half_open_successes: 0,
                 opened_at: Duration::ZERO,
+                half_open_admitted: 0,
+                half_open_window_started: Duration::ZERO,
             }),
             breaker_state_change_count: AtomicU64::new(0),
             breaker_open_rejection_count: AtomicU64::new(0),
@@ -283,14 +288,38 @@ impl CircuitBreaker {
                 lb_observability::FailureManagementEventKind::BreakerHalfOpened,
                 "breaker cool-down elapsed; allowing probe traffic",
             );
+            record.half_open_admitted = 0;
+            record.half_open_window_started = now;
         }
 
-        if matches!(record.state, CircuitBreakerState::Open) {
-            self.breaker_open_rejection_count.fetch_add(1, Ordering::SeqCst);
-            return false;
+        match record.state {
+            CircuitBreakerState::Open => {
+                self.breaker_open_rejection_count.fetch_add(1, Ordering::SeqCst);
+                false
+            }
+            CircuitBreakerState::HalfOpen => {
+                // Only admit as many probes as are needed to close the breaker; a full burst
+                // of traffic against a still-recovering upstream defeats the breaker. Probes
+                // whose outcome is never reported are re-armed after another cool-down.
+                if now.saturating_sub(record.half_open_window_started) >= self.policy.open_duration
+                {
+                    record.half_open_admitted = 0;
+                    record.half_open_window_started = now;
+                }
+                let probe_budget = self
+                    .policy
+                    .half_open_success_threshold
+                    .saturating_sub(record.half_open_successes);
+                if record.half_open_admitted < probe_budget {
+                    record.half_open_admitted += 1;
+                    true
+                } else {
+                    self.breaker_open_rejection_count.fetch_add(1, Ordering::SeqCst);
+                    false
+                }
+            }
+            CircuitBreakerState::Closed => true,
         }
-
-        true
     }
 
     pub fn record_success(&self) {

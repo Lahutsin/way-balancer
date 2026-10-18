@@ -103,3 +103,32 @@ fn repeated_failure_handling_stays_deterministic() -> Result<(), Box<dyn std::er
     assert!(!manager.allow_retry(Duration::from_secs(2), UpstreamFailureClass::Permanent).allowed);
     Ok(())
 }
+
+#[test]
+fn half_open_breaker_admits_only_bounded_probe_traffic() -> Result<(), Box<dyn std::error::Error>> {
+    let manager = failure_manager()?;
+    manager.record_failure(Duration::ZERO, UpstreamFailureClass::Connect);
+    manager.record_failure(Duration::ZERO, UpstreamFailureClass::Connect);
+    assert_eq!(manager.breaker_snapshot(Duration::ZERO).state, CircuitBreakerState::Open);
+
+    let cooled_down = Duration::from_secs(20);
+    assert!(manager.allow_request(cooled_down));
+    assert!(manager.allow_request(cooled_down));
+    assert!(!manager.allow_request(cooled_down), "burst beyond probe budget must be rejected");
+    assert!(!manager.allow_request(cooled_down + Duration::from_secs(1)));
+
+    manager.record_success();
+    assert!(!manager.allow_request(cooled_down + Duration::from_secs(1)));
+
+    // Probes whose outcome was never reported are re-armed after another cool-down.
+    let rearmed = cooled_down + Duration::from_secs(20);
+    assert!(manager.allow_request(rearmed));
+    assert!(!manager.allow_request(rearmed));
+
+    manager.record_success();
+    assert_eq!(manager.breaker_snapshot(rearmed).state, CircuitBreakerState::Closed);
+    assert!(manager.allow_request(rearmed));
+    assert!(manager.allow_request(rearmed));
+    assert!(manager.allow_request(rearmed));
+    Ok(())
+}

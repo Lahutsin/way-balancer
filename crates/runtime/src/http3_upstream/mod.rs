@@ -54,6 +54,8 @@ pub enum Http3UpstreamError {
     RequestFailed,
     ResponseTimeout,
     ResponseFailed,
+    /// Upstream response body exceeded the configured maximum body size.
+    ResponseTooLarge,
 }
 
 impl std::fmt::Display for Http3UpstreamError {
@@ -69,6 +71,9 @@ impl std::fmt::Display for Http3UpstreamError {
             Self::RequestFailed => formatter.write_str("HTTP/3 upstream request failed"),
             Self::ResponseTimeout => formatter.write_str("HTTP/3 upstream response timeout"),
             Self::ResponseFailed => formatter.write_str("HTTP/3 upstream response failed"),
+            Self::ResponseTooLarge => {
+                formatter.write_str("HTTP/3 upstream response exceeded the body size limit")
+            }
         }
     }
 }
@@ -86,6 +91,7 @@ pub async fn dispatch_http3_upstream_request(
     effective_client_ip: IpAddr,
     connect_timeout: Duration,
     idle_timeout: Duration,
+    max_response_body_bytes: u64,
 ) -> Result<Http3BridgeResponse, Http3UpstreamError> {
     dispatch_http3_upstream_request_with_client_config(
         upstream,
@@ -96,6 +102,7 @@ pub async fn dispatch_http3_upstream_request(
         effective_client_ip,
         connect_timeout,
         idle_timeout,
+        max_response_body_bytes,
         default_quic_client_config()?,
     )
     .await
@@ -111,6 +118,7 @@ async fn dispatch_http3_upstream_request_with_client_config(
     effective_client_ip: IpAddr,
     connect_timeout: Duration,
     idle_timeout: Duration,
+    max_response_body_bytes: u64,
     client_config: quinn::ClientConfig,
 ) -> Result<Http3BridgeResponse, Http3UpstreamError> {
     let authority = request_authority(headers).unwrap_or_else(|| upstream.address.to_string());
@@ -189,7 +197,13 @@ async fn dispatch_http3_upstream_request_with_client_config(
         let Some(mut chunk) = chunk else {
             break;
         };
-        let chunk_bytes = chunk.copy_to_bytes(chunk.remaining());
+        let remaining = chunk.remaining();
+        if (response_body.len() as u64).saturating_add(remaining as u64) > max_response_body_bytes {
+            request_stream.stop_sending(h3::error::Code::H3_REQUEST_CANCELLED);
+            endpoint.close(0u32.into(), b"response too large");
+            return Err(Http3UpstreamError::ResponseTooLarge);
+        }
+        let chunk_bytes = chunk.copy_to_bytes(remaining);
         response_body.extend_from_slice(&chunk_bytes);
     }
 
@@ -248,6 +262,9 @@ fn should_skip_request_header(name: &str) -> bool {
         || name.eq_ignore_ascii_case("upgrade")
         || name.eq_ignore_ascii_case("host")
         || name.eq_ignore_ascii_case("content-length")
+        || name.eq_ignore_ascii_case("proxy-authorization")
+        // HTTP/3 only permits `te: trailers`; any other value makes the request malformed.
+        || name.eq_ignore_ascii_case("te")
 }
 
 fn server_name_from_authority(authority: &str) -> String {
@@ -398,6 +415,7 @@ mod tests {
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             Duration::from_secs(2),
             Duration::from_secs(2),
+            1024 * 1024,
             client_config,
         )
         .await?;
@@ -430,6 +448,7 @@ mod tests {
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             Duration::from_millis(200),
             Duration::from_millis(200),
+            1024 * 1024,
             client_config,
         )
         .await;

@@ -31,7 +31,7 @@ async fn relay_recv_body_to_send_stream(
                 StreamBodyDirection::Response => StreamForwardError::ResponseBodyLimitExceeded,
             });
         }
-        send_bytes_chunked(send_stream, chunk, false, direction).await?;
+        send_bytes_chunked(send_stream, chunk, false, idle_timeout, direction).await?;
     }
 
     if let Some(trailers) = time::timeout(idle_timeout, recv_stream.trailers())
@@ -49,6 +49,7 @@ async fn relay_recv_body_to_send_stream(
             StreamBodyDirection::Response => StreamForwardError::ResponseBody,
         })?
     {
+        let trailers = sanitize_http2_trailers(trailers);
         let trailers_for_metrics = trailers.clone();
         send_stream.send_trailers(trailers).map_err(|_| match direction {
             StreamBodyDirection::Request => StreamForwardError::RequestBody,
@@ -56,7 +57,7 @@ async fn relay_recv_body_to_send_stream(
         })?;
         return Ok(Some(trailers_for_metrics));
     } else {
-        send_bytes_chunked(send_stream, Bytes::new(), true, direction).await?;
+        send_bytes_chunked(send_stream, Bytes::new(), true, idle_timeout, direction).await?;
     }
 
     Ok(None)
@@ -97,7 +98,7 @@ async fn relay_recv_body_to_send_stream_buffered(
             });
         }
         body.extend_from_slice(&chunk);
-        send_bytes_chunked(send_stream, chunk, false, direction).await?;
+        send_bytes_chunked(send_stream, chunk, false, idle_timeout, direction).await?;
     }
 
     let trailers = time::timeout(idle_timeout, recv_stream.trailers())
@@ -115,13 +116,14 @@ async fn relay_recv_body_to_send_stream_buffered(
             StreamBodyDirection::Response => StreamForwardError::ResponseBody,
         })?;
 
+    let trailers = trailers.map(sanitize_http2_trailers);
     if let Some(trailers_to_send) = trailers.clone() {
         send_stream.send_trailers(trailers_to_send).map_err(|_| match direction {
             StreamBodyDirection::Request => StreamForwardError::RequestBody,
             StreamBodyDirection::Response => StreamForwardError::ResponseBody,
         })?;
     } else {
-        send_bytes_chunked(send_stream, Bytes::new(), true, direction).await?;
+        send_bytes_chunked(send_stream, Bytes::new(), true, idle_timeout, direction).await?;
     }
 
     Ok(BufferedStreamPayload {
@@ -190,6 +192,7 @@ async fn read_recv_body_to_buffer(
 async fn send_buffered_stream_payload(
     send_stream: &mut SendStream<Bytes>,
     payload: &BufferedStreamPayload,
+    idle_timeout: Duration,
     direction: StreamBodyDirection,
 ) -> Result<(), StreamForwardError> {
     if !payload.body.is_empty() {
@@ -197,14 +200,15 @@ async fn send_buffered_stream_payload(
             send_stream,
             payload.body.clone(),
             payload.trailers.is_none(),
+            idle_timeout,
             direction,
         )
         .await?;
     } else if payload.trailers.is_none() {
-        send_bytes_chunked(send_stream, Bytes::new(), true, direction).await?;
+        send_bytes_chunked(send_stream, Bytes::new(), true, idle_timeout, direction).await?;
     }
 
-    if let Some(trailers) = payload.trailers.clone() {
+    if let Some(trailers) = payload.trailers.clone().map(sanitize_http2_trailers) {
         send_stream.send_trailers(trailers).map_err(|_| match direction {
             StreamBodyDirection::Request => StreamForwardError::RequestBody,
             StreamBodyDirection::Response => StreamForwardError::ResponseBody,
@@ -214,10 +218,27 @@ async fn send_buffered_stream_payload(
     Ok(())
 }
 
+/// Drops connection-specific fields that are never valid in an HTTP/2 trailer block.
+fn sanitize_http2_trailers(mut trailers: http::HeaderMap) -> http::HeaderMap {
+    let forbidden: Vec<HeaderName> = trailers
+        .iter()
+        .filter(|(name, value)| should_skip_http2_header(name, value))
+        .map(|(name, _)| name.clone())
+        .collect();
+    for name in forbidden {
+        trailers.remove(&name);
+    }
+    for name in [http::header::CONTENT_LENGTH, http::header::TRAILER] {
+        trailers.remove(&name);
+    }
+    trailers
+}
+
 async fn send_bytes_chunked(
     send_stream: &mut SendStream<Bytes>,
     mut bytes: Bytes,
     end_stream: bool,
+    idle_timeout: Duration,
     direction: StreamBodyDirection,
 ) -> Result<(), StreamForwardError> {
     if bytes.is_empty() {
@@ -232,17 +253,32 @@ async fn send_bytes_chunked(
         let next_len = bytes.remaining().min(MAX_FRAME_CHUNK);
         let capacity = loop {
             send_stream.reserve_capacity(next_len);
-            let capacity = poll_fn(|cx| match send_stream.poll_capacity(cx) {
-                Poll::Ready(Some(Ok(capacity))) => Poll::Ready(Ok(capacity)),
-                Poll::Ready(Some(Err(_))) | Poll::Ready(None) => {
-                    Poll::Ready(Err(match direction {
-                        StreamBodyDirection::Request => StreamForwardError::RequestBody,
-                        StreamBodyDirection::Response => StreamForwardError::ResponseBody,
-                    }))
+            // A peer that stops granting flow-control window must not pin this stream forever.
+            let capacity = time::timeout(
+                idle_timeout,
+                poll_fn(|cx| match send_stream.poll_capacity(cx) {
+                    Poll::Ready(Some(Ok(capacity))) => Poll::Ready(Ok(capacity)),
+                    Poll::Ready(Some(Err(_))) | Poll::Ready(None) => {
+                        Poll::Ready(Err(match direction {
+                            StreamBodyDirection::Request => StreamForwardError::RequestBody,
+                            StreamBodyDirection::Response => StreamForwardError::ResponseBody,
+                        }))
+                    }
+                    Poll::Pending => Poll::Pending,
+                }),
+            )
+            .await
+            .map_err(|_| {
+                send_stream.send_reset(h2::Reason::CANCEL);
+                match direction {
+                    StreamBodyDirection::Request => {
+                        StreamForwardError::IdleTimeout(StreamIdlePhase::RequestBody)
+                    }
+                    StreamBodyDirection::Response => {
+                        StreamForwardError::IdleTimeout(StreamIdlePhase::ResponseBody)
+                    }
                 }
-                Poll::Pending => Poll::Pending,
-            })
-            .await?;
+            })??;
             if capacity != 0 {
                 break capacity;
             }

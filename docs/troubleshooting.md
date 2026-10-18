@@ -215,6 +215,7 @@ Destination-local retries are also health-gated:
 
 - retries are denied when the selected destination endpoint is already ejected
 - retries are denied when the destination circuit breaker is open
+- while the breaker is half-open, only `half_open_success_threshold` probe requests are admitted per cool-down window; additional requests are rejected as if the breaker were open until the probes succeed (breaker closes) or one fails (breaker re-opens)
 
 In these cases, increase retry budgets will not help until destination health recovers.
 

@@ -32,6 +32,8 @@ enum ManagedListenerKind {
 #[derive(Debug, Clone)]
 struct AdminRuntimeHandles {
     shared_policy: Arc<RwLock<CompiledAdminPolicy>>,
+    /// TLS material for new admin connections; swapped in place on reload (cert rotation).
+    shared_tls: Arc<RwLock<Option<ManagedAdminTlsConfig>>>,
     rate_limit_state: Arc<StdMutex<AdminRateLimitState>>,
     replay_state: Arc<StdMutex<AdminReplayState>>,
 }

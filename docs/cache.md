@@ -78,6 +78,8 @@ The runtime distinguishes:
 - stale-if-error entries
 - fully expired entries
 
+All deadlines are exclusive (RFC 9111 §4.2): an entry is fresh only while its age is strictly below the freshness lifetime, so `max-age=0` responses are never served as fresh. The same rule applies to the stale-while-revalidate and stale-if-error windows.
+
 Revalidation uses validators such as `ETag` or `Last-Modified` when present.
 
 ### Storage Bounds

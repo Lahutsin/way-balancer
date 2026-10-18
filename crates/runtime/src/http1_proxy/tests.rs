@@ -289,6 +289,114 @@ mod tests {
         Ok(())
     }
 
+    async fn run_chunked(input: &[u8]) -> (Result<(), Http1ProxyError>, Vec<u8>) {
+        let (mut reader, mut feeder) = tokio::io::duplex(256 * 1024);
+        let (mut sink_reader, mut writer) = tokio::io::duplex(64 * 1024);
+        feeder.write_all(input).await.expect("feed input");
+        feeder.shutdown().await.expect("close input");
+        let result = relay_chunked(
+            &mut reader,
+            &mut Vec::new(),
+            &mut writer,
+            1024 * 1024,
+            Duration::from_millis(200),
+            RelayDirection::Request,
+        )
+        .await;
+        drop(writer);
+        let mut output = Vec::new();
+        sink_reader.read_to_end(&mut output).await.expect("read output");
+        (result, output)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn relay_chunked_rejects_smuggling_prone_chunk_framing() {
+        for input in [
+            &b"+4\r\ntest\r\n0\r\n\r\n"[..],
+            b"0x4\r\ntest\r\n0\r\n\r\n",
+            b"-4\r\ntest\r\n0\r\n\r\n",
+            b"\r\n",
+            b"4\r\ntestXX0\r\n\r\n",
+            b"11111111111111111\r\n",
+        ] {
+            let (result, _) = run_chunked(input).await;
+            assert!(
+                matches!(result, Err(Http1ProxyError::ParseRequest(_))),
+                "accepted {:?}",
+                String::from_utf8_lossy(input)
+            );
+        }
+
+        let (result, output) = run_chunked(b"4;ext=1\r\ntest\r\nA \r\n0123456789\r\n0\r\n\r\n").await;
+        assert!(result.is_ok());
+        assert_eq!(output, b"4;ext=1\r\ntest\r\nA \r\n0123456789\r\n0\r\n\r\n");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn relay_chunked_bounds_chunk_lines_and_trailers() {
+        let mut oversized_line = b"1;".to_vec();
+        oversized_line.extend(std::iter::repeat(b'a').take(16 * 1024));
+        let (result, _) = run_chunked(&oversized_line).await;
+        assert!(matches!(
+            result,
+            Err(Http1ProxyError::ParseRequest(lb_proto_http::Http1ParseError::HeadTooLarge))
+        ));
+
+        let mut oversized_trailers = b"0\r\n".to_vec();
+        for _ in 0..64 {
+            oversized_trailers.extend_from_slice(b"x-trailer: ");
+            oversized_trailers.extend(std::iter::repeat(b'b').take(1000));
+            oversized_trailers.extend_from_slice(b"\r\n");
+        }
+        oversized_trailers.extend_from_slice(b"\r\n");
+        let (result, _) = run_chunked(&oversized_trailers).await;
+        assert!(matches!(
+            result,
+            Err(Http1ProxyError::ParseRequest(lb_proto_http::Http1ParseError::HeadTooLarge))
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn close_delimited_body_is_reframed_as_chunked() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (mut reader, mut feeder) = tokio::io::duplex(64);
+        let (mut sink_reader, mut writer) = tokio::io::duplex(1024);
+        feeder.write_all(b"world").await?;
+        feeder.shutdown().await?;
+        relay_body(
+            &mut reader,
+            &mut b"hello ".to_vec(),
+            &mut writer,
+            &lb_proto_http::BodyKind::CloseDelimited,
+            1024,
+            Duration::from_millis(200),
+            RelayDirection::Response,
+        )
+        .await?;
+        drop(writer);
+        let mut output = Vec::new();
+        sink_reader.read_to_end(&mut output).await?;
+        assert_eq!(output, b"6\r\nhello \r\n5\r\nworld\r\n0\r\n\r\n");
+
+        let (mut reader, mut feeder) = tokio::io::duplex(64);
+        let (_sink_reader, mut writer) = tokio::io::duplex(1024);
+        feeder.write_all(b"0123456789").await?;
+        feeder.shutdown().await?;
+        let limited = relay_body(
+            &mut reader,
+            &mut Vec::new(),
+            &mut writer,
+            &lb_proto_http::BodyKind::CloseDelimited,
+            4,
+            Duration::from_millis(200),
+            RelayDirection::Response,
+        )
+        .await
+        .expect_err("limit must apply to close-delimited bodies");
+        assert!(matches!(limited, Http1ProxyError::BodyLimitExceeded("response body")));
+        Ok(())
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn ensure_upstream_connection_reconnects_after_idle_timeout(
     ) -> Result<(), Box<dyn std::error::Error>> {

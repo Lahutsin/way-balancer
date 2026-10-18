@@ -9,7 +9,14 @@ This runbook summarizes the current edge and control-plane hardening posture for
 - HTTP/1 request parsing rejects ambiguous `content-length` and `transfer-encoding` combinations.
 - HTTP/1 request parsing rejects unsupported `Transfer-Encoding` chains such as `gzip, chunked`.
 - HTTP/1 request parsing rejects missing or duplicated `host` headers.
+- `Content-Length` values must be bare decimal digits; signed (`+5`) or otherwise decorated values are rejected.
+- Absolute-form request targets (`GET http://host/path`) replace the received `host` header with the target authority (RFC 9112 §3.2.2), so routing, authorization, and the upstream always agree on the addressed virtual host.
+- Chunked bodies are validated while relayed: chunk sizes must be plain hexadecimal, every chunk must end with exactly `CRLF`, chunk-size/trailer lines are capped at 4 KiB, and the trailer section is capped at 16 KiB.
+- HTTP/1 upstream responses follow RFC 9112 §6.3 framing: a response whose final transfer coding is not `chunked`, or that has neither `content-length` nor `transfer-encoding`, is read until the upstream closes, re-framed as `chunked` for the downstream, and the upstream connection is never reused. HTTP/1.0 upstream responses are accepted. Non-`chunked` transfer codings (for example `gzip`) are preserved ahead of the re-applied `chunked` framing.
+- HTTP/1.0 clients are accepted and served as non-persistent connections: chunked or close-delimited upstream bodies are de-framed and the connection is closed to delimit the response.
 - HTTP/2 malformed prefaces and invalid forwarding metadata are rejected and classified by focused regressions.
+- HTTP/2 flow-control waits are bounded by the idle timeout, and connection-specific fields are stripped from relayed trailers.
+- HTTP/3 bridge request and response bodies are bounded by the listener body limit, and HTTP/1 transfer framing never leaks into HTTP/3 bodies or headers.
 
 ## Header Normalization Invariants
 
@@ -22,6 +29,7 @@ This runbook summarizes the current edge and control-plane hardening posture for
 
 - Enable `listeners[].proxy_protocol` only on sockets that are actually fronted by a trusted L4 proxy or load balancer.
 - Treat `proxy_protocol: v1` and `proxy_protocol: v2` as fail-closed listener modes: a direct client that does not send the expected preface is rejected before HTTP parsing.
+- The Proxy Protocol preface is read off the accept loop, so a client that never sends it only holds its own connection until the preface timeout and cannot stall acceptance of other connections.
 - Proxy Protocol source identity and forwarded-header trust are separate controls. Proxy Protocol establishes the immediate downstream source address; `security.trusted_client_ip` still decides whether later `Forwarded` or `X-Forwarded-For` hops are trusted.
 - The effective precedence is: direct socket peer, then Proxy Protocol source if enabled, then a trusted `Forwarded` chain, and finally trusted `X-Forwarded-For` only when `Forwarded` is absent.
 - A spoofed forwarded chain is rejected even if the raw TCP peer is local, as long as the Proxy Protocol source itself is outside `trusted_proxy_cidrs`.

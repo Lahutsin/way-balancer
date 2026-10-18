@@ -743,15 +743,18 @@ async fn proxy_one_http2_stream(
                                 return Err(StreamForwardError::UpstreamRequest);
                             }
                         };
+                    // Release the shared connection handle before streaming the body so
+                    // other streams multiplexed on this connection are not serialized.
+                    drop(retry_send_request);
                     if let Some(payload) = buffered_request_payload.as_ref() {
                         send_buffered_stream_payload(
                             &mut retry_upstream_send_stream,
                             payload,
+                            effective_timeouts.idle_timeout,
                             StreamBodyDirection::Request,
                         )
                         .await?;
                     }
-                    drop(retry_send_request);
                     drop(retry_upstream_send_stream);
 
                     let (retry_response_timeout, retry_response_timeout_category) =
@@ -894,6 +897,7 @@ async fn proxy_one_http2_stream(
             send_buffered_stream_payload(
                 &mut downstream_send_stream,
                 &buffered_response_payload,
+                effective_timeouts.idle_timeout,
                 StreamBodyDirection::Response,
             )
             .await?;

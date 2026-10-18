@@ -1,5 +1,6 @@
 use std::fmt;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -161,10 +162,12 @@ pub async fn proxy_tcp_stream(
 
     let downstream_addr = downstream.peer_addr().map_err(TcpProxyError::PrefaceRead)?;
     let mut events = vec![ConnectionEventKind::SessionStarted];
-    let tls_classification = if config.inspect_tls_client_hello {
-        Some(inspect_downstream_preface(&mut downstream, config.timeouts.preface_timeout).await?)
+    let (tls_classification, preface) = if config.inspect_tls_client_hello {
+        let (classification, preface) =
+            inspect_downstream_preface(&mut downstream, config.timeouts.preface_timeout).await?;
+        (Some(classification), preface)
     } else {
-        None
+        (None, Vec::new())
     };
 
     let connect_started = Instant::now();
@@ -181,22 +184,33 @@ pub async fn proxy_tcp_stream(
 
     let (mut downstream_reader, mut downstream_writer) = downstream.into_split();
     let (mut upstream_reader, mut upstream_writer) = upstream.into_split();
+    if !preface.is_empty() {
+        upstream_writer.write_all(&preface).await.map_err(|source| TcpProxyError::RelayIo {
+            direction: "downstream->upstream",
+            source,
+        })?;
+    }
 
     let idle_timeout = config.timeouts.idle_timeout;
+    let activity = ConnectionActivity::new();
     let (downstream_to_upstream_bytes, upstream_to_downstream_bytes) = tokio::try_join!(
-        relay_direction(
+        relay_direction_tracked(
             &mut downstream_reader,
             &mut upstream_writer,
             idle_timeout,
             "downstream->upstream",
+            &activity,
         ),
-        relay_direction(
+        relay_direction_tracked(
             &mut upstream_reader,
             &mut downstream_writer,
             idle_timeout,
             "upstream->downstream",
+            &activity,
         ),
     )?;
+    let downstream_to_upstream_bytes =
+        downstream_to_upstream_bytes.saturating_add(preface.len() as u64);
     events.push(ConnectionEventKind::Completed);
 
     Ok(ProxySessionReport {
@@ -216,19 +230,72 @@ pub async fn proxy_tcp_stream(
     })
 }
 
+const TLS_HANDSHAKE_CONTENT_TYPE: u8 = 22;
+
+/// Largest TLS record (header plus 2^14 bytes of plaintext and expansion allowance).
+const MAX_CLIENT_HELLO_PREFACE_BYTES: usize = 5 + 16 * 1024 + 2048;
+
+/// Reads the downstream preface until the ClientHello can be classified.
+///
+/// The consumed bytes are returned so they can be replayed to the upstream. A single `peek`
+/// is not sufficient: post-quantum key shares push ClientHellos past 1.5 KB and TCP may
+/// deliver them across several segments.
 async fn inspect_downstream_preface(
     downstream: &mut TcpStream,
     preface_timeout: Duration,
-) -> Result<lb_proto_tls::TlsClientHelloClassification, TcpProxyError> {
-    let mut preface = [0_u8; 1024];
-    let peeked = time::timeout(preface_timeout, downstream.peek(&mut preface))
-        .await
-        .map_err(|_| TcpProxyError::PrefaceTimeout)?
-        .map_err(TcpProxyError::PrefaceRead)?;
+) -> Result<(lb_proto_tls::TlsClientHelloClassification, Vec<u8>), TcpProxyError> {
+    let deadline = time::Instant::now() + preface_timeout;
+    let mut preface = Vec::with_capacity(2048);
+    let mut chunk = [0_u8; 4096];
+    loop {
+        let bytes_read = match time::timeout_at(deadline, downstream.read(&mut chunk)).await {
+            Ok(read) => read.map_err(TcpProxyError::PrefaceRead)?,
+            Err(_) if preface.is_empty() => return Err(TcpProxyError::PrefaceTimeout),
+            Err(_) => {
+                return Ok((lb_proto_tls::TlsClientHelloClassification::Incomplete, preface));
+            }
+        };
+        preface.extend_from_slice(&chunk[..bytes_read]);
 
-    lb_proto_tls::inspect_client_hello(&preface[..peeked]).map_err(TcpProxyError::TlsInspect)
+        let classification =
+            lb_proto_tls::inspect_client_hello(&preface).map_err(TcpProxyError::TlsInspect)?;
+        // Only a TLS handshake record is worth waiting for; other protocols are forwarded as-is.
+        let awaiting_tls_record =
+            matches!(classification, lb_proto_tls::TlsClientHelloClassification::Incomplete)
+                && preface.first() == Some(&TLS_HANDSHAKE_CONTENT_TYPE);
+        if !awaiting_tls_record
+            || bytes_read == 0
+            || preface.len() >= MAX_CLIENT_HELLO_PREFACE_BYTES
+        {
+            return Ok((classification, preface));
+        }
+    }
 }
 
+/// Last time either relay direction moved bytes, shared so that a connection is only
+/// considered idle when *both* directions are quiet.
+struct ConnectionActivity {
+    started: Instant,
+    last_activity_micros: AtomicU64,
+}
+
+impl ConnectionActivity {
+    fn new() -> Self {
+        Self { started: Instant::now(), last_activity_micros: AtomicU64::new(0) }
+    }
+
+    fn touch(&self) {
+        let elapsed = u64::try_from(self.started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        self.last_activity_micros.fetch_max(elapsed, Ordering::Relaxed);
+    }
+
+    fn idle_for(&self) -> Duration {
+        let last = Duration::from_micros(self.last_activity_micros.load(Ordering::Relaxed));
+        self.started.elapsed().saturating_sub(last)
+    }
+}
+
+#[cfg(test)]
 async fn relay_direction<R, W>(
     reader: &mut R,
     writer: &mut W,
@@ -239,15 +306,38 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    relay_direction_tracked(reader, writer, idle_timeout, direction, &ConnectionActivity::new())
+        .await
+}
+
+async fn relay_direction_tracked<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    idle_timeout: Duration,
+    direction: &'static str,
+    activity: &ConnectionActivity,
+) -> Result<u64, TcpProxyError>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
     let mut transferred = 0_u64;
-    let mut buffer = [0_u8; 8192];
+    let mut buffer = vec![0_u8; 16 * 1024];
 
     loop {
-        let read_result = time::timeout(idle_timeout, reader.read(&mut buffer))
-            .await
-            .map_err(|_| TcpProxyError::IdleTimeout(direction))?;
-        let bytes_read =
-            read_result.map_err(|source| TcpProxyError::RelayIo { direction, source })?;
+        let bytes_read = loop {
+            let wait = idle_timeout.saturating_sub(activity.idle_for());
+            match time::timeout(wait, reader.read(&mut buffer)).await {
+                Ok(read_result) => {
+                    break read_result
+                        .map_err(|source| TcpProxyError::RelayIo { direction, source })?;
+                }
+                Err(_) if activity.idle_for() >= idle_timeout => {
+                    return Err(TcpProxyError::IdleTimeout(direction));
+                }
+                Err(_) => {}
+            }
+        };
 
         if bytes_read == 0 {
             writer
@@ -261,6 +351,7 @@ where
             .write_all(&buffer[..bytes_read])
             .await
             .map_err(|source| TcpProxyError::RelayIo { direction, source })?;
+        activity.touch();
         transferred += u64::try_from(bytes_read).unwrap_or(u64::MAX);
     }
 }

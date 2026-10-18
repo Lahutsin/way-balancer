@@ -154,6 +154,7 @@ async fn start_managed_listener(
             let (ready_tx, ready_rx) = oneshot::channel();
             let admin_runtime = AdminRuntimeHandles {
                 shared_policy: Arc::new(RwLock::new(admin_policy)),
+                shared_tls: Arc::new(RwLock::new(tls.clone())),
                 rate_limit_state: Arc::new(StdMutex::new(AdminRateLimitState::default())),
                 replay_state: Arc::new(StdMutex::new(AdminReplayState::default())),
             };
@@ -168,7 +169,6 @@ async fn start_managed_listener(
                 shutdown_rx,
                 drain_timeout,
                 admin_runtime.clone(),
-                tls.clone(),
                 Arc::clone(&supervisor.shared.admin_secret),
                 supervisor,
                 ready_tx,
@@ -239,93 +239,102 @@ async fn run_public_listener_loop(
                 }
             }
             accepted = listener.accept() => {
-                let (mut stream, peer_addr) = accepted?;
+                let (mut stream, peer_addr) = match accepted {
+                    Ok(accepted) => accepted,
+                    Err(error) => {
+                        backoff_after_accept_error(&listener_name, &error).await;
+                        continue;
+                    }
+                };
                 let proxy = shared_proxy.read().await.clone();
-                let downstream_addr = match resolve_downstream_addr_from_proxy_protocol(
-                    &mut stream,
-                    peer_addr,
-                    proxy_protocol,
-                    proxy_preface_timeout(&proxy),
-                )
-                .await
-                {
-                    Ok(downstream_addr) => downstream_addr,
-                    Err(_) => continue,
-                };
-                let source_lease = {
-                    let protection = abuse_protection.read().await;
-                    match protection.try_acquire_source(downstream_addr) {
-                        Ok(source_lease) => source_lease,
-                        Err(reason) => {
-                            state.record_listener_abuse_rejection(&listener_name, reason);
-                            state.sync_listener_abuse_snapshot(&listener_name, &abuse_protection).await;
-                            if matches!(&proxy, ManagedProxyConfig::Http1(_)) {
-                                let _ = write_abuse_rejection_response(&mut stream, reason).await;
-                            }
-                            continue;
-                        }
-                    }
-                };
-                let mut handshake_permit = {
-                    let protection = abuse_protection.read().await;
-                    match protection.try_acquire_handshake() {
-                        Ok(handshake_permit) => handshake_permit,
-                        Err(reason) => {
-                            drop(source_lease);
-                            state.record_listener_abuse_rejection(&listener_name, reason);
-                            state.sync_listener_abuse_snapshot(&listener_name, &abuse_protection).await;
-                            if matches!(&proxy, ManagedProxyConfig::Http1(_)) {
-                                let _ = write_abuse_rejection_response(&mut stream, reason).await;
-                            }
-                            continue;
-                        }
-                    }
-                };
-                if !matches!(&proxy, ManagedProxyConfig::Https(_)) {
-                    if let Some(handshake_permit) = handshake_permit.as_mut() {
-                        handshake_permit.release();
-                    }
-                }
-                state.sync_listener_abuse_snapshot(&listener_name, &abuse_protection).await;
-                counters.accepted_connections.fetch_add(1, Ordering::SeqCst);
-                if !try_acquire_listener_slot(&counters, &admission_limit) {
-                    drop(source_lease);
-                    drop(handshake_permit);
-                    counters.shed_connections.fetch_add(1, Ordering::SeqCst);
-                    state.record_overload_event(
-                        &listener_name,
-                        lb_observability::OverloadEventKind::RequestShed,
-                        format!(
-                            "listener shed public connection at capacity {}",
-                            admission_limit.load(Ordering::SeqCst)
-                        ),
-                    );
-                    state.sync_listener_overload_snapshot(
-                        &listener_name,
-                        &counters,
-                        admission_limit.load(Ordering::SeqCst),
-                        &overload_runtime,
-                        true,
-                    );
-                    if matches!(&proxy, ManagedProxyConfig::Http1(_)) {
-                        let _ = write_overload_response(&mut stream).await;
-                    }
-                    continue;
-                }
-                state.sync_listener_overload_snapshot(
-                    &listener_name,
-                    &counters,
-                    admission_limit.load(Ordering::SeqCst),
-                    &overload_runtime,
-                    false,
-                );
                 let counters = Arc::clone(&counters);
                 let state = Arc::clone(&state);
                 let listener_name = listener_name.clone();
                 let admission_limit = Arc::clone(&admission_limit);
                 let overload_runtime = Arc::clone(&overload_runtime);
                 let abuse_protection = Arc::clone(&abuse_protection);
+                // Admission runs off the accept loop: a PROXY protocol preface or a slow
+                // rejection write must never stall acceptance of other connections.
                 tasks.spawn(async move {
+                    let downstream_addr = match resolve_downstream_addr_from_proxy_protocol(
+                        &mut stream,
+                        peer_addr,
+                        proxy_protocol,
+                        proxy_preface_timeout(&proxy),
+                    )
+                    .await
+                    {
+                        Ok(downstream_addr) => downstream_addr,
+                        Err(_) => return,
+                    };
+                    let source_lease = {
+                        let protection = abuse_protection.read().await;
+                        match protection.try_acquire_source(downstream_addr) {
+                            Ok(source_lease) => source_lease,
+                            Err(reason) => {
+                                state.record_listener_abuse_rejection(&listener_name, reason);
+                                state.sync_listener_abuse_snapshot(&listener_name, &abuse_protection).await;
+                                if matches!(&proxy, ManagedProxyConfig::Http1(_)) {
+                                    let _ = write_abuse_rejection_response(&mut stream, reason).await;
+                                }
+                                return;
+                            }
+                        }
+                    };
+                    let mut handshake_permit = {
+                        let protection = abuse_protection.read().await;
+                        match protection.try_acquire_handshake() {
+                            Ok(handshake_permit) => handshake_permit,
+                            Err(reason) => {
+                                drop(source_lease);
+                                state.record_listener_abuse_rejection(&listener_name, reason);
+                                state.sync_listener_abuse_snapshot(&listener_name, &abuse_protection).await;
+                                if matches!(&proxy, ManagedProxyConfig::Http1(_)) {
+                                    let _ = write_abuse_rejection_response(&mut stream, reason).await;
+                                }
+                                return;
+                            }
+                        }
+                    };
+                    if !matches!(&proxy, ManagedProxyConfig::Https(_)) {
+                        if let Some(handshake_permit) = handshake_permit.as_mut() {
+                            handshake_permit.release();
+                        }
+                    }
+                    state.sync_listener_abuse_snapshot(&listener_name, &abuse_protection).await;
+                    counters.accepted_connections.fetch_add(1, Ordering::SeqCst);
+                    if !try_acquire_listener_slot(&counters, &admission_limit) {
+                        drop(source_lease);
+                        drop(handshake_permit);
+                        counters.shed_connections.fetch_add(1, Ordering::SeqCst);
+                        state.record_overload_event(
+                            &listener_name,
+                            lb_observability::OverloadEventKind::RequestShed,
+                            format!(
+                                "listener shed public connection at capacity {}",
+                                admission_limit.load(Ordering::SeqCst)
+                            ),
+                        );
+                        state.sync_listener_overload_snapshot(
+                            &listener_name,
+                            &counters,
+                            admission_limit.load(Ordering::SeqCst),
+                            &overload_runtime,
+                            true,
+                        );
+                        if matches!(&proxy, ManagedProxyConfig::Http1(_)) {
+                            let _ = write_overload_response(&mut stream).await;
+                        }
+                        return;
+                    }
+                    state.sync_listener_overload_snapshot(
+                        &listener_name,
+                        &counters,
+                        admission_limit.load(Ordering::SeqCst),
+                        &overload_runtime,
+                        false,
+                    );
+                    {
                     let _source_lease = source_lease;
                     let result: io::Result<u64> = match proxy {
                         ManagedProxyConfig::Http1(config) => {
@@ -370,8 +379,10 @@ async fn run_public_listener_loop(
                         false,
                     );
                     state.sync_listener_abuse_snapshot(&listener_name, &abuse_protection).await;
+                    }
                 });
             }
+            Some(_) = tasks.join_next(), if !tasks.is_empty() => {}
         }
     }
 
@@ -401,7 +412,6 @@ async fn run_admin_listener_loop(
     mut shutdown_rx: watch::Receiver<bool>,
     drain_timeout: Duration,
     admin_runtime: AdminRuntimeHandles,
-    admin_tls: Option<ManagedAdminTlsConfig>,
     admin_secret: Arc<String>,
     supervisor: ServeSupervisor,
     ready_tx: oneshot::Sender<()>,
@@ -418,7 +428,14 @@ async fn run_admin_listener_loop(
                 }
             }
             accepted = listener.accept() => {
-                let (mut stream, peer_addr) = accepted?;
+                let (mut stream, peer_addr) = match accepted {
+                    Ok(accepted) => accepted,
+                    Err(error) => {
+                        backoff_after_accept_error(&listener_name, &error).await;
+                        continue;
+                    }
+                };
+                let admin_tls = admin_runtime.shared_tls.read().await.clone();
                 let source_lease = {
                     let protection = abuse_protection.read().await;
                     match protection.try_acquire_source(peer_addr) {
@@ -495,7 +512,6 @@ async fn run_admin_listener_loop(
                 let admission_limit = Arc::clone(&admission_limit);
                 let overload_runtime = Arc::clone(&overload_runtime);
                 let abuse_protection = Arc::clone(&abuse_protection);
-                let admin_tls = admin_tls.clone();
                 tasks.spawn(async move {
                     let _source_lease = source_lease;
                     let state_for_connection = Arc::clone(&state);
@@ -539,6 +555,7 @@ async fn run_admin_listener_loop(
                     state.sync_listener_abuse_snapshot(&listener_name, &abuse_protection).await;
                 });
             }
+            Some(_) = tasks.join_next(), if !tasks.is_empty() => {}
         }
     }
 
@@ -607,6 +624,13 @@ fn try_acquire_listener_slot(
             return true;
         }
     }
+}
+
+/// Transient accept failures (for example `EMFILE` or `ECONNABORTED`) must not tear down the
+/// listener; back off briefly so descriptor exhaustion does not spin the accept loop.
+async fn backoff_after_accept_error(listener_name: &str, error: &io::Error) {
+    eprintln!("listener {listener_name} accept failed: {error}");
+    time::sleep(Duration::from_millis(50)).await;
 }
 
 async fn write_overload_response(stream: &mut TcpStream) -> io::Result<()> {

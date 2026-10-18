@@ -836,6 +836,13 @@ Supported discovery source types:
 - `kubernetes_endpoint_slice`: consume EndpointSlice updates for one Kubernetes Service
 - `consul_like`: consume service-catalog style updates (watch or long-poll adapter)
 
+Membership reconciliation semantics:
+
+- snapshots are validated in full before any endpoint is changed, so one invalid endpoint rejects the whole update and leaves the previous topology intact
+- for DNS and Consul-style sources, a snapshot older than the last applied generation is ignored, so delayed refreshes cannot resurrect removed endpoints (EndpointSlice snapshots are always applied because aggregated slice generations are not monotonic)
+- an endpoint removed by one source keeps serving while another source for the same cluster still advertises it
+- an endpoint that reappears during its drain window is reactivated instead of failing the update
+
 Example discovery-backed upstream:
 
 ```json

@@ -65,6 +65,12 @@ struct H3RequestCapture {
 
 struct H3TestRootGuard;
 
+/// HTTP/3 bridge tests share the process-wide test root store and must not interleave.
+fn h3_test_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 impl Drop for H3TestRootGuard {
     fn drop(&mut self) {
         clear_http3_test_root_certificates();
@@ -157,6 +163,7 @@ async fn retries_safe_http1_request_once_after_reused_upstream_connection_closes
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bridges_http1_downstream_to_http3_upstream_with_normalized_headers_and_body(
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let _h3_lock = h3_test_lock().lock().await;
     let (upstream_addr, cert_der, capture_rx) = spawn_http3_capture_upstream().await?;
     time::sleep(Duration::from_millis(20)).await;
     set_http3_test_root_certificates(vec![cert_der]);
@@ -201,6 +208,136 @@ async fn bridges_http1_downstream_to_http3_upstream_with_normalized_headers_and_
 
     assert_eq!(report.metrics.request_count, 1);
     assert_eq!(report.metrics.response_status_counts.get(&200), Some(&1));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rechunks_close_delimited_http10_upstream_responses_and_keeps_downstream_alive(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let upstream_addr = listener.local_addr()?;
+    tokio::spawn(async move {
+        for index in 0..2 {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buffer = Vec::new();
+            if read_until_sequence(&mut stream, &mut buffer, b"\r\n\r\n").await.is_err() {
+                return;
+            }
+            let response = format!(
+                "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n\r\nclose-delimited-{index}"
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        }
+    });
+    let (proxy_addr, report_rx) =
+        spawn_one_shot_http1_proxy_listener(proxy_config(upstream_addr)).await?;
+
+    let mut client = TcpStream::connect(proxy_addr).await?;
+    let mut buffer = Vec::new();
+    for index in 0..2 {
+        let connection = if index == 0 { "keep-alive" } else { "close" };
+        client
+            .write_all(
+                format!("GET /legacy HTTP/1.1\r\nHost: example.test\r\nConnection: {connection}\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await?;
+        let head_end = read_until_sequence(&mut client, &mut buffer, b"\r\n\r\n").await?;
+        let head = String::from_utf8(buffer[..head_end].to_vec())?.to_ascii_lowercase();
+        assert!(head.starts_with("http/1.1 200 ok\r\n"), "unexpected head: {head}");
+        assert!(head.contains("transfer-encoding: chunked\r\n"), "unexpected head: {head}");
+        assert!(!head.contains("content-length"), "unexpected head: {head}");
+        buffer.drain(..head_end);
+        let body_end = read_until_sequence(&mut client, &mut buffer, b"0\r\n\r\n").await?;
+        let body = String::from_utf8(buffer[..body_end].to_vec())?;
+        assert_eq!(body, format!("11\r\nclose-delimited-{index}\r\n0\r\n\r\n"));
+        buffer.drain(..body_end);
+    }
+    drop(client);
+
+    let report = receive_proxy_result(report_rx).await?;
+    assert_eq!(report.metrics.request_count, 2);
+    assert_eq!(report.metrics.response_status_counts.get(&200), Some(&2));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn serves_http10_clients_with_deframed_chunked_upstream_bodies(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let upstream_addr = listener.local_addr()?;
+    tokio::spawn(async move {
+        let Ok((mut stream, _)) = listener.accept().await else {
+            return;
+        };
+        let mut buffer = Vec::new();
+        if read_until_sequence(&mut stream, &mut buffer, b"\r\n\r\n").await.is_err() {
+            return;
+        }
+        let _ = stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n6\r\nlegacy\r\n7\r\n-client\r\n0\r\n\r\n",
+            )
+            .await;
+        let _ = stream.shutdown().await;
+    });
+    let (proxy_addr, report_rx) =
+        spawn_one_shot_http1_proxy_listener(proxy_config(upstream_addr)).await?;
+
+    let mut client = TcpStream::connect(proxy_addr).await?;
+    client.write_all(b"GET /legacy HTTP/1.0\r\nHost: example.test\r\n\r\n").await?;
+    let mut response = Vec::new();
+    client.read_to_end(&mut response).await?;
+    let response = String::from_utf8(response)?;
+    let (head, body) = response.split_once("\r\n\r\n").ok_or("missing head terminator")?;
+    let head = head.to_ascii_lowercase();
+    assert!(head.starts_with("http/1.1 200 ok\r\n"), "unexpected head: {head}");
+    assert!(!head.contains("transfer-encoding"), "unexpected head: {head}");
+    assert!(head.contains("connection: close"), "unexpected head: {head}");
+    assert_eq!(body, "legacy-client");
+
+    let report = receive_proxy_result(report_rx).await?;
+    assert_eq!(report.metrics.request_count, 1);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bridges_chunked_http1_request_body_to_http3_upstream_without_framing(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _h3_lock = h3_test_lock().lock().await;
+    let (upstream_addr, cert_der, capture_rx) = spawn_http3_capture_upstream().await?;
+    time::sleep(Duration::from_millis(20)).await;
+    set_http3_test_root_certificates(vec![cert_der]);
+    let _test_root_guard = H3TestRootGuard;
+    let host_header = format!("localhost:{}", upstream_addr.port());
+
+    let config = Http1ProxyConfig::new(UpstreamTarget::with_transport(
+        "h3-upstream",
+        upstream_addr,
+        UpstreamTransport::Http3,
+    ));
+    let (proxy_addr, report_rx) = spawn_one_shot_http1_proxy_listener(config).await?;
+
+    let mut client = TcpStream::connect(proxy_addr).await?;
+    let request = format!(
+        "POST /bridge HTTP/1.1\r\nHost: {host_header}\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n-world\r\n0\r\n\r\n"
+    );
+    client.write_all(request.as_bytes()).await?;
+
+    let report = receive_proxy_result(report_rx).await?;
+    let response = read_http_response(&mut client).await?;
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+
+    let capture = receive_h3_capture(capture_rx).await?;
+    assert_eq!(capture.body, b"hello-world");
+    assert!(!capture
+        .headers
+        .iter()
+        .any(|header| header.name.eq_ignore_ascii_case("transfer-encoding")));
+    assert_eq!(report.metrics.request_count, 1);
     Ok(())
 }
 
