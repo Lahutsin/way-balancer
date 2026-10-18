@@ -5,12 +5,11 @@ use crate::{
     AdminSupportBundle, EmergencyModeAdminRequest, HttpCacheAdminService, HttpCachePurgeError,
     HttpCachePurgeRequest, HttpCachePurgeResponse, ListenerCanaryApplyRequest,
     ListenerCanaryApplyResponse, ListenerCanaryCoordinator, ListenerCanaryError,
-    PromotionApplyRequest,
-    PromotionApplyResponse, PromotionCoordinator, PromotionError, PromotionPreviewRequest,
-    PromotionPreviewResponse, PublishResponse, PublishedSnapshotRecord,
-    PublishedSnapshotSummary, RollbackRequest, RolloutCoordinator, RolloutError,
-    RolloutRequest, RolloutResponse, SnapshotControlService, SnapshotLookupError,
-    SnapshotPublicationError, SnapshotPublishRequest,
+    PromotionApplyRequest, PromotionApplyResponse, PromotionCoordinator, PromotionError,
+    PromotionPreviewRequest, PromotionPreviewResponse, PublishResponse, PublishedSnapshotRecord,
+    PublishedSnapshotSummary, RollbackRequest, RolloutCoordinator, RolloutError, RolloutRequest,
+    RolloutResponse, SnapshotControlService, SnapshotLookupError, SnapshotPublicationError,
+    SnapshotPublishRequest,
 };
 
 const MAX_TOKEN_ID_LEN: usize = 128;
@@ -117,9 +116,8 @@ impl std::fmt::Display for InvalidAdminCredential {
                 formatter.write_str("credential principal exceeds max length")
             }
             Self::EmptySecret => formatter.write_str("credential secret must not be empty"),
-            Self::SecretHasSurroundingWhitespace => {
-                formatter.write_str("credential secret must not have leading or trailing whitespace")
-            }
+            Self::SecretHasSurroundingWhitespace => formatter
+                .write_str("credential secret must not have leading or trailing whitespace"),
             Self::SecretTooLong => formatter.write_str("credential secret exceeds max length"),
             Self::DuplicateSecret => formatter.write_str("credential secret is duplicated"),
         }

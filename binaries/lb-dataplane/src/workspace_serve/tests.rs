@@ -1,4 +1,5 @@
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use std::fs;
     use std::io;
@@ -1628,13 +1629,12 @@ mod tests {
         assert_eq!(stable.timeout_hierarchy.as_deref(), Some("route-timeout"));
         assert_eq!(stable.transform_policy.as_deref(), Some("route-transform"));
         assert_eq!(stable.local_rate_limits, vec!["listener-rate", "route-rate"]);
-        assert_eq!(
+        assert!(
             stable
                 .effective_request_transform
                 .as_ref()
                 .and_then(|transform| transform.path_rewrite.as_ref())
-                .is_some(),
-            true
+                .is_some()
         );
         assert_eq!(
             stable
@@ -1843,13 +1843,12 @@ mod tests {
                 .and_then(|transform| transform.host_rewrite.as_deref()),
             Some("canary.internal")
         );
-        assert_eq!(
+        assert!(
             canary
                 .effective_request_transform
                 .as_ref()
                 .and_then(|transform| transform.path_rewrite.as_ref())
-                .is_some(),
-            true
+                .is_some()
         );
         let canary_runtime = config
             .route_destination_policies

@@ -3,10 +3,9 @@ use std::collections::BTreeMap;
 use crate::{
     BotSignalAdapterChain, BotSignalInput, HeaderAnomalyScorer, ReputationAdapterChain,
     ReputationSignalInput, RequestBodyInspector, RequestClassificationAdaptiveMitigationDecision,
-    RequestClassificationAdaptiveMitigator, RequestClassificationAdaptiveMitigationPolicy,
-    RequestClassificationAuthContext,
-    RequestClassificationEnforcementDecision, RequestClassificationEnforcementPolicy,
-    RequestClassificationEnforcer, SheddingDecision,
+    RequestClassificationAdaptiveMitigationPolicy, RequestClassificationAdaptiveMitigator,
+    RequestClassificationAuthContext, RequestClassificationEnforcementDecision,
+    RequestClassificationEnforcementPolicy, RequestClassificationEnforcer, SheddingDecision,
 };
 
 /// Request context forwarded to pluggable classifier adapters.
@@ -120,16 +119,10 @@ impl RequestClassificationPolicyRuntime {
         body: &[u8],
     ) -> RequestClassificationResult {
         let mut signals = self.header_anomaly_scorer.score_headers(
-            context
-                .headers
-                .iter()
-                .map(|(name, value)| (name.as_str(), value.as_str())),
+            context.headers.iter().map(|(name, value)| (name.as_str(), value.as_str())),
         );
 
-        signals.extend(
-            self.body_inspector
-                .score_body(body, context.content_type.as_deref()),
-        );
+        signals.extend(self.body_inspector.score_body(body, context.content_type.as_deref()));
 
         signals.extend(self.reputation_adapter.score(&ReputationSignalInput {
             source_ip: context.source_ip.clone(),
@@ -188,10 +181,9 @@ impl RequestClassificationPolicyRuntime {
             *current = (*current).saturating_add(score);
         }
 
-        let anomaly_score = weighted
-            .values()
-            .fold(0u16, |acc, score| acc.saturating_add(*score as u16))
-            .min(100) as u8;
+        let anomaly_score =
+            weighted.values().fold(0u16, |acc, score| acc.saturating_add(*score as u16)).min(100)
+                as u8;
         let action = if anomaly_score >= self.block_threshold {
             RequestClassificationAction::Block
         } else if anomaly_score >= self.challenge_threshold {
@@ -200,11 +192,7 @@ impl RequestClassificationPolicyRuntime {
             RequestClassificationAction::Allow
         };
 
-        RequestClassificationResult {
-            anomaly_score,
-            action,
-            signal_scores: weighted,
-        }
+        RequestClassificationResult { anomaly_score, action, signal_scores: weighted }
     }
 
     fn weight_for(&self, kind: RequestClassifierSignalKind) -> u8 {
@@ -225,15 +213,13 @@ mod tests {
 
     use super::{
         RequestClassificationAction, RequestClassificationAdapterContext,
-        RequestClassificationPolicyRuntime,
-        RequestClassifierSignal, RequestClassifierSignalKind,
+        RequestClassificationPolicyRuntime, RequestClassifierSignal, RequestClassifierSignalKind,
     };
     use crate::{
-        BotSignalAdapterChain, BotSignalInput, BotSignalProvider, BotSignalVerdict,
-        OverloadState, RequestClassificationAdaptiveMitigationPolicy,
-        RequestClassificationAuthContext,
-        RequestClassificationEnforcementAction, RequestClassificationEnforcementPolicy,
+        BotSignalAdapterChain, BotSignalInput, BotSignalProvider, BotSignalVerdict, OverloadState,
         ReputationAdapterChain, ReputationSignalInput, ReputationSignalProvider, ReputationVerdict,
+        RequestClassificationAdaptiveMitigationPolicy, RequestClassificationAuthContext,
+        RequestClassificationEnforcementAction, RequestClassificationEnforcementPolicy,
         SheddingAction, SheddingDecision,
     };
 
@@ -321,7 +307,10 @@ mod tests {
             },
         ]);
 
-        assert_eq!(result.signal_scores.get(&RequestClassifierSignalKind::HeaderAnomaly), Some(&32));
+        assert_eq!(
+            result.signal_scores.get(&RequestClassifierSignalKind::HeaderAnomaly),
+            Some(&32)
+        );
         assert_eq!(result.signal_scores.get(&RequestClassifierSignalKind::QueryAnomaly), Some(&5));
         assert_eq!(result.anomaly_score, 37);
         assert_eq!(result.action, RequestClassificationAction::Allow);
@@ -409,16 +398,12 @@ mod tests {
         policy.signal_weights.user_agent_anomaly = 0;
 
         let runtime = RequestClassificationPolicyRuntime::from_config(&policy)
-            .with_reputation_adapter(
-                ReputationAdapterChain::new().with_provider(Arc::new(StaticReputationProvider {
-                    verdict: ReputationVerdict::Malicious,
-                })),
-            )
-            .with_bot_signal_adapter(
-                BotSignalAdapterChain::new().with_provider(Arc::new(StaticBotProvider {
-                    verdict: BotSignalVerdict::AutomationConfirmed,
-                })),
-            );
+            .with_reputation_adapter(ReputationAdapterChain::new().with_provider(Arc::new(
+                StaticReputationProvider { verdict: ReputationVerdict::Malicious },
+            )))
+            .with_bot_signal_adapter(BotSignalAdapterChain::new().with_provider(Arc::new(
+                StaticBotProvider { verdict: BotSignalVerdict::AutomationConfirmed },
+            )));
 
         let result = runtime.classify_with_adapters(&RequestClassificationAdapterContext {
             source_ip: Some(String::from("198.51.100.12")),
@@ -430,12 +415,8 @@ mod tests {
         });
 
         assert_eq!(result.action, RequestClassificationAction::Block);
-        assert!(result
-            .signal_scores
-            .contains_key(&RequestClassifierSignalKind::Reputation));
-        assert!(result
-            .signal_scores
-            .contains_key(&RequestClassifierSignalKind::BotSignal));
+        assert!(result.signal_scores.contains_key(&RequestClassifierSignalKind::Reputation));
+        assert!(result.signal_scores.contains_key(&RequestClassifierSignalKind::BotSignal));
     }
 
     #[test]
@@ -462,12 +443,8 @@ mod tests {
         });
 
         assert!(result.anomaly_score > 0);
-        assert!(result
-            .signal_scores
-            .contains_key(&RequestClassifierSignalKind::Reputation));
-        assert!(result
-            .signal_scores
-            .contains_key(&RequestClassifierSignalKind::BotSignal));
+        assert!(result.signal_scores.contains_key(&RequestClassifierSignalKind::Reputation));
+        assert!(result.signal_scores.contains_key(&RequestClassifierSignalKind::BotSignal));
     }
 
     #[test]
@@ -480,11 +457,9 @@ mod tests {
         policy.signal_weights.user_agent_anomaly = 0;
 
         let runtime = RequestClassificationPolicyRuntime::from_config(&policy)
-            .with_reputation_adapter(
-                ReputationAdapterChain::new().with_provider(Arc::new(StaticReputationProvider {
-                    verdict: ReputationVerdict::Malicious,
-                })),
-            );
+            .with_reputation_adapter(ReputationAdapterChain::new().with_provider(Arc::new(
+                StaticReputationProvider { verdict: ReputationVerdict::Malicious },
+            )));
 
         let context = RequestClassificationAdapterContext {
             source_ip: Some(String::from("198.51.100.10")),
@@ -531,11 +506,10 @@ mod tests {
             headers: Vec::new(),
         };
 
-        let result = runtime.classify_with_adapters_and_body(&context, b"{\"q\":\"union select 1\"}");
+        let result =
+            runtime.classify_with_adapters_and_body(&context, b"{\"q\":\"union select 1\"}");
         assert_eq!(result.action, RequestClassificationAction::Challenge);
-        assert!(result
-            .signal_scores
-            .contains_key(&RequestClassifierSignalKind::BodyAnomaly));
+        assert!(result.signal_scores.contains_key(&RequestClassifierSignalKind::BodyAnomaly));
     }
 
     #[test]

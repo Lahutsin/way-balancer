@@ -2,13 +2,13 @@ use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{
-    collect_wave_health_signals, evaluate_wave_gate, plan_staged_rollout, render_staged_status_surface,
-    FleetAbortRollbackDecision, FleetAutoRollbackOutcome, FleetHealthGatePolicy, FleetNodeBackend,
-    FleetRollbackPolicyConfig, FleetRolloutCoordinator, FleetRolloutError, FleetRolloutRequest, FleetRolloutResponse,
-    FleetRolloutStrategy, FleetStagedRolloutPlan, FleetStagedRolloutRequest,
-    FleetStagedStatusSurface, FleetWaveGateEvaluation, InvalidFleetStagedRolloutRequest,
-    SnapshotControlService, SnapshotDiffPreview, SnapshotDiffPreviewError, SnapshotImpactSeverity,
-    SnapshotLookupError,
+    collect_wave_health_signals, evaluate_wave_gate, plan_staged_rollout,
+    render_staged_status_surface, FleetAbortRollbackDecision, FleetAutoRollbackOutcome,
+    FleetHealthGatePolicy, FleetNodeBackend, FleetRollbackPolicyConfig, FleetRolloutCoordinator,
+    FleetRolloutError, FleetRolloutRequest, FleetRolloutResponse, FleetRolloutStrategy,
+    FleetStagedRolloutPlan, FleetStagedRolloutRequest, FleetStagedStatusSurface,
+    FleetWaveGateEvaluation, InvalidFleetStagedRolloutRequest, SnapshotControlService,
+    SnapshotDiffPreview, SnapshotDiffPreviewError, SnapshotImpactSeverity, SnapshotLookupError,
 };
 
 const MAX_LISTENER_NAME_LEN: usize = 128;
@@ -76,17 +76,18 @@ impl std::fmt::Display for ListenerCanaryError {
             Self::InvalidCanaryNodes => {
                 write!(formatter, "canary_nodes must be in 1..=node_ids.len()")
             }
-            Self::InvalidCanaryMaxParallel => write!(
-                formatter,
-                "canary_max_parallel must be in 1..=canary wave size"
-            ),
+            Self::InvalidCanaryMaxParallel => {
+                write!(formatter, "canary_max_parallel must be in 1..=canary wave size")
+            }
             Self::InvalidFleetMaxParallel => {
                 write!(formatter, "fleet_max_parallel must be in 1..=fleet wave size")
             }
             Self::CandidateNotPublished(version) => {
                 write!(formatter, "candidate version '{version}' was not found")
             }
-            Self::SnapshotLookup(error) => write!(formatter, "listener canary lookup failed: {error}"),
+            Self::SnapshotLookup(error) => {
+                write!(formatter, "listener canary lookup failed: {error}")
+            }
             Self::DiffPreview(error) => {
                 write!(formatter, "listener canary preview failed: {error}")
             }
@@ -94,9 +95,13 @@ impl std::fmt::Display for ListenerCanaryError {
                 formatter,
                 "listener canary apply requires staged acknowledgment for {severity:?} impact"
             ),
-            Self::Plan(error) => write!(formatter, "listener canary staged plan is invalid: {error}"),
+            Self::Plan(error) => {
+                write!(formatter, "listener canary staged plan is invalid: {error}")
+            }
             Self::Fleet(error) => write!(formatter, "listener canary fleet apply failed: {error}"),
-            Self::Internal(error) => write!(formatter, "listener canary failed internally: {error}"),
+            Self::Internal(error) => {
+                write!(formatter, "listener canary failed internally: {error}")
+            }
         }
     }
 }
@@ -227,9 +232,7 @@ impl ListenerCanaryCoordinator {
                 requested_by: request.requested_by.clone(),
                 reason: request.reason.clone(),
                 node_ids: request.node_ids.clone(),
-                strategy: FleetRolloutStrategy::Canary {
-                    canary_nodes: request.canary_nodes,
-                },
+                strategy: FleetRolloutStrategy::Canary { canary_nodes: request.canary_nodes },
                 max_allowed_divergence_ms: request.max_allowed_divergence_ms,
             },
             waves,
@@ -249,16 +252,15 @@ impl ListenerCanaryCoordinator {
             wave_gates.insert(wave.wave_id.clone(), gate);
         }
 
-        let abort_decision = staged_plan
-            .waves
-            .first()
-            .and_then(|first| wave_gates.get(&first.wave_id))
-            .map(|gate| {
-                FleetRolloutCoordinator::decide_wave_abort_and_rollback(
-                    gate,
-                    request.rollback_policy,
-                )
-            });
+        let abort_decision =
+            staged_plan.waves.first().and_then(|first| wave_gates.get(&first.wave_id)).map(
+                |gate| {
+                    FleetRolloutCoordinator::decide_wave_abort_and_rollback(
+                        gate,
+                        request.rollback_policy,
+                    )
+                },
+            );
 
         let auto_rollback = if let Some(decision) = &abort_decision {
             let outcome = fleet
@@ -274,7 +276,8 @@ impl ListenerCanaryCoordinator {
                 )
                 .map_err(ListenerCanaryError::Fleet)?;
             if outcome.attempted {
-                self.metrics.auto_rollback_count = self.metrics.auto_rollback_count.saturating_add(1);
+                self.metrics.auto_rollback_count =
+                    self.metrics.auto_rollback_count.saturating_add(1);
                 Some(outcome)
             } else {
                 None
@@ -318,6 +321,7 @@ fn current_unix_ms() -> Result<u64, SystemTimeError> {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use std::collections::BTreeMap;
 
@@ -363,10 +367,9 @@ mod tests {
             &self,
             node_id: &str,
         ) -> Result<crate::FleetNodeRuntimeStatus, crate::FleetNodeBackendError> {
-            self.nodes
-                .get(node_id)
-                .map(|node| node.status.clone())
-                .ok_or_else(|| crate::FleetNodeBackendError::Unreachable(String::from("missing node")))
+            self.nodes.get(node_id).map(|node| node.status.clone()).ok_or_else(|| {
+                crate::FleetNodeBackendError::Unreachable(String::from("missing node"))
+            })
         }
 
         fn fetch_health_signals(
@@ -394,15 +397,12 @@ mod tests {
             request: crate::RolloutRequest,
             occurred_at_unix_ms: u64,
         ) -> Result<crate::RolloutResponse, crate::FleetNodeBackendError> {
-            let node = self
-                .nodes
-                .get_mut(node_id)
-                .ok_or_else(|| crate::FleetNodeBackendError::Unreachable(String::from("missing node")))?;
-            let digest = self
-                .digests
-                .get(&request.version)
-                .cloned()
-                .ok_or_else(|| crate::FleetNodeBackendError::Rejected(String::from("unknown digest")))?;
+            let node = self.nodes.get_mut(node_id).ok_or_else(|| {
+                crate::FleetNodeBackendError::Unreachable(String::from("missing node"))
+            })?;
+            let digest = self.digests.get(&request.version).cloned().ok_or_else(|| {
+                crate::FleetNodeBackendError::Rejected(String::from("unknown digest"))
+            })?;
             node.status.active_version = Some(request.version.clone());
             node.status.active_digest_sha256 = Some(digest.clone());
             node.status.desired_version = Some(request.version.clone());
@@ -429,15 +429,12 @@ mod tests {
             occurred_at_unix_ms: u64,
         ) -> Result<crate::RolloutResponse, crate::FleetNodeBackendError> {
             let target = request.target_version.unwrap_or_else(|| String::from("stable-v1"));
-            let digest = self
-                .digests
-                .get(&target)
-                .cloned()
-                .ok_or_else(|| crate::FleetNodeBackendError::Rejected(String::from("unknown digest")))?;
-            let node = self
-                .nodes
-                .get_mut(node_id)
-                .ok_or_else(|| crate::FleetNodeBackendError::Unreachable(String::from("missing node")))?;
+            let digest = self.digests.get(&target).cloned().ok_or_else(|| {
+                crate::FleetNodeBackendError::Rejected(String::from("unknown digest"))
+            })?;
+            let node = self.nodes.get_mut(node_id).ok_or_else(|| {
+                crate::FleetNodeBackendError::Unreachable(String::from("missing node"))
+            })?;
             node.status.active_version = Some(target.clone());
             node.status.active_digest_sha256 = Some(digest.clone());
             node.status.observed_at_unix_ms = occurred_at_unix_ms;
@@ -581,12 +578,8 @@ mod tests {
             .with_node("node-a", "stable-v1", &stable_digest)
             .with_node("node-b", "stable-v1", &stable_digest)
             .with_node("node-c", "stable-v1", &stable_digest);
-        backend
-            .digests
-            .insert(String::from("stable-v1"), stable_digest.clone());
-        backend
-            .digests
-            .insert(String::from("canary-v2"), canary_digest.clone());
+        backend.digests.insert(String::from("stable-v1"), stable_digest.clone());
+        backend.digests.insert(String::from("canary-v2"), canary_digest.clone());
 
         let mut fleet = crate::FleetRolloutCoordinator::new();
         let mut coordinator = ListenerCanaryCoordinator::new();
@@ -629,12 +622,8 @@ mod tests {
         let changed_digest = publish_weighted_snapshot(&mut control, "canary-v2", 80, 20, 2)?;
 
         let mut backend = MockBackend::default();
-        backend
-            .digests
-            .insert(String::from("canary-v2"), changed_digest);
-        backend
-            .digests
-            .insert(String::from("stable-v1"), stable_digest.clone());
+        backend.digests.insert(String::from("canary-v2"), changed_digest);
+        backend.digests.insert(String::from("stable-v1"), stable_digest.clone());
         backend = backend.with_node("node-a", "stable-v1", &stable_digest);
 
         let mut fleet = crate::FleetRolloutCoordinator::new();
@@ -664,10 +653,7 @@ mod tests {
             )
             .expect_err("staged ack should be required for changed snapshot");
 
-        assert!(matches!(
-            error,
-            ListenerCanaryError::StagedApplyRequired { .. }
-        ));
+        assert!(matches!(error, ListenerCanaryError::StagedApplyRequired { .. }));
         Ok(())
     }
 }

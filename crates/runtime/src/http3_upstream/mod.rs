@@ -13,25 +13,22 @@ fn test_root_certificates_store() -> &'static Mutex<Vec<Vec<u8>>> {
 }
 
 fn test_root_certificates() -> Vec<Vec<u8>> {
-    let guard = test_root_certificates_store()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let guard =
+        test_root_certificates_store().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     guard.clone()
 }
 
 #[doc(hidden)]
 pub fn set_http3_test_root_certificates(certificates: Vec<Vec<u8>>) {
-    let mut guard = test_root_certificates_store()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut guard =
+        test_root_certificates_store().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     *guard = certificates;
 }
 
 #[doc(hidden)]
 pub fn clear_http3_test_root_certificates() {
-    let mut guard = test_root_certificates_store()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut guard =
+        test_root_certificates_store().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     guard.clear();
 }
 
@@ -79,6 +76,7 @@ impl std::fmt::Display for Http3UpstreamError {
 impl std::error::Error for Http3UpstreamError {}
 
 /// Dispatches one HTTP request to an explicit HTTP/3 upstream and buffers the response.
+#[allow(clippy::too_many_arguments)]
 pub async fn dispatch_http3_upstream_request(
     upstream: &lb_net_core::UpstreamTarget,
     method: &str,
@@ -98,11 +96,12 @@ pub async fn dispatch_http3_upstream_request(
         effective_client_ip,
         connect_timeout,
         idle_timeout,
-        default_quic_client_config(),
+        default_quic_client_config()?,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_http3_upstream_request_with_client_config(
     upstream: &lb_net_core::UpstreamTarget,
     method: &str,
@@ -117,13 +116,9 @@ async fn dispatch_http3_upstream_request_with_client_config(
     let authority = request_authority(headers).unwrap_or_else(|| upstream.address.to_string());
     let url = compose_upstream_url(target, &authority)?;
     let request = build_http3_request(method, &url, headers)?;
-    let bind_addr = if upstream.address.is_ipv6() {
-        "[::]:0"
-    } else {
-        "0.0.0.0:0"
-    }
-    .parse()
-    .map_err(|_| Http3UpstreamError::ConnectFailed)?;
+    let bind_addr = if upstream.address.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" }
+        .parse()
+        .map_err(|_| Http3UpstreamError::ConnectFailed)?;
 
     let mut endpoint =
         quinn::Endpoint::client(bind_addr).map_err(|_| Http3UpstreamError::ConnectFailed)?;
@@ -137,30 +132,39 @@ async fn dispatch_http3_upstream_request_with_client_config(
         .map_err(|_| Http3UpstreamError::ConnectTimeout)?
         .map_err(|_| Http3UpstreamError::ConnectFailed)?;
 
-    let (_driver, mut send_request) = h3_client::new(h3_quinn::Connection::new(connection))
-        .await
-        .map_err(|error| classify_http3_transport_error(&error, Http3UpstreamError::HandshakeFailed))?;
+    let (_driver, mut send_request) =
+        h3_client::new(h3_quinn::Connection::new(connection)).await.map_err(|error| {
+            classify_http3_transport_error(&error, Http3UpstreamError::HandshakeFailed)
+        })?;
 
     let mut request_stream = tokio::time::timeout(idle_timeout, send_request.send_request(request))
         .await
         .map_err(|_| Http3UpstreamError::RequestTimeout)?
-        .map_err(|error| classify_http3_transport_error(&error, Http3UpstreamError::RequestFailed))?;
+        .map_err(|error| {
+            classify_http3_transport_error(&error, Http3UpstreamError::RequestFailed)
+        })?;
 
     if !body.is_empty() {
         tokio::time::timeout(idle_timeout, request_stream.send_data(Bytes::copy_from_slice(body)))
             .await
             .map_err(|_| Http3UpstreamError::RequestTimeout)?
-            .map_err(|error| classify_http3_transport_error(&error, Http3UpstreamError::RequestFailed))?;
+            .map_err(|error| {
+                classify_http3_transport_error(&error, Http3UpstreamError::RequestFailed)
+            })?;
     }
     tokio::time::timeout(idle_timeout, request_stream.finish())
         .await
         .map_err(|_| Http3UpstreamError::RequestTimeout)?
-        .map_err(|error| classify_http3_transport_error(&error, Http3UpstreamError::RequestFailed))?;
+        .map_err(|error| {
+            classify_http3_transport_error(&error, Http3UpstreamError::RequestFailed)
+        })?;
 
     let response = tokio::time::timeout(idle_timeout, request_stream.recv_response())
         .await
         .map_err(|_| Http3UpstreamError::ResponseTimeout)?
-        .map_err(|error| classify_http3_transport_error(&error, Http3UpstreamError::ResponseFailed))?;
+        .map_err(|error| {
+            classify_http3_transport_error(&error, Http3UpstreamError::ResponseFailed)
+        })?;
 
     let status = response.status();
     let response_headers = response
@@ -179,7 +183,9 @@ async fn dispatch_http3_upstream_request_with_client_config(
         let chunk = tokio::time::timeout(idle_timeout, request_stream.recv_data())
             .await
             .map_err(|_| Http3UpstreamError::ResponseTimeout)?
-            .map_err(|error| classify_http3_transport_error(&error, Http3UpstreamError::ResponseFailed))?;
+            .map_err(|error| {
+                classify_http3_transport_error(&error, Http3UpstreamError::ResponseFailed)
+            })?;
         let Some(mut chunk) = chunk else {
             break;
         };
@@ -264,15 +270,13 @@ fn ensure_rustls_crypto_provider() {
     });
 }
 
-fn default_quic_client_config() -> quinn::ClientConfig {
+fn default_quic_client_config() -> Result<quinn::ClientConfig, Http3UpstreamError> {
     ensure_rustls_crypto_provider();
     let mut roots = RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     let test_roots = test_root_certificates();
     roots.add_parsable_certificates(
-        test_roots
-            .into_iter()
-            .map(rustls::pki_types::CertificateDer::from),
+        test_roots.into_iter().map(rustls::pki_types::CertificateDer::from),
     );
 
     let mut tls = RustlsClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
@@ -280,9 +284,9 @@ fn default_quic_client_config() -> quinn::ClientConfig {
         .with_no_client_auth();
     tls.alpn_protocols = vec![b"h3".to_vec()];
 
-    let quic_config = QuicClientConfig::try_from(Arc::new(tls))
-        .expect("valid rustls client config for quic");
-    quinn::ClientConfig::new(Arc::new(quic_config))
+    let quic_config =
+        QuicClientConfig::try_from(Arc::new(tls)).map_err(|_| Http3UpstreamError::ConnectFailed)?;
+    Ok(quinn::ClientConfig::new(Arc::new(quic_config)))
 }
 
 fn compose_upstream_url(target: &str, authority: &str) -> Result<String, Http3UpstreamError> {
@@ -307,6 +311,7 @@ fn request_authority(headers: &[lb_proto_http::HttpHeader]) -> Option<String> {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use std::error::Error;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -317,7 +322,9 @@ mod tests {
     use h3::server;
     use quinn::crypto::rustls::QuicServerConfig;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-    use rustls::{ClientConfig as RustlsClientConfig, RootCertStore, ServerConfig as RustlsServerConfig};
+    use rustls::{
+        ClientConfig as RustlsClientConfig, RootCertStore, ServerConfig as RustlsServerConfig,
+    };
     use tokio::net::UdpSocket;
 
     use super::{
@@ -349,9 +356,7 @@ mod tests {
         assert!(http3_error_is_graceful_drain(
             "ConnectionError(ApplicationClose { error_code: 0, reason: \"H3_NO_ERROR\" })"
         ));
-        assert!(http3_error_is_graceful_drain(
-            "GoAway received with NO_ERROR from peer"
-        ));
+        assert!(http3_error_is_graceful_drain("GoAway received with NO_ERROR from peer"));
         assert!(!http3_error_is_graceful_drain(
             "ConnectionError(ApplicationClose { error_code: 268, reason: \"boom\" })"
         ));
@@ -403,7 +408,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn dispatch_http3_upstream_request_connect_failure_is_classified() -> Result<(), Box<dyn Error>> {
+    async fn dispatch_http3_upstream_request_connect_failure_is_classified(
+    ) -> Result<(), Box<dyn Error>> {
         let client_config = test_quic_client_config_with_default_roots();
         let unreachable = SocketAddr::from(([127, 0, 0, 1], 1));
         let upstream = lb_net_core::UpstreamTarget::with_transport(
@@ -444,8 +450,8 @@ mod tests {
                 .with_root_certificates(roots)
                 .with_no_client_auth();
         tls.alpn_protocols = vec![b"h3".to_vec()];
-        let quic =
-            quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(tls)).expect("client quic config");
+        let quic = quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(tls))
+            .expect("client quic config");
         quinn::ClientConfig::new(Arc::new(quic))
     }
 
@@ -465,18 +471,19 @@ mod tests {
     }
 
     async fn spawn_test_h3_server(
-    ) -> Result<(SocketAddr, CertificateDer<'static>, tokio::task::JoinHandle<()>), Box<dyn Error>> {
+    ) -> Result<(SocketAddr, CertificateDer<'static>, tokio::task::JoinHandle<()>), Box<dyn Error>>
+    {
         ensure_rustls_crypto_provider();
 
         let certified = rcgen::generate_simple_self_signed(vec![String::from("localhost")])?;
         let cert_der = CertificateDer::from(certified.cert.der().to_vec());
-        let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-            certified.key_pair.serialize_der(),
-        ));
+        let key_der =
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(certified.key_pair.serialize_der()));
 
-        let mut rustls_server = RustlsServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
-            .with_no_client_auth()
-            .with_single_cert(vec![cert_der.clone()], key_der)?;
+        let mut rustls_server =
+            RustlsServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+                .with_no_client_auth()
+                .with_single_cert(vec![cert_der.clone()], key_der)?;
         rustls_server.alpn_protocols = vec![b"h3".to_vec()];
 
         let quic_server = QuicServerConfig::try_from(Arc::new(rustls_server))?;
@@ -501,7 +508,9 @@ mod tests {
             let Ok(connection) = connecting.await else {
                 return;
             };
-            let Ok(mut h3_conn) = server::builder().build(h3_quinn::Connection::new(connection)).await else {
+            let Ok(mut h3_conn) =
+                server::builder().build(h3_quinn::Connection::new(connection)).await
+            else {
                 return;
             };
             let Ok(Some(resolver)) = h3_conn.accept().await else {
@@ -519,11 +528,7 @@ mod tests {
             if stream.send_response(response).await.is_err() {
                 return;
             }
-            if stream
-                .send_data(Bytes::from_static(b"h3-ok"))
-                .await
-                .is_err()
-            {
+            if stream.send_data(Bytes::from_static(b"h3-ok")).await.is_err() {
                 return;
             }
             let _ = stream.finish().await;

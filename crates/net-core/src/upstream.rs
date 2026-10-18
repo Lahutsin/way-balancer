@@ -65,7 +65,7 @@ pub struct EndpointMetadata {
     pub zone: Option<String>,
     /// Optional locality identifier.
     pub locality: Option<String>,
-    /// Static endpoint weight placeholder for later balancing features.
+    /// Configured nominal endpoint weight used by weighted load balancing and warm-up calculations.
     pub weight: u16,
 }
 

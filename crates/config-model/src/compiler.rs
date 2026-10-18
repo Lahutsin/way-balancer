@@ -7,11 +7,9 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     ConfigApiVersion, EndpointStateConfig, ListenerCertificateSourceConfig, ListenerClassConfig,
-    ListenerProtocolConfig, PolicyBindingConfig, PolicyResourcesConfig, RouteMatchConfig,
-    RouteDestinationConfig, UpgradePolicyConfig,
-    UpstreamTrafficPolicyConfig, UpstreamTransportConfig, ValidationReport, WorkspaceConfig,
-    WorkspaceConfigError,
-    WorkspaceSecurityConfig,
+    ListenerProtocolConfig, PolicyBindingConfig, PolicyResourcesConfig, RouteDestinationConfig,
+    RouteMatchConfig, UpgradePolicyConfig, UpstreamTrafficPolicyConfig, UpstreamTransportConfig,
+    ValidationReport, WorkspaceConfig, WorkspaceConfigError, WorkspaceSecurityConfig,
 };
 
 const SNAPSHOT_FORMAT_VERSION: &str = "v1";
@@ -672,20 +670,16 @@ where
     let mut changes = Vec::new();
     for name in names {
         match (previous_by_name.get(&name), next_by_name.get(&name)) {
-            (None, Some(_)) => {
-                changes.push(SnapshotResourceChange {
-                    name,
-                    kind: SnapshotChangeKind::Added,
-                    detail: None,
-                })
-            }
-            (Some(_), None) => {
-                changes.push(SnapshotResourceChange {
-                    name,
-                    kind: SnapshotChangeKind::Removed,
-                    detail: None,
-                })
-            }
+            (None, Some(_)) => changes.push(SnapshotResourceChange {
+                name,
+                kind: SnapshotChangeKind::Added,
+                detail: None,
+            }),
+            (Some(_), None) => changes.push(SnapshotResourceChange {
+                name,
+                kind: SnapshotChangeKind::Removed,
+                detail: None,
+            }),
             (Some(previous_fingerprint), Some(next_fingerprint))
                 if previous_fingerprint != next_fingerprint =>
             {
@@ -763,7 +757,11 @@ fn describe_route_change(previous: &RouteSnapshot, next: &RouteSnapshot) -> Opti
         parts.push(String::from("policies changed"));
     }
 
-    if parts.is_empty() { None } else { Some(parts.join("; ")) }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("; "))
+    }
 }
 
 fn format_route_destinations(destinations: &[RouteDestinationConfig]) -> String {
@@ -805,10 +803,8 @@ mod tests {
         AdminListenerPolicyConfig, AdminOperatorConfig, AdminRateLimitConfig, ListenerClassConfig,
         ListenerProtocolConfig, ListenerResourceConfig, NamedRetryBudgetPolicyConfig,
         PolicyBindingConfig, PolicyResourcesConfig, RetryBudgetPolicyConfig, RouteConfig,
-        RouteDestinationConfig, UpgradePolicyConfig,
-        UpstreamClusterConfig, UpstreamEndpointConfig, UpstreamTrafficPolicyConfig,
-        UpstreamTransportConfig,
-        WorkspaceConfig,
+        RouteDestinationConfig, UpgradePolicyConfig, UpstreamClusterConfig, UpstreamEndpointConfig,
+        UpstreamTrafficPolicyConfig, UpstreamTransportConfig, WorkspaceConfig,
     };
 
     fn valid_workspace() -> WorkspaceConfig {
@@ -901,10 +897,7 @@ mod tests {
 
         assert_eq!(snapshot.routes()[0].destinations(), restored.routes()[0].destinations());
         assert_eq!(
-            restored.routes()[0].destinations()[0]
-                .policies
-                .retry_budget
-                .as_deref(),
+            restored.routes()[0].destinations()[0].policies.retry_budget.as_deref(),
             Some("canary-retry")
         );
         Ok(())

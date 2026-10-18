@@ -13,12 +13,12 @@ use lb_net_core::{
     UpstreamEndpointId, UpstreamTarget,
 };
 use lb_runtime::{
-    CircuitBreakerPolicy, EndpointHealthPolicy, FailureManager, LoadBalancingAlgorithm,
-    LocalityRoutingPolicy, NoHealthyFallback, RetryBudgetPolicy, RouteBackendPool,
-    RouteDestinationPolicyRuntime, TimeoutHierarchy, UpstreamSelectionPolicy,
-    proxy_http1_connection, proxy_http2_connection, Http1ConnectionReport, Http1ProxyConfig,
-    Http1ProxyError, Http2ConnectionReport, Http2ProxyConfig, Http2ProxyError,
-    ProtocolAnomalyCategory, SlowClientStage,
+    proxy_http1_connection, proxy_http2_connection, CircuitBreakerPolicy, EndpointHealthPolicy,
+    FailureManager, Http1ConnectionReport, Http1ProxyConfig, Http1ProxyError,
+    Http2ConnectionReport, Http2ProxyConfig, Http2ProxyError, LoadBalancingAlgorithm,
+    LocalityRoutingPolicy, NoHealthyFallback, ProtocolAnomalyCategory, RetryBudgetPolicy,
+    RouteBackendPool, RouteDestinationPolicyRuntime, SlowClientStage, TimeoutHierarchy,
+    UpstreamSelectionPolicy,
 };
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
@@ -72,20 +72,8 @@ async fn grpc_unary_metadata_and_status_are_preserved() -> Result<(), Box<dyn st
 
     let report = receive_http2_report(report_rx).await?;
     assert_eq!(report.metrics.grpc_request_count, 1);
-    assert_eq!(
-        report
-            .metrics
-            .grpc_service_counts
-            .get("grpc.test.Echo"),
-        Some(&1)
-    );
-    assert_eq!(
-        report
-            .metrics
-            .grpc_method_counts
-            .get("grpc.test.Echo/Unary"),
-        Some(&1)
-    );
+    assert_eq!(report.metrics.grpc_service_counts.get("grpc.test.Echo"), Some(&1));
+    assert_eq!(report.metrics.grpc_method_counts.get("grpc.test.Echo/Unary"), Some(&1));
     assert_eq!(report.metrics.grpc_status_counts.get(&0), Some(&1));
     assert_eq!(report.metrics.response_status_counts.get(&200), Some(&1));
 
@@ -113,21 +101,24 @@ async fn grpc_unary_retry_budget_retries_unavailable_trailers(
     let pool = single_endpoint_backend_pool("grpc-primary", upstream_addr)?;
     let mut config = Http2ProxyConfig::new(UpstreamTarget::new("grpc-upstream", upstream_addr))
         .with_route_backend_pools([(String::from("grpc-route"), pool)])
-        .with_route_destination_policies([(String::from("grpc-route"), std::collections::BTreeMap::from([(
-            String::from("grpc-primary"),
-            RouteDestinationPolicyRuntime {
-                request_transform: None,
-                response_transform: None,
-                traffic_mirror: None,
-                fault_injection: None,
-                rate_limiters: Vec::new(),
-                concurrency_limiters: Vec::new(),
-                failure_manager: Some(failure_manager.clone()),
-                enforce_retry_budget: true,
-                enforce_timeout_hierarchy: false,
-                enforce_circuit_breaker: false,
-            },
-        )]))]);
+        .with_route_destination_policies([(
+            String::from("grpc-route"),
+            std::collections::BTreeMap::from([(
+                String::from("grpc-primary"),
+                RouteDestinationPolicyRuntime {
+                    request_transform: None,
+                    response_transform: None,
+                    traffic_mirror: None,
+                    fault_injection: None,
+                    rate_limiters: Vec::new(),
+                    concurrency_limiters: Vec::new(),
+                    failure_manager: Some(failure_manager.clone()),
+                    enforce_retry_budget: true,
+                    enforce_timeout_hierarchy: false,
+                    enforce_circuit_breaker: false,
+                },
+            )]),
+        )]);
     config.routes = vec![lb_proto_http::RoutePrefixRule::new("grpc-route", "/")];
 
     let (proxy_addr, report_rx) = spawn_one_shot_http2_proxy_listener(config).await?;
@@ -137,10 +128,7 @@ async fn grpc_unary_retry_budget_retries_unavailable_trailers(
     drop(client);
 
     assert_eq!(response.status, StatusCode::OK);
-    assert_eq!(
-        response.headers.get("x-upstream-attempt").and_then(|v| v.to_str().ok()),
-        Some("2")
-    );
+    assert_eq!(response.headers.get("x-upstream-attempt").and_then(|v| v.to_str().ok()), Some("2"));
     assert_eq!(response.body, grpc_frame(b"pong"));
     assert_eq!(
         response
@@ -338,11 +326,8 @@ async fn spawn_grpc_retrying_upstream() -> io::Result<SocketAddr> {
                         return;
                     };
 
-                    let payload = if this_attempt == 1 {
-                        grpc_frame(b"retry")
-                    } else {
-                        grpc_frame(b"pong")
-                    };
+                    let payload =
+                        if this_attempt == 1 { grpc_frame(b"retry") } else { grpc_frame(b"pong") };
                     if send.send_data(Bytes::from(payload), false).is_err() {
                         return;
                     }
@@ -531,11 +516,7 @@ fn single_endpoint_backend_pool(
         UpstreamEndpointId::new("grpc-primary-a")?,
         upstream_addr,
         EndpointState::Ready,
-        EndpointMetadata {
-            zone: None,
-            locality: None,
-            weight: 1,
-        },
+        EndpointMetadata { zone: None, locality: None, weight: 1 },
     )?;
     Ok(RouteBackendPool::from_cluster(
         UpstreamCluster::new(cluster_name, vec![endpoint])?,

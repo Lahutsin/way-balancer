@@ -1,6 +1,7 @@
 fn validate_listener(
     listener: &crate::ListenerResourceConfig,
     index: usize,
+    insecure_dev_mode_enabled: bool,
     route_names: &BTreeSet<String>,
     route_registry: &BTreeMap<String, &RouteConfig>,
     policy_registry: &PolicyRegistry,
@@ -288,7 +289,7 @@ fn validate_listener(
         (_, None) => {}
     }
 
-    validate_admin_listener_policy(listener, &base_path, report);
+    validate_admin_listener_policy(listener, &base_path, insecure_dev_mode_enabled, report);
 
     let mut seen_routes = BTreeSet::new();
     for (route_index, route_name) in listener.routes.iter().enumerate() {

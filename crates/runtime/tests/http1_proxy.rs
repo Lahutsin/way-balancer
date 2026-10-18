@@ -1,4 +1,4 @@
-#![allow(clippy::expect_used, clippy::type_complexity)]
+#![allow(clippy::expect_used, clippy::panic, clippy::type_complexity)]
 
 use std::io;
 use std::net::SocketAddr;
@@ -11,8 +11,8 @@ use ipnet::IpNet;
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use lb_config_model::{
     AuthorizationCacheBehaviorConfig, AuthorizationDecisionConfig, AuthorizationPolicyConfig,
-    AuthorizationRuleConfig, CacheKeyPolicyConfig, HeaderMutationConfig,
-    FaultInjectionAbortConfig, FaultInjectionDelayConfig, FaultInjectionPolicyConfig,
+    AuthorizationRuleConfig, CacheKeyPolicyConfig, FaultInjectionAbortConfig,
+    FaultInjectionDelayConfig, FaultInjectionPolicyConfig, HeaderMutationConfig,
     HttpCachePolicyConfig, JwtAuthPolicyConfig, JwtJwksSourceConfig, PathRewriteTransformConfig,
     RequestTransformConfig, ResponseTransformConfig, TrafficMirrorPolicyConfig,
     UpgradeProtocolConfig,
@@ -25,14 +25,14 @@ use lb_runtime::{
     build_http_cache_key_material, clear_http3_test_root_certificates, proxy_http1_connection,
     set_http3_test_root_certificates, AffinityFallbackPolicy, AffinityPolicy,
     AnonymousSourceFilterPolicy, AuthorizationPolicyRuntime, CircuitBreakerPolicy,
-    EndpointHealthPolicy, FailureManager, Http1ConnectionReport, Http1ProxyConfig,
-    Http1ProxyError, Http1ResponseCacheConfig, Http1RouteUpstream, HttpCacheRequest,
-    HttpCacheStore, HttpCacheStoreConfig, HttpCacheStoreError, JwtAuthPolicyRuntime,
-    LoadBalancingAlgorithm, LocalLimitKeyKind, LocalLimitScope, LocalRateLimitConfig,
-    LocalRateLimiter, LocalityRoutingPolicy, NoHealthyFallback, ProtocolAnomalyCategory,
-    RetryBudgetPolicy, RouteBackendPool, RouteDestinationPolicyRuntime,
-    RouteEnumerationProtectionPolicy, RuntimeTelemetry, SourceAggregation, TimeoutHierarchy,
-    TrustedClientIpPolicy, UpstreamSelectionPolicy, WeightedRouteDestination,
+    EndpointHealthPolicy, FailureManager, Http1ConnectionReport, Http1ProxyConfig, Http1ProxyError,
+    Http1ResponseCacheConfig, Http1RouteUpstream, HttpCacheRequest, HttpCacheStore,
+    HttpCacheStoreConfig, HttpCacheStoreError, JwtAuthPolicyRuntime, LoadBalancingAlgorithm,
+    LocalLimitKeyKind, LocalLimitScope, LocalRateLimitConfig, LocalRateLimiter,
+    LocalityRoutingPolicy, NoHealthyFallback, ProtocolAnomalyCategory, RetryBudgetPolicy,
+    RouteBackendPool, RouteDestinationPolicyRuntime, RouteEnumerationProtectionPolicy,
+    RuntimeTelemetry, SourceAggregation, TimeoutHierarchy, TrustedClientIpPolicy,
+    UpstreamSelectionPolicy, WeightedRouteDestination,
 };
 use quinn::crypto::rustls::QuicServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -76,11 +76,10 @@ async fn proxies_keep_alive_requests_and_normalizes_headers(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (upstream_addr, captures_rx) = spawn_keep_alive_upstream().await?;
     let telemetry = Arc::new(RuntimeTelemetry::new()?);
-    let (proxy_addr, report_rx) =
-        spawn_one_shot_http1_proxy_listener(
-            proxy_config(upstream_addr).with_request_telemetry("public-http", Arc::clone(&telemetry)),
-        )
-        .await?;
+    let (proxy_addr, report_rx) = spawn_one_shot_http1_proxy_listener(
+        proxy_config(upstream_addr).with_request_telemetry("public-http", Arc::clone(&telemetry)),
+    )
+    .await?;
 
     let mut client = TcpStream::connect(proxy_addr).await?;
     client
@@ -110,12 +109,10 @@ async fn proxies_keep_alive_requests_and_normalizes_headers(
     assert_eq!(report.metrics.request_count, 2);
     assert_eq!(report.metrics.response_status_counts.get(&200), Some(&1));
     assert_eq!(report.metrics.response_status_counts.get(&201), Some(&1));
-    assert!(
-        report
-            .decision_trace_events
-            .iter()
-            .any(|event| event.code == lb_observability::TelemetryEventCode::DecisionRouteSelected)
-    );
+    assert!(report
+        .decision_trace_events
+        .iter()
+        .any(|event| event.code == lb_observability::TelemetryEventCode::DecisionRouteSelected));
     let metrics = telemetry.export_metrics();
     assert!(metrics.contains("runtime_route_latency_samples_total"));
     assert!(metrics.contains("runtime_destination_latency_samples_total"));
@@ -177,18 +174,13 @@ async fn bridges_http1_downstream_to_http3_upstream_with_normalized_headers_and_
     let request = format!(
         "POST /bridge HTTP/1.1\r\nHost: {host_header}\r\nConnection: close\r\nProxy-Connection: keep-alive\r\nX-Forwarded-For: 203.0.113.9\r\nContent-Type: text/plain\r\nContent-Length: 11\r\n\r\nhello-world"
     );
-    client
-        .write_all(request.as_bytes())
-        .await?;
+    client.write_all(request.as_bytes()).await?;
 
     let report = receive_proxy_result(report_rx).await?;
     let response = read_http_response(&mut client).await?;
 
     assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
-    assert!(
-        response.contains("h3-bridge"),
-        "unexpected bridge response payload: {response:?}"
-    );
+    assert!(response.contains("h3-bridge"), "unexpected bridge response payload: {response:?}");
 
     let capture = receive_h3_capture(capture_rx).await?;
     assert_eq!(capture.method, "POST");
@@ -201,18 +193,11 @@ async fn bridges_http1_downstream_to_http3_upstream_with_normalized_headers_and_
         .find(|header| header.name.eq_ignore_ascii_case("x-forwarded-for"))
         .map(|header| header.value.as_str());
     assert_eq!(forwarded_for, Some("127.0.0.1"));
-    assert!(
-        !capture
-            .headers
-            .iter()
-            .any(|header| header.name.eq_ignore_ascii_case("connection"))
-    );
-    assert!(
-        !capture
-            .headers
-            .iter()
-            .any(|header| header.name.eq_ignore_ascii_case("proxy-connection"))
-    );
+    assert!(!capture.headers.iter().any(|header| header.name.eq_ignore_ascii_case("connection")));
+    assert!(!capture
+        .headers
+        .iter()
+        .any(|header| header.name.eq_ignore_ascii_case("proxy-connection")));
 
     assert_eq!(report.metrics.request_count, 1);
     assert_eq!(report.metrics.response_status_counts.get(&200), Some(&1));
@@ -252,21 +237,24 @@ async fn destination_circuit_breaker_blocks_http1_stale_reuse_retry(
 
     let mut config = proxy_config(upstream_addr)
         .with_route_backend_pools([(String::from("api"), pool)])
-        .with_route_destination_policies([(String::from("api"), std::collections::BTreeMap::from([(
-            String::from("frontend-primary"),
-            RouteDestinationPolicyRuntime {
-                request_transform: None,
-                response_transform: None,
-                traffic_mirror: None,
-                fault_injection: None,
-                rate_limiters: Vec::new(),
-                concurrency_limiters: Vec::new(),
-                failure_manager: Some(failure_manager.clone()),
-                enforce_retry_budget: true,
-                enforce_timeout_hierarchy: false,
-                enforce_circuit_breaker: true,
-            },
-        )]))])
+        .with_route_destination_policies([(
+            String::from("api"),
+            std::collections::BTreeMap::from([(
+                String::from("frontend-primary"),
+                RouteDestinationPolicyRuntime {
+                    request_transform: None,
+                    response_transform: None,
+                    traffic_mirror: None,
+                    fault_injection: None,
+                    rate_limiters: Vec::new(),
+                    concurrency_limiters: Vec::new(),
+                    failure_manager: Some(failure_manager.clone()),
+                    enforce_retry_budget: true,
+                    enforce_timeout_hierarchy: false,
+                    enforce_circuit_breaker: true,
+                },
+            )]),
+        )])
         .with_request_telemetry("public-http", Arc::clone(&telemetry));
     config.routes = vec![lb_proto_http::RoutePrefixRule::new("api", "/")];
 
@@ -362,8 +350,8 @@ async fn does_not_retry_unsafe_http1_post_without_idempotency_override(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn retries_http1_post_with_idempotency_key_override(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn retries_http1_post_with_idempotency_key_override() -> Result<(), Box<dyn std::error::Error>>
+{
     let (upstream_addr, captures_rx) = spawn_reused_connection_close_then_retry_upstream().await?;
     let (proxy_addr, report_rx) =
         spawn_one_shot_http1_proxy_listener(proxy_config(upstream_addr)).await?;
@@ -480,22 +468,23 @@ async fn applies_request_transforms_before_http1_upstream_dispatch(
                 value: String::from("demo"),
             }],
         }),
-        [(String::from("api"), RequestTransformConfig {
-            path_rewrite: Some(PathRewriteTransformConfig::ReplacePrefix {
-                match_prefix: String::from("/edge"),
-                replacement: String::from("/v1"),
-            }),
-            host_rewrite: Some(String::from("backend.internal")),
-            header_mutations: vec![
-                HeaderMutationConfig::Set {
-                    name: String::from("x-route"),
-                    value: String::from("api"),
-                },
-                HeaderMutationConfig::Remove {
-                    name: String::from("x-remove-me"),
-                },
-            ],
-        })],
+        [(
+            String::from("api"),
+            RequestTransformConfig {
+                path_rewrite: Some(PathRewriteTransformConfig::ReplacePrefix {
+                    match_prefix: String::from("/edge"),
+                    replacement: String::from("/v1"),
+                }),
+                host_rewrite: Some(String::from("backend.internal")),
+                header_mutations: vec![
+                    HeaderMutationConfig::Set {
+                        name: String::from("x-route"),
+                        value: String::from("api"),
+                    },
+                    HeaderMutationConfig::Remove { name: String::from("x-remove-me") },
+                ],
+            },
+        )],
     );
     config.routes = vec![lb_proto_http::RoutePrefixRule::new("api", "/edge")];
     let (proxy_addr, report_rx) = spawn_one_shot_http1_proxy_listener(config).await?;
@@ -550,36 +539,39 @@ async fn enforces_destination_local_http1_transform_and_rate_limit(
 
     let mut config = proxy_config(upstream_addr)
         .with_route_backend_pools([(String::from("api"), pool)])
-        .with_route_destination_policies([(String::from("api"), std::collections::BTreeMap::from([(
-            String::from("frontend-primary"),
-            RouteDestinationPolicyRuntime {
-                request_transform: Some(RequestTransformConfig {
-                    path_rewrite: Some(PathRewriteTransformConfig::ReplacePrefix {
-                        match_prefix: String::from("/edge"),
-                        replacement: String::from("/dest"),
+        .with_route_destination_policies([(
+            String::from("api"),
+            std::collections::BTreeMap::from([(
+                String::from("frontend-primary"),
+                RouteDestinationPolicyRuntime {
+                    request_transform: Some(RequestTransformConfig {
+                        path_rewrite: Some(PathRewriteTransformConfig::ReplacePrefix {
+                            match_prefix: String::from("/edge"),
+                            replacement: String::from("/dest"),
+                        }),
+                        host_rewrite: Some(String::from("frontend.internal")),
+                        header_mutations: vec![HeaderMutationConfig::Set {
+                            name: String::from("x-destination"),
+                            value: String::from("primary"),
+                        }],
                     }),
-                    host_rewrite: Some(String::from("frontend.internal")),
-                    header_mutations: vec![HeaderMutationConfig::Set {
-                        name: String::from("x-destination"),
-                        value: String::from("primary"),
-                    }],
-                }),
-                response_transform: Some(ResponseTransformConfig {
-                    header_mutations: vec![HeaderMutationConfig::Set {
-                        name: String::from("x-destination-response"),
-                        value: String::from("primary"),
-                    }],
-                }),
-                traffic_mirror: None,
-                fault_injection: None,
-                rate_limiters: vec![destination_rate_limiter],
-                concurrency_limiters: Vec::new(),
-                failure_manager: None,
-                enforce_retry_budget: false,
-                enforce_timeout_hierarchy: false,
-                enforce_circuit_breaker: false,
-            },
-        )]))]);
+                    response_transform: Some(ResponseTransformConfig {
+                        header_mutations: vec![HeaderMutationConfig::Set {
+                            name: String::from("x-destination-response"),
+                            value: String::from("primary"),
+                        }],
+                    }),
+                    traffic_mirror: None,
+                    fault_injection: None,
+                    rate_limiters: vec![destination_rate_limiter],
+                    concurrency_limiters: Vec::new(),
+                    failure_manager: None,
+                    enforce_retry_budget: false,
+                    enforce_timeout_hierarchy: false,
+                    enforce_circuit_breaker: false,
+                },
+            )]),
+        )]);
     config.routes = vec![lb_proto_http::RoutePrefixRule::new("api", "/edge")];
     let (proxy_addr, report_rx) = spawn_one_shot_http1_proxy_listener(config).await?;
 
@@ -594,9 +586,7 @@ async fn enforces_destination_local_http1_transform_and_rate_limit(
     assert!(first_response.contains("x-destination-response: primary\r\n"));
 
     client
-        .write_all(
-            b"GET /edge/orders HTTP/1.1\r\nHost: edge.example\r\nConnection: close\r\n\r\n",
-        )
+        .write_all(b"GET /edge/orders HTTP/1.1\r\nHost: edge.example\r\nConnection: close\r\n\r\n")
         .await?;
     let second_response = read_http_response(&mut client).await?;
     assert!(second_response.starts_with("HTTP/1.1 429"));
@@ -645,25 +635,28 @@ async fn mirrors_bodyless_http1_request_without_affecting_primary_response(
     let mut config = proxy_config(primary_upstream_addr)
         .with_route_backend_pools([(String::from("api"), primary_pool)])
         .with_mirror_backend_pools([(String::from("frontend-shadow"), shadow_pool)])
-        .with_route_destination_policies([(String::from("api"), std::collections::BTreeMap::from([(
-            String::from("frontend-primary"),
-            RouteDestinationPolicyRuntime {
-                request_transform: None,
-                response_transform: None,
-                traffic_mirror: Some(TrafficMirrorPolicyConfig {
-                    percentage: 100,
-                    target_upstream_cluster: String::from("frontend-shadow"),
-                    methods: Vec::new(),
-                }),
-                fault_injection: None,
-                rate_limiters: Vec::new(),
-                concurrency_limiters: Vec::new(),
-                failure_manager: None,
-                enforce_retry_budget: false,
-                enforce_timeout_hierarchy: false,
-                enforce_circuit_breaker: false,
-            },
-        )]))]);
+        .with_route_destination_policies([(
+            String::from("api"),
+            std::collections::BTreeMap::from([(
+                String::from("frontend-primary"),
+                RouteDestinationPolicyRuntime {
+                    request_transform: None,
+                    response_transform: None,
+                    traffic_mirror: Some(TrafficMirrorPolicyConfig {
+                        percentage: 100,
+                        target_upstream_cluster: String::from("frontend-shadow"),
+                        methods: Vec::new(),
+                    }),
+                    fault_injection: None,
+                    rate_limiters: Vec::new(),
+                    concurrency_limiters: Vec::new(),
+                    failure_manager: None,
+                    enforce_retry_budget: false,
+                    enforce_timeout_hierarchy: false,
+                    enforce_circuit_breaker: false,
+                },
+            )]),
+        )]);
     config.routes = vec![lb_proto_http::RoutePrefixRule::new("api", "/api")];
 
     let (proxy_addr, report_rx) = spawn_one_shot_http1_proxy_listener(config).await?;
@@ -689,8 +682,8 @@ async fn mirrors_bodyless_http1_request_without_affecting_primary_response(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn mirror_policy_method_allow_list_skips_http1_post(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn mirror_policy_method_allow_list_skips_http1_post() -> Result<(), Box<dyn std::error::Error>>
+{
     let (primary_upstream_addr, primary_capture_rx) = spawn_single_capture_upstream().await?;
     let (shadow_upstream_addr, shadow_capture_rx) = spawn_single_capture_upstream().await?;
     let primary_pool = route_backend_pool(
@@ -709,25 +702,28 @@ async fn mirror_policy_method_allow_list_skips_http1_post(
     let mut config = proxy_config(primary_upstream_addr)
         .with_route_backend_pools([(String::from("api"), primary_pool)])
         .with_mirror_backend_pools([(String::from("frontend-shadow"), shadow_pool)])
-        .with_route_destination_policies([(String::from("api"), std::collections::BTreeMap::from([(
-            String::from("frontend-primary"),
-            RouteDestinationPolicyRuntime {
-                request_transform: None,
-                response_transform: None,
-                traffic_mirror: Some(TrafficMirrorPolicyConfig {
-                    percentage: 100,
-                    target_upstream_cluster: String::from("frontend-shadow"),
-                    methods: vec![String::from("GET")],
-                }),
-                fault_injection: None,
-                rate_limiters: Vec::new(),
-                concurrency_limiters: Vec::new(),
-                failure_manager: None,
-                enforce_retry_budget: false,
-                enforce_timeout_hierarchy: false,
-                enforce_circuit_breaker: false,
-            },
-        )]))]);
+        .with_route_destination_policies([(
+            String::from("api"),
+            std::collections::BTreeMap::from([(
+                String::from("frontend-primary"),
+                RouteDestinationPolicyRuntime {
+                    request_transform: None,
+                    response_transform: None,
+                    traffic_mirror: Some(TrafficMirrorPolicyConfig {
+                        percentage: 100,
+                        target_upstream_cluster: String::from("frontend-shadow"),
+                        methods: vec![String::from("GET")],
+                    }),
+                    fault_injection: None,
+                    rate_limiters: Vec::new(),
+                    concurrency_limiters: Vec::new(),
+                    failure_manager: None,
+                    enforce_retry_budget: false,
+                    enforce_timeout_hierarchy: false,
+                    enforce_circuit_breaker: false,
+                },
+            )]),
+        )]);
     config.routes = vec![lb_proto_http::RoutePrefixRule::new("api", "/api")];
 
     let (proxy_addr, report_rx) = spawn_one_shot_http1_proxy_listener(config).await?;
@@ -765,10 +761,13 @@ async fn jwt_auth_policy_rejects_http1_request_without_bearer(
     )?;
     let mut config = proxy_config(upstream_addr)
         .with_route_backend_pools([(String::from("api"), pool)])
-        .with_route_destination_jwt_auth_policies([(String::from("api"), std::collections::BTreeMap::from([(
-            String::from("frontend-primary"),
-            jwt_auth_policy_runtime()?,
-        )]))]);
+        .with_route_destination_jwt_auth_policies([(
+            String::from("api"),
+            std::collections::BTreeMap::from([(
+                String::from("frontend-primary"),
+                jwt_auth_policy_runtime()?,
+            )]),
+        )]);
     config.routes = vec![lb_proto_http::RoutePrefixRule::new("api", "/")];
 
     let (proxy_addr, report_rx) = spawn_one_shot_http1_proxy_listener(config).await?;
@@ -798,10 +797,13 @@ async fn jwt_auth_policy_accepts_http1_request_with_valid_bearer(
     )?;
     let mut config = proxy_config(upstream_addr)
         .with_route_backend_pools([(String::from("api"), pool)])
-        .with_route_destination_jwt_auth_policies([(String::from("api"), std::collections::BTreeMap::from([(
-            String::from("frontend-primary"),
-            jwt_auth_policy_runtime()?,
-        )]))]);
+        .with_route_destination_jwt_auth_policies([(
+            String::from("api"),
+            std::collections::BTreeMap::from([(
+                String::from("frontend-primary"),
+                jwt_auth_policy_runtime()?,
+            )]),
+        )]);
     config.routes = vec![lb_proto_http::RoutePrefixRule::new("api", "/")];
 
     let token = issue_test_jwt("https://issuer.example", "edge-api")?;
@@ -929,27 +931,30 @@ async fn delays_http1_request_before_primary_upstream_dispatch(
 
     let mut config = proxy_config(upstream_addr)
         .with_route_backend_pools([(String::from("api"), primary_pool)])
-        .with_route_destination_policies([(String::from("api"), std::collections::BTreeMap::from([(
-            String::from("frontend-primary"),
-            RouteDestinationPolicyRuntime {
-                request_transform: None,
-                response_transform: None,
-                traffic_mirror: None,
-                fault_injection: Some(FaultInjectionPolicyConfig {
-                    delay: Some(FaultInjectionDelayConfig {
-                        percentage: 100,
-                        fixed_delay_ms: 60,
+        .with_route_destination_policies([(
+            String::from("api"),
+            std::collections::BTreeMap::from([(
+                String::from("frontend-primary"),
+                RouteDestinationPolicyRuntime {
+                    request_transform: None,
+                    response_transform: None,
+                    traffic_mirror: None,
+                    fault_injection: Some(FaultInjectionPolicyConfig {
+                        delay: Some(FaultInjectionDelayConfig {
+                            percentage: 100,
+                            fixed_delay_ms: 60,
+                        }),
+                        abort: None,
                     }),
-                    abort: None,
-                }),
-                rate_limiters: Vec::new(),
-                concurrency_limiters: Vec::new(),
-                failure_manager: None,
-                enforce_retry_budget: false,
-                enforce_timeout_hierarchy: false,
-                enforce_circuit_breaker: false,
-            },
-        )]))]);
+                    rate_limiters: Vec::new(),
+                    concurrency_limiters: Vec::new(),
+                    failure_manager: None,
+                    enforce_retry_budget: false,
+                    enforce_timeout_hierarchy: false,
+                    enforce_circuit_breaker: false,
+                },
+            )]),
+        )]);
     config.routes = vec![lb_proto_http::RoutePrefixRule::new("api", "/api")];
 
     let (proxy_addr, report_rx) = spawn_one_shot_http1_proxy_listener(config).await?;
@@ -993,27 +998,30 @@ async fn aborts_http1_request_locally_without_contacting_primary_upstream(
 
     let mut config = proxy_config(upstream_addr)
         .with_route_backend_pools([(String::from("api"), primary_pool)])
-        .with_route_destination_policies([(String::from("api"), std::collections::BTreeMap::from([(
-            String::from("frontend-primary"),
-            RouteDestinationPolicyRuntime {
-                request_transform: None,
-                response_transform: None,
-                traffic_mirror: None,
-                fault_injection: Some(FaultInjectionPolicyConfig {
-                    delay: None,
-                    abort: Some(FaultInjectionAbortConfig {
-                        percentage: 100,
-                        http_status: 503,
+        .with_route_destination_policies([(
+            String::from("api"),
+            std::collections::BTreeMap::from([(
+                String::from("frontend-primary"),
+                RouteDestinationPolicyRuntime {
+                    request_transform: None,
+                    response_transform: None,
+                    traffic_mirror: None,
+                    fault_injection: Some(FaultInjectionPolicyConfig {
+                        delay: None,
+                        abort: Some(FaultInjectionAbortConfig {
+                            percentage: 100,
+                            http_status: 503,
+                        }),
                     }),
-                }),
-                rate_limiters: Vec::new(),
-                concurrency_limiters: Vec::new(),
-                failure_manager: None,
-                enforce_retry_budget: false,
-                enforce_timeout_hierarchy: false,
-                enforce_circuit_breaker: false,
-            },
-        )]))]);
+                    rate_limiters: Vec::new(),
+                    concurrency_limiters: Vec::new(),
+                    failure_manager: None,
+                    enforce_retry_budget: false,
+                    enforce_timeout_hierarchy: false,
+                    enforce_circuit_breaker: false,
+                },
+            )]),
+        )]);
     config.routes = vec![lb_proto_http::RoutePrefixRule::new("api", "/api")];
 
     let (proxy_addr, report_rx) = spawn_one_shot_http1_proxy_listener(config).await?;
@@ -1087,10 +1095,8 @@ async fn rejects_websocket_upgrade_when_route_policy_does_not_allow_it(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let upstream_addr = reserve_unused_addr().await?;
     let telemetry = Arc::new(RuntimeTelemetry::new()?);
-    let mut config = proxy_config(upstream_addr).with_upgrade_telemetry(
-        "public-http",
-        Arc::clone(&telemetry),
-    );
+    let mut config =
+        proxy_config(upstream_addr).with_upgrade_telemetry("public-http", Arc::clone(&telemetry));
     config.timeouts.connect_timeout = Duration::from_millis(50);
     config.routes = vec![lb_proto_http::RoutePrefixRule::new("ws", "/ws")];
     let (proxy_addr, report_rx) = spawn_one_shot_http1_proxy_listener(config).await?;
@@ -1144,8 +1150,7 @@ async fn rejects_malformed_websocket_upgrade_without_upgrade_header(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn rejects_unsupported_http1_upgrade_protocol(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn rejects_unsupported_http1_upgrade_protocol() -> Result<(), Box<dyn std::error::Error>> {
     let upstream_addr = reserve_unused_addr().await?;
     let mut config = proxy_config(upstream_addr).with_upgrade_policies(
         vec![UpgradeProtocolConfig::Websocket],
@@ -1277,21 +1282,24 @@ async fn destination_circuit_breaker_rejects_http1_request_after_connect_failure
 
     let mut config = proxy_config(upstream_addr)
         .with_route_backend_pools([(String::from("api"), pool)])
-        .with_route_destination_policies([(String::from("api"), std::collections::BTreeMap::from([(
-            String::from("frontend-primary"),
-            RouteDestinationPolicyRuntime {
-                request_transform: None,
-                response_transform: None,
-                traffic_mirror: None,
-                fault_injection: None,
-                rate_limiters: Vec::new(),
-                concurrency_limiters: Vec::new(),
-                failure_manager: Some(failure_manager.clone()),
-                enforce_retry_budget: false,
-                enforce_timeout_hierarchy: false,
-                enforce_circuit_breaker: true,
-            },
-        )]))]);
+        .with_route_destination_policies([(
+            String::from("api"),
+            std::collections::BTreeMap::from([(
+                String::from("frontend-primary"),
+                RouteDestinationPolicyRuntime {
+                    request_transform: None,
+                    response_transform: None,
+                    traffic_mirror: None,
+                    fault_injection: None,
+                    rate_limiters: Vec::new(),
+                    concurrency_limiters: Vec::new(),
+                    failure_manager: Some(failure_manager.clone()),
+                    enforce_retry_budget: false,
+                    enforce_timeout_hierarchy: false,
+                    enforce_circuit_breaker: true,
+                },
+            )]),
+        )]);
     config.routes = vec![lb_proto_http::RoutePrefixRule::new("api", "/")];
 
     let (proxy_addr, report_rx) = spawn_one_shot_http1_proxy_listener(config).await?;
@@ -1341,21 +1349,24 @@ async fn destination_timeout_hierarchy_returns_gateway_timeout_for_http1(
 
     let mut config = proxy_config(upstream_addr)
         .with_route_backend_pools([(String::from("api"), pool)])
-        .with_route_destination_policies([(String::from("api"), std::collections::BTreeMap::from([(
-            String::from("frontend-primary"),
-            RouteDestinationPolicyRuntime {
-                request_transform: None,
-                response_transform: None,
-                traffic_mirror: None,
-                fault_injection: None,
-                rate_limiters: Vec::new(),
-                concurrency_limiters: Vec::new(),
-                failure_manager: Some(failure_manager),
-                enforce_retry_budget: false,
-                enforce_timeout_hierarchy: true,
-                enforce_circuit_breaker: false,
-            },
-        )]))]);
+        .with_route_destination_policies([(
+            String::from("api"),
+            std::collections::BTreeMap::from([(
+                String::from("frontend-primary"),
+                RouteDestinationPolicyRuntime {
+                    request_transform: None,
+                    response_transform: None,
+                    traffic_mirror: None,
+                    fault_injection: None,
+                    rate_limiters: Vec::new(),
+                    concurrency_limiters: Vec::new(),
+                    failure_manager: Some(failure_manager),
+                    enforce_retry_budget: false,
+                    enforce_timeout_hierarchy: true,
+                    enforce_circuit_breaker: false,
+                },
+            )]),
+        )]);
     config.routes = vec![lb_proto_http::RoutePrefixRule::new("api", "/")];
 
     let (proxy_addr, report_rx) = spawn_one_shot_http1_proxy_listener(config).await?;
@@ -1474,7 +1485,10 @@ async fn applies_response_transforms_to_live_and_cached_http1_responses(
 
     let (upstream_addr, capture_rx) = spawn_transformable_cacheable_upstream().await?;
     let mut first_config = proxy_config(upstream_addr)
-        .with_response_cache(Http1ResponseCacheConfig::new(policy.clone(), Arc::clone(&shared_store)))
+        .with_response_cache(Http1ResponseCacheConfig::new(
+            policy.clone(),
+            Arc::clone(&shared_store),
+        ))
         .with_response_transforms(
             Some(ResponseTransformConfig {
                 header_mutations: vec![HeaderMutationConfig::Set {
@@ -1482,17 +1496,18 @@ async fn applies_response_transforms_to_live_and_cached_http1_responses(
                     value: String::from("demo"),
                 }],
             }),
-            [(String::from("api"), ResponseTransformConfig {
-                header_mutations: vec![
-                    HeaderMutationConfig::Set {
-                        name: String::from("x-route-response"),
-                        value: String::from("api"),
-                    },
-                    HeaderMutationConfig::Remove {
-                        name: String::from("x-remove-me"),
-                    },
-                ],
-            })],
+            [(
+                String::from("api"),
+                ResponseTransformConfig {
+                    header_mutations: vec![
+                        HeaderMutationConfig::Set {
+                            name: String::from("x-route-response"),
+                            value: String::from("api"),
+                        },
+                        HeaderMutationConfig::Remove { name: String::from("x-remove-me") },
+                    ],
+                },
+            )],
         );
     first_config.routes = vec![lb_proto_http::RoutePrefixRule::new("api", "/cacheable")];
     let (first_proxy_addr, first_report_rx) =
@@ -1525,17 +1540,18 @@ async fn applies_response_transforms_to_live_and_cached_http1_responses(
                     value: String::from("demo"),
                 }],
             }),
-            [(String::from("api"), ResponseTransformConfig {
-                header_mutations: vec![
-                    HeaderMutationConfig::Set {
-                        name: String::from("x-route-response"),
-                        value: String::from("api"),
-                    },
-                    HeaderMutationConfig::Remove {
-                        name: String::from("x-remove-me"),
-                    },
-                ],
-            })],
+            [(
+                String::from("api"),
+                ResponseTransformConfig {
+                    header_mutations: vec![
+                        HeaderMutationConfig::Set {
+                            name: String::from("x-route-response"),
+                            value: String::from("api"),
+                        },
+                        HeaderMutationConfig::Remove { name: String::from("x-remove-me") },
+                    ],
+                },
+            )],
         );
     second_config.routes = vec![lb_proto_http::RoutePrefixRule::new("api", "/cacheable")];
     let (second_proxy_addr, second_report_rx) =
@@ -1827,12 +1843,10 @@ async fn unmatched_host_filtered_routes_return_local_forbidden(
     assert!(metrics.contains("runtime_decision_events_total"));
     assert!(metrics.contains("decision=\"route_selection\""));
     assert!(metrics.contains("result=\"rejected\""));
-    assert!(
-        report
-            .decision_trace_events
-            .iter()
-            .any(|event| event.code == lb_observability::TelemetryEventCode::DecisionRouteSelected)
-    );
+    assert!(report
+        .decision_trace_events
+        .iter()
+        .any(|event| event.code == lb_observability::TelemetryEventCode::DecisionRouteSelected));
     Ok(())
 }
 
@@ -2138,8 +2152,10 @@ async fn route_backend_pool_honors_http1_cookie_affinity() -> Result<(), Box<dyn
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn weighted_route_backend_pool_splits_http1_requests_across_route_destinations(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (stable_upstream, stable_capture_rx) = spawn_multi_tagged_upstream("stable-route", 9).await?;
-    let (canary_upstream, canary_capture_rx) = spawn_multi_tagged_upstream("canary-route", 1).await?;
+    let (stable_upstream, stable_capture_rx) =
+        spawn_multi_tagged_upstream("stable-route", 9).await?;
+    let (canary_upstream, canary_capture_rx) =
+        spawn_multi_tagged_upstream("canary-route", 1).await?;
     let stable_pool = route_backend_pool(
         "stable",
         vec![("stable-a", stable_upstream, 1, None, None)],
@@ -2173,21 +2189,12 @@ async fn weighted_route_backend_pool_splits_http1_requests_across_route_destinat
         assert_eq!(report.metrics.response_status_counts.get(&200), Some(&1));
     }
 
-    let selection_metrics = config
-        .route_backend_pools
-        .get("api")
-        .expect("api weighted pool")
-        .selection_metrics();
+    let selection_metrics =
+        config.route_backend_pools.get("api").expect("api weighted pool").selection_metrics();
     assert_eq!(selection_metrics.weighted_route_selection_count, 10);
     assert_eq!(selection_metrics.route_destination_fallback_count, 0);
-    assert_eq!(
-        selection_metrics.route_destination_selection_counts.get("stable"),
-        Some(&9)
-    );
-    assert_eq!(
-        selection_metrics.route_destination_selection_counts.get("canary"),
-        Some(&1)
-    );
+    assert_eq!(selection_metrics.route_destination_selection_counts.get("stable"), Some(&9));
+    assert_eq!(selection_metrics.route_destination_selection_counts.get("canary"), Some(&1));
 
     let stable_captures = receive_capture_list(stable_capture_rx).await?;
     let canary_captures = receive_capture_list(canary_capture_rx).await?;
@@ -2247,15 +2254,11 @@ async fn weighted_route_backend_pool_reports_http1_destination_fallback_metrics(
 
     let report = receive_proxy_result(report_rx).await?;
     assert_eq!(report.metrics.response_status_counts.get(&200), Some(&1));
-    let selection_metrics = report
-        .route_selection_metrics
-        .expect("route selection metrics should be present");
+    let selection_metrics =
+        report.route_selection_metrics.expect("route selection metrics should be present");
     assert_eq!(selection_metrics.weighted_route_selection_count, 1);
     assert_eq!(selection_metrics.route_destination_fallback_count, 1);
-    assert_eq!(
-        selection_metrics.route_destination_selection_counts.get("stable"),
-        Some(&1)
-    );
+    assert_eq!(selection_metrics.route_destination_selection_counts.get("stable"), Some(&1));
     let capture = receive_capture(stable_capture_rx).await?;
     assert!(capture.head.contains("GET /api HTTP/1.1\r\n"));
     Ok(())
@@ -3688,9 +3691,7 @@ async fn spawn_malformed_websocket_upgrade_upstream() -> io::Result<SocketAddr> 
         if let Ok((mut stream, _)) = listener.accept().await {
             if read_http_head(&mut stream).await.is_ok() {
                 let _ = stream
-                    .write_all(
-                        b"HTTP/1.1 101 Switching Protocols\r\nConnection: close\r\n\r\n",
-                    )
+                    .write_all(b"HTTP/1.1 101 Switching Protocols\r\nConnection: close\r\n\r\n")
                     .await;
             }
         }
@@ -3733,14 +3734,14 @@ async fn spawn_idle_upstream() -> io::Result<SocketAddr> {
 }
 
 async fn spawn_http3_capture_upstream(
-) -> Result<(SocketAddr, Vec<u8>, oneshot::Receiver<H3RequestCapture>), Box<dyn std::error::Error>> {
+) -> Result<(SocketAddr, Vec<u8>, oneshot::Receiver<H3RequestCapture>), Box<dyn std::error::Error>>
+{
     ensure_rustls_crypto_provider();
 
     let certified = rcgen::generate_simple_self_signed(vec![String::from("localhost")])?;
     let cert_der = CertificateDer::from(certified.cert.der().to_vec());
-    let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-        certified.key_pair.serialize_der(),
-    ));
+    let key_der =
+        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(certified.key_pair.serialize_der()));
 
     let mut rustls_server =
         RustlsServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
@@ -3773,7 +3774,8 @@ async fn spawn_http3_capture_upstream(
         let Ok(connection) = connecting.await else {
             return;
         };
-        let Ok(mut h3_conn) = server::builder().build(h3_quinn::Connection::new(connection)).await else {
+        let Ok(mut h3_conn) = server::builder().build(h3_quinn::Connection::new(connection)).await
+        else {
             return;
         };
         let Ok(Some(resolver)) = h3_conn.accept().await else {
@@ -3821,11 +3823,7 @@ async fn spawn_http3_capture_upstream(
         if stream.send_response(response).await.is_err() {
             return;
         }
-        if stream
-            .send_data(bytes::Bytes::from_static(b"h3-bridge"))
-            .await
-            .is_err()
-        {
+        if stream.send_data(bytes::Bytes::from_static(b"h3-bridge")).await.is_err() {
             return;
         }
         let _ = stream.finish().await;
@@ -4041,11 +4039,7 @@ fn issue_test_jwt(iss: &str, aud: &str) -> Result<String, Box<dyn std::error::Er
     };
     let mut header = Header::new(Algorithm::HS256);
     header.kid = Some(String::from("jwt-key-1"));
-    Ok(encode(
-        &header,
-        &claims,
-        &EncodingKey::from_secret(b"super-secret"),
-    )?)
+    Ok(encode(&header, &claims, &EncodingKey::from_secret(b"super-secret"))?)
 }
 
 fn route_backend_pool(

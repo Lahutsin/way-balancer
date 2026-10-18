@@ -172,17 +172,14 @@ where
             &effective_timeouts,
         )
         .await
-        .map_err(|error| {
-            match &error {
-                Http1ProxyError::ConnectTimeout { .. } => {
-                    record_destination_timeout(destination_policy, crate::TimeoutCategory::Connect);
-                }
-                Http1ProxyError::Connect { .. } => {
-                    record_destination_failure(destination_policy, crate::UpstreamFailureClass::Connect);
-                }
-                _ => {}
+        .inspect_err(|error| match error {
+            Http1ProxyError::ConnectTimeout { .. } => {
+                record_destination_timeout(destination_policy, crate::TimeoutCategory::Connect);
             }
-            error
+            Http1ProxyError::Connect { .. } => {
+                record_destination_failure(destination_policy, crate::UpstreamFailureClass::Connect);
+            }
+            _ => {}
         })?;
         let retry_stale_reuse = reused_existing_connection
             && !retried_stale_reuse
@@ -685,7 +682,6 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-
 async fn write_cached_response<W>(
     downstream: &mut W,
     request_method: &str,

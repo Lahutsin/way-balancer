@@ -25,10 +25,7 @@ fn read_lock_or_recover<'a, T>(lock: &'a RwLock<T>, lock_name: &str) -> RwLockRe
     lock.read().unwrap_or_else(|poisoned| recover_poisoned_lock(lock_name, poisoned))
 }
 
-fn write_lock_or_recover<'a, T>(
-    lock: &'a RwLock<T>,
-    lock_name: &str,
-) -> RwLockWriteGuard<'a, T> {
+fn write_lock_or_recover<'a, T>(lock: &'a RwLock<T>, lock_name: &str) -> RwLockWriteGuard<'a, T> {
     lock.write().unwrap_or_else(|poisoned| recover_poisoned_lock(lock_name, poisoned))
 }
 
@@ -406,13 +403,14 @@ impl UpstreamHealthRegistry {
         let _topology = write_lock_or_recover(&self.topology, "upstream_health.topology");
         let endpoint_id = endpoint.id().clone();
         let record = EndpointHealthRecord::new(&endpoint, &self.policy);
+        let is_warming = matches!(record.status, EndpointHealthStatus::Warming);
         self.registry.insert_endpoint(cluster_name, endpoint)?;
         let mut records = write_lock_or_recover(&self.records, "upstream_health.records");
         records.insert(
             EndpointKey { cluster: cluster_name.clone(), endpoint_id: endpoint_id.clone() },
             record,
         );
-        if self.policy.warmup_duration > Duration::ZERO {
+        if is_warming {
             self.push_event(
                 lb_observability::UpstreamHealthEventKind::WarmupStarted,
                 cluster_name,
@@ -477,7 +475,11 @@ impl UpstreamHealthRegistry {
         cluster_name: &lb_net_core::UpstreamClusterName,
         endpoint_id: &lb_net_core::UpstreamEndpointId,
     ) -> Result<EndpointHealthSnapshot, UpstreamHealthError> {
-        self.note_passive_success_for_protocol(cluster_name, endpoint_id, ProtocolHealthClass::Generic)
+        self.note_passive_success_for_protocol(
+            cluster_name,
+            endpoint_id,
+            ProtocolHealthClass::Generic,
+        )
     }
 
     /// Records a passive success hint scoped to a protocol class.
@@ -488,11 +490,7 @@ impl UpstreamHealthRegistry {
         protocol: ProtocolHealthClass,
     ) -> Result<EndpointHealthSnapshot, UpstreamHealthError> {
         self.metrics.passive_success_count.fetch_add(1, Ordering::SeqCst);
-        self.apply_signal(
-            cluster_name,
-            endpoint_id,
-            HealthSignal::PassiveSuccess { protocol },
-        )
+        self.apply_signal(cluster_name, endpoint_id, HealthSignal::PassiveSuccess { protocol })
     }
 
     /// Records a passive failure hint.
@@ -501,7 +499,11 @@ impl UpstreamHealthRegistry {
         cluster_name: &lb_net_core::UpstreamClusterName,
         endpoint_id: &lb_net_core::UpstreamEndpointId,
     ) -> Result<EndpointHealthSnapshot, UpstreamHealthError> {
-        self.note_passive_failure_for_protocol(cluster_name, endpoint_id, ProtocolHealthClass::Generic)
+        self.note_passive_failure_for_protocol(
+            cluster_name,
+            endpoint_id,
+            ProtocolHealthClass::Generic,
+        )
     }
 
     /// Records a passive failure hint scoped to a protocol class.
@@ -512,11 +514,7 @@ impl UpstreamHealthRegistry {
         protocol: ProtocolHealthClass,
     ) -> Result<EndpointHealthSnapshot, UpstreamHealthError> {
         self.metrics.passive_failure_count.fetch_add(1, Ordering::SeqCst);
-        self.apply_signal(
-            cluster_name,
-            endpoint_id,
-            HealthSignal::PassiveFailure { protocol },
-        )
+        self.apply_signal(cluster_name, endpoint_id, HealthSignal::PassiveFailure { protocol })
     }
 
     /// Advances ejection and warm-up timers for all tracked endpoints.
@@ -602,10 +600,11 @@ impl UpstreamHealthRegistry {
         for endpoint in cluster.endpoints() {
             let key =
                 EndpointKey { cluster: cluster_name.clone(), endpoint_id: endpoint.id().clone() };
-            let record = records.get(&key).ok_or_else(|| UpstreamHealthError::InconsistentState {
-                cluster: cluster_name.clone(),
-                endpoint_id: endpoint.id().clone(),
-            })?;
+            let record =
+                records.get(&key).ok_or_else(|| UpstreamHealthError::InconsistentState {
+                    cluster: cluster_name.clone(),
+                    endpoint_id: endpoint.id().clone(),
+                })?;
             if endpoint.state().is_ready() && record.status.is_available() {
                 ready_endpoints += 1;
             }
@@ -667,10 +666,11 @@ impl UpstreamHealthRegistry {
             }
             let key =
                 EndpointKey { cluster: cluster_name.clone(), endpoint_id: endpoint.id().clone() };
-            let record = records.get(&key).ok_or_else(|| UpstreamHealthError::InconsistentState {
-                cluster: cluster_name.clone(),
-                endpoint_id: endpoint.id().clone(),
-            })?;
+            let record =
+                records.get(&key).ok_or_else(|| UpstreamHealthError::InconsistentState {
+                    cluster: cluster_name.clone(),
+                    endpoint_id: endpoint.id().clone(),
+                })?;
             let snapshot = record.snapshot(&self.policy);
             let allowed = snapshot.status.is_available()
                 || (include_unhealthy
@@ -748,18 +748,15 @@ impl UpstreamHealthRegistry {
             }
         }
 
-        let needs_budget_cap = records
-            .get(&key)
-            .is_some_and(|record| {
+        let needs_budget_cap =
+            records.get(&key).is_some_and(|record| {
                 matches!(record.status, EndpointHealthStatus::Ejected)
                     && !matches!(previous_status, EndpointHealthStatus::Ejected)
-            })
-            && !can_apply_ejection_budget(&records, cluster_name, endpoint_id, &self.policy);
+            }) && !can_apply_ejection_budget(&records, cluster_name, endpoint_id, &self.policy);
 
         if needs_budget_cap {
-            let record = records
-                .get_mut(&key)
-                .ok_or_else(|| UpstreamHealthError::InconsistentState {
+            let record =
+                records.get_mut(&key).ok_or_else(|| UpstreamHealthError::InconsistentState {
                     cluster: cluster_name.clone(),
                     endpoint_id: endpoint_id.clone(),
                 })?;
@@ -918,17 +915,16 @@ fn increment_protocol_failure_counter(
     *counter = counter.saturating_add(1);
 }
 
-fn clear_protocol_failure_counter(record: &mut EndpointHealthRecord, protocol: ProtocolHealthClass) {
+fn clear_protocol_failure_counter(
+    record: &mut EndpointHealthRecord,
+    protocol: ProtocolHealthClass,
+) {
     record.passive_failures_by_protocol.insert(protocol, 0);
 }
 
 fn refresh_passive_failure_aggregate(record: &mut EndpointHealthRecord) {
-    record.passive_failures = record
-        .passive_failures_by_protocol
-        .values()
-        .copied()
-        .max()
-        .unwrap_or(0);
+    record.passive_failures =
+        record.passive_failures_by_protocol.values().copied().max().unwrap_or(0);
 }
 
 fn clear_protocol_failure_state(record: &mut EndpointHealthRecord) {
@@ -963,11 +959,8 @@ fn passive_failure_triggers_ejection(
         return false;
     }
 
-    let success_count = record
-        .passive_results_window
-        .iter()
-        .filter(|is_success| **is_success)
-        .count() as u32;
+    let success_count =
+        record.passive_results_window.iter().filter(|is_success| **is_success).count() as u32;
     let observed = record.passive_results_window.len() as u32;
     success_count.saturating_mul(100)
         < u32::from(policy.success_rate_ejection_threshold_percent).saturating_mul(observed)
@@ -996,17 +989,15 @@ fn can_apply_ejection_budget(
     if total == 0 {
         return false;
     }
-    let allowed = (total.saturating_mul(u64::from(policy.cluster_ejection_budget_percent))
+    let allowed = (total
+        .saturating_mul(u64::from(policy.cluster_ejection_budget_percent))
         .saturating_add(99))
         / 100;
     if allowed == 0 {
         return false;
     }
     let this_is_ejected = records
-        .get(&EndpointKey {
-            cluster: cluster_name.clone(),
-            endpoint_id: endpoint_id.clone(),
-        })
+        .get(&EndpointKey { cluster: cluster_name.clone(), endpoint_id: endpoint_id.clone() })
         .is_some_and(|record| matches!(record.status, EndpointHealthStatus::Ejected));
     if this_is_ejected {
         ejected <= allowed
@@ -1047,9 +1038,7 @@ fn event_for_transition(
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-    use super::{
-        EndpointHealthPolicy, EndpointKey, UpstreamHealthError, UpstreamHealthRegistry,
-    };
+    use super::{EndpointHealthPolicy, EndpointKey, UpstreamHealthError, UpstreamHealthRegistry};
 
     fn endpoint(
         id: &str,
@@ -1101,8 +1090,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_signal_reports_missing_record_as_error(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn apply_signal_reports_missing_record_as_error() -> Result<(), Box<dyn std::error::Error>> {
         let registry = UpstreamHealthRegistry::new(EndpointHealthPolicy::default());
         let cluster_name = lb_net_core::UpstreamClusterName::new("payments")?;
         let endpoint_id = lb_net_core::UpstreamEndpointId::new("a")?;

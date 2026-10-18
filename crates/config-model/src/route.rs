@@ -149,9 +149,10 @@ impl RouteConfig {
 
                 let mut normalized_methods = BTreeSet::new();
                 for method in methods {
-                    let normalized = lb_proto_http::normalize_http_method(method).ok_or_else(|| {
-                        WorkspaceConfigError::InvalidRouteMethod(self.name.clone())
-                    })?;
+                    let normalized =
+                        lb_proto_http::normalize_http_method(method).ok_or_else(|| {
+                            WorkspaceConfigError::InvalidRouteMethod(self.name.clone())
+                        })?;
                     normalized_methods.insert(normalized);
                 }
 
@@ -160,24 +161,24 @@ impl RouteConfig {
                     let normalized = match header_match {
                         RouteHeaderMatchConfig::Exact { name, value } => {
                             lb_proto_http::RouteHeaderMatch::Exact {
-                                name: lb_proto_http::normalize_http_header_name(name).ok_or_else(|| {
-                                    WorkspaceConfigError::InvalidRouteHeader(self.name.clone())
-                                })?,
+                                name: lb_proto_http::normalize_http_header_name(name).ok_or_else(
+                                    || WorkspaceConfigError::InvalidRouteHeader(self.name.clone()),
+                                )?,
                                 value: value.trim().to_string(),
                             }
                         }
                         RouteHeaderMatchConfig::Present { name } => {
                             lb_proto_http::RouteHeaderMatch::Present {
-                                name: lb_proto_http::normalize_http_header_name(name).ok_or_else(|| {
-                                    WorkspaceConfigError::InvalidRouteHeader(self.name.clone())
-                                })?,
+                                name: lb_proto_http::normalize_http_header_name(name).ok_or_else(
+                                    || WorkspaceConfigError::InvalidRouteHeader(self.name.clone()),
+                                )?,
                             }
                         }
                         RouteHeaderMatchConfig::Absent { name } => {
                             lb_proto_http::RouteHeaderMatch::Absent {
-                                name: lb_proto_http::normalize_http_header_name(name).ok_or_else(|| {
-                                    WorkspaceConfigError::InvalidRouteHeader(self.name.clone())
-                                })?,
+                                name: lb_proto_http::normalize_http_header_name(name).ok_or_else(
+                                    || WorkspaceConfigError::InvalidRouteHeader(self.name.clone()),
+                                )?,
                             }
                         }
                     };
@@ -189,26 +190,27 @@ impl RouteConfig {
                     let normalized = match query_match {
                         RouteQueryMatchConfig::Exact { name, value } => {
                             lb_proto_http::RouteQueryMatch::Exact {
-                                name: lb_proto_http::canonicalize_query_match_name(name).map_err(|_| {
-                                    WorkspaceConfigError::InvalidRouteQuery(self.name.clone())
-                                })?,
-                                value: lb_proto_http::canonicalize_query_match_value(value).map_err(|_| {
-                                    WorkspaceConfigError::InvalidRouteQuery(self.name.clone())
-                                })?,
+                                name: lb_proto_http::canonicalize_query_match_name(name).map_err(
+                                    |_| WorkspaceConfigError::InvalidRouteQuery(self.name.clone()),
+                                )?,
+                                value: lb_proto_http::canonicalize_query_match_value(value)
+                                    .map_err(|_| {
+                                        WorkspaceConfigError::InvalidRouteQuery(self.name.clone())
+                                    })?,
                             }
                         }
                         RouteQueryMatchConfig::Present { name } => {
                             lb_proto_http::RouteQueryMatch::Present {
-                                name: lb_proto_http::canonicalize_query_match_name(name).map_err(|_| {
-                                    WorkspaceConfigError::InvalidRouteQuery(self.name.clone())
-                                })?,
+                                name: lb_proto_http::canonicalize_query_match_name(name).map_err(
+                                    |_| WorkspaceConfigError::InvalidRouteQuery(self.name.clone()),
+                                )?,
                             }
                         }
                         RouteQueryMatchConfig::Absent { name } => {
                             lb_proto_http::RouteQueryMatch::Absent {
-                                name: lb_proto_http::canonicalize_query_match_name(name).map_err(|_| {
-                                    WorkspaceConfigError::InvalidRouteQuery(self.name.clone())
-                                })?,
+                                name: lb_proto_http::canonicalize_query_match_name(name).map_err(
+                                    |_| WorkspaceConfigError::InvalidRouteQuery(self.name.clone()),
+                                )?,
                             }
                         }
                     };
@@ -218,29 +220,35 @@ impl RouteConfig {
                 let mut normalized_content_types = BTreeSet::new();
                 for content_type in content_types {
                     let normalized = lb_proto_http::normalize_content_type_match(content_type)
-                        .ok_or_else(|| WorkspaceConfigError::InvalidRouteContentType(self.name.clone()))?;
+                        .ok_or_else(|| {
+                            WorkspaceConfigError::InvalidRouteContentType(self.name.clone())
+                        })?;
                     normalized_content_types.insert(normalized);
                 }
 
                 let mut normalized_grpc_services = BTreeSet::new();
                 for grpc_service in grpc_services {
                     let normalized = lb_proto_http::normalize_grpc_service_match(grpc_service)
-                        .ok_or_else(|| WorkspaceConfigError::InvalidRouteGrpcService(self.name.clone()))?;
+                        .ok_or_else(|| {
+                            WorkspaceConfigError::InvalidRouteGrpcService(self.name.clone())
+                        })?;
                     normalized_grpc_services.insert(normalized);
                 }
 
                 let mut normalized_grpc_methods = BTreeSet::new();
                 for grpc_method in grpc_methods {
                     let normalized = lb_proto_http::normalize_grpc_method_match(grpc_method)
-                        .ok_or_else(|| WorkspaceConfigError::InvalidRouteGrpcMethod(self.name.clone()))?;
+                        .ok_or_else(|| {
+                            WorkspaceConfigError::InvalidRouteGrpcMethod(self.name.clone())
+                        })?;
                     normalized_grpc_methods.insert(normalized);
                 }
 
                 let mut normalized_source_cidrs = BTreeSet::new();
                 for source_cidr in source_cidrs {
-                    let parsed: IpNet = source_cidr
-                        .parse()
-                        .map_err(|_| WorkspaceConfigError::InvalidRouteSourceCidr(self.name.clone()))?;
+                    let parsed: IpNet = source_cidr.parse().map_err(|_| {
+                        WorkspaceConfigError::InvalidRouteSourceCidr(self.name.clone())
+                    })?;
                     normalized_source_cidrs.insert(parsed);
                 }
 

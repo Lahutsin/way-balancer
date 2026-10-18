@@ -13,11 +13,10 @@ fn bench_hedging_scenario(criterion: &mut Criterion) {
     group.throughput(Throughput::Elements(operations as u64));
     group.bench_function("hedging_execution_batch", |bench| {
         bench.iter(|| {
-            let measurement = run_or_exit(
-                tokio::runtime::Runtime::new().map_err(Into::into).and_then(|runtime| {
-                    runtime.block_on(measure_hedging_execution_throughput(operations))
-                }),
-            );
+            let measurement =
+                run_or_exit(tokio::runtime::Runtime::new().map_err(Into::into).and_then(
+                    |runtime| runtime.block_on(measure_hedging_execution_throughput(operations)),
+                ));
             criterion::black_box(measurement);
         });
     });
@@ -30,8 +29,7 @@ fn bench_abuse_mitigation_scenario(criterion: &mut Criterion) {
     group.throughput(Throughput::Elements(operations as u64));
     group.bench_function("abuse_mitigation_decision_batch", |bench| {
         bench.iter(|| {
-            let measurement =
-                run_or_exit(measure_abuse_mitigation_decision_throughput(operations));
+            let measurement = run_or_exit(measure_abuse_mitigation_decision_throughput(operations));
             criterion::black_box(measurement);
         });
     });

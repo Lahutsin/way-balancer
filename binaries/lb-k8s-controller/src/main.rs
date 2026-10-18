@@ -438,15 +438,12 @@ impl LeadershipCoordinator {
                 if elapsed_ms > renew_deadline_ms {
                     self.state = LeadershipState::Lost {
                         leader_identity: Some(self.config.identity.clone()),
-                        detail: format!(
-                            "lease renewal deadline exceeded after {elapsed_ms}ms"
-                        ),
+                        detail: format!("lease renewal deadline exceeded after {elapsed_ms}ms"),
                     };
                     LeaseAction::Fence
                 } else {
-                    self.state = LeadershipState::Leader {
-                        leader_identity: self.config.identity.clone(),
-                    };
+                    self.state =
+                        LeadershipState::Leader { leader_identity: self.config.identity.clone() };
                     LeaseAction::Renew
                 }
             }
@@ -541,7 +538,11 @@ where
         self.leadership.state()
     }
 
-    fn evaluate_leadership(&mut self, lease: Option<&LeaseRecord>, now_unix_ms: u64) -> LeaseAction {
+    fn evaluate_leadership(
+        &mut self,
+        lease: Option<&LeaseRecord>,
+        now_unix_ms: u64,
+    ) -> LeaseAction {
         self.leadership.evaluate(lease, now_unix_ms)
     }
 
@@ -629,13 +630,14 @@ async fn main() -> Result<(), DynError> {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use std::collections::BTreeMap;
 
     use lb_config_model::{ArtifactSigner, ListenerProtocolConfig};
 
     use super::{
-        ControllerConfig, ControllerRuntime, LeaseAction, LeaseRecord, LeadershipState,
+        ControllerConfig, ControllerRuntime, LeadershipState, LeaseAction, LeaseRecord,
         ReconcileQueue, WatchedResourceKind, DEFAULT_MAX_REQUEUE_DELAY_MS,
     };
     use lb_k8s_integration::{
@@ -763,7 +765,10 @@ mod tests {
             (String::from("LB_K8S_CONTROLLER_MAX_REQUEUE_MS"), String::from("15000")),
             (String::from("LB_K8S_CONTROLLER_LEADER_ELECTION"), String::from("true")),
             (String::from("LB_K8S_CONTROLLER_LEASE_NAME"), String::from("lb-k8s-controller-ha")),
-            (String::from("LB_K8S_CONTROLLER_LEASE_NAMESPACE"), String::from("way-balancer-system")),
+            (
+                String::from("LB_K8S_CONTROLLER_LEASE_NAMESPACE"),
+                String::from("way-balancer-system"),
+            ),
             (String::from("LB_K8S_CONTROLLER_IDENTITY"), String::from("controller-a")),
             (String::from("LB_K8S_CONTROLLER_LEASE_DURATION_MS"), String::from("20000")),
             (String::from("LB_K8S_CONTROLLER_RENEW_DEADLINE_MS"), String::from("12000")),
@@ -815,7 +820,8 @@ mod tests {
     }
 
     #[test]
-    fn controller_runtime_fences_reconcile_after_lease_loss() -> Result<(), Box<dyn std::error::Error>> {
+    fn controller_runtime_fences_reconcile_after_lease_loss(
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let backend = InMemoryReconcileBackend::new(test_artifact_signer()?);
         let mut runtime = ControllerRuntime::new(ControllerConfig::default(), backend);
         runtime.record_leadership_acquired();

@@ -48,10 +48,13 @@ impl HeaderAnomalyScorer {
         if headers.len() > self.max_header_count as usize {
             signals.push(RequestClassifierSignal {
                 kind: RequestClassifierSignalKind::HeaderAnomaly,
-                strength: score_to_u8((headers.len() * 100) / self.max_header_count.max(1) as usize),
+                strength: score_to_u8(
+                    (headers.len() * 100) / self.max_header_count.max(1) as usize,
+                ),
                 detail: format!(
                     "header count {} exceeds max_header_count {}",
-                    headers.len(), self.max_header_count
+                    headers.len(),
+                    self.max_header_count
                 ),
             });
         }
@@ -76,11 +79,7 @@ impl HeaderAnomalyScorer {
                 });
             }
 
-            if self
-                .suspicious_headers
-                .iter()
-                .any(|header| header == &normalized)
-            {
+            if self.suspicious_headers.iter().any(|header| header == &normalized) {
                 signals.push(RequestClassifierSignal {
                     kind: RequestClassifierSignalKind::HeaderAnomaly,
                     strength: 100,
@@ -95,10 +94,7 @@ impl HeaderAnomalyScorer {
                         signals.push(RequestClassifierSignal {
                             kind: RequestClassifierSignalKind::UserAgentAnomaly,
                             strength: 100,
-                            detail: format!(
-                                "user-agent matched suspicious pattern {}",
-                                pattern
-                            ),
+                            detail: format!("user-agent matched suspicious pattern {}", pattern),
                         });
                     }
                 }
@@ -146,10 +142,8 @@ mod tests {
     #[test]
     fn header_anomaly_scoring_detects_suspicious_headers_and_user_agents() {
         let scorer = scorer();
-        let signals = scorer.score_headers([
-            ("user-agent", "sqlmap/1.0"),
-            ("x-original-url", "/admin"),
-        ]);
+        let signals =
+            scorer.score_headers([("user-agent", "sqlmap/1.0"), ("x-original-url", "/admin")]);
 
         assert!(signals.iter().any(|signal| {
             signal.kind == RequestClassifierSignalKind::HeaderAnomaly

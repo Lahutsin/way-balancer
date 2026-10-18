@@ -177,8 +177,7 @@ impl Default for RequestClassificationPolicyConfig {
 mod tests {
     use super::{
         BodyInspectionScoringConfig, HeaderAnomalyScoringConfig,
-        RequestClassificationContextConfig,
-        RequestClassificationPolicyConfig,
+        RequestClassificationContextConfig, RequestClassificationPolicyConfig,
         RequestClassificationSignalWeightsConfig, RequestClassifierSensitivityConfig,
     };
 

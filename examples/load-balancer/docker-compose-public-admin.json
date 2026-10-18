@@ -2,6 +2,10 @@
   "api_version": "v1_alpha1",
   "name": "edge-public-admin-docker",
   "security": {
+    "insecure_dev_mode": {
+      "enabled": true,
+      "acknowledgement": "docker-compose local demo exposes plaintext admin listener inside container network"
+    },
     "artifact_verification": {
       "mode": "enforced",
       "trusted_signers": []

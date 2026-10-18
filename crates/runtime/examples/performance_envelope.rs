@@ -11,7 +11,8 @@ fn main() {
     let mode = parse_mode(arguments.clone());
     let profile = parse_profile(arguments.clone());
     let baseline = parse_string_flag(arguments.clone(), "--baseline");
-    let capture_control_plane_timing = has_flag(arguments.clone(), "--capture-control-plane-timing");
+    let capture_control_plane_timing =
+        has_flag(arguments.clone(), "--capture-control-plane-timing");
     let timing_evidence_source = parse_string_flag(arguments.clone(), "--timing-evidence-source");
     let mut timing = ControlPlaneTimingEvidence {
         reload_success_ms: parse_u64_flag(arguments.clone(), "--observed-reload-success-ms"),
@@ -29,14 +30,12 @@ fn main() {
         timing = merge_control_plane_timing(captured, timing);
     }
 
-    let report = run_or_exit(
-        runtime.block_on(build_performance_envelope_artifact(
-            mode,
-            profile,
-            timing,
-            baseline.as_deref(),
-        )),
-    );
+    let report = run_or_exit(runtime.block_on(build_performance_envelope_artifact(
+        mode,
+        profile,
+        timing,
+        baseline.as_deref(),
+    )));
 
     let json = run_or_exit(serde_json::to_string_pretty(&report).map_err(Into::into));
     println!("{json}");

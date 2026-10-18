@@ -14,10 +14,7 @@ pub struct RequestHedgingPolicy {
 
 impl Default for RequestHedgingPolicy {
     fn default() -> Self {
-        Self {
-            hedge_delay: Duration::from_millis(20),
-            max_attempts: 2,
-        }
+        Self { hedge_delay: Duration::from_millis(20), max_attempts: 2 }
     }
 }
 
@@ -41,6 +38,7 @@ pub struct HedgeOutcome {
 /// - first successful attempt wins and cancels the other attempt
 /// - if one attempt fails, waits for the other attempt
 /// - if both fail, returns the first failure
+#[allow(clippy::expect_used)]
 pub async fn execute_with_hedge<T, E, A, B, AFut, BFut, AllowHedge>(
     policy: RequestHedgingPolicy,
     allow_hedge: AllowHedge,
@@ -59,31 +57,15 @@ where
     let mut primary_handle = tokio::spawn(primary_attempt());
 
     if !policy.enabled() || !allow_hedge() {
-        let value = primary_handle
-            .await
-            .expect("primary hedged task must not panic")?;
-        return Ok((
-            value,
-            HedgeOutcome {
-                hedge_launched: false,
-                winner_attempt: 1,
-            },
-        ));
+        let value = primary_handle.await.expect("primary hedged task must not panic")?;
+        return Ok((value, HedgeOutcome { hedge_launched: false, winner_attempt: 1 }));
     }
 
     tokio::time::sleep(policy.hedge_delay).await;
 
     if primary_handle.is_finished() {
-        let value = primary_handle
-            .await
-            .expect("primary hedged task must not panic")?;
-        return Ok((
-            value,
-            HedgeOutcome {
-                hedge_launched: false,
-                winner_attempt: 1,
-            },
-        ));
+        let value = primary_handle.await.expect("primary hedged task must not panic")?;
+        return Ok((value, HedgeOutcome { hedge_launched: false, winner_attempt: 1 }));
     }
 
     let mut hedge_handle = tokio::spawn(hedge_attempt());
@@ -117,31 +99,16 @@ where
 
     // One attempt already failed. Await the other one for a possible recovery success.
     if winner == 1 {
-        match primary_handle
-            .await
-            .expect("primary hedged task must not panic")
-        {
+        match primary_handle.await.expect("primary hedged task must not panic") {
             Ok(value) => {
-                return Ok((
-                    value,
-                    HedgeOutcome {
-                        hedge_launched: true,
-                        winner_attempt: 1,
-                    },
-                ));
+                return Ok((value, HedgeOutcome { hedge_launched: true, winner_attempt: 1 }));
             }
             Err(error) => return Err(first_error.unwrap_or(error)),
         }
     }
 
     match hedge_handle.await.expect("hedge task must not panic") {
-        Ok(value) => Ok((
-            value,
-            HedgeOutcome {
-                hedge_launched: true,
-                winner_attempt: 2,
-            },
-        )),
+        Ok(value) => Ok((value, HedgeOutcome { hedge_launched: true, winner_attempt: 2 })),
         Err(error) => Err(first_error.unwrap_or(error)),
     }
 }
@@ -165,10 +132,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn hedge_selects_faster_second_attempt() -> Result<(), Box<dyn std::error::Error>> {
-        let policy = RequestHedgingPolicy {
-            hedge_delay: Duration::from_millis(5),
-            max_attempts: 2,
-        };
+        let policy =
+            RequestHedgingPolicy { hedge_delay: Duration::from_millis(5), max_attempts: 2 };
 
         let result = execute_with_hedge(
             policy,
@@ -193,10 +158,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn hedge_is_not_launched_when_budget_denies() -> Result<(), Box<dyn std::error::Error>> {
         let attempts = Arc::new(AtomicU8::new(0));
-        let policy = RequestHedgingPolicy {
-            hedge_delay: Duration::from_millis(5),
-            max_attempts: 2,
-        };
+        let policy =
+            RequestHedgingPolicy { hedge_delay: Duration::from_millis(5), max_attempts: 2 };
         let attempts_for_primary = Arc::clone(&attempts);
 
         let result = execute_with_hedge(
@@ -209,9 +172,7 @@ mod tests {
                     Ok::<_, &'static str>("primary")
                 }
             },
-            || async {
-                Ok::<_, &'static str>("hedge")
-            },
+            || async { Ok::<_, &'static str>("hedge") },
         )
         .await?;
 
@@ -223,10 +184,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn loser_attempt_is_cancelled_after_winner() -> Result<(), Box<dyn std::error::Error>> {
-        let policy = RequestHedgingPolicy {
-            hedge_delay: Duration::from_millis(1),
-            max_attempts: 2,
-        };
+        let policy =
+            RequestHedgingPolicy { hedge_delay: Duration::from_millis(1), max_attempts: 2 };
         let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
 
         let result = execute_with_hedge(
@@ -251,10 +210,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn helper_obeys_external_timeout_bound() -> Result<(), Box<dyn std::error::Error>> {
-        let policy = RequestHedgingPolicy {
-            hedge_delay: Duration::from_millis(1),
-            max_attempts: 2,
-        };
+        let policy =
+            RequestHedgingPolicy { hedge_delay: Duration::from_millis(1), max_attempts: 2 };
 
         let bounded = tokio::time::timeout(
             Duration::from_millis(50),

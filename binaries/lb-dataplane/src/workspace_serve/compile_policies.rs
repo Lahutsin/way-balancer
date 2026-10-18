@@ -221,31 +221,48 @@ fn compile_route_destination_policy_runtime(
                         diagnostic,
                     )?;
 
+                    let traffic_mirror = diagnostic
+                        .traffic_mirror
+                        .as_ref()
+                        .map(|policy_name| {
+                            config
+                                .policies
+                                .traffic_mirrors
+                                .iter()
+                                .find(|policy| policy.name == *policy_name)
+                                .map(|policy| policy.spec.clone())
+                                .ok_or_else(|| {
+                                    to_dyn_error(format!(
+                                        "missing traffic mirroring policy {policy_name}"
+                                    ))
+                                })
+                        })
+                        .transpose()?;
+                    let fault_injection = diagnostic
+                        .fault_injection
+                        .as_ref()
+                        .map(|policy_name| {
+                            config
+                                .policies
+                                .fault_injections
+                                .iter()
+                                .find(|policy| policy.name == *policy_name)
+                                .map(|policy| policy.spec.clone())
+                                .ok_or_else(|| {
+                                    to_dyn_error(format!(
+                                        "missing fault injection policy {policy_name}"
+                                    ))
+                                })
+                        })
+                        .transpose()?;
+
                     Ok((
                         diagnostic.upstream_cluster.clone(),
                         lb_runtime::RouteDestinationPolicyRuntime {
                             request_transform: diagnostic.effective_request_transform.clone(),
                             response_transform: diagnostic.effective_response_transform.clone(),
-                            traffic_mirror: diagnostic.traffic_mirror.as_ref().map(|policy_name| {
-                                config
-                                    .policies
-                                    .traffic_mirrors
-                                    .iter()
-                                    .find(|policy| policy.name == *policy_name)
-                                    .expect("validated traffic mirroring policy reference")
-                                    .spec
-                                    .clone()
-                            }),
-                                    fault_injection: diagnostic.fault_injection.as_ref().map(|policy_name| {
-                                    config
-                                        .policies
-                                        .fault_injections
-                                        .iter()
-                                        .find(|policy| policy.name == *policy_name)
-                                        .expect("validated fault injection policy reference")
-                                        .spec
-                                        .clone()
-                                    }),
+                            traffic_mirror,
+                            fault_injection,
                             rate_limiters,
                             concurrency_limiters,
                             failure_manager,

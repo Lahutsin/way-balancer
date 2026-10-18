@@ -52,16 +52,12 @@ pub struct LifecycleStateMachine {
 impl LifecycleStateMachine {
     #[must_use]
     pub const fn new_warming() -> Self {
-        Self {
-            state: LifecycleState::Warming,
-        }
+        Self { state: LifecycleState::Warming }
     }
 
     #[must_use]
     pub const fn new_active() -> Self {
-        Self {
-            state: LifecycleState::Active,
-        }
+        Self { state: LifecycleState::Active }
     }
 
     #[must_use]
@@ -76,10 +72,7 @@ impl LifecycleStateMachine {
                 Ok(())
             }
             LifecycleState::Active => Ok(()),
-            state => Err(LifecycleTransitionError {
-                from: state,
-                action: "activate",
-            }),
+            state => Err(LifecycleTransitionError { from: state, action: "activate" }),
         }
     }
 
@@ -90,10 +83,7 @@ impl LifecycleStateMachine {
                 Ok(())
             }
             LifecycleState::Draining => Ok(()),
-            state => Err(LifecycleTransitionError {
-                from: state,
-                action: "start_draining",
-            }),
+            state => Err(LifecycleTransitionError { from: state, action: "start_draining" }),
         }
     }
 
@@ -104,10 +94,7 @@ impl LifecycleStateMachine {
                 Ok(())
             }
             LifecycleState::Drained => Ok(()),
-            state => Err(LifecycleTransitionError {
-                from: state,
-                action: "mark_drained",
-            }),
+            state => Err(LifecycleTransitionError { from: state, action: "mark_drained" }),
         }
     }
 
@@ -118,10 +105,7 @@ impl LifecycleStateMachine {
                 Ok(())
             }
             LifecycleState::Removed => Ok(()),
-            state => Err(LifecycleTransitionError {
-                from: state,
-                action: "mark_removed",
-            }),
+            state => Err(LifecycleTransitionError { from: state, action: "mark_removed" }),
         }
     }
 

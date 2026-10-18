@@ -11,8 +11,8 @@ mod policy;
 mod request_classification;
 mod route;
 mod security;
-mod upstream;
 mod upgrade;
+mod upstream;
 mod validator;
 
 pub use compiler::{
@@ -41,37 +41,33 @@ pub use limits::{
 pub use listener::{
     AdminAuditConfig, AdminAuthPolicyConfig, AdminAuthorizationScopeConfig,
     AdminListenerPolicyConfig, AdminOperatorConfig, AdminRateLimitConfig,
-    ListenerAlpnProtocolConfig, ListenerBindModeConfig, ListenerCertificateSourceConfig, ListenerClassConfig,
-    ListenerProtocolConfig, ListenerResourceConfig, ListenerTlsMinimumVersionConfig,
-    ProxyProtocolModeConfig,
-    ListenerTlsSessionResumptionConfig, ListenerTlsSessionResumptionModeConfig,
-    ListenerTlsSniCertificateConfig, ListenerTlsTerminationConfig,
+    ListenerAlpnProtocolConfig, ListenerBindModeConfig, ListenerCertificateSourceConfig,
+    ListenerClassConfig, ListenerProtocolConfig, ListenerResourceConfig,
+    ListenerTlsMinimumVersionConfig, ListenerTlsSessionResumptionConfig,
+    ListenerTlsSessionResumptionModeConfig, ListenerTlsSniCertificateConfig,
+    ListenerTlsTerminationConfig, ProxyProtocolModeConfig,
 };
 pub use overload_policy::{
     BrownoutFeatureConfig, OverloadResponsePolicyConfig, TrafficClassConfig,
 };
 pub use policy::{
     AuthorizationCacheBehaviorConfig, CacheKeyPolicyConfig, CacheQueryKeyBehaviorConfig,
+    FaultInjectionAbortConfig, FaultInjectionDelayConfig, FaultInjectionPolicyConfig,
     HeaderMutationConfig, HostileEdgeHandshakeGuardConfig, HostileEdgeProtectionPolicyConfig,
     HostileEdgeSourceAggregationConfig, HostileEdgeSourceQuotaConfig, HttpCacheMethodConfig,
-    HttpCachePolicyConfig, HttpCacheStorageConfig, NamedBrownoutFeatureConfig,
-    NamedCircuitBreakerPolicyConfig, NamedHostileEdgeProtectionPolicyConfig,
-    NamedHttpCachePolicyConfig, NamedLocalConcurrencyLimitPolicyConfig,
+    HttpCachePolicyConfig, HttpCacheStorageConfig, NamedAuthorizationPolicyConfig,
+    NamedBrownoutFeatureConfig, NamedCircuitBreakerPolicyConfig, NamedExternalAuthPolicyConfig,
+    NamedFaultInjectionPolicyConfig, NamedHostileEdgeProtectionPolicyConfig,
+    NamedHttpCachePolicyConfig, NamedJwtAuthPolicyConfig, NamedLocalConcurrencyLimitPolicyConfig,
     NamedLocalRateLimitPolicyConfig, NamedOverloadResponsePolicyConfig,
-    NamedAuthorizationPolicyConfig, NamedExternalAuthPolicyConfig,
-    NamedFaultInjectionPolicyConfig,
-    NamedJwtAuthPolicyConfig, NamedUpstreamIdentityPolicyConfig,
-    NamedRetryBudgetPolicyConfig, NamedTimeoutHierarchyPolicyConfig,
-    NamedTrafficMirrorPolicyConfig,
-    NamedRequestClassificationPolicyConfig, NamedTransformPolicyConfig,
-    PathRewriteTransformConfig, PolicyBindingConfig,
+    NamedRequestClassificationPolicyConfig, NamedRetryBudgetPolicyConfig,
+    NamedTimeoutHierarchyPolicyConfig, NamedTrafficMirrorPolicyConfig, NamedTransformPolicyConfig,
+    NamedUpstreamIdentityPolicyConfig, PathRewriteTransformConfig, PolicyBindingConfig,
     PolicyResourcesConfig, RequestTransformConfig, ResponseTransformConfig,
-    TrafficMirrorPolicyConfig, TransformPolicyConfig, FaultInjectionPolicyConfig,
-    FaultInjectionDelayConfig, FaultInjectionAbortConfig,
+    TrafficMirrorPolicyConfig, TransformPolicyConfig,
 };
 pub use request_classification::{
-    BodyInspectionScoringConfig, HeaderAnomalyScoringConfig,
-    RequestClassificationContextConfig,
+    BodyInspectionScoringConfig, HeaderAnomalyScoringConfig, RequestClassificationContextConfig,
     RequestClassificationPolicyConfig, RequestClassificationSignalWeightsConfig,
     RequestClassifierSensitivityConfig,
 };
@@ -85,14 +81,13 @@ pub use security::{
     ArtifactVerificationMode, InsecureDevModeConfig, TrustedArtifactSignerConfig,
     TrustedClientIpConfig, WorkspaceSecurityConfig,
 };
+pub use upgrade::{UpgradePolicyConfig, UpgradeProtocolConfig};
 pub use upstream::{
     AffinityFallbackConfig, AffinityPolicyConfig, DiscoverySourceConfig, EndpointStateConfig,
     LoadBalancingAlgorithmConfig, LocalityRoutingConfig, NoHealthyFallbackConfig,
     UpstreamClusterConfig, UpstreamEndpointConfig, UpstreamTrafficPolicyConfig,
-    UpstreamTransportConfig,
-    WorkspaceConfigError,
+    UpstreamTransportConfig, WorkspaceConfigError,
 };
-pub use upgrade::{UpgradePolicyConfig, UpgradeProtocolConfig};
 pub use validator::{
     ConfigValidationStats, ValidationCategory, ValidationCode, ValidationError, ValidationReport,
     WorkspaceConfigValidator,
@@ -263,8 +258,7 @@ mod tests {
         ListenerTlsSessionResumptionConfig, ListenerTlsSessionResumptionModeConfig,
         ListenerTlsSniCertificateConfig, ListenerTlsTerminationConfig, PolicyBindingConfig,
         RouteConfig, UpstreamClusterConfig, UpstreamEndpointConfig, UpstreamTrafficPolicyConfig,
-        UpstreamTransportConfig,
-        WorkspaceConfig, WorkspaceConfigParser,
+        UpstreamTransportConfig, WorkspaceConfig, WorkspaceConfigParser,
     };
 
     #[test]
@@ -484,11 +478,7 @@ mod tests {
         assert_eq!(config.policies.traffic_mirrors[0].spec.percentage, 20);
         assert_eq!(config.policies.fault_injections.len(), 1);
         assert_eq!(
-            config.policies.fault_injections[0]
-                .spec
-                .abort
-                .as_ref()
-                .map(|abort| abort.http_status),
+            config.policies.fault_injections[0].spec.abort.as_ref().map(|abort| abort.http_status),
             Some(503)
         );
         match &config.routes[0].match_rule {
@@ -515,10 +505,7 @@ mod tests {
         assert_eq!(config.routes[0].policies.cache_policy.as_deref(), Some("public-cache"));
         assert_eq!(config.upstream_clusters[0].endpoints[0].state, EndpointStateConfig::Ready);
         assert_eq!(config.policies.timeout_hierarchies.len(), 1);
-        assert_eq!(
-            config.policies.timeout_hierarchies[0].spec.per_try_timeout_ms,
-            Some(8_000)
-        );
+        assert_eq!(config.policies.timeout_hierarchies[0].spec.per_try_timeout_ms, Some(8_000));
         assert_eq!(config.policies.http_caches.len(), 1);
         assert_eq!(
             config.policies.http_caches[0].spec.authorization,

@@ -120,7 +120,8 @@ impl RoutePrefixRule {
     /// Restricts a prefix rule to the provided normalized HTTP methods.
     #[must_use]
     pub fn with_methods(mut self, methods: Vec<String>) -> Self {
-        self.methods = methods.into_iter().map(|method| method.trim().to_ascii_uppercase()).collect();
+        self.methods =
+            methods.into_iter().map(|method| method.trim().to_ascii_uppercase()).collect();
         self
     }
 
@@ -195,10 +196,7 @@ pub fn normalize_grpc_service_match(value: &str) -> Option<String> {
         return None;
     }
 
-    normalized
-        .split('.')
-        .all(is_valid_grpc_identifier)
-        .then(|| normalized.to_string())
+    normalized.split('.').all(is_valid_grpc_identifier).then(|| normalized.to_string())
 }
 
 #[must_use]
@@ -840,10 +838,7 @@ pub fn extract_grpc_path_components(path: &str) -> Option<(String, String)> {
         return None;
     }
 
-    Some((
-        normalize_grpc_service_match(service)?,
-        normalize_grpc_method_match(method)?,
-    ))
+    Some((normalize_grpc_service_match(service)?, normalize_grpc_method_match(method)?))
 }
 
 /// Enforces explicit HTTP/1.1 hardening rules for ambiguous framing and host handling.
@@ -1004,17 +999,17 @@ fn route_rule_matches(rule: &RoutePrefixRule, input: &CanonicalRouteMatchInput) 
                 .as_deref()
                 .is_some_and(|value| rule.methods.iter().any(|method| method == value)))
         && rule.header_matches.iter().all(|matcher| header_match_satisfied(matcher, &input.headers))
-        && rule.query_matches.iter().all(|matcher| query_match_satisfied(matcher, &input.query_pairs))
+        && rule
+            .query_matches
+            .iter()
+            .all(|matcher| query_match_satisfied(matcher, &input.query_pairs))
         && (rule.content_types.is_empty()
-            || input
-                .content_type
-                .as_deref()
-                .is_some_and(|value| {
-                    rule.content_types.iter().any(|content_type| {
-                        content_type == value
-                            || (content_type == "application/grpc" && is_grpc_content_type(value))
-                    })
-                }))
+            || input.content_type.as_deref().is_some_and(|value| {
+                rule.content_types.iter().any(|content_type| {
+                    content_type == value
+                        || (content_type == "application/grpc" && is_grpc_content_type(value))
+                })
+            }))
         && (rule.grpc_services.is_empty()
             || input
                 .grpc_service
@@ -1034,9 +1029,9 @@ fn route_rule_matches(rule: &RoutePrefixRule, input: &CanonicalRouteMatchInput) 
 
 fn header_match_satisfied(matcher: &RouteHeaderMatch, headers: &[HttpHeader]) -> bool {
     match matcher {
-        RouteHeaderMatch::Exact { name, value } => headers.iter().any(|header| {
-            header.name.eq_ignore_ascii_case(name) && header.value.trim() == value
-        }),
+        RouteHeaderMatch::Exact { name, value } => headers
+            .iter()
+            .any(|header| header.name.eq_ignore_ascii_case(name) && header.value.trim() == value),
         RouteHeaderMatch::Present { name } => {
             headers.iter().any(|header| header.name.eq_ignore_ascii_case(name))
         }
@@ -1048,11 +1043,15 @@ fn header_match_satisfied(matcher: &RouteHeaderMatch, headers: &[HttpHeader]) ->
 
 fn query_match_satisfied(matcher: &RouteQueryMatch, query_pairs: &[(String, String)]) -> bool {
     match matcher {
-        RouteQueryMatch::Exact { name, value } => {
-            query_pairs.iter().any(|(query_name, query_value)| query_name == name && query_value == value)
+        RouteQueryMatch::Exact { name, value } => query_pairs
+            .iter()
+            .any(|(query_name, query_value)| query_name == name && query_value == value),
+        RouteQueryMatch::Present { name } => {
+            query_pairs.iter().any(|(query_name, _)| query_name == name)
         }
-        RouteQueryMatch::Present { name } => query_pairs.iter().any(|(query_name, _)| query_name == name),
-        RouteQueryMatch::Absent { name } => !query_pairs.iter().any(|(query_name, _)| query_name == name),
+        RouteQueryMatch::Absent { name } => {
+            !query_pairs.iter().any(|(query_name, _)| query_name == name)
+        }
     }
 }
 
@@ -1076,20 +1075,7 @@ fn split_path_and_query(path_and_query: &str) -> (&str, &str) {
 fn is_http_token_char(character: char) -> bool {
     matches!(
         character,
-        '!' | '#'
-            | '$'
-            | '%'
-            | '&'
-            | '\''
-            | '*'
-            | '+'
-            | '-'
-            | '.'
-            | '^'
-            | '_'
-            | '`'
-            | '|'
-            | '~'
+        '!' | '#' | '$' | '%' | '&' | '\'' | '*' | '+' | '-' | '.' | '^' | '_' | '`' | '|' | '~'
     ) || character.is_ascii_alphanumeric()
 }
 
@@ -1247,15 +1233,16 @@ fn default_reason(status: u16) -> &'static str {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::{
-        canonicalize_host, canonicalize_request_target, encode_request_head, is_grpc_content_type,
-        is_grpc_request, match_route_prefix, match_route_request, match_route_request_with_context,
+        canonicalize_host, canonicalize_query_match_name, canonicalize_query_match_value,
+        canonicalize_request_target, encode_request_head, is_grpc_content_type, is_grpc_request,
+        match_route_prefix, match_route_request, match_route_request_with_context,
         match_route_request_with_method, normalize_content_type_match, normalize_http_header_name,
         normalize_http_method, normalize_request_headers, validate_http1_request_hardening,
-        BodyKind, Http1Limits, Http2Limits, HttpHeader, ProtocolHardeningError,
-        RequestTargetError, RouteHeaderMatch, RouteMatchInput, RoutePrefixRule, RouteQueryMatch,
-        SupportedHttpVersion, canonicalize_query_match_name, canonicalize_query_match_value,
+        BodyKind, Http1Limits, Http2Limits, HttpHeader, ProtocolHardeningError, RequestTargetError,
+        RouteHeaderMatch, RouteMatchInput, RoutePrefixRule, RouteQueryMatch, SupportedHttpVersion,
     };
 
     #[test]
@@ -1282,12 +1269,11 @@ mod tests {
 
     #[test]
     fn route_matching_can_filter_by_method() {
-        let routes = vec![RoutePrefixRule::new("writes", "/api")
-            .with_methods(vec![String::from("post")])];
+        let routes =
+            vec![RoutePrefixRule::new("writes", "/api").with_methods(vec![String::from("post")])];
 
         let matched = match_route_request_with_method("/api/v1/items", None, Some("POST"), &routes);
-        let rejected =
-            match_route_request_with_method("/api/v1/items", None, Some("GET"), &routes);
+        let rejected = match_route_request_with_method("/api/v1/items", None, Some("GET"), &routes);
 
         assert_eq!(matched.map(|route| route.label), Some(String::from("writes")));
         assert_eq!(rejected, None);
@@ -1344,7 +1330,10 @@ mod tests {
     #[test]
     fn canonicalize_query_match_components_validate_shape() {
         assert_eq!(canonicalize_query_match_name("auth"), Ok(String::from("auth")));
-        assert_eq!(canonicalize_query_match_value("user%2Falpha"), Ok(String::from("user%2Falpha")));
+        assert_eq!(
+            canonicalize_query_match_value("user%2Falpha"),
+            Ok(String::from("user%2Falpha"))
+        );
         assert!(canonicalize_query_match_name("").is_err());
         assert!(canonicalize_query_match_name("a=b").is_err());
     }

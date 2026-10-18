@@ -29,7 +29,11 @@ impl RequestBodyInspector {
     }
 
     #[must_use]
-    pub fn score_body(&self, body: &[u8], content_type: Option<&str>) -> Vec<RequestClassifierSignal> {
+    pub fn score_body(
+        &self,
+        body: &[u8],
+        content_type: Option<&str>,
+    ) -> Vec<RequestClassifierSignal> {
         let mut signals = Vec::new();
 
         if body.len() as u32 > self.config.max_body_bytes {
@@ -44,9 +48,8 @@ impl RequestBodyInspector {
             });
         }
 
-        let normalized_content_type = content_type
-            .map(|value| value.trim().to_ascii_lowercase())
-            .unwrap_or_default();
+        let normalized_content_type =
+            content_type.map(|value| value.trim().to_ascii_lowercase()).unwrap_or_default();
         let allowlisted = self
             .allowlisted_content_types
             .iter()
@@ -133,12 +136,8 @@ mod tests {
 
         let signals = inspector.score_body(payload, Some("application/json"));
 
-        assert!(signals
-            .iter()
-            .any(|signal| signal.detail.contains("max_body_bytes")));
-        assert!(signals
-            .iter()
-            .any(|signal| signal.detail.contains("16 inspected bytes")));
+        assert!(signals.iter().any(|signal| signal.detail.contains("max_body_bytes")));
+        assert!(signals.iter().any(|signal| signal.detail.contains("16 inspected bytes")));
     }
 
     #[test]
@@ -150,10 +149,7 @@ mod tests {
         };
         let inspector = RequestBodyInspector::from_config(&config);
 
-        let signals = inspector.score_body(
-            b"union select 1,2,3",
-            Some("application/grpc+proto"),
-        );
+        let signals = inspector.score_body(b"union select 1,2,3", Some("application/grpc+proto"));
 
         assert!(signals.is_empty());
     }

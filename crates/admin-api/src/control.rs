@@ -561,11 +561,8 @@ impl SnapshotControlService {
             return Err(SnapshotPublicationError::Conflict(error));
         }
 
-        let previous_record = self
-            .history
-            .last()
-            .and_then(|version| self.records_by_version.get(version))
-            .cloned();
+        let previous_record =
+            self.history.last().and_then(|version| self.records_by_version.get(version)).cloned();
         let record = PublishedSnapshotRecord {
             version: request.version.clone(),
             workspace_name: request.snapshot.workspace_name().to_owned(),
@@ -673,8 +670,8 @@ impl SnapshotControlService {
                 .collect(),
             audit_events: prune_publish_events(&self.audit_events, retention.max_audit_events),
         };
-        let payload_json =
-            serde_json::to_string_pretty(&payload).map_err(SnapshotRegistryStateError::Serialize)?;
+        let payload_json = serde_json::to_string_pretty(&payload)
+            .map_err(SnapshotRegistryStateError::Serialize)?;
         Ok(SnapshotRegistryDurableEnvelope {
             version: SNAPSHOT_REGISTRY_STATE_VERSION,
             payload_sha256: sha256_hex(payload_json.as_bytes()),
@@ -710,8 +707,10 @@ impl SnapshotControlService {
                 .restore_record(record.try_into_record()?)
                 .map_err(SnapshotRegistryStateError::Publication)?;
         }
-        service.audit_events = prune_publish_events(&payload.audit_events, retention.max_audit_events);
-        service.metrics.restore_success_count = service.metrics.restore_success_count.saturating_add(1);
+        service.audit_events =
+            prune_publish_events(&payload.audit_events, retention.max_audit_events);
+        service.metrics.restore_success_count =
+            service.metrics.restore_success_count.saturating_add(1);
         service.metrics.active_registry_size = service.records_by_version.len();
         Ok(service)
     }
@@ -754,7 +753,8 @@ impl SnapshotControlService {
         let baseline = match base_version {
             Some(version) => self.get_version(version).map_err(SnapshotDiffPreviewError::Lookup)?,
             None => {
-                let latest = self.history.last().ok_or(SnapshotDiffPreviewError::NoBaselineVersion)?;
+                let latest =
+                    self.history.last().ok_or(SnapshotDiffPreviewError::NoBaselineVersion)?;
                 self.records_by_version
                     .get(latest)
                     .ok_or(SnapshotDiffPreviewError::NoBaselineVersion)?
@@ -797,23 +797,27 @@ impl SnapshotControlService {
         .map_err(SnapshotPublicationError::InvalidRequest)?;
 
         if let Some(existing) = self.records_by_version.get(&record.version) {
-            return Err(SnapshotPublicationError::Conflict(PublishConflict::VersionAlreadyExists {
-                version: existing.version.clone(),
-                existing_digest_sha256: existing.digest_sha256.clone(),
-            }));
+            return Err(SnapshotPublicationError::Conflict(
+                PublishConflict::VersionAlreadyExists {
+                    version: existing.version.clone(),
+                    existing_digest_sha256: existing.digest_sha256.clone(),
+                },
+            ));
         }
         if let Some(existing_version) = self.version_by_digest.get(&record.digest_sha256) {
-            return Err(SnapshotPublicationError::Conflict(PublishConflict::DigestAlreadyPublished {
-                digest_sha256: record.digest_sha256.clone(),
-                existing_version: existing_version.clone(),
-            }));
+            return Err(SnapshotPublicationError::Conflict(
+                PublishConflict::DigestAlreadyPublished {
+                    digest_sha256: record.digest_sha256.clone(),
+                    existing_version: existing_version.clone(),
+                },
+            ));
         }
 
-        self.version_by_digest
-            .insert(record.digest_sha256.clone(), record.version.clone());
+        self.version_by_digest.insert(record.digest_sha256.clone(), record.version.clone());
         self.history.push(record.version.clone());
         self.records_by_version.insert(record.version.clone(), record);
-        self.metrics.published_versions_count = self.records_by_version.len().try_into().unwrap_or(u64::MAX);
+        self.metrics.published_versions_count =
+            self.records_by_version.len().try_into().unwrap_or(u64::MAX);
         self.metrics.active_registry_size = self.records_by_version.len();
         Ok(())
     }
@@ -974,10 +978,8 @@ fn analyze_snapshot_impact(diff: &WorkspaceSnapshotDiff) -> SnapshotImpactAnalys
     let listeners = summarize_change_counts(&diff.listener_changes);
     let routes = summarize_change_counts(&diff.route_changes);
     let upstream_clusters = summarize_change_counts(&diff.upstream_cluster_changes);
-    let total_changes = listeners
-        .total()
-        .saturating_add(routes.total())
-        .saturating_add(upstream_clusters.total());
+    let total_changes =
+        listeners.total().saturating_add(routes.total()).saturating_add(upstream_clusters.total());
 
     let mut reasons = Vec::new();
 
@@ -985,7 +987,8 @@ fn analyze_snapshot_impact(diff: &WorkspaceSnapshotDiff) -> SnapshotImpactAnalys
         || listeners.updated > 0
         || routes.removed > 0
         || upstream_clusters.removed > 0;
-    let has_behavior_change = routes.updated > 0 || upstream_clusters.updated > 0 || listeners.added > 0;
+    let has_behavior_change =
+        routes.updated > 0 || upstream_clusters.updated > 0 || listeners.added > 0;
 
     let severity = if has_disruptive_change {
         reasons.push(String::from(
@@ -1017,11 +1020,7 @@ fn summarize_resource_changes(kind_label: &str, changes: &[SnapshotResourceChang
         return String::new();
     }
 
-    let mut entries = changes
-        .iter()
-        .take(4)
-        .map(summarize_resource_change)
-        .collect::<Vec<_>>();
+    let mut entries = changes.iter().take(4).map(summarize_resource_change).collect::<Vec<_>>();
     if changes.len() > 4 {
         entries.push(format!("and {} more", changes.len() - 4));
     }
@@ -1041,6 +1040,7 @@ fn summarize_resource_change(change: &SnapshotResourceChange) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use lb_config_model::WorkspaceConfig;
     use lb_test_support::{configure_test_trusted_signers, test_artifact_attestation};
@@ -1049,8 +1049,8 @@ mod tests {
         InvalidPublishRequest, PublishEventKind, PublishResponseKind, SnapshotBackupBundle,
         SnapshotControlService, SnapshotDiffPreviewError, SnapshotImpactSeverity,
         SnapshotLookupError, SnapshotPublicationError, SnapshotPublishRequest,
-        SnapshotRegistryDurableEnvelope,
-        SnapshotRegistryRetentionPolicy, SnapshotRegistryStateError, SnapshotRestoreError,
+        SnapshotRegistryDurableEnvelope, SnapshotRegistryRetentionPolicy,
+        SnapshotRegistryStateError, SnapshotRestoreError,
     };
 
     fn foundation_snapshot(
@@ -1236,9 +1236,7 @@ mod tests {
                 version: String::from("v1.0.0"),
                 snapshot: stable_snapshot.clone(),
                 artifact_attestation: Some(test_artifact_attestation(&stable_snapshot)?),
-                expected_digest_sha256: Some(
-                    stable_snapshot.metadata().digest_sha256().to_owned(),
-                ),
+                expected_digest_sha256: Some(stable_snapshot.metadata().digest_sha256().to_owned()),
                 published_by: Some(String::from("ops")),
                 reason: Some(String::from("stable baseline")),
             },
@@ -1250,9 +1248,7 @@ mod tests {
                 version: String::from("v1.1.0"),
                 snapshot: canary_snapshot.clone(),
                 artifact_attestation: Some(test_artifact_attestation(&canary_snapshot)?),
-                expected_digest_sha256: Some(
-                    canary_snapshot.metadata().digest_sha256().to_owned(),
-                ),
+                expected_digest_sha256: Some(canary_snapshot.metadata().digest_sha256().to_owned()),
                 published_by: Some(String::from("ops")),
                 reason: Some(String::from("increase canary weight")),
             },
@@ -1311,10 +1307,7 @@ mod tests {
 
         let preview = service.preview_diff(None, &candidate_snapshot)?;
         assert_eq!(preview.base_version, "canary-v2");
-        assert_eq!(
-            preview.base_digest_sha256,
-            canary_snapshot.metadata().digest_sha256()
-        );
+        assert_eq!(preview.base_digest_sha256, canary_snapshot.metadata().digest_sha256());
         Ok(())
     }
 
@@ -1683,8 +1676,7 @@ mod tests {
     }
 
     #[test]
-    fn durable_state_restore_rejects_checksum_mismatch(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn durable_state_restore_rejects_checksum_mismatch() -> Result<(), Box<dyn std::error::Error>> {
         let snapshot = foundation_snapshot()?;
         let mut service = SnapshotControlService::new();
         service.publish_at(
@@ -1749,9 +1741,10 @@ mod tests {
             200,
         )?;
 
-        let envelope = service.export_durable_state_with_retention(SnapshotRegistryRetentionPolicy {
-            max_audit_events: 2,
-        })?;
+        let envelope =
+            service.export_durable_state_with_retention(SnapshotRegistryRetentionPolicy {
+                max_audit_events: 2,
+            })?;
         let restored = SnapshotControlService::restore_durable_state_with_retention(
             &envelope,
             SnapshotRegistryRetentionPolicy { max_audit_events: 2 },
@@ -1765,7 +1758,8 @@ mod tests {
     }
 
     #[test]
-    fn durable_state_restore_rejects_unsupported_version() -> Result<(), Box<dyn std::error::Error>> {
+    fn durable_state_restore_rejects_unsupported_version() -> Result<(), Box<dyn std::error::Error>>
+    {
         let envelope = SnapshotRegistryDurableEnvelope {
             version: 999,
             payload_json: String::from("{}"),

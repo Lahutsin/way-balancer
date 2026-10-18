@@ -150,19 +150,13 @@ pub fn plan_staged_rollout(
             return Err(InvalidFleetStagedRolloutRequest::WaveIdTooLong);
         }
         if !wave_ids.insert(wave_id.to_string()) {
-            return Err(InvalidFleetStagedRolloutRequest::DuplicateWaveId(
-                wave_id.to_string(),
-            ));
+            return Err(InvalidFleetStagedRolloutRequest::DuplicateWaveId(wave_id.to_string()));
         }
         if wave.node_ids.is_empty() {
-            return Err(InvalidFleetStagedRolloutRequest::EmptyWaveNodes(
-                wave_id.to_string(),
-            ));
+            return Err(InvalidFleetStagedRolloutRequest::EmptyWaveNodes(wave_id.to_string()));
         }
         if wave.max_parallel == 0 {
-            return Err(InvalidFleetStagedRolloutRequest::ZeroMaxParallel(
-                wave_id.to_string(),
-            ));
+            return Err(InvalidFleetStagedRolloutRequest::ZeroMaxParallel(wave_id.to_string()));
         }
         if wave.max_parallel > wave.node_ids.len() {
             return Err(InvalidFleetStagedRolloutRequest::MaxParallelExceedsWaveSize(
@@ -175,9 +169,7 @@ pub fn plan_staged_rollout(
             ));
         }
         if wave.gate_policy.timeout_ms == 0 {
-            return Err(InvalidFleetStagedRolloutRequest::ZeroGateTimeout(
-                wave_id.to_string(),
-            ));
+            return Err(InvalidFleetStagedRolloutRequest::ZeroGateTimeout(wave_id.to_string()));
         }
         if wave.gate_policy.min_ready_percent == 0 || wave.gate_policy.min_ready_percent > 100 {
             return Err(InvalidFleetStagedRolloutRequest::InvalidGateReadyPercent(
@@ -208,20 +200,15 @@ pub fn plan_staged_rollout(
 
     for node_id in &expected_nodes {
         if !assigned_nodes.contains(node_id) {
-            return Err(InvalidFleetStagedRolloutRequest::UnassignedNode(
-                node_id.to_string(),
-            ));
+            return Err(InvalidFleetStagedRolloutRequest::UnassignedNode(node_id.to_string()));
         }
     }
 
-    Ok(FleetStagedRolloutPlan {
-        rollout: request.rollout,
-        waves: request.waves,
-        node_to_wave,
-    })
+    Ok(FleetStagedRolloutPlan { rollout: request.rollout, waves: request.waves, node_to_wave })
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::{
         plan_staged_rollout, FleetHealthGateMode, FleetHealthGatePolicy,

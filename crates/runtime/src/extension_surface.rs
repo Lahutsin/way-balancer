@@ -55,9 +55,7 @@ impl ExtensionCompatibilityPolicy {
         for version in supported_api_versions {
             versions.insert(version.into());
         }
-        Self {
-            supported_api_versions: versions,
-        }
+        Self { supported_api_versions: versions }
     }
 
     #[must_use]
@@ -184,14 +182,8 @@ pub struct PolicyPluginEvaluationOutcome {
 pub enum PolicyPluginRegistryError {
     DuplicatePlugin { name: String },
     UnknownPlugin { name: String },
-    DescriptorNameMismatch {
-        registration_name: String,
-        descriptor_name: String,
-    },
-    IncompatibleApiVersion {
-        plugin_name: String,
-        api_version: String,
-    },
+    DescriptorNameMismatch { registration_name: String, descriptor_name: String },
+    IncompatibleApiVersion { plugin_name: String, api_version: String },
     PluginDisabledRequired { name: String },
     PluginExecutionFailed { name: String, reason: String },
     PluginExecutionTimedOut { name: String },
@@ -216,11 +208,7 @@ pub struct PolicyPluginIsolationPolicy {
 
 impl Default for PolicyPluginIsolationPolicy {
     fn default() -> Self {
-        Self {
-            execution_timeout_ms: 250,
-            max_consecutive_failures: 3,
-            isolation_cooldown_secs: 30,
-        }
+        Self { execution_timeout_ms: 250, max_consecutive_failures: 3, isolation_cooldown_secs: 30 }
     }
 }
 
@@ -235,7 +223,10 @@ pub struct PolicyPluginRegistry {
 impl PolicyPluginRegistry {
     #[must_use]
     pub fn new(compatibility_policy: ExtensionCompatibilityPolicy) -> Self {
-        Self::new_with_isolation_policy(compatibility_policy, PolicyPluginIsolationPolicy::default())
+        Self::new_with_isolation_policy(
+            compatibility_policy,
+            PolicyPluginIsolationPolicy::default(),
+        )
     }
 
     #[must_use]
@@ -243,11 +234,7 @@ impl PolicyPluginRegistry {
         compatibility_policy: ExtensionCompatibilityPolicy,
         isolation_policy: PolicyPluginIsolationPolicy,
     ) -> Self {
-        Self {
-            compatibility_policy,
-            isolation_policy,
-            plugins: BTreeMap::new(),
-        }
+        Self { compatibility_policy, isolation_policy, plugins: BTreeMap::new() }
     }
 
     pub fn register(
@@ -295,9 +282,7 @@ impl PolicyPluginRegistry {
         disabled: bool,
     ) -> Result<(), PolicyPluginRegistryError> {
         let Some(entry) = self.plugins.get_mut(plugin_name) else {
-            return Err(PolicyPluginRegistryError::UnknownPlugin {
-                name: plugin_name.to_string(),
-            });
+            return Err(PolicyPluginRegistryError::UnknownPlugin { name: plugin_name.to_string() });
         };
         entry.disabled = disabled;
         Ok(())
@@ -309,15 +294,10 @@ impl PolicyPluginRegistry {
         request: &PolicyPluginRequestContext,
     ) -> Result<PolicyPluginEvaluationOutcome, PolicyPluginRegistryError> {
         let Some(entry) = self.plugins.get_mut(plugin_name) else {
-            return Err(PolicyPluginRegistryError::UnknownPlugin {
-                name: plugin_name.to_string(),
-            });
+            return Err(PolicyPluginRegistryError::UnknownPlugin { name: plugin_name.to_string() });
         };
 
-        if entry
-            .isolated_until
-            .is_some_and(|deadline| Instant::now() < deadline)
-        {
+        if entry.isolated_until.is_some_and(|deadline| Instant::now() < deadline) {
             if entry.registration.required {
                 return Err(PolicyPluginRegistryError::PluginExecutionFailed {
                     name: plugin_name.to_string(),
@@ -406,9 +386,8 @@ impl PolicyPluginRegistry {
 fn record_plugin_failure(entry: &mut RegisteredPolicyPlugin, policy: PolicyPluginIsolationPolicy) {
     entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
     if entry.consecutive_failures >= policy.max_consecutive_failures.max(1) {
-        entry.isolated_until = Some(
-            Instant::now() + Duration::from_secs(policy.isolation_cooldown_secs.max(1)),
-        );
+        entry.isolated_until =
+            Some(Instant::now() + Duration::from_secs(policy.isolation_cooldown_secs.max(1)));
         entry.consecutive_failures = 0;
     }
 }
@@ -427,9 +406,9 @@ fn execute_policy_plugin_with_timeout(
 
     match receiver.recv_timeout(timeout) {
         Ok(Ok(result)) => Ok(result),
-        Ok(Err(_)) => Err(PolicyPluginRegistryError::PluginPanicked {
-            name: plugin_name.to_string(),
-        }),
+        Ok(Err(_)) => {
+            Err(PolicyPluginRegistryError::PluginPanicked { name: plugin_name.to_string() })
+        }
         Err(mpsc::RecvTimeoutError::Timeout) => {
             Err(PolicyPluginRegistryError::PluginExecutionTimedOut {
                 name: plugin_name.to_string(),
@@ -535,12 +514,16 @@ impl<'a> RuntimeExternalAuthHook<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExtensionRegistryError {
-    DuplicateExtensionName { name: String },
+    DuplicateExtensionName {
+        name: String,
+    },
     IncompatibleApiVersion {
         extension_name: String,
         api_version: String,
     },
-    UnknownExtension { name: String },
+    UnknownExtension {
+        name: String,
+    },
     InvalidStateTransition {
         name: String,
         from: ExtensionLifecycleState,
@@ -558,10 +541,7 @@ pub struct ExtensionRegistry {
 impl ExtensionRegistry {
     #[must_use]
     pub fn new(compatibility_policy: ExtensionCompatibilityPolicy) -> Self {
-        Self {
-            compatibility_policy,
-            extensions: Vec::new(),
-        }
+        Self { compatibility_policy, extensions: Vec::new() }
     }
 
     #[must_use]
@@ -579,14 +559,8 @@ impl ExtensionRegistry {
         descriptor: ExtensionDescriptor,
         hooks: Vec<ExtensionHookBinding>,
     ) -> Result<(), ExtensionRegistryError> {
-        if self
-            .extensions
-            .iter()
-            .any(|extension| extension.descriptor.name == descriptor.name)
-        {
-            return Err(ExtensionRegistryError::DuplicateExtensionName {
-                name: descriptor.name,
-            });
+        if self.extensions.iter().any(|extension| extension.descriptor.name == descriptor.name) {
+            return Err(ExtensionRegistryError::DuplicateExtensionName { name: descriptor.name });
         }
 
         if !self.compatibility_policy.supports(&descriptor.api_version) {
@@ -613,11 +587,13 @@ impl ExtensionRegistry {
                 extension.failure_reason = None;
                 Ok(())
             }
-            ExtensionLifecycleState::Failed => Err(ExtensionRegistryError::InvalidStateTransition {
-                name: name.to_string(),
-                from: extension.state,
-                to: ExtensionLifecycleState::Active,
-            }),
+            ExtensionLifecycleState::Failed => {
+                Err(ExtensionRegistryError::InvalidStateTransition {
+                    name: name.to_string(),
+                    from: extension.state,
+                    to: ExtensionLifecycleState::Active,
+                })
+            }
             ExtensionLifecycleState::Active | ExtensionLifecycleState::Draining => Ok(()),
         }
     }
@@ -631,11 +607,13 @@ impl ExtensionRegistry {
             }
             ExtensionLifecycleState::Registered
             | ExtensionLifecycleState::Stopped
-            | ExtensionLifecycleState::Failed => Err(ExtensionRegistryError::InvalidStateTransition {
-                name: name.to_string(),
-                from: extension.state,
-                to: ExtensionLifecycleState::Draining,
-            }),
+            | ExtensionLifecycleState::Failed => {
+                Err(ExtensionRegistryError::InvalidStateTransition {
+                    name: name.to_string(),
+                    from: extension.state,
+                    to: ExtensionLifecycleState::Draining,
+                })
+            }
             ExtensionLifecycleState::Draining => Ok(()),
         }
     }
@@ -651,15 +629,21 @@ impl ExtensionRegistry {
                 Ok(())
             }
             ExtensionLifecycleState::Stopped => Ok(()),
-            ExtensionLifecycleState::Failed => Err(ExtensionRegistryError::InvalidStateTransition {
-                name: name.to_string(),
-                from: extension.state,
-                to: ExtensionLifecycleState::Stopped,
-            }),
+            ExtensionLifecycleState::Failed => {
+                Err(ExtensionRegistryError::InvalidStateTransition {
+                    name: name.to_string(),
+                    from: extension.state,
+                    to: ExtensionLifecycleState::Stopped,
+                })
+            }
         }
     }
 
-    pub fn fail(&mut self, name: &str, reason: impl Into<String>) -> Result<(), ExtensionRegistryError> {
+    pub fn fail(
+        &mut self,
+        name: &str,
+        reason: impl Into<String>,
+    ) -> Result<(), ExtensionRegistryError> {
         let extension = self.find_mut(name)?;
         extension.state = ExtensionLifecycleState::Failed;
         extension.failure_reason = Some(reason.into());
@@ -698,9 +682,7 @@ impl ExtensionRegistry {
         self.extensions
             .iter_mut()
             .find(|extension| extension.descriptor.name == name)
-            .ok_or_else(|| ExtensionRegistryError::UnknownExtension {
-                name: name.to_string(),
-            })
+            .ok_or_else(|| ExtensionRegistryError::UnknownExtension { name: name.to_string() })
     }
 }
 
@@ -711,6 +693,7 @@ impl Default for ExtensionRegistry {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 
@@ -824,10 +807,7 @@ mod tests {
     }
 
     fn request_headers_hook(priority: u16) -> ExtensionHookBinding {
-        ExtensionHookBinding {
-            phase: ExtensionHookPhase::RequestHeaders,
-            priority,
-        }
+        ExtensionHookBinding { phase: ExtensionHookPhase::RequestHeaders, priority }
     }
 
     fn external_auth_policy() -> crate::ExternalAuthPolicyRuntime {
@@ -883,10 +863,7 @@ mod tests {
         registry.activate("rate").expect("activate rate");
 
         let plan = registry.hook_execution_plan(ExtensionHookPhase::RequestHeaders);
-        let names = plan
-            .iter()
-            .map(|entry| entry.extension_name.clone())
-            .collect::<Vec<_>>();
+        let names = plan.iter().map(|entry| entry.extension_name.clone()).collect::<Vec<_>>();
 
         assert_eq!(names, vec!["rate", "a-auth", "z-auth"]);
     }
@@ -895,18 +872,11 @@ mod tests {
     fn lifecycle_transitions_enforce_safety_boundaries() {
         let mut registry = ExtensionRegistry::default();
         registry
-            .register(
-                descriptor("external-auth", "v1"),
-                vec![request_headers_hook(5)],
-            )
+            .register(descriptor("external-auth", "v1"), vec![request_headers_hook(5)])
             .expect("register extension");
 
-        registry
-            .activate("external-auth")
-            .expect("activate extension");
-        registry
-            .begin_drain("external-auth")
-            .expect("begin drain");
+        registry.activate("external-auth").expect("activate extension");
+        registry.begin_drain("external-auth").expect("begin drain");
         registry.stop("external-auth").expect("stop extension");
 
         let extension = registry
@@ -916,9 +886,8 @@ mod tests {
             .expect("extension must exist");
         assert_eq!(extension.state, ExtensionLifecycleState::Stopped);
 
-        let error = registry
-            .begin_drain("external-auth")
-            .expect_err("drain from stopped must fail");
+        let error =
+            registry.begin_drain("external-auth").expect_err("drain from stopped must fail");
         assert_eq!(
             error,
             ExtensionRegistryError::InvalidStateTransition {
@@ -937,24 +906,14 @@ mod tests {
         let request = hook.build_request(
             "GET",
             "/payments",
-            [
-                ("authorization", "Bearer token"),
-                ("x-device-id", "ios"),
-                ("x-ignore", "skip"),
-            ],
+            [("authorization", "Bearer token"), ("x-device-id", "ios"), ("x-ignore", "skip")],
         );
 
         assert_eq!(request.method, "GET");
         assert_eq!(request.path_and_query, "/payments");
         assert_eq!(request.headers.len(), 2);
-        assert_eq!(
-            request.headers.get("authorization"),
-            Some(&String::from("Bearer token"))
-        );
-        assert_eq!(
-            request.headers.get("x-device-id"),
-            Some(&String::from("ios"))
-        );
+        assert_eq!(request.headers.get("authorization"), Some(&String::from("Bearer token")));
+        assert_eq!(request.headers.get("x-device-id"), Some(&String::from("ios")));
     }
 
     #[test]
@@ -963,28 +922,17 @@ mod tests {
         let hook = RuntimeExternalAuthHook::new(&policy);
 
         let decision = ExternalAuthHookDecision {
-            context: [(String::from("principal"), String::from("alice"))]
-                .into_iter()
-                .collect(),
+            context: [(String::from("principal"), String::from("alice"))].into_iter().collect(),
             fail_open_applied: false,
         };
 
-        let headers = hook
-            .resolve_context_headers(&decision)
-            .expect("required mapping should resolve");
-        assert_eq!(
-            headers,
-            vec![(String::from("x-auth-principal"), String::from("alice"))]
-        );
+        let headers =
+            hook.resolve_context_headers(&decision).expect("required mapping should resolve");
+        assert_eq!(headers, vec![(String::from("x-auth-principal"), String::from("alice"))]);
 
-        let missing = ExternalAuthHookDecision {
-            context: BTreeMap::new(),
-            fail_open_applied: false,
-        };
-        assert_eq!(
-            hook.resolve_context_headers(&missing),
-            Err(ExternalAuthHookError::Denied)
-        );
+        let missing =
+            ExternalAuthHookDecision { context: BTreeMap::new(), fail_open_applied: false };
+        assert_eq!(hook.resolve_context_headers(&missing), Err(ExternalAuthHookError::Denied));
     }
 
     #[test]
@@ -1026,12 +974,8 @@ mod tests {
             "v1",
             PolicyPluginDecision::Allow,
         ));
-        registry
-            .register(registration, plugin)
-            .expect("plugin should register");
-        registry
-            .set_disabled("custom-authz", true)
-            .expect("plugin should disable");
+        registry.register(registration, plugin).expect("plugin should register");
+        registry.set_disabled("custom-authz", true).expect("plugin should disable");
 
         let outcome = registry
             .evaluate("custom-authz", &PolicyPluginRequestContext::default())
@@ -1053,12 +997,8 @@ mod tests {
             "v1",
             PolicyPluginDecision::Allow,
         ));
-        registry
-            .register(registration, plugin)
-            .expect("plugin should register");
-        registry
-            .set_disabled("required-authz", true)
-            .expect("plugin should disable");
+        registry.register(registration, plugin).expect("plugin should register");
+        registry.set_disabled("required-authz", true).expect("plugin should disable");
 
         let error = registry
             .evaluate("required-authz", &PolicyPluginRequestContext::default())
@@ -1133,9 +1073,7 @@ mod tests {
             .expect_err("panic should be contained and mapped to error");
         assert_eq!(
             error,
-            PolicyPluginRegistryError::PluginPanicked {
-                name: String::from("panic-authz"),
-            }
+            PolicyPluginRegistryError::PluginPanicked { name: String::from("panic-authz") }
         );
     }
 }

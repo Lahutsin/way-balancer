@@ -27,11 +27,7 @@ struct JwtDecodingKey {
 #[derive(Clone)]
 enum JwtKeySource {
     Inline(Vec<JwtDecodingKey>),
-    File {
-        path: String,
-        refresh_secs: u64,
-        cache: Arc<RwLock<JwtFileKeyCache>>,
-    },
+    File { path: String, refresh_secs: u64, cache: Arc<RwLock<JwtFileKeyCache>> },
 }
 
 #[derive(Clone)]
@@ -118,11 +114,7 @@ pub struct UpstreamIdentityPolicyRuntime {
 #[derive(Debug, Clone)]
 enum UpstreamTrustBundleSource {
     Inline,
-    File {
-        path: String,
-        refresh_secs: u64,
-        last_validated_at: Arc<RwLock<SystemTime>>,
-    },
+    File { path: String, refresh_secs: u64, last_validated_at: Arc<RwLock<SystemTime>> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -167,10 +159,14 @@ impl std::error::Error for JwtAuthVerificationError {}
 impl std::fmt::Display for ExternalAuthVerificationError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::UnsupportedProtocol => write!(formatter, "external auth protocol is not supported"),
+            Self::UnsupportedProtocol => {
+                write!(formatter, "external auth protocol is not supported")
+            }
             Self::InvalidEndpoint => write!(formatter, "external auth endpoint is invalid"),
             Self::ServiceUnavailable => write!(formatter, "external auth service unavailable"),
-            Self::InvalidResponse => write!(formatter, "external auth service returned invalid response"),
+            Self::InvalidResponse => {
+                write!(formatter, "external auth service returned invalid response")
+            }
             Self::Denied => write!(formatter, "external auth service denied request"),
             Self::MissingMappedContext(key) => {
                 write!(formatter, "external auth context is missing required key {key}")
@@ -194,7 +190,9 @@ impl std::error::Error for AuthorizationVerificationError {}
 impl std::fmt::Display for UpstreamIdentityVerificationError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::InvalidTrustBundle => write!(formatter, "upstream identity trust bundle is invalid"),
+            Self::InvalidTrustBundle => {
+                write!(formatter, "upstream identity trust bundle is invalid")
+            }
             Self::MissingPeerIdentity => write!(formatter, "upstream peer identity is missing"),
             Self::InvalidPeerIdentity => write!(formatter, "upstream peer identity is invalid"),
             Self::IdentityNotAllowed => write!(formatter, "upstream peer identity is not allowed"),
@@ -216,8 +214,8 @@ impl JwtAuthPolicyRuntime {
                 JwtKeySource::Inline(load_jwt_decoding_keys(jwks_json)?)
             }
             Some(lb_config_model::JwtJwksSourceConfig::File { path, refresh_secs }) => {
-                let jwks_json =
-                    std::fs::read_to_string(path).map_err(|_| JwtAuthVerificationError::InvalidJwks)?;
+                let jwks_json = std::fs::read_to_string(path)
+                    .map_err(|_| JwtAuthVerificationError::InvalidJwks)?;
                 let keys = load_jwt_decoding_keys(&jwks_json)?;
                 JwtKeySource::File {
                     path: path.clone(),
@@ -243,7 +241,10 @@ impl JwtAuthPolicyRuntime {
         })
     }
 
-    pub fn verify_bearer(&self, authorization_header: &str) -> Result<(), JwtAuthVerificationError> {
+    pub fn verify_bearer(
+        &self,
+        authorization_header: &str,
+    ) -> Result<(), JwtAuthVerificationError> {
         let token = parse_bearer_token(authorization_header)?;
         self.verify_token(token)
     }
@@ -277,28 +278,21 @@ impl JwtAuthPolicyRuntime {
     fn active_keys(&self) -> Result<Vec<JwtDecodingKey>, JwtAuthVerificationError> {
         match &self.key_source {
             JwtKeySource::Inline(keys) => Ok(keys.clone()),
-            JwtKeySource::File {
-                path,
-                refresh_secs,
-                cache,
-            } => {
+            JwtKeySource::File { path, refresh_secs, cache } => {
                 {
-                    let guard = cache
-                        .read()
-                        .map_err(|_| JwtAuthVerificationError::InvalidJwks)?;
+                    let guard = cache.read().map_err(|_| JwtAuthVerificationError::InvalidJwks)?;
                     let refresh_due = jwks_refresh_due(guard.loaded_at, *refresh_secs)?;
                     if !refresh_due {
                         return Ok(guard.keys.clone());
                     }
                 }
 
-                let jwks_json =
-                    std::fs::read_to_string(path).map_err(|_| JwtAuthVerificationError::InvalidJwks)?;
+                let jwks_json = std::fs::read_to_string(path)
+                    .map_err(|_| JwtAuthVerificationError::InvalidJwks)?;
                 let keys = load_jwt_decoding_keys(&jwks_json)?;
                 {
-                    let mut guard = cache
-                        .write()
-                        .map_err(|_| JwtAuthVerificationError::InvalidJwks)?;
+                    let mut guard =
+                        cache.write().map_err(|_| JwtAuthVerificationError::InvalidJwks)?;
                     guard.keys = keys.clone();
                     guard.loaded_at = SystemTime::now();
                 }
@@ -342,12 +336,7 @@ impl ExternalAuthPolicyRuntime {
 
         let timeout = std::time::Duration::from_millis(self.timeout_ms.max(1));
         let raw = time::timeout(timeout, async {
-            send_http_json(
-                &self.endpoint.authority,
-                &self.endpoint.path_and_query,
-                &payload,
-            )
-            .await
+            send_http_json(&self.endpoint.authority, &self.endpoint.path_and_query, &payload).await
         })
         .await
         .map_err(|_| ExternalAuthVerificationError::ServiceUnavailable)
@@ -377,15 +366,20 @@ impl ExternalAuthPolicyRuntime {
     ) -> Result<ExternalAuthCheckResult, ExternalAuthVerificationError> {
         match self.authorize_http_request(method, path_and_query, headers).await {
             Ok(result) => Ok(result),
-            Err(error) if self.fail_open && matches!(
-                error,
-                ExternalAuthVerificationError::ServiceUnavailable
-                    | ExternalAuthVerificationError::InvalidResponse
-            ) => Ok(ExternalAuthCheckResult {
-                allowed: true,
-                context: BTreeMap::new(),
-                fail_open_applied: true,
-            }),
+            Err(error)
+                if self.fail_open
+                    && matches!(
+                        error,
+                        ExternalAuthVerificationError::ServiceUnavailable
+                            | ExternalAuthVerificationError::InvalidResponse
+                    ) =>
+            {
+                Ok(ExternalAuthCheckResult {
+                    allowed: true,
+                    context: BTreeMap::new(),
+                    fail_open_applied: true,
+                })
+            }
             Err(error) => Err(error),
         }
     }
@@ -510,17 +504,16 @@ impl UpstreamIdentityPolicyRuntime {
 
         match &self.mode {
             lb_config_model::UpstreamIdentityModeConfig::Spiffe => {}
-            lb_config_model::UpstreamIdentityModeConfig::SpireWorkloadApi { trust_domain, .. } => {
+            lb_config_model::UpstreamIdentityModeConfig::SpireWorkloadApi {
+                trust_domain, ..
+            } => {
                 if !peer_trust_domain.eq_ignore_ascii_case(trust_domain) {
                     return Err(UpstreamIdentityVerificationError::TrustDomainNotAllowed);
                 }
             }
         }
         if !self.allowed_spiffe_ids.is_empty()
-            && !self
-                .allowed_spiffe_ids
-                .iter()
-                .any(|entry| entry.eq_ignore_ascii_case(identity))
+            && !self.allowed_spiffe_ids.iter().any(|entry| entry.eq_ignore_ascii_case(identity))
         {
             return Err(UpstreamIdentityVerificationError::IdentityNotAllowed);
         }
@@ -537,11 +530,8 @@ impl UpstreamIdentityPolicyRuntime {
     }
 
     fn refresh_trust_bundle_if_needed(&self) -> Result<(), UpstreamIdentityVerificationError> {
-        let UpstreamTrustBundleSource::File {
-            path,
-            refresh_secs,
-            last_validated_at,
-        } = &self.trust_bundle_source
+        let UpstreamTrustBundleSource::File { path, refresh_secs, last_validated_at } =
+            &self.trust_bundle_source
         else {
             return Ok(());
         };
@@ -575,16 +565,15 @@ struct ExternalAuthServiceResult {
     context: BTreeMap<String, String>,
 }
 
-fn load_jwt_decoding_keys(jwks_json: &str) -> Result<Vec<JwtDecodingKey>, JwtAuthVerificationError> {
+fn load_jwt_decoding_keys(
+    jwks_json: &str,
+) -> Result<Vec<JwtDecodingKey>, JwtAuthVerificationError> {
     let jwks = serde_json::from_str::<jsonwebtoken::jwk::JwkSet>(jwks_json)
         .map_err(|_| JwtAuthVerificationError::InvalidJwks)?;
     let mut keys = Vec::new();
     for jwk in jwks.keys {
         let key = DecodingKey::from_jwk(&jwk).map_err(|_| JwtAuthVerificationError::InvalidJwks)?;
-        keys.push(JwtDecodingKey {
-            kid: jwk.common.key_id,
-            key,
-        });
+        keys.push(JwtDecodingKey { kid: jwk.common.key_id, key });
     }
     if keys.is_empty() {
         return Err(JwtAuthVerificationError::InvalidJwks);
@@ -592,7 +581,10 @@ fn load_jwt_decoding_keys(jwks_json: &str) -> Result<Vec<JwtDecodingKey>, JwtAut
     Ok(keys)
 }
 
-fn jwks_refresh_due(loaded_at: SystemTime, refresh_secs: u64) -> Result<bool, JwtAuthVerificationError> {
+fn jwks_refresh_due(
+    loaded_at: SystemTime,
+    refresh_secs: u64,
+) -> Result<bool, JwtAuthVerificationError> {
     if refresh_secs == 0 {
         return Ok(true);
     }
@@ -623,36 +615,23 @@ fn validate_trust_bundle_pem(pem: &str) -> Result<(), UpstreamIdentityVerificati
 
 fn rule_matches(headers: &BTreeMap<String, String>, rule: &AuthorizationRuleRuntime) -> bool {
     let claim_matches = rule.any_claims.is_empty()
-        || rule
-            .any_claims
-            .iter()
-            .any(|claim| header_claim_present(headers, claim));
+        || rule.any_claims.iter().any(|claim| header_claim_present(headers, claim));
     if !claim_matches {
         return false;
     }
 
     let scopes = collect_token_set(headers, &["x-auth-scopes", "x-auth-scope"]);
     let roles = collect_token_set(headers, &["x-auth-roles", "x-auth-role"]);
-    let scopes_match = rule
-        .required_scopes
-        .iter()
-        .all(|scope| scopes.contains(scope));
-    let roles_match = rule
-        .required_roles
-        .iter()
-        .all(|role| roles.contains(role));
+    let scopes_match = rule.required_scopes.iter().all(|scope| scopes.contains(scope));
+    let roles_match = rule.required_roles.iter().all(|role| roles.contains(role));
 
     scopes_match && roles_match
 }
 
 fn header_claim_present(headers: &BTreeMap<String, String>, claim: &str) -> bool {
-    [
-        claim.to_string(),
-        format!("x-auth-{claim}"),
-        format!("x-auth-claim-{claim}"),
-    ]
-    .into_iter()
-    .any(|key| headers.get(&key).is_some_and(|value| !value.trim().is_empty()))
+    [claim.to_string(), format!("x-auth-{claim}"), format!("x-auth-claim-{claim}")]
+        .into_iter()
+        .any(|key| headers.get(&key).is_some_and(|value| !value.trim().is_empty()))
 }
 
 fn collect_token_set(
@@ -664,11 +643,7 @@ fn collect_token_set(
         let Some(value) = headers.get(*name) else {
             continue;
         };
-        for token in value
-            .split([' ', ','])
-            .map(str::trim)
-            .filter(|token| !token.is_empty())
-        {
+        for token in value.split([' ', ',']).map(str::trim).filter(|token| !token.is_empty()) {
             tokens.insert(token.to_ascii_lowercase());
         }
     }
@@ -678,9 +653,8 @@ fn collect_token_set(
 fn parse_external_auth_endpoint(
     endpoint: &str,
 ) -> Result<ExternalAuthEndpoint, ExternalAuthVerificationError> {
-    let uri = endpoint
-        .parse::<Uri>()
-        .map_err(|_| ExternalAuthVerificationError::InvalidEndpoint)?;
+    let uri =
+        endpoint.parse::<Uri>().map_err(|_| ExternalAuthVerificationError::InvalidEndpoint)?;
     if uri.scheme_str() != Some("http") {
         return Err(ExternalAuthVerificationError::InvalidEndpoint);
     }
@@ -692,10 +666,7 @@ fn parse_external_auth_endpoint(
         .path_and_query()
         .map(|value| value.as_str().to_string())
         .unwrap_or_else(|| String::from("/"));
-    Ok(ExternalAuthEndpoint {
-        authority,
-        path_and_query,
-    })
+    Ok(ExternalAuthEndpoint { authority, path_and_query })
 }
 
 async fn send_http_json(
@@ -714,10 +685,7 @@ async fn send_http_json(
         .write_all(request.as_bytes())
         .await
         .map_err(|_| ExternalAuthVerificationError::ServiceUnavailable)?;
-    stream
-        .write_all(body)
-        .await
-        .map_err(|_| ExternalAuthVerificationError::ServiceUnavailable)?;
+    stream.write_all(body).await.map_err(|_| ExternalAuthVerificationError::ServiceUnavailable)?;
     let mut response = Vec::new();
     stream
         .read_to_end(&mut response)
@@ -730,9 +698,7 @@ fn parse_external_auth_response(
     raw_response: &[u8],
 ) -> Result<ExternalAuthServiceResult, ExternalAuthVerificationError> {
     let marker = b"\r\n\r\n";
-    let Some(head_end) = raw_response
-        .windows(marker.len())
-        .position(|window| window == marker)
+    let Some(head_end) = raw_response.windows(marker.len()).position(|window| window == marker)
     else {
         return Err(ExternalAuthVerificationError::InvalidResponse);
     };
@@ -741,14 +707,10 @@ fn parse_external_auth_response(
     let body = &raw_response[(head_end + marker.len())..];
 
     let mut head_lines = head.lines();
-    let status_line = head_lines
-        .next()
-        .ok_or(ExternalAuthVerificationError::InvalidResponse)?;
-    let status_ok = status_line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|value| value.parse::<u16>().ok())
-        == Some(200);
+    let status_line = head_lines.next().ok_or(ExternalAuthVerificationError::InvalidResponse)?;
+    let status_ok =
+        status_line.split_whitespace().nth(1).and_then(|value| value.parse::<u16>().ok())
+            == Some(200);
     if !status_ok {
         return Err(ExternalAuthVerificationError::ServiceUnavailable);
     }
@@ -792,12 +754,10 @@ fn validate_required_claims(
     let Value::Object(map) = claims else {
         return Err(JwtAuthVerificationError::InvalidToken);
     };
-    let claim_index = map
-        .iter()
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect::<BTreeMap<_, _>>();
+    let claim_index =
+        map.iter().map(|(key, value)| (key.clone(), value.clone())).collect::<BTreeMap<_, _>>();
     for claim in required_claims {
-        if claim_index.get(claim).is_none_or(Value::is_null) {
+        if claim_index.get(claim).map_or(true, Value::is_null) {
             return Err(JwtAuthVerificationError::MissingRequiredClaim(claim.clone()));
         }
     }
@@ -816,8 +776,7 @@ mod tests {
 
     use super::{
         AuthorizationPolicyRuntime, AuthorizationVerificationError, ExternalAuthPolicyRuntime,
-        JwtAuthPolicyRuntime, UpstreamIdentityPolicyRuntime,
-        UpstreamIdentityVerificationError,
+        JwtAuthPolicyRuntime, UpstreamIdentityPolicyRuntime, UpstreamIdentityVerificationError,
     };
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -885,7 +844,9 @@ mod tests {
         Ok(encode(&header, &claims, &EncodingKey::from_secret(b"super-secret"))?)
     }
 
-    fn file_based_upstream_identity_policy(path: &str) -> lb_config_model::UpstreamIdentityPolicyConfig {
+    fn file_based_upstream_identity_policy(
+        path: &str,
+    ) -> lb_config_model::UpstreamIdentityPolicyConfig {
         lb_config_model::UpstreamIdentityPolicyConfig {
             mode: lb_config_model::UpstreamIdentityModeConfig::Spiffe,
             trust_bundle: lb_config_model::IdentityTrustBundleSourceConfig::File {
@@ -897,7 +858,10 @@ mod tests {
         }
     }
 
-    fn external_policy(endpoint: String, fail_open: bool) -> lb_config_model::ExternalAuthPolicyConfig {
+    fn external_policy(
+        endpoint: String,
+        fail_open: bool,
+    ) -> lb_config_model::ExternalAuthPolicyConfig {
         lb_config_model::ExternalAuthPolicyConfig {
             endpoint,
             protocol: lb_config_model::ExternalAuthProtocolConfig::Http,
@@ -1030,10 +994,7 @@ mod tests {
         let runtime = AuthorizationPolicyRuntime::from_config(&authorization_policy_config());
         let headers = [
             (String::from("x-auth-principal"), String::from("alice")),
-            (
-                String::from("x-auth-scopes"),
-                String::from("payments.read payments.write"),
-            ),
+            (String::from("x-auth-scopes"), String::from("payments.read payments.write")),
             (String::from("x-auth-roles"), String::from("reader,admin")),
         ]
         .into_iter()
@@ -1060,19 +1021,14 @@ mod tests {
 
     #[tokio::test]
     async fn external_auth_allows_and_returns_context() -> Result<(), Box<dyn std::error::Error>> {
-        let endpoint = spawn_external_auth_server(
-            200,
-            r#"{"allow":true,"context":{"principal":"alice"}}"#,
-        )
-        .await?;
+        let endpoint =
+            spawn_external_auth_server(200, r#"{"allow":true,"context":{"principal":"alice"}}"#)
+                .await?;
         let runtime = ExternalAuthPolicyRuntime::from_config(&external_policy(endpoint, false))?;
-        let headers = [(String::from("authorization"), String::from("Bearer token"))]
-            .into_iter()
-            .collect();
+        let headers =
+            [(String::from("authorization"), String::from("Bearer token"))].into_iter().collect();
 
-        let result = runtime
-            .authorize_http_request_with_fail_open("GET", "/v1", &headers)
-            .await?;
+        let result = runtime.authorize_http_request_with_fail_open("GET", "/v1", &headers).await?;
         assert!(result.allowed);
         assert_eq!(result.context.get("principal"), Some(&String::from("alice")));
         assert!(!result.fail_open_applied);
@@ -1081,21 +1037,16 @@ mod tests {
 
     #[tokio::test]
     async fn external_auth_denies_when_service_denies() -> Result<(), Box<dyn std::error::Error>> {
-        let endpoint =
-            spawn_external_auth_server(200, r#"{"allow":false}"#).await?;
+        let endpoint = spawn_external_auth_server(200, r#"{"allow":false}"#).await?;
         let runtime = ExternalAuthPolicyRuntime::from_config(&external_policy(endpoint, false))?;
-        let headers = [(String::from("authorization"), String::from("Bearer token"))]
-            .into_iter()
-            .collect();
+        let headers =
+            [(String::from("authorization"), String::from("Bearer token"))].into_iter().collect();
 
         // Local one-shot test servers can race on loopback accept under heavy parallel load.
         // Retry transient service-unavailable once or twice so this test validates deny semantics,
         // not socket scheduling timing.
         for _attempt in 0..3 {
-            match runtime
-                .authorize_http_request_with_fail_open("GET", "/v1", &headers)
-                .await
-            {
+            match runtime.authorize_http_request_with_fail_open("GET", "/v1", &headers).await {
                 Ok(result) => {
                     assert!(!result.allowed);
                     assert!(!result.fail_open_applied);
@@ -1118,13 +1069,10 @@ mod tests {
             String::from("http://127.0.0.1:9/authz"),
             true,
         ))?;
-        let headers = [(String::from("authorization"), String::from("Bearer token"))]
-            .into_iter()
-            .collect();
+        let headers =
+            [(String::from("authorization"), String::from("Bearer token"))].into_iter().collect();
 
-        let result = runtime
-            .authorize_http_request_with_fail_open("GET", "/v1", &headers)
-            .await?;
+        let result = runtime.authorize_http_request_with_fail_open("GET", "/v1", &headers).await?;
         assert!(result.allowed);
         assert!(result.fail_open_applied);
         Ok(())
@@ -1134,10 +1082,7 @@ mod tests {
     fn upstream_identity_rejects_missing_peer_identity() -> Result<(), Box<dyn std::error::Error>> {
         let runtime = UpstreamIdentityPolicyRuntime::from_config(&upstream_identity_policy())?;
         let result = runtime.verify_peer_identity(None);
-        assert_eq!(
-            result,
-            Err(UpstreamIdentityVerificationError::MissingPeerIdentity)
-        );
+        assert_eq!(result, Err(UpstreamIdentityVerificationError::MissingPeerIdentity));
         Ok(())
     }
 
@@ -1161,7 +1106,8 @@ mod tests {
         runtime.verify_peer_identity(Some("spiffe://example.org/ns/payments/sa/default"))?;
 
         write_file(&path, "not-a-certificate")?;
-        let result = runtime.verify_peer_identity(Some("spiffe://example.org/ns/payments/sa/default"));
+        let result =
+            runtime.verify_peer_identity(Some("spiffe://example.org/ns/payments/sa/default"));
         assert_eq!(result, Err(UpstreamIdentityVerificationError::InvalidTrustBundle));
 
         let _ = std::fs::remove_file(path);

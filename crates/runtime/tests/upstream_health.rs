@@ -179,8 +179,7 @@ fn new_endpoint_starts_in_warmup_and_emits_events() -> Result<(), Box<dyn std::e
 }
 
 #[test]
-fn removed_cluster_rejects_stale_endpoint_health_reads(
-) -> Result<(), Box<dyn std::error::Error>> {
+fn removed_cluster_rejects_stale_endpoint_health_reads() -> Result<(), Box<dyn std::error::Error>> {
     let registry = UpstreamHealthRegistry::new(policy());
     let cluster_name = UpstreamClusterName::new("removed")?;
     let endpoint_id = UpstreamEndpointId::new("a")?;
@@ -272,10 +271,7 @@ fn cluster_ejection_budget_limits_parallel_ejections() -> Result<(), Box<dyn std
     let second_id = UpstreamEndpointId::new("b")?;
     registry.insert_cluster(UpstreamCluster::new(
         cluster_name.clone(),
-        vec![
-            endpoint(first_id.as_str(), 8080, 1)?,
-            endpoint(second_id.as_str(), 8081, 1)?,
-        ],
+        vec![endpoint(first_id.as_str(), 8080, 1)?, endpoint(second_id.as_str(), 8081, 1)?],
     )?)?;
     registry.advance_time(Duration::from_secs(20));
 

@@ -481,15 +481,13 @@ impl FleetRolloutCoordinator {
                 reason: None,
                 detail: String::from("wave gate passed; rollout can continue"),
             },
-            crate::FleetWaveGateVerdict::Pending if !gate.timed_out => {
-                FleetAbortRollbackDecision {
-                    wave_id: gate.wave_id.clone(),
-                    should_abort: false,
-                    should_auto_rollback: false,
-                    reason: None,
-                    detail: String::from("wave gate pending within timeout; keep observing"),
-                }
-            }
+            crate::FleetWaveGateVerdict::Pending if !gate.timed_out => FleetAbortRollbackDecision {
+                wave_id: gate.wave_id.clone(),
+                should_abort: false,
+                should_auto_rollback: false,
+                reason: None,
+                detail: String::from("wave gate pending within timeout; keep observing"),
+            },
             crate::FleetWaveGateVerdict::Pending | crate::FleetWaveGateVerdict::Failed => {
                 let reason = if gate.timed_out {
                     FleetAbortReason::WaveGateTimedOut
@@ -503,15 +501,20 @@ impl FleetRolloutCoordinator {
                     should_auto_rollback,
                     reason: Some(reason),
                     detail: if should_auto_rollback {
-                        String::from("wave gate failed; aborting rollout and triggering automatic rollback")
+                        String::from(
+                            "wave gate failed; aborting rollout and triggering automatic rollback",
+                        )
                     } else {
-                        String::from("wave gate failed; aborting rollout and waiting for operator rollback")
+                        String::from(
+                            "wave gate failed; aborting rollout and waiting for operator rollback",
+                        )
                     },
                 }
             }
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn execute_auto_rollback_if_needed<B>(
         &mut self,
         control: &SnapshotControlService,
@@ -560,7 +563,9 @@ impl FleetRolloutCoordinator {
             target_version: Some(response.desired_version),
             convergence_state: Some(response.convergence.state),
             detail: if succeeded {
-                String::from("automatic rollback converged fleet to the shared last-known-good snapshot")
+                String::from(
+                    "automatic rollback converged fleet to the shared last-known-good snapshot",
+                )
             } else {
                 String::from("automatic rollback executed but fleet did not fully converge")
             },
@@ -681,7 +686,7 @@ impl FleetRolloutCoordinator {
                     });
                     halted = matches!(strategy, FleetRolloutStrategy::Sequential)
                         || matches!(strategy, FleetRolloutStrategy::Canary { .. }
-                            if index + 1 <= canary_nodes);
+                            if index < canary_nodes);
                 }
             }
         }
@@ -799,10 +804,7 @@ where
                     (FleetNodeConvergenceState::Converged, None)
                 } else if status.observed_at_unix_ms <= deadline {
                     pending_nodes += 1;
-                    (
-                        FleetNodeConvergenceState::Pending,
-                        outcome.map(|entry| entry.detail.clone()),
-                    )
+                    (FleetNodeConvergenceState::Pending, outcome.map(|entry| entry.detail.clone()))
                 } else {
                     diverged_nodes += 1;
                     (
@@ -846,9 +848,8 @@ where
     }
 
     let partial_rollout = converged_nodes > 0 && converged_nodes < node_ids.len();
-    let action_failure = node_outcomes
-        .iter()
-        .any(|outcome| matches!(outcome.result, FleetNodeActionResult::Failed));
+    let action_failure =
+        node_outcomes.iter().any(|outcome| matches!(outcome.result, FleetNodeActionResult::Failed));
     let state = if converged_nodes == node_ids.len() {
         FleetConvergenceState::Converged
     } else if unavailable_nodes > 0 || action_failure {
@@ -911,14 +912,10 @@ fn validate_fleet_request(
     max_allowed_divergence_ms: u64,
 ) -> Result<(), FleetRolloutError> {
     if node_ids.is_empty() {
-        return Err(FleetRolloutError::InvalidFleetRequest(
-            InvalidFleetRequest::EmptyNodeIds,
-        ));
+        return Err(FleetRolloutError::InvalidFleetRequest(InvalidFleetRequest::EmptyNodeIds));
     }
     if node_ids.len() > MAX_FLEET_NODES {
-        return Err(FleetRolloutError::InvalidFleetRequest(
-            InvalidFleetRequest::TooManyNodes,
-        ));
+        return Err(FleetRolloutError::InvalidFleetRequest(InvalidFleetRequest::TooManyNodes));
     }
     if max_allowed_divergence_ms == 0 {
         return Err(FleetRolloutError::InvalidFleetRequest(
@@ -929,14 +926,10 @@ fn validate_fleet_request(
     for node_id in node_ids {
         let node_id = node_id.trim();
         if node_id.is_empty() {
-            return Err(FleetRolloutError::InvalidFleetRequest(
-                InvalidFleetRequest::EmptyNodeId,
-            ));
+            return Err(FleetRolloutError::InvalidFleetRequest(InvalidFleetRequest::EmptyNodeId));
         }
         if node_id.len() > MAX_NODE_ID_LEN {
-            return Err(FleetRolloutError::InvalidFleetRequest(
-                InvalidFleetRequest::NodeIdTooLong,
-            ));
+            return Err(FleetRolloutError::InvalidFleetRequest(InvalidFleetRequest::NodeIdTooLong));
         }
         if !seen.insert(node_id.to_string()) {
             return Err(FleetRolloutError::InvalidFleetRequest(
@@ -945,9 +938,7 @@ fn validate_fleet_request(
         }
     }
     if matches!(strategy, FleetRolloutStrategy::Canary { canary_nodes: 0 }) {
-        return Err(FleetRolloutError::InvalidFleetRequest(
-            InvalidFleetRequest::ZeroCanaryNodes,
-        ));
+        return Err(FleetRolloutError::InvalidFleetRequest(InvalidFleetRequest::ZeroCanaryNodes));
     }
     Ok(())
 }
@@ -1032,7 +1023,10 @@ mod tests {
     }
 
     impl FleetNodeBackend for MockBackend {
-        fn fetch_status(&self, node_id: &str) -> Result<FleetNodeRuntimeStatus, FleetNodeBackendError> {
+        fn fetch_status(
+            &self,
+            node_id: &str,
+        ) -> Result<FleetNodeRuntimeStatus, FleetNodeBackendError> {
             self.nodes
                 .get(node_id)
                 .cloned()
@@ -1071,7 +1065,11 @@ mod tests {
             Ok(crate::RolloutResponse {
                 action: crate::RolloutActionKind::Rollout,
                 result: crate::RolloutResultKind::Applied,
-                active_version: node.status.active_version.clone().unwrap_or_else(|| request.version.clone()),
+                active_version: node
+                    .status
+                    .active_version
+                    .clone()
+                    .unwrap_or_else(|| request.version.clone()),
                 active_digest_sha256: node
                     .status
                     .active_digest_sha256
@@ -1159,8 +1157,18 @@ mod tests {
         let stable_digest = control.get_version("stable-2")?.digest_sha256.clone();
         let mut backend = MockBackend::default()
             .with_known_digest("stable-2", &stable_digest)
-            .with_node("node-a", Some("baseline-1"), Some(&digest_for_version("baseline-1")), ApplyMode::Immediate)
-            .with_node("node-b", Some("baseline-1"), Some(&digest_for_version("baseline-1")), ApplyMode::Immediate);
+            .with_node(
+                "node-a",
+                Some("baseline-1"),
+                Some(&digest_for_version("baseline-1")),
+                ApplyMode::Immediate,
+            )
+            .with_node(
+                "node-b",
+                Some("baseline-1"),
+                Some(&digest_for_version("baseline-1")),
+                ApplyMode::Immediate,
+            );
         let mut coordinator = FleetRolloutCoordinator::new();
 
         let response = coordinator.rollout_at(
@@ -1192,9 +1200,24 @@ mod tests {
         let stable_digest = control.get_version("stable-2")?.digest_sha256.clone();
         let mut backend = MockBackend::default()
             .with_known_digest("stable-2", &stable_digest)
-            .with_node("node-a", Some("baseline-1"), Some(&digest_for_version("baseline-1")), ApplyMode::Immediate)
-            .with_node("node-b", Some("baseline-1"), Some(&digest_for_version("baseline-1")), ApplyMode::Immediate)
-            .with_node("node-c", Some("baseline-1"), Some(&digest_for_version("baseline-1")), ApplyMode::Immediate)
+            .with_node(
+                "node-a",
+                Some("baseline-1"),
+                Some(&digest_for_version("baseline-1")),
+                ApplyMode::Immediate,
+            )
+            .with_node(
+                "node-b",
+                Some("baseline-1"),
+                Some(&digest_for_version("baseline-1")),
+                ApplyMode::Immediate,
+            )
+            .with_node(
+                "node-c",
+                Some("baseline-1"),
+                Some(&digest_for_version("baseline-1")),
+                ApplyMode::Immediate,
+            )
             .with_rollout_failure("node-b");
         let mut coordinator = FleetRolloutCoordinator::new();
 
@@ -1230,9 +1253,24 @@ mod tests {
         let stable_digest = control.get_version("stable-2")?.digest_sha256.clone();
         let mut backend = MockBackend::default()
             .with_known_digest("stable-2", &stable_digest)
-            .with_node("node-a", Some("baseline-1"), Some(&digest_for_version("baseline-1")), ApplyMode::Immediate)
-            .with_node("node-b", Some("baseline-1"), Some(&digest_for_version("baseline-1")), ApplyMode::Immediate)
-            .with_node("node-c", Some("baseline-1"), Some(&digest_for_version("baseline-1")), ApplyMode::Immediate)
+            .with_node(
+                "node-a",
+                Some("baseline-1"),
+                Some(&digest_for_version("baseline-1")),
+                ApplyMode::Immediate,
+            )
+            .with_node(
+                "node-b",
+                Some("baseline-1"),
+                Some(&digest_for_version("baseline-1")),
+                ApplyMode::Immediate,
+            )
+            .with_node(
+                "node-c",
+                Some("baseline-1"),
+                Some(&digest_for_version("baseline-1")),
+                ApplyMode::Immediate,
+            )
             .with_rollout_failure("node-a");
         let mut coordinator = FleetRolloutCoordinator::new();
 
@@ -1267,8 +1305,18 @@ mod tests {
         let stable_digest = control.get_version("stable-2")?.digest_sha256.clone();
         let mut backend = MockBackend::default()
             .with_known_digest("stable-2", &stable_digest)
-            .with_node("node-a", Some("baseline-1"), Some(&digest_for_version("baseline-1")), ApplyMode::Pending)
-            .with_node("node-b", Some("baseline-1"), Some(&digest_for_version("baseline-1")), ApplyMode::Pending);
+            .with_node(
+                "node-a",
+                Some("baseline-1"),
+                Some(&digest_for_version("baseline-1")),
+                ApplyMode::Pending,
+            )
+            .with_node(
+                "node-b",
+                Some("baseline-1"),
+                Some(&digest_for_version("baseline-1")),
+                ApplyMode::Pending,
+            );
         let mut coordinator = FleetRolloutCoordinator::new();
 
         let response = coordinator.rollout_at(
@@ -1286,34 +1334,51 @@ mod tests {
         )?;
 
         assert_eq!(response.convergence.state, FleetConvergenceState::Progressing);
-        assert_eq!(response.convergence.recommended_action, FleetRecommendedAction::WaitForConvergence);
+        assert_eq!(
+            response.convergence.recommended_action,
+            FleetRecommendedAction::WaitForConvergence
+        );
         Ok(())
     }
 
     #[test]
-    fn rollback_requires_shared_known_good_when_target_missing() -> Result<(), Box<dyn std::error::Error>> {
+    fn rollback_requires_shared_known_good_when_target_missing(
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let mut control = crate::SnapshotControlService::new();
         publish_snapshot(&mut control, "stable-1", "stable", 10)?;
         let mut backend = MockBackend::default()
-            .with_node("node-a", Some("canary-2"), Some(&digest_for_version("canary-2")), ApplyMode::Immediate)
-            .with_node("node-b", Some("canary-2"), Some(&digest_for_version("canary-2")), ApplyMode::Immediate);
-        backend.nodes.get_mut("node-a").unwrap().status.last_known_good_version = Some(String::from("stable-1"));
-        backend.nodes.get_mut("node-b").unwrap().status.last_known_good_version = Some(String::from("older-0"));
+            .with_node(
+                "node-a",
+                Some("canary-2"),
+                Some(&digest_for_version("canary-2")),
+                ApplyMode::Immediate,
+            )
+            .with_node(
+                "node-b",
+                Some("canary-2"),
+                Some(&digest_for_version("canary-2")),
+                ApplyMode::Immediate,
+            );
+        backend.nodes.get_mut("node-a").unwrap().status.last_known_good_version =
+            Some(String::from("stable-1"));
+        backend.nodes.get_mut("node-b").unwrap().status.last_known_good_version =
+            Some(String::from("older-0"));
         let mut coordinator = FleetRolloutCoordinator::new();
 
-        let error = coordinator.rollback_at(
-            &control,
-            &mut backend,
-            FleetRollbackRequest {
-                target_version: None,
-                requested_by: Some(String::from("operator")),
-                reason: Some(String::from("rollback")),
-                node_ids: vec![String::from("node-a"), String::from("node-b")],
-                max_allowed_divergence_ms: 1_000,
-            },
-            100,
-        )
-        .expect_err("rollback should reject without shared candidate");
+        let error = coordinator
+            .rollback_at(
+                &control,
+                &mut backend,
+                FleetRollbackRequest {
+                    target_version: None,
+                    requested_by: Some(String::from("operator")),
+                    reason: Some(String::from("rollback")),
+                    node_ids: vec![String::from("node-a"), String::from("node-b")],
+                    max_allowed_divergence_ms: 1_000,
+                },
+                100,
+            )
+            .expect_err("rollback should reject without shared candidate");
 
         assert!(matches!(error, FleetRolloutError::NoSharedRollbackCandidate));
         Ok(())

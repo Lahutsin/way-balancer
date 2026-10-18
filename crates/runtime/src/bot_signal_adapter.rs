@@ -123,10 +123,7 @@ mod tests {
 
     impl StaticBotProvider {
         fn new(name: &str, verdict: BotSignalVerdict) -> Self {
-            Self {
-                name: name.to_string(),
-                verdict,
-            }
+            Self { name: name.to_string(), verdict }
         }
     }
 
@@ -170,9 +167,7 @@ mod tests {
     #[test]
     fn bot_signal_adapter_emits_fallback_when_provider_fails() {
         let adapter = BotSignalAdapterChain::new()
-            .with_provider(Arc::new(FailingBotProvider {
-                name: String::from("vendor-botnet"),
-            }))
+            .with_provider(Arc::new(FailingBotProvider { name: String::from("vendor-botnet") }))
             .with_fallback_strength(40);
 
         let signals = adapter.score(&BotSignalInput::default());

@@ -247,17 +247,12 @@ impl fmt::Display for ListenerConfigError {
 impl std::error::Error for ListenerConfigError {}
 
 /// Explicit application transport protocol for an upstream target.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum UpstreamTransport {
+    #[default]
     Http1,
     Http2,
     Http3,
-}
-
-impl Default for UpstreamTransport {
-    fn default() -> Self {
-        Self::Http1
-    }
 }
 
 /// Static upstream target used by the initial L4 proxy path.
@@ -275,11 +270,7 @@ impl UpstreamTarget {
     /// Creates an upstream target.
     #[must_use]
     pub fn new(name: impl Into<String>, address: SocketAddr) -> Self {
-        Self {
-            name: name.into(),
-            address,
-            transport: UpstreamTransport::Http1,
-        }
+        Self { name: name.into(), address, transport: UpstreamTransport::Http1 }
     }
 
     /// Creates an upstream target with explicit transport selection.
@@ -289,11 +280,7 @@ impl UpstreamTarget {
         address: SocketAddr,
         transport: UpstreamTransport,
     ) -> Self {
-        Self {
-            name: name.into(),
-            address,
-            transport,
-        }
+        Self { name: name.into(), address, transport }
     }
 }
 
@@ -319,6 +306,7 @@ impl Default for ConnectionTimeouts {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 

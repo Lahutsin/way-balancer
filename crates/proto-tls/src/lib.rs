@@ -364,17 +364,20 @@ pub fn inspect_tls_identity_from_files(
 ) -> Result<LoadedTlsIdentityMetadata, TlsIdentityInspectError> {
     let cert_path = cert_path.as_ref();
     let key_path = key_path.as_ref();
-    let cert_pem = std::fs::read_to_string(cert_path)
-        .map_err(|_| TlsIdentityInspectError::Load(CertificateLoadError::ReadFile(
+    let cert_pem = std::fs::read_to_string(cert_path).map_err(|_| {
+        TlsIdentityInspectError::Load(CertificateLoadError::ReadFile(
             cert_path.display().to_string(),
-        )))?;
-    let key_pem = std::fs::read_to_string(key_path)
-        .map_err(|_| TlsIdentityInspectError::Load(CertificateLoadError::ReadFile(
+        ))
+    })?;
+    let key_pem = std::fs::read_to_string(key_path).map_err(|_| {
+        TlsIdentityInspectError::Load(CertificateLoadError::ReadFile(
             key_path.display().to_string(),
-        )))?;
+        ))
+    })?;
     let certificate_chain_der =
         load_certificates_from_pem(&cert_pem).map_err(TlsIdentityInspectError::Load)?;
-    let _private_key = load_private_key_from_pem(&key_pem).map_err(TlsIdentityInspectError::Load)?;
+    let _private_key =
+        load_private_key_from_pem(&key_pem).map_err(TlsIdentityInspectError::Load)?;
     let chain = parse_certificates(&certificate_chain_der)
         .map_err(|_| TlsIdentityInspectError::InvalidCertificate)?;
     let leaf = chain.first().ok_or(TlsIdentityInspectError::InvalidCertificate)?;
@@ -681,6 +684,9 @@ fn parse_server_name_extension(extension: &[u8]) -> Result<Option<String>, TlsIn
         if name_type == 0 {
             let name = std::str::from_utf8(&extension[offset..offset + name_len])
                 .map_err(|_| TlsInspectError::Malformed("server name is not valid UTF-8"))?;
+            if name.trim().is_empty() || name.chars().any(char::is_control) {
+                return Err(TlsInspectError::Malformed("server name is invalid"));
+            }
             return Ok(Some(name.to_string()));
         }
 

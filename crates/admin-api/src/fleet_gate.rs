@@ -48,7 +48,9 @@ where
 {
     let mut signals = BTreeMap::new();
     for node_id in &wave.node_ids {
-        if let Ok(Some(signal)) = backend.fetch_health_signals(node_id, wave.gate_policy.evaluation_window_ms) {
+        if let Ok(Some(signal)) =
+            backend.fetch_health_signals(node_id, wave.gate_policy.evaluation_window_ms)
+        {
             signals.insert(node_id.clone(), signal);
         }
     }
@@ -293,12 +295,8 @@ mod tests {
     #[test]
     fn backend_can_ingest_signals_for_wave_nodes() -> Result<(), Box<dyn std::error::Error>> {
         let mut backend = MockBackend::default();
-        backend
-            .signals
-            .insert(String::from("node-a"), signal("node-a", 97, 2));
-        backend
-            .signals
-            .insert(String::from("node-b"), signal("node-b", 99, 1));
+        backend.signals.insert(String::from("node-a"), signal("node-a", 97, 2));
+        backend.signals.insert(String::from("node-b"), signal("node-b", 99, 1));
         let wave = wave(FleetHealthGateMode::Required);
 
         let signals = super::collect_wave_health_signals(&backend, &wave);

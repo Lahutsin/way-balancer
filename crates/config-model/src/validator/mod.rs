@@ -6,11 +6,12 @@ use crate::{
     AdminAuthPolicyConfig, AdminAuthorizationScopeConfig, AffinityPolicyConfig,
     AnonymousSourceFilterConfig, ArtifactVerificationMode, CacheKeyPolicyConfig,
     HeaderMutationConfig, HostileEdgeProtectionPolicyConfig, HttpCachePolicyConfig,
-    HttpCacheStorageConfig, ListenerAlpnProtocolConfig, ListenerBindModeConfig, ListenerClassConfig,
-    ListenerProtocolConfig, LocalConcurrencyLimitPolicyConfig, LocalLimitScopeConfig,
-    LocalRateLimitPolicyConfig, NamedOverloadResponsePolicyConfig, OverloadResponsePolicyConfig,
-    PathRewriteTransformConfig, PolicyBindingConfig, PolicyResourcesConfig, RouteConfig,
-    RouteMatchConfig, TransformPolicyConfig, TrustedClientIpConfig, WorkspaceConfig,
+    HttpCacheStorageConfig, ListenerAlpnProtocolConfig, ListenerBindModeConfig,
+    ListenerClassConfig, ListenerProtocolConfig, LocalConcurrencyLimitPolicyConfig,
+    LocalLimitScopeConfig, LocalRateLimitPolicyConfig, NamedOverloadResponsePolicyConfig,
+    OverloadResponsePolicyConfig, PathRewriteTransformConfig, PolicyBindingConfig,
+    PolicyResourcesConfig, RouteConfig, RouteMatchConfig, TransformPolicyConfig,
+    TrustedClientIpConfig, WorkspaceConfig,
 };
 
 include!("report.rs");

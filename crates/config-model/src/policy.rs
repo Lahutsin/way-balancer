@@ -1,10 +1,10 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    BrownoutFeatureConfig, CircuitBreakerPolicyConfig, LocalConcurrencyLimitPolicyConfig,
-    LocalRateLimitPolicyConfig, OverloadResponsePolicyConfig, RetryBudgetPolicyConfig,
-    TimeoutHierarchyConfig, AuthorizationPolicyConfig, ExternalAuthPolicyConfig,
-    JwtAuthPolicyConfig, RequestClassificationPolicyConfig, UpstreamIdentityPolicyConfig,
+    AuthorizationPolicyConfig, BrownoutFeatureConfig, CircuitBreakerPolicyConfig,
+    ExternalAuthPolicyConfig, JwtAuthPolicyConfig, LocalConcurrencyLimitPolicyConfig,
+    LocalRateLimitPolicyConfig, OverloadResponsePolicyConfig, RequestClassificationPolicyConfig,
+    RetryBudgetPolicyConfig, TimeoutHierarchyConfig, UpstreamIdentityPolicyConfig,
 };
 
 /// Named policy resources referenced by listeners, routes, and upstreams.
@@ -117,11 +117,7 @@ pub struct TrafficMirrorPolicyConfig {
 
 impl Default for TrafficMirrorPolicyConfig {
     fn default() -> Self {
-        Self {
-            percentage: 100,
-            target_upstream_cluster: String::new(),
-            methods: Vec::new(),
-        }
+        Self { percentage: 100, target_upstream_cluster: String::new(), methods: Vec::new() }
     }
 }
 
@@ -551,23 +547,22 @@ pub struct NamedBrownoutFeatureConfig {
 #[cfg(test)]
 mod tests {
     use super::{
+        FaultInjectionAbortConfig, FaultInjectionDelayConfig, FaultInjectionPolicyConfig,
         HeaderMutationConfig, HostileEdgeHandshakeGuardConfig, HostileEdgeProtectionPolicyConfig,
-        HostileEdgeSourceQuotaConfig, HttpCachePolicyConfig, NamedHostileEdgeProtectionPolicyConfig,
-        NamedHttpCachePolicyConfig, NamedRetryBudgetPolicyConfig, NamedTrafficMirrorPolicyConfig,
-        NamedTransformPolicyConfig, NamedAuthorizationPolicyConfig,
-        NamedExternalAuthPolicyConfig, NamedJwtAuthPolicyConfig,
-        NamedRequestClassificationPolicyConfig, NamedUpstreamIdentityPolicyConfig,
-        PathRewriteTransformConfig, PolicyBindingConfig,
+        HostileEdgeSourceQuotaConfig, HttpCachePolicyConfig, NamedAuthorizationPolicyConfig,
+        NamedExternalAuthPolicyConfig, NamedFaultInjectionPolicyConfig,
+        NamedHostileEdgeProtectionPolicyConfig, NamedHttpCachePolicyConfig,
+        NamedJwtAuthPolicyConfig, NamedRequestClassificationPolicyConfig,
+        NamedRetryBudgetPolicyConfig, NamedTrafficMirrorPolicyConfig, NamedTransformPolicyConfig,
+        NamedUpstreamIdentityPolicyConfig, PathRewriteTransformConfig, PolicyBindingConfig,
         PolicyResourcesConfig, RequestTransformConfig, ResponseTransformConfig,
-        TrafficMirrorPolicyConfig, TransformPolicyConfig, FaultInjectionPolicyConfig,
-        FaultInjectionDelayConfig, FaultInjectionAbortConfig, NamedFaultInjectionPolicyConfig,
+        TrafficMirrorPolicyConfig, TransformPolicyConfig,
     };
     use crate::{
         AuthorizationPolicyConfig, ExternalAuthPolicyConfig, JwtAuthPolicyConfig,
         RequestClassificationContextConfig, RequestClassificationPolicyConfig,
         RequestClassificationSignalWeightsConfig, RequestClassifierSensitivityConfig,
-        RetryBudgetPolicyConfig,
-        UpstreamIdentityPolicyConfig,
+        RetryBudgetPolicyConfig, UpstreamIdentityPolicyConfig,
     };
 
     #[test]
@@ -624,14 +619,8 @@ mod tests {
             fault_injections: vec![NamedFaultInjectionPolicyConfig {
                 name: String::from("canary-chaos"),
                 spec: FaultInjectionPolicyConfig {
-                    delay: Some(FaultInjectionDelayConfig {
-                        percentage: 10,
-                        fixed_delay_ms: 250,
-                    }),
-                    abort: Some(FaultInjectionAbortConfig {
-                        percentage: 5,
-                        http_status: 503,
-                    }),
+                    delay: Some(FaultInjectionDelayConfig { percentage: 10, fixed_delay_ms: 250 }),
+                    abort: Some(FaultInjectionAbortConfig { percentage: 5, http_status: 503 }),
                 },
             }],
             jwt_auth_policies: vec![NamedJwtAuthPolicyConfig {

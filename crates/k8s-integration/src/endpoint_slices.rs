@@ -62,6 +62,7 @@ pub enum EndpointSliceUpdateOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EndpointSliceApplyError {
     UnsupportedAddressType { namespace: String, name: String },
+    AddressFamilyMismatch { namespace: String, name: String, endpoint_id: String },
     MissingPort { namespace: String, name: String },
     MultiplePortsUnsupported { namespace: String, name: String },
     EmptyEndpointAddresses { namespace: String, name: String, endpoint_id: String },
@@ -73,6 +74,10 @@ impl std::fmt::Display for EndpointSliceApplyError {
             Self::UnsupportedAddressType { namespace, name } => {
                 write!(formatter, "EndpointSlice {namespace}/{name} uses unsupported address_type")
             }
+            Self::AddressFamilyMismatch { namespace, name, endpoint_id } => write!(
+                formatter,
+                "EndpointSlice {namespace}/{name} endpoint {endpoint_id} address family does not match slice address_type"
+            ),
             Self::MissingPort { namespace, name } => {
                 write!(formatter, "EndpointSlice {namespace}/{name} must declare one port")
             }
@@ -92,18 +97,8 @@ impl std::error::Error for EndpointSliceApplyError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiscoverySnapshotBuildError {
-    InvalidClusterName {
-        namespace: String,
-        service: String,
-        port: u16,
-        detail: String,
-    },
-    InvalidEndpointId {
-        namespace: String,
-        service: String,
-        endpoint_id: String,
-        detail: String,
-    },
+    InvalidClusterName { namespace: String, service: String, port: u16, detail: String },
+    InvalidEndpointId { namespace: String, service: String, endpoint_id: String, detail: String },
 }
 
 impl std::fmt::Display for DiscoverySnapshotBuildError {
@@ -198,11 +193,13 @@ impl EndpointSliceController {
 
     pub fn flush_into(&mut self, resources: &GatewayApiResourceSet) -> GatewayApiResourceSet {
         let mut next = resources.clone();
+        let mut flushed_any = false;
         for service in &mut next.services {
             let key = (service.metadata.namespace.clone(), service.metadata.name.clone());
-            if !self.pending_services.contains(&key) {
+            if !self.pending_services.remove(&key) {
                 continue;
             }
+            flushed_any = true;
 
             let mut endpoints = self
                 .slices
@@ -212,17 +209,19 @@ impl EndpointSliceController {
                         && slice.service_name == service.metadata.name
                 })
                 .flat_map(|slice| {
-                    slice.endpoints.iter().filter_map(|endpoint| {
+                    let port_opt = slice.ports.first().copied();
+                    slice.endpoints.iter().filter_map(move |endpoint| {
+                        let port = port_opt?;
+                        let ip = *endpoint.addresses.first()?;
                         if !endpoint.conditions.ready
                             || !endpoint.conditions.serving
                             || endpoint.conditions.terminating
                         {
                             return None;
                         }
-                        let port = slice.ports[0];
                         Some(ServiceEndpointResource {
                             id: endpoint.id.clone(),
-                            address: SocketAddr::new(endpoint.addresses[0], port),
+                            address: SocketAddr::new(ip, port),
                         })
                     })
                 })
@@ -231,9 +230,8 @@ impl EndpointSliceController {
             service.endpoints = endpoints;
         }
 
-        if !self.pending_services.is_empty() {
+        if flushed_any {
             self.stats.flush_count = self.stats.flush_count.saturating_add(1);
-            self.pending_services.clear();
         }
         next
     }
@@ -258,8 +256,11 @@ impl EndpointSliceController {
             let mut port = 0_u16;
 
             for slice in slices {
+                let Some(&slice_port) = slice.ports.first() else {
+                    continue;
+                };
                 generation = generation.max(slice.generation);
-                port = slice.ports[0];
+                port = slice_port;
                 for endpoint in &slice.endpoints {
                     if !endpoint.conditions.ready
                         || !endpoint.conditions.serving
@@ -267,18 +268,23 @@ impl EndpointSliceController {
                     {
                         continue;
                     }
+                    let Some(&ip) = endpoint.addresses.first() else {
+                        continue;
+                    };
                     let resolved = lb_runtime::DiscoveryEndpoint::new(
                         endpoint.id.clone(),
-                        SocketAddr::new(endpoint.addresses[0], slice.ports[0]),
+                        SocketAddr::new(ip, slice_port),
                         None,
                         None,
                         1,
                     )
-                    .map_err(|error| DiscoverySnapshotBuildError::InvalidEndpointId {
-                        namespace: namespace.clone(),
-                        service: service.clone(),
-                        endpoint_id: endpoint.id.clone(),
-                        detail: error.to_string(),
+                    .map_err(|error| {
+                        DiscoverySnapshotBuildError::InvalidEndpointId {
+                            namespace: namespace.clone(),
+                            service: service.clone(),
+                            endpoint_id: endpoint.id.clone(),
+                            detail: error.to_string(),
+                        }
                     })?;
                     endpoint_map.insert(endpoint.id.clone(), resolved);
                 }
@@ -343,6 +349,20 @@ fn validate_slice(slice: &EndpointSliceResource) -> Result<(), EndpointSliceAppl
                 name: slice.metadata.name.clone(),
                 endpoint_id: endpoint.id.clone(),
             });
+        }
+        for address in &endpoint.addresses {
+            let family_matches = matches!(
+                (slice.address_type, address),
+                (EndpointAddressType::Ipv4, IpAddr::V4(_))
+                    | (EndpointAddressType::Ipv6, IpAddr::V6(_))
+            );
+            if !family_matches {
+                return Err(EndpointSliceApplyError::AddressFamilyMismatch {
+                    namespace: slice.metadata.namespace.clone(),
+                    name: slice.metadata.name.clone(),
+                    endpoint_id: endpoint.id.clone(),
+                });
+            }
         }
     }
     Ok(())
@@ -499,18 +519,54 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_slices_build_runtime_discovery_snapshots() -> Result<(), Box<dyn std::error::Error>> {
+    fn endpoint_slices_build_runtime_discovery_snapshots() -> Result<(), Box<dyn std::error::Error>>
+    {
         let mut controller = EndpointSliceController::new();
         let _ = controller.upsert_slice(slice(5, &["payments-a", "payments-b"]))?;
 
         let snapshots = controller.build_discovery_snapshots(Duration::from_secs(30))?;
 
         assert_eq!(snapshots.len(), 1);
-        assert_eq!(snapshots[0].source.provider, lb_runtime::DiscoveryProviderKind::KubernetesEndpointSlice);
+        assert_eq!(
+            snapshots[0].source.provider,
+            lb_runtime::DiscoveryProviderKind::KubernetesEndpointSlice
+        );
         assert_eq!(snapshots[0].source.source_name, "edge/payments");
         assert_eq!(snapshots[0].source.cluster_name.as_str(), "edge.payments.8081");
         assert_eq!(snapshots[0].generation, 5);
         assert_eq!(snapshots[0].endpoints.len(), 2);
         Ok(())
+    }
+
+    #[test]
+    fn pending_slice_updates_are_retained_until_matching_service_is_present() {
+        let mut controller = EndpointSliceController::new();
+        let mut empty_resources = base_resources();
+        let services = std::mem::take(&mut empty_resources.services);
+
+        let outcome = controller.upsert_slice(slice(1, &["payments-a", "payments-b"]));
+        assert_eq!(outcome, Ok(EndpointSliceUpdateOutcome::Accepted));
+
+        let flushed_without_service = controller.flush_into(&empty_resources);
+        assert!(flushed_without_service.services.is_empty());
+        assert_eq!(controller.stats().flush_count, 0);
+
+        let mut resources_with_service = empty_resources;
+        resources_with_service.services = services;
+        let flushed_with_service = controller.flush_into(&resources_with_service);
+        assert_eq!(flushed_with_service.services[0].endpoints.len(), 2);
+        assert_eq!(controller.stats().flush_count, 1);
+    }
+
+    #[test]
+    fn mismatched_endpoint_address_family_is_rejected() {
+        let mut controller = EndpointSliceController::new();
+        let mut mismatched = slice(1, &["payments-a"]);
+        mismatched.address_type = EndpointAddressType::Ipv6;
+
+        let result = controller.upsert_slice(mismatched);
+
+        assert!(matches!(result, Err(EndpointSliceApplyError::AddressFamilyMismatch { .. })));
+        assert_eq!(controller.stats().malformed_update_count, 1);
     }
 }

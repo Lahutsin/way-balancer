@@ -87,8 +87,13 @@ pub fn render_staged_status_surface(
     let mut waves = Vec::with_capacity(plan.waves.len());
     let mut blocked = false;
     for wave in &plan.waves {
-        let surface = render_wave_surface(wave, wave_gates.get(&wave.wave_id), abort_wave_id, blocked);
-        blocked = blocked || matches!(surface.state, FleetWaveStatusState::Failed | FleetWaveStatusState::Aborted);
+        let surface =
+            render_wave_surface(wave, wave_gates.get(&wave.wave_id), abort_wave_id, blocked);
+        blocked = blocked
+            || matches!(
+                surface.state,
+                FleetWaveStatusState::Failed | FleetWaveStatusState::Aborted
+            );
         waves.push(surface);
     }
 
@@ -166,45 +171,53 @@ fn render_wave_surface(
         };
     }
 
-    let (state, verdict, degraded, timed_out, evaluated_nodes, failing_nodes, missing_nodes, detail) =
-        if abort_wave_id == Some(wave.wave_id.as_str()) {
-            (
-                FleetWaveStatusState::Aborted,
-                gate.map(|entry| entry.verdict),
-                gate.is_some_and(|entry| entry.degraded),
-                gate.is_some_and(|entry| entry.timed_out),
-                gate.map_or(0, |entry| entry.evaluated_nodes),
-                gate.map_or(0, |entry| entry.failing_nodes),
-                gate.map_or(0, |entry| entry.missing_nodes),
-                String::from("wave aborted by rollout decision policy"),
-            )
-        } else if let Some(gate) = gate {
-            (
-                match gate.verdict {
-                    FleetWaveGateVerdict::Passed => FleetWaveStatusState::Passed,
-                    FleetWaveGateVerdict::Failed => FleetWaveStatusState::Failed,
-                    FleetWaveGateVerdict::Pending => FleetWaveStatusState::InProgress,
-                },
-                Some(gate.verdict),
-                gate.degraded,
-                gate.timed_out,
-                gate.evaluated_nodes,
-                gate.failing_nodes,
-                gate.missing_nodes,
-                gate.detail.clone(),
-            )
-        } else {
-            (
-                FleetWaveStatusState::Pending,
-                None,
-                false,
-                false,
-                0,
-                0,
-                0,
-                String::from("wave has not started gate evaluation yet"),
-            )
-        };
+    let (
+        state,
+        verdict,
+        degraded,
+        timed_out,
+        evaluated_nodes,
+        failing_nodes,
+        missing_nodes,
+        detail,
+    ) = if abort_wave_id == Some(wave.wave_id.as_str()) {
+        (
+            FleetWaveStatusState::Aborted,
+            gate.map(|entry| entry.verdict),
+            gate.is_some_and(|entry| entry.degraded),
+            gate.is_some_and(|entry| entry.timed_out),
+            gate.map_or(0, |entry| entry.evaluated_nodes),
+            gate.map_or(0, |entry| entry.failing_nodes),
+            gate.map_or(0, |entry| entry.missing_nodes),
+            String::from("wave aborted by rollout decision policy"),
+        )
+    } else if let Some(gate) = gate {
+        (
+            match gate.verdict {
+                FleetWaveGateVerdict::Passed => FleetWaveStatusState::Passed,
+                FleetWaveGateVerdict::Failed => FleetWaveStatusState::Failed,
+                FleetWaveGateVerdict::Pending => FleetWaveStatusState::InProgress,
+            },
+            Some(gate.verdict),
+            gate.degraded,
+            gate.timed_out,
+            gate.evaluated_nodes,
+            gate.failing_nodes,
+            gate.missing_nodes,
+            gate.detail.clone(),
+        )
+    } else {
+        (
+            FleetWaveStatusState::Pending,
+            None,
+            false,
+            false,
+            0,
+            0,
+            0,
+            String::from("wave has not started gate evaluation yet"),
+        )
+    };
 
     FleetWaveStatusSurface {
         wave_id: wave.wave_id.clone(),
@@ -248,6 +261,7 @@ fn gate_failure_nodes(
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use std::collections::BTreeMap;
 
@@ -256,9 +270,7 @@ mod tests {
         FleetAbortReason, FleetNodeConvergenceState, FleetNodeStatus,
     };
 
-    use super::{
-        render_staged_status_surface, FleetStagedRolloutState, FleetWaveStatusState,
-    };
+    use super::{render_staged_status_surface, FleetStagedRolloutState, FleetWaveStatusState};
 
     fn wave(id: &str, nodes: &[&str]) -> crate::FleetRolloutWaveDefinition {
         crate::FleetRolloutWaveDefinition {
@@ -392,7 +404,10 @@ mod tests {
     fn status_surface_marks_blocked_waves_after_failure() {
         let plan = sample_plan();
         let convergence = sample_convergence(crate::FleetConvergenceState::Progressing);
-        let gates = BTreeMap::from([(String::from("wave-1"), gate("wave-1", crate::FleetWaveGateVerdict::Failed))]);
+        let gates = BTreeMap::from([(
+            String::from("wave-1"),
+            gate("wave-1", crate::FleetWaveGateVerdict::Failed),
+        )]);
 
         let surface = render_staged_status_surface(&plan, &convergence, &gates, None, None);
 
@@ -405,7 +420,10 @@ mod tests {
     fn status_surface_marks_aborted_and_rolled_back() {
         let plan = sample_plan();
         let convergence = sample_convergence(crate::FleetConvergenceState::Degraded);
-        let gates = BTreeMap::from([(String::from("wave-1"), gate("wave-1", crate::FleetWaveGateVerdict::Failed))]);
+        let gates = BTreeMap::from([(
+            String::from("wave-1"),
+            gate("wave-1", crate::FleetWaveGateVerdict::Failed),
+        )]);
         let decision = crate::FleetAbortRollbackDecision {
             wave_id: String::from("wave-1"),
             should_abort: true,
@@ -440,7 +458,10 @@ mod tests {
     fn status_surface_maps_nodes_to_waves_and_keeps_gate_signal() {
         let plan = sample_plan();
         let convergence = sample_convergence(crate::FleetConvergenceState::Converged);
-        let gates = BTreeMap::from([(String::from("wave-1"), gate("wave-1", crate::FleetWaveGateVerdict::Passed))]);
+        let gates = BTreeMap::from([(
+            String::from("wave-1"),
+            gate("wave-1", crate::FleetWaveGateVerdict::Passed),
+        )]);
 
         let surface = render_staged_status_surface(&plan, &convergence, &gates, None, None);
 

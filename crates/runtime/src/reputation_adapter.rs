@@ -122,10 +122,7 @@ mod tests {
 
     impl StaticReputationProvider {
         fn new(name: &str, verdict: ReputationVerdict) -> Self {
-            Self {
-                name: name.to_string(),
-                verdict,
-            }
+            Self { name: name.to_string(), verdict }
         }
     }
 

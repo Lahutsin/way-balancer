@@ -4,15 +4,15 @@ use std::time::Duration;
 use lb_observability::{
     CorrelationId, DecisionTraceKind, DiagnosticsLimits, IncomingTraceContext, LoggingPolicy,
     MetricDescriptor, MetricKind, MetricRegistry, RuntimeDiagnostics, RuntimeDiagnosticsInput,
-    SpanId, StructuredLogRecord, SupportBundleBuilder, TelemetryBufferSnapshot,
-    TelemetryCollector, TelemetryError, TelemetryEvent, TelemetryEventCode, TelemetryLabel,
-    TelemetryLabelKey, TraceContext, TraceContextError, TraceHookPhase, TraceId, TracingPolicy,
+    SpanId, StructuredLogRecord, SupportBundleBuilder, TelemetryBufferSnapshot, TelemetryCollector,
+    TelemetryError, TelemetryEvent, TelemetryEventCode, TelemetryLabel, TelemetryLabelKey,
+    TraceContext, TraceContextError, TraceHookPhase, TraceId, TracingPolicy,
 };
 
 use crate::{
-    AbuseRejectionReason,
-    HttpCacheStoreMetrics, HttpCacheStoreSnapshot, ListenerEvent, ListenerEventKind,
-    ListenerAbuseProtectionSnapshot, ListenerSnapshot, OverloadSnapshot, OverloadState,
+    AbuseRejectionReason, HttpCacheStoreMetrics, HttpCacheStoreSnapshot,
+    ListenerAbuseProtectionSnapshot, ListenerEvent, ListenerEventKind, ListenerSnapshot,
+    OverloadSnapshot, OverloadState,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -654,6 +654,7 @@ impl RuntimeTelemetry {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn record_decision_trace(
         &self,
         scope: &str,
@@ -675,8 +676,7 @@ impl RuntimeTelemetry {
             TelemetryLabel::new(TelemetryLabelKey::Scope, scope),
         ];
         self.metrics.increment_counter("runtime_decision_events_total", labels.clone(), 1)?;
-        self.collector
-            .push_event(TelemetryEvent::new(kind.event_code(), scope, detail, labels));
+        self.collector.push_event(TelemetryEvent::new(kind.event_code(), scope, detail, labels));
         Ok(())
     }
 
@@ -803,8 +803,7 @@ impl RuntimeTelemetry {
             TelemetryLabel::new(TelemetryLabelKey::Reason, reason),
         ];
         self.metrics.increment_counter("runtime_http_upgrades_total", labels.clone(), 1)?;
-        self.collector
-            .push_event(TelemetryEvent::new(result.event_code(), scope, detail, labels));
+        self.collector.push_event(TelemetryEvent::new(result.event_code(), scope, detail, labels));
         Ok(())
     }
 
@@ -1067,6 +1066,7 @@ fn latency_bucket_label(latency: Duration) -> &'static str {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use std::time::Duration;
 
@@ -1075,7 +1075,8 @@ mod tests {
     use super::{ExtensionPolicyPluginOutcome, RuntimeTelemetry};
 
     #[test]
-    fn records_route_and_destination_latency_with_dimensions() -> Result<(), Box<dyn std::error::Error>> {
+    fn records_route_and_destination_latency_with_dimensions(
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let telemetry = RuntimeTelemetry::new()?;
         telemetry.record_route_latency(
             "ingress",
@@ -1158,12 +1159,7 @@ mod tests {
         let snapshot = telemetry.snapshot();
         assert!(!snapshot.events.is_empty());
         assert_eq!(
-            snapshot
-                .events
-                .last()
-                .expect("event should exist")
-                .code
-                .as_str(),
+            snapshot.events.last().expect("event should exist").code.as_str(),
             "decision.policy.enforced"
         );
         Ok(())

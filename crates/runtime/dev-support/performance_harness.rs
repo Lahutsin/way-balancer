@@ -1,13 +1,13 @@
 #![allow(dead_code)]
 
+use std::fs;
 use std::io;
 use std::net::SocketAddr;
-use std::fs;
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::{Buf, Bytes};
 use h2::{client, server, Reason};
@@ -19,17 +19,16 @@ use lb_net_core::{
     UpstreamClusterName, UpstreamEndpoint, UpstreamEndpointId, UpstreamTarget, UpstreamTransport,
 };
 use lb_runtime::{
-    clear_http3_test_root_certificates, execute_with_hedge,
-    set_http3_test_root_certificates,
-    proxy_http1_connection, proxy_http1_connection_with_downstream_addr, proxy_http2_connection,
-    start_listener, DiscoveryEndpoint,
+    clear_http3_test_root_certificates, execute_with_hedge, proxy_http1_connection,
+    proxy_http1_connection_with_downstream_addr, proxy_http2_connection,
+    set_http3_test_root_certificates, start_listener, DiscoveryEndpoint,
     DiscoveryMembershipReconciler, DiscoveryProviderKind, DiscoverySnapshot, DiscoverySourceId,
     EndpointHealthPolicy, Http1ConnectionReport, Http1ProxyConfig, Http1ProxyError,
-    Http2ConnectionReport, Http2ProxyConfig, Http2ProxyError, ListenerHandle,
-    OverloadState, RequestClassificationAdapterContext,
-    RequestClassificationAdaptiveMitigationPolicy, RequestClassificationAuthContext,
-    RequestClassificationEnforcementPolicy, RequestClassificationPolicyRuntime,
-    RequestHedgingPolicy, SheddingAction, SheddingDecision, UpstreamHealthRegistry,
+    Http2ConnectionReport, Http2ProxyConfig, Http2ProxyError, ListenerHandle, OverloadState,
+    RequestClassificationAdapterContext, RequestClassificationAdaptiveMitigationPolicy,
+    RequestClassificationAuthContext, RequestClassificationEnforcementPolicy,
+    RequestClassificationPolicyRuntime, RequestHedgingPolicy, SheddingAction, SheddingDecision,
+    UpstreamHealthRegistry,
 };
 use quinn::crypto::rustls::QuicServerConfig;
 use rcgen::generate_simple_self_signed;
@@ -493,11 +492,12 @@ pub async fn build_performance_envelope_artifact(
 ) -> Result<PerformanceEnvelopeArtifact, DynError> {
     let report = run_performance_envelope(mode).await?;
     let profile = profile.spec();
-    let threshold_evaluation = evaluate_supported_envelope(&profile, &report, &control_plane_timing);
-    let baseline_comparison = baseline_path
-        .map(load_performance_envelope_artifact)
-        .transpose()?
-        .map(|baseline| compare_against_baseline(&profile, &report, &control_plane_timing, &baseline));
+    let threshold_evaluation =
+        evaluate_supported_envelope(&profile, &report, &control_plane_timing);
+    let baseline_comparison =
+        baseline_path.map(load_performance_envelope_artifact).transpose()?.map(|baseline| {
+            compare_against_baseline(&profile, &report, &control_plane_timing, &baseline)
+        });
 
     Ok(PerformanceEnvelopeArtifact {
         schema_version: String::from("v1"),
@@ -510,7 +510,8 @@ pub async fn build_performance_envelope_artifact(
     })
 }
 
-pub async fn capture_control_plane_timing_evidence() -> Result<ControlPlaneTimingEvidence, DynError> {
+pub async fn capture_control_plane_timing_evidence() -> Result<ControlPlaneTimingEvidence, DynError>
+{
     let reload_success_ms = Some(measure_reload_success_timing_ms().await?);
     let reload_degraded_success_ms = Some(measure_reload_degraded_success_timing_ms().await?);
     let failover_ms = Some(measure_failover_timing_ms()?);
@@ -797,7 +798,9 @@ fn increase_regression_check_optional(
     baseline: Option<f64>,
     allowed_regression_pct: f64,
 ) -> BaselineComparisonCheck {
-    let regression_pct = baseline.zip(candidate).and_then(|(baseline, candidate)| percentage_increase(baseline, candidate));
+    let regression_pct = baseline
+        .zip(candidate)
+        .and_then(|(baseline, candidate)| percentage_increase(baseline, candidate));
     let status = match regression_pct {
         Some(regression_pct) if regression_pct <= allowed_regression_pct => CheckStatus::Passed,
         Some(_) => CheckStatus::Failed,
@@ -854,7 +857,8 @@ pub async fn measure_reload_success_timing_ms() -> Result<u64, DynError> {
 }
 
 pub async fn measure_reload_degraded_success_timing_ms() -> Result<u64, DynError> {
-    let mut config = ListenerConfig::foundation_local("perf-reload-degraded", ListenerClass::Public);
+    let mut config =
+        ListenerConfig::foundation_local("perf-reload-degraded", ListenerClass::Public);
     config.idle_timeout = Duration::from_secs(2);
     config.drain_timeout = Duration::from_millis(40);
     let handle = start_listener(config).await?;
@@ -869,10 +873,12 @@ pub async fn measure_reload_degraded_success_timing_ms() -> Result<u64, DynError
 }
 
 pub fn measure_failover_timing_ms() -> Result<u64, DynError> {
-    let mut policy = EndpointHealthPolicy::default();
-    policy.degraded_failure_threshold = 1;
-    policy.unhealthy_failure_threshold = 1;
-    policy.ejection_failure_threshold = 1;
+    let policy = EndpointHealthPolicy {
+        degraded_failure_threshold: 1,
+        unhealthy_failure_threshold: 1,
+        ejection_failure_threshold: 1,
+        ..Default::default()
+    };
 
     let registry = UpstreamHealthRegistry::new(policy);
     let cluster_name = UpstreamClusterName::new("perf-failover")?;
@@ -882,32 +888,22 @@ pub fn measure_failover_timing_ms() -> Result<u64, DynError> {
         primary_id.clone(),
         SocketAddr::from(([127, 0, 0, 1], 9100)),
         EndpointState::Ready,
-        EndpointMetadata {
-            zone: None,
-            locality: None,
-            weight: 1,
-        },
+        EndpointMetadata { zone: None, locality: None, weight: 1 },
     )?;
     let secondary = UpstreamEndpoint::new(
         secondary_id.clone(),
         SocketAddr::from(([127, 0, 0, 1], 9101)),
         EndpointState::Ready,
-        EndpointMetadata {
-            zone: None,
-            locality: None,
-            weight: 1,
-        },
+        EndpointMetadata { zone: None, locality: None, weight: 1 },
     )?;
-    registry.insert_cluster(UpstreamCluster::new(cluster_name.clone(), vec![primary, secondary])?)?;
+    registry
+        .insert_cluster(UpstreamCluster::new(cluster_name.clone(), vec![primary, secondary])?)?;
     registry.advance_time(Duration::from_secs(20));
 
     let started_at = Instant::now();
     let _ = registry.note_active_failure(&cluster_name, &primary_id)?;
     let candidates = registry.selection_candidates(&cluster_name, true)?;
-    if !candidates
-        .iter()
-        .any(|candidate| candidate.endpoint_id == secondary_id)
-    {
+    if !candidates.iter().any(|candidate| candidate.endpoint_id == secondary_id) {
         return Err(io::Error::other("failover candidate was not selected").into());
     }
 
@@ -1146,10 +1142,7 @@ pub async fn measure_hedging_execution_throughput(
 
     for _ in 0..operations {
         let _ = execute_with_hedge(
-            RequestHedgingPolicy {
-                hedge_delay: Duration::from_millis(2),
-                max_attempts: 2,
-            },
+            RequestHedgingPolicy { hedge_delay: Duration::from_millis(2), max_attempts: 2 },
             || true,
             || async {
                 time::sleep(Duration::from_millis(6)).await;
@@ -1164,11 +1157,7 @@ pub async fn measure_hedging_execution_throughput(
         .map_err(|error| -> DynError { Box::new(error) })?;
     }
 
-    Ok(throughput_measurement(
-        "hedging_execution_batch",
-        operations,
-        started_at.elapsed(),
-    ))
+    Ok(throughput_measurement("hedging_execution_batch", operations, started_at.elapsed()))
 }
 
 pub fn measure_abuse_mitigation_decision_throughput(
@@ -1211,11 +1200,7 @@ pub fn measure_abuse_mitigation_decision_throughput(
         );
     }
 
-    Ok(throughput_measurement(
-        "abuse_mitigation_decision_batch",
-        operations,
-        started_at.elapsed(),
-    ))
+    Ok(throughput_measurement("abuse_mitigation_decision_batch", operations, started_at.elapsed()))
 }
 
 pub fn measure_discovery_churn_reconcile_throughput(
@@ -1224,7 +1209,8 @@ pub fn measure_discovery_churn_reconcile_throughput(
     let operations = updates.max(1);
     let registry = UpstreamHealthRegistry::new(EndpointHealthPolicy::default());
     let cluster_name = lb_net_core::UpstreamClusterName::new("perf-discovery")?;
-    registry.insert_cluster(lb_net_core::UpstreamCluster::new(cluster_name.clone(), Vec::new())?)?;
+    registry
+        .insert_cluster(lb_net_core::UpstreamCluster::new(cluster_name.clone(), Vec::new())?)?;
     let source = DiscoverySourceId::new(
         DiscoveryProviderKind::DnsAaaa,
         "perf.internal",
@@ -1258,11 +1244,7 @@ pub fn measure_discovery_churn_reconcile_throughput(
         let _ = reconciler.advance_time(&registry, Duration::from_millis(4))?;
     }
 
-    Ok(throughput_measurement(
-        "discovery_churn_reconcile_batch",
-        operations,
-        started_at.elapsed(),
-    ))
+    Ok(throughput_measurement("discovery_churn_reconcile_batch", operations, started_at.elapsed()))
 }
 
 pub async fn measure_http1_to_http3_bridge_throughput(
@@ -1310,11 +1292,7 @@ async fn measure_http1_to_http3_bridge_throughput_once(
         return Err(io::Error::other("unexpected HTTP/1->HTTP/3 harness counts").into());
     }
 
-    Ok(throughput_measurement(
-        "http1_to_http3_bridge_batch",
-        operations,
-        elapsed,
-    ))
+    Ok(throughput_measurement("http1_to_http3_bridge_batch", operations, elapsed))
 }
 
 fn throughput_measurement(
@@ -1658,17 +1636,18 @@ async fn spawn_repeating_h3_upstream(
     let certified =
         generate_simple_self_signed(vec![String::from("localhost")]).map_err(io::Error::other)?;
     let cert_der = CertificateDer::from(certified.cert.der().to_vec());
-    let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-        certified.key_pair.serialize_der(),
-    ));
+    let key_der =
+        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(certified.key_pair.serialize_der()));
 
-    let mut rustls_server = RustlsServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
-        .with_no_client_auth()
-        .with_single_cert(vec![cert_der.clone()], key_der)
-        .map_err(io::Error::other)?;
+    let mut rustls_server =
+        RustlsServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der.clone()], key_der)
+            .map_err(io::Error::other)?;
     rustls_server.alpn_protocols = vec![b"h3".to_vec()];
 
-    let quic_server = QuicServerConfig::try_from(Arc::new(rustls_server)).map_err(io::Error::other)?;
+    let quic_server =
+        QuicServerConfig::try_from(Arc::new(rustls_server)).map_err(io::Error::other)?;
     let server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_server));
 
     let socket = UdpSocket::bind("127.0.0.1:0").await?;
@@ -1694,7 +1673,9 @@ async fn spawn_repeating_h3_upstream(
             let Ok(connection) = connecting.await else {
                 continue;
             };
-            let Ok(mut h3_conn) = h3_server::builder().build(h3_quinn::Connection::new(connection)).await else {
+            let Ok(mut h3_conn) =
+                h3_server::builder().build(h3_quinn::Connection::new(connection)).await
+            else {
                 continue;
             };
 
@@ -1723,11 +1704,7 @@ async fn spawn_repeating_h3_upstream(
                 if stream.send_response(response).await.is_err() {
                     break;
                 }
-                if stream
-                    .send_data(Bytes::from_static(body.as_bytes()))
-                    .await
-                    .is_err()
-                {
+                if stream.send_data(Bytes::from_static(body.as_bytes())).await.is_err() {
                     break;
                 }
                 if stream.finish().await.is_err() {
@@ -2171,7 +2148,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn artifact_builder_returns_loopback_profile_without_supported_claim() -> Result<(), DynError> {
+    async fn artifact_builder_returns_loopback_profile_without_supported_claim(
+    ) -> Result<(), DynError> {
         let artifact = build_performance_envelope_artifact(
             EnvelopeMode::Smoke,
             DeploymentProfile::LoopbackRegressionV1,

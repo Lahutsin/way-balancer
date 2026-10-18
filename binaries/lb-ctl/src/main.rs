@@ -16,15 +16,8 @@ fn control_plane_signer() -> Result<lb_config_model::ArtifactSigner, Box<dyn std
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CliCommand {
     Demo,
-    Preview {
-        candidate_version: String,
-        baseline_version: Option<String>,
-    },
-    Apply {
-        candidate_version: String,
-        baseline_version: Option<String>,
-        allow_staged_apply: bool,
-    },
+    Preview { candidate_version: String, baseline_version: Option<String> },
+    Apply { candidate_version: String, baseline_version: Option<String>, allow_staged_apply: bool },
 }
 
 fn parse_cli_command_from_args(args: &[String]) -> Result<CliCommand, String> {
@@ -65,18 +58,11 @@ fn parse_cli_command_from_args(args: &[String]) -> Result<CliCommand, String> {
 
     match command {
         "demo" => Ok(CliCommand::Demo),
-        "preview" => Ok(CliCommand::Preview {
-            candidate_version,
-            baseline_version,
-        }),
-        "apply" => Ok(CliCommand::Apply {
-            candidate_version,
-            baseline_version,
-            allow_staged_apply,
-        }),
-        other => Err(format!(
-            "unknown command '{other}'; expected one of: demo, preview, apply"
-        )),
+        "preview" => Ok(CliCommand::Preview { candidate_version, baseline_version }),
+        "apply" => {
+            Ok(CliCommand::Apply { candidate_version, baseline_version, allow_staged_apply })
+        }
+        other => Err(format!("unknown command '{other}'; expected one of: demo, preview, apply")),
     }
 }
 
@@ -150,10 +136,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut promotion = lb_admin_api::PromotionCoordinator::new();
 
     match cli_command {
-        CliCommand::Preview {
-            candidate_version,
-            baseline_version,
-        } => {
+        CliCommand::Preview { candidate_version, baseline_version } => {
             let preview = auth.preview_promotion(
                 &control,
                 &mut promotion,
@@ -176,11 +159,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
             return Ok(());
         }
-        CliCommand::Apply {
-            candidate_version,
-            baseline_version,
-            allow_staged_apply,
-        } => {
+        CliCommand::Apply { candidate_version, baseline_version, allow_staged_apply } => {
             let _ = auth.rollout_snapshot(
                 &control,
                 &mut rollout,
@@ -304,10 +283,8 @@ mod tests {
 
     #[test]
     fn parse_preview_command_with_defaults() -> Result<(), Box<dyn std::error::Error>> {
-        let command = parse_cli_command_from_args(&[
-            String::from("lb-ctl"),
-            String::from("preview"),
-        ])?;
+        let command =
+            parse_cli_command_from_args(&[String::from("lb-ctl"), String::from("preview")])?;
         assert!(matches!(
             command,
             CliCommand::Preview {

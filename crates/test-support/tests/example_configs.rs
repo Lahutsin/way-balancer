@@ -49,6 +49,9 @@ fn documented_example_configs_parse_and_compile() -> Result<(), Box<dyn std::err
 #[test]
 fn docker_compose_example_config_parses() -> Result<(), Box<dyn std::error::Error>> {
     let contents = fs::read_to_string(example_path("docker-compose-public-admin.json"))?;
-    let _config = lb_config_model::WorkspaceConfig::parse_json_str(&contents)?;
+    let config = lb_config_model::WorkspaceConfig::parse_json_str(&contents)?;
+    config.validate()?;
+    let snapshot = config.compile_snapshot()?;
+    assert!(!snapshot.metadata().digest_sha256().is_empty());
     Ok(())
 }

@@ -7,23 +7,23 @@ mod discovery;
 mod emergency_protection;
 mod extension_surface;
 mod failure_management;
-mod hedging;
 mod header_anomaly_scoring;
+mod hedging;
 mod http1_proxy;
 mod http2_proxy;
 mod http3_upstream;
 mod http_cache;
 mod l7_auth;
-mod local_limits;
 mod lifecycle;
+mod local_limits;
 mod overload_management;
 mod probe_semantics;
-mod request_body_inspection;
-mod request_classification_adaptive_mitigation;
-mod request_classification;
-mod request_classification_enforcement;
 mod protocol_protection;
 mod reputation_adapter;
+mod request_body_inspection;
+mod request_classification;
+mod request_classification_adaptive_mitigation;
+mod request_classification_enforcement;
 mod route_enumeration;
 mod source_guards;
 mod tcp_proxy;
@@ -48,9 +48,10 @@ pub use config_application::{
     SnapshotApplyMetrics, SnapshotApplyOutcome, SnapshotApplyRequest,
 };
 pub use discovery::{
-    failure_backoff_delay, jittered_refresh_delay, DiscoveryEndpoint, DiscoveryMembershipReconciler,
-    DiscoveryProviderKind, DiscoveryReconcileError, DiscoveryReconcileOutcome,
-    DiscoveryRefreshHealth, DiscoveryRefreshState, DiscoverySnapshot, DiscoverySourceId,
+    failure_backoff_delay, jittered_refresh_delay, DiscoveryEndpoint,
+    DiscoveryMembershipReconciler, DiscoveryProviderKind, DiscoveryReconcileError,
+    DiscoveryReconcileOutcome, DiscoveryRefreshHealth, DiscoveryRefreshState, DiscoverySnapshot,
+    DiscoverySourceId,
 };
 pub use emergency_protection::{
     AbuseEventCategory, AbuseEventInput, AbuseEventLabel, AbuseForensicsError,
@@ -62,13 +63,11 @@ pub use emergency_protection::{
 pub use extension_surface::{
     ExtensionCompatibilityPolicy, ExtensionDescriptor, ExtensionHookBinding, ExtensionHookPhase,
     ExtensionLifecycleState, ExtensionRegistry, ExtensionRegistryError, ExternalAuthHookDecision,
-    ExternalAuthHookError, ExternalAuthHookRequest, HookExecutionPlanEntry,
-    PolicyPlugin, PolicyPluginDecision, PolicyPluginDescriptor,
-    PolicyPluginDisabledFallback, PolicyPluginError, PolicyPluginEvaluationOutcome,
-    PolicyPluginIsolationPolicy, PolicyPluginRegistration, PolicyPluginRegistry,
-    PolicyPluginRegistryError,
-    PolicyPluginRequestContext, PolicyPluginResponse, RegisteredExtension,
-    RuntimeExternalAuthHook,
+    ExternalAuthHookError, ExternalAuthHookRequest, HookExecutionPlanEntry, PolicyPlugin,
+    PolicyPluginDecision, PolicyPluginDescriptor, PolicyPluginDisabledFallback, PolicyPluginError,
+    PolicyPluginEvaluationOutcome, PolicyPluginIsolationPolicy, PolicyPluginRegistration,
+    PolicyPluginRegistry, PolicyPluginRegistryError, PolicyPluginRequestContext,
+    PolicyPluginResponse, RegisteredExtension, RuntimeExternalAuthHook,
 };
 pub use failure_management::{
     CircuitBreaker, CircuitBreakerPolicy, CircuitBreakerSnapshot, CircuitBreakerState,
@@ -76,21 +75,19 @@ pub use failure_management::{
     RetryBudgetPolicy, RetryBudgetSnapshot, TimeoutCategory, TimeoutHierarchy,
     UpstreamFailureClass,
 };
-pub use hedging::{execute_with_hedge, HedgeOutcome, RequestHedgingPolicy};
 pub use header_anomaly_scoring::HeaderAnomalyScorer;
+pub use hedging::{execute_with_hedge, HedgeOutcome, RequestHedgingPolicy};
 pub use http1_proxy::{
     proxy_http1_connection, proxy_http1_connection_with_downstream_addr,
-    proxy_http1_request_with_downstream_addr, Http1ConnectionMetrics,
-    Http1ConnectionReport, Http1ProxyConfig, Http1ProxyError, Http1ResponseCacheConfig,
-    Http1RouteUpstream, Http1SingleRequestResponse, RouteDestinationPolicyRuntime,
+    proxy_http1_request_with_downstream_addr, Http1ConnectionMetrics, Http1ConnectionReport,
+    Http1ProxyConfig, Http1ProxyError, Http1ResponseCacheConfig, Http1RouteUpstream,
+    Http1SingleRequestResponse, RouteDestinationPolicyRuntime,
 };
 pub use http2_proxy::{
     proxy_http2_connection, proxy_http2_connection_with_downstream_addr, Http2ConnectionMetrics,
     Http2ConnectionReport, Http2ProxyConfig, Http2ProxyError, Http2RouteUpstream,
 };
-pub use http3_upstream::{
-    clear_http3_test_root_certificates, set_http3_test_root_certificates,
-};
+pub use http3_upstream::{clear_http3_test_root_certificates, set_http3_test_root_certificates};
 pub use http_cache::{
     build_http_cache_key_material, HttpCacheEntry, HttpCacheEntrySnapshot, HttpCacheFreshness,
     HttpCacheHeader, HttpCacheInsertResult, HttpCacheInvalidationApplyResult,
@@ -108,12 +105,12 @@ pub use l7_auth::{
     ExternalAuthPolicyRuntime, ExternalAuthVerificationError, JwtAuthPolicyRuntime,
     JwtAuthVerificationError, UpstreamIdentityPolicyRuntime, UpstreamIdentityVerificationError,
 };
+pub use lifecycle::{LifecycleState, LifecycleStateMachine, LifecycleTransitionError};
 pub use local_limits::{
     LimitContext, LocalConcurrencyLease, LocalConcurrencyLimitConfig, LocalConcurrencyLimiter,
     LocalConcurrencyLimiterMetrics, LocalLimitError, LocalLimitKeyKind, LocalLimitScope,
     LocalRateLimitConfig, LocalRateLimiter, LocalRateLimiterMetrics, RateLimitDecision,
 };
-pub use lifecycle::{LifecycleState, LifecycleStateMachine, LifecycleTransitionError};
 pub use overload_management::{
     BrownoutFeature, BrownoutFeatureState, BrownoutHookRegistry, OverloadManagementError,
     OverloadManager, OverloadMetrics, OverloadPolicy, OverloadSignal, OverloadSignalKind,
@@ -123,33 +120,33 @@ pub use probe_semantics::{
     LivenessProbeState, ProbeEvaluation, ProbeMetrics, ProbeSemanticsEvaluator,
     ReadinessProbeState, RuntimeProbeInput, StartupProbeState,
 };
+pub use protocol_protection::{ProtocolAnomalyCategory, SlowClientStage};
+pub use reputation_adapter::{
+    ReputationAdapterChain, ReputationSignalInput, ReputationSignalProvider, ReputationVerdict,
+};
 pub use request_body_inspection::RequestBodyInspector;
+pub use request_classification::{
+    RequestClassificationAction, RequestClassificationAdapterContext,
+    RequestClassificationPolicyRuntime, RequestClassificationResult, RequestClassifierSignal,
+    RequestClassifierSignalKind,
+};
 pub use request_classification_adaptive_mitigation::{
     RequestClassificationAdaptiveMitigationDecision, RequestClassificationAdaptiveMitigationPolicy,
     RequestClassificationAdaptiveMitigator,
 };
-pub use reputation_adapter::{
-    ReputationAdapterChain, ReputationSignalInput, ReputationSignalProvider, ReputationVerdict,
-};
-pub use request_classification::{
-    RequestClassificationAction, RequestClassificationAdapterContext,
-    RequestClassificationPolicyRuntime, RequestClassificationResult,
-    RequestClassifierSignal, RequestClassifierSignalKind,
-};
 pub use request_classification_enforcement::{
     RequestClassificationAuditRecord, RequestClassificationAuthContext,
-    RequestClassificationEnforcer, RequestClassificationEnforcementAction,
-    RequestClassificationEnforcementDecision, RequestClassificationEnforcementPolicy,
+    RequestClassificationEnforcementAction, RequestClassificationEnforcementDecision,
+    RequestClassificationEnforcementPolicy, RequestClassificationEnforcer,
 };
-pub use protocol_protection::{ProtocolAnomalyCategory, SlowClientStage};
 pub use route_enumeration::{
     RouteEnumerationProtectionPolicy, RouteEnumerationProtectionSnapshot,
     RouteEnumerationProtectionState,
 };
 pub use source_guards::{
-    AbuseRejectionReason, HandshakeGuardPolicy, HandshakePermit,
-    ListenerAbuseProtectionPolicy, ListenerAbuseProtectionSnapshot,
-    ListenerAbuseProtectionState, SourceAggregation, SourceQuotaPolicy,
+    AbuseRejectionReason, HandshakeGuardPolicy, HandshakePermit, ListenerAbuseProtectionPolicy,
+    ListenerAbuseProtectionSnapshot, ListenerAbuseProtectionState, SourceAggregation,
+    SourceQuotaPolicy,
 };
 pub use tcp_proxy::{
     proxy_tcp_stream, ConnectionContext, ConnectionEventKind, ConnectionMetadata,
@@ -167,8 +164,8 @@ pub use upstream_balancer::{
     ActiveProbeTarget, AffinityFallbackPolicy, AffinityPolicy, EndpointSelectionCandidate,
     LoadBalancingAlgorithm, LocalityRoutingPolicy, NoHealthyFallback, RouteBackendPool,
     RouteBackendPoolBuildError, SelectedEndpoint, SelectedRouteBackend, SelectionContext,
-    UpstreamBalancer, UpstreamSelectionError, UpstreamSelectionMetrics,
-    UpstreamSelectionPolicy, WeightedRouteDestination,
+    UpstreamBalancer, UpstreamSelectionError, UpstreamSelectionMetrics, UpstreamSelectionPolicy,
+    WeightedRouteDestination,
 };
 pub use upstream_health::{
     EndpointHealthPolicy, EndpointHealthSnapshot, EndpointHealthStatus, ProtocolHealthClass,
@@ -530,8 +527,8 @@ pub async fn start_listener_with_protection(
 ) -> Result<ListenerHandle, ListenerRuntimeError> {
     config.validate().map_err(ListenerRuntimeError::InvalidConfig)?;
 
-    let listener =
-        bind_tcp_listener(config.bind_address, config.bind_mode).map_err(ListenerRuntimeError::Bind)?;
+    let listener = bind_tcp_listener(config.bind_address, config.bind_mode)
+        .map_err(ListenerRuntimeError::Bind)?;
     let local_addr = listener.local_addr().map_err(ListenerRuntimeError::Bind)?;
     let shared = Arc::new(ListenerShared::new(&config, local_addr));
     let protections = Arc::new(ListenerAbuseProtectionState::new(protection_policy));

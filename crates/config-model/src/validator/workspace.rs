@@ -36,6 +36,7 @@ pub(crate) fn validate_workspace_config(config: &WorkspaceConfig) -> ValidationR
         validate_listener(
             listener,
             index,
+            config.security.insecure_dev_mode.enabled,
             &route_names,
             &route_registry,
             &policy_registry,

@@ -7,8 +7,8 @@ mod cache_transport;
 mod control;
 mod fleet;
 mod fleet_gate;
-mod fleet_status;
 mod fleet_staged;
+mod fleet_status;
 mod listener_canary;
 mod mtls;
 mod promotion;
@@ -34,41 +34,38 @@ pub use cache::{
 pub use cache_transport::{
     sign_http_cache_peer_request, HttpCacheInvalidationDeliveryMode, HttpCachePeerConfig,
     HttpCachePeerDeliveryRecord, HttpCachePeerDeliveryResult, HttpCachePeerFanoutReport,
-    HttpCachePeerInvalidationResponse, HttpCachePeerInvalidationResult,
-    HttpCachePeerRetryPolicy, HttpCachePeerTransport, InvalidHttpCachePeerConfig,
+    HttpCachePeerInvalidationResponse, HttpCachePeerInvalidationResult, HttpCachePeerRetryPolicy,
+    HttpCachePeerTransport, InvalidHttpCachePeerConfig,
 };
 pub use control::{
     InvalidPublishRequest, PublishConflict, PublishEvent, PublishEventKind, PublishResponse,
     PublishResponseKind, PublishedSnapshotRecord, PublishedSnapshotSummary, SnapshotBackupBundle,
     SnapshotBackupError, SnapshotControlService, SnapshotDiffPreview, SnapshotDiffPreviewError,
-    SnapshotImpactAnalysis, SnapshotImpactSeverity, SnapshotLookupError,
-    SnapshotPublicationError, SnapshotPublishRequest, SnapshotRegistryDurableEnvelope,
-    SnapshotRegistryDurableState, SnapshotRegistryMetrics, SnapshotRegistryRetentionPolicy,
-    SnapshotRegistryStateError, SnapshotResourceImpactSummary, SnapshotRestoreError,
+    SnapshotImpactAnalysis, SnapshotImpactSeverity, SnapshotLookupError, SnapshotPublicationError,
+    SnapshotPublishRequest, SnapshotRegistryDurableEnvelope, SnapshotRegistryDurableState,
+    SnapshotRegistryMetrics, SnapshotRegistryRetentionPolicy, SnapshotRegistryStateError,
+    SnapshotResourceImpactSummary, SnapshotRestoreError,
 };
 pub use fleet::{
-    FleetAbortReason, FleetAbortRollbackDecision, FleetAutoRollbackMode,
-    FleetAutoRollbackOutcome, FleetConsistencyMode, FleetConvergenceReport,
-    FleetConvergenceState,
-    FleetNodeActionOutcome, FleetNodeActionResult, FleetNodeBackend, FleetNodeBackendError,
-    FleetNodeConvergenceState, FleetNodeRuntimeStatus, FleetNodeStatus,
-    FleetRecommendedAction, FleetRollbackPolicyConfig, FleetRollbackRequest,
-    FleetRolloutCoordinator,
-    FleetRolloutError, FleetRolloutHistoryEntry, FleetRolloutMetrics, FleetRolloutRequest,
-    FleetRolloutResponse, FleetRolloutStrategy, InvalidFleetRequest,
+    FleetAbortReason, FleetAbortRollbackDecision, FleetAutoRollbackMode, FleetAutoRollbackOutcome,
+    FleetConsistencyMode, FleetConvergenceReport, FleetConvergenceState, FleetNodeActionOutcome,
+    FleetNodeActionResult, FleetNodeBackend, FleetNodeBackendError, FleetNodeConvergenceState,
+    FleetNodeRuntimeStatus, FleetNodeStatus, FleetRecommendedAction, FleetRollbackPolicyConfig,
+    FleetRollbackRequest, FleetRolloutCoordinator, FleetRolloutError, FleetRolloutHistoryEntry,
+    FleetRolloutMetrics, FleetRolloutRequest, FleetRolloutResponse, FleetRolloutStrategy,
+    InvalidFleetRequest,
 };
 pub use fleet_gate::{
     collect_wave_health_signals, evaluate_wave_gate, evaluate_wave_gate_with_policy,
     FleetNodeHealthSignal, FleetWaveGateEvaluation, FleetWaveGateVerdict,
 };
+pub use fleet_staged::{
+    plan_staged_rollout, FleetHealthGateMode, FleetHealthGatePolicy, FleetRolloutWaveDefinition,
+    FleetStagedRolloutPlan, FleetStagedRolloutRequest, InvalidFleetStagedRolloutRequest,
+};
 pub use fleet_status::{
     render_staged_status_surface, FleetNodeStatusSurface, FleetStagedRolloutState,
     FleetStagedStatusSurface, FleetWaveStatusState, FleetWaveStatusSurface,
-};
-pub use fleet_staged::{
-    plan_staged_rollout, FleetHealthGateMode, FleetHealthGatePolicy,
-    FleetRolloutWaveDefinition, FleetStagedRolloutPlan, FleetStagedRolloutRequest,
-    InvalidFleetStagedRolloutRequest,
 };
 pub use listener_canary::{
     ListenerCanaryApplyRequest, ListenerCanaryApplyResponse, ListenerCanaryCoordinator,
@@ -380,26 +377,19 @@ fn increment_bucket(map: &mut std::collections::BTreeMap<String, u64>, key: &str
 fn map_to_breakdown(
     map: std::collections::BTreeMap<String, u64>,
 ) -> Vec<AdminDecisionBreakdownEntry> {
-    map.into_iter()
-        .map(|(key, count)| AdminDecisionBreakdownEntry { key, count })
-        .collect()
+    map.into_iter().map(|(key, count)| AdminDecisionBreakdownEntry { key, count }).collect()
 }
 
 fn is_decision_failure(result: &str) -> bool {
-    matches!(
-        result,
-        "failed" | "rejected" | "denied" | "blocked" | "timeout" | "error"
-    )
+    matches!(result, "failed" | "rejected" | "denied" | "blocked" | "timeout" | "error")
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         export_decision_trace_events, render_decision_diagnostics_dashboard,
-        versioned_admin_target, AdminApiErrorCode, AdminStatus,
-        SupportBundleService,
-        VersionedAdminApiError, VersionedAdminApiErrorEnvelope,
-        VersionedAdminApiSuccessEnvelope,
+        versioned_admin_target, AdminApiErrorCode, AdminStatus, SupportBundleService,
+        VersionedAdminApiError, VersionedAdminApiErrorEnvelope, VersionedAdminApiSuccessEnvelope,
     };
 
     #[test]
@@ -527,16 +517,17 @@ mod tests {
             ),
         ];
 
-        let diagnostics = lb_observability::SupportBundleBuilder::new(lb_observability::RedactionEngine)
-            .collect_runtime_diagnostics(
-                lb_observability::DiagnosticsLimits::default(),
-                lb_observability::RuntimeDiagnosticsInput {
-                    metrics_text: Some(String::new()),
-                    logs: Some(Vec::new()),
-                    events: Some(decision_events),
-                    cache_diagnostics_text: Some(String::new()),
-                },
-            );
+        let diagnostics =
+            lb_observability::SupportBundleBuilder::new(lb_observability::RedactionEngine)
+                .collect_runtime_diagnostics(
+                    lb_observability::DiagnosticsLimits::default(),
+                    lb_observability::RuntimeDiagnosticsInput {
+                        metrics_text: Some(String::new()),
+                        logs: Some(Vec::new()),
+                        events: Some(decision_events),
+                        cache_diagnostics_text: Some(String::new()),
+                    },
+                );
 
         let decision_events = export_decision_trace_events(&diagnostics);
         assert_eq!(decision_events.len(), 2);
@@ -592,16 +583,17 @@ mod tests {
             ),
         ];
 
-        let diagnostics = lb_observability::SupportBundleBuilder::new(lb_observability::RedactionEngine)
-            .collect_runtime_diagnostics(
-                lb_observability::DiagnosticsLimits::default(),
-                lb_observability::RuntimeDiagnosticsInput {
-                    metrics_text: Some(String::new()),
-                    logs: Some(Vec::new()),
-                    events: Some(decision_events),
-                    cache_diagnostics_text: Some(String::new()),
-                },
-            );
+        let diagnostics =
+            lb_observability::SupportBundleBuilder::new(lb_observability::RedactionEngine)
+                .collect_runtime_diagnostics(
+                    lb_observability::DiagnosticsLimits::default(),
+                    lb_observability::RuntimeDiagnosticsInput {
+                        metrics_text: Some(String::new()),
+                        logs: Some(Vec::new()),
+                        events: Some(decision_events),
+                        cache_diagnostics_text: Some(String::new()),
+                    },
+                );
 
         let dashboard = render_decision_diagnostics_dashboard(&diagnostics);
         assert_eq!(dashboard.total_decision_events, 2);

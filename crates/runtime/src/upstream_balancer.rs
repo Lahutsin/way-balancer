@@ -313,10 +313,7 @@ impl RouteBackendPool {
         transport: lb_net_core::UpstreamTransport,
     ) -> Result<lb_net_core::UpstreamTarget, UpstreamSelectionError> {
         self.select_upstream_with_context_and_transport(
-            &SelectionContext {
-                request_hash,
-                ..SelectionContext::default()
-            },
+            &SelectionContext { request_hash, ..SelectionContext::default() },
             transport,
         )
     }
@@ -380,17 +377,16 @@ impl RouteBackendPool {
                 let selection_order = select_weighted_route_destination_order(destinations, state);
                 let mut last_error = None;
                 for (selection_rank, destination_index) in selection_order.into_iter().enumerate() {
-                    match destinations[destination_index].pool.select_backend_with_context(context) {
+                    match destinations[destination_index].pool.select_backend_with_context(context)
+                    {
                         Ok(selected) => {
-                            let mut state = state
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            let mut state =
+                                state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                             state.weighted_route_selection_count =
                                 state.weighted_route_selection_count.saturating_add(1);
                             if selection_rank > 0 {
-                                state.route_destination_fallback_count = state
-                                    .route_destination_fallback_count
-                                    .saturating_add(1);
+                                state.route_destination_fallback_count =
+                                    state.route_destination_fallback_count.saturating_add(1);
                             }
                             let counter = state
                                 .route_destination_selection_counts
@@ -423,9 +419,11 @@ impl RouteBackendPool {
                 registry.note_passive_success(cluster_name, endpoint_id)
             }
             RouteBackendPoolInner::Weighted { destinations, .. } => {
-                note_endpoint_across_weighted_destinations(destinations, endpoint_id, |pool, endpoint_id| {
-                    pool.note_passive_success(endpoint_id)
-                })
+                note_endpoint_across_weighted_destinations(
+                    destinations,
+                    endpoint_id,
+                    |pool, endpoint_id| pool.note_passive_success(endpoint_id),
+                )
             }
         }
     }
@@ -439,9 +437,11 @@ impl RouteBackendPool {
                 registry.note_passive_failure(cluster_name, endpoint_id)
             }
             RouteBackendPoolInner::Weighted { destinations, .. } => {
-                note_endpoint_across_weighted_destinations(destinations, endpoint_id, |pool, endpoint_id| {
-                    pool.note_passive_failure(endpoint_id)
-                })
+                note_endpoint_across_weighted_destinations(
+                    destinations,
+                    endpoint_id,
+                    |pool, endpoint_id| pool.note_passive_failure(endpoint_id),
+                )
             }
         }
     }
@@ -455,9 +455,11 @@ impl RouteBackendPool {
                 registry.endpoint_health(cluster_name, endpoint_id)
             }
             RouteBackendPoolInner::Weighted { destinations, .. } => {
-                note_endpoint_across_weighted_destinations(destinations, endpoint_id, |pool, endpoint_id| {
-                    pool.endpoint_health(endpoint_id)
-                })
+                note_endpoint_across_weighted_destinations(
+                    destinations,
+                    endpoint_id,
+                    |pool, endpoint_id| pool.endpoint_health(endpoint_id),
+                )
             }
         }
     }
@@ -537,9 +539,11 @@ impl RouteBackendPool {
                 registry.note_active_success(cluster_name, endpoint_id)
             }
             RouteBackendPoolInner::Weighted { destinations, .. } => {
-                note_endpoint_across_weighted_destinations(destinations, endpoint_id, |pool, endpoint_id| {
-                    pool.note_active_success(endpoint_id)
-                })
+                note_endpoint_across_weighted_destinations(
+                    destinations,
+                    endpoint_id,
+                    |pool, endpoint_id| pool.note_active_success(endpoint_id),
+                )
             }
         }
     }
@@ -553,9 +557,11 @@ impl RouteBackendPool {
                 registry.note_active_failure(cluster_name, endpoint_id)
             }
             RouteBackendPoolInner::Weighted { destinations, .. } => {
-                note_endpoint_across_weighted_destinations(destinations, endpoint_id, |pool, endpoint_id| {
-                    pool.note_active_failure(endpoint_id)
-                })
+                note_endpoint_across_weighted_destinations(
+                    destinations,
+                    endpoint_id,
+                    |pool, endpoint_id| pool.note_active_failure(endpoint_id),
+                )
             }
         }
     }
@@ -565,8 +571,9 @@ impl RouteBackendPool {
         match self.inner.as_ref() {
             RouteBackendPoolInner::Single { balancer, .. } => balancer.metrics(),
             RouteBackendPoolInner::Weighted { destinations, state } => {
-                let mut aggregate =
-                    destinations.iter().fold(UpstreamSelectionMetrics::default(), |mut aggregate, destination| {
+                let mut aggregate = destinations.iter().fold(
+                    UpstreamSelectionMetrics::default(),
+                    |mut aggregate, destination| {
                         let metrics = destination.pool.selection_metrics();
                         aggregate.round_robin_selection_count +=
                             metrics.round_robin_selection_count;
@@ -585,14 +592,16 @@ impl RouteBackendPool {
                         aggregate.affinity_fallback_count += metrics.affinity_fallback_count;
                         aggregate.route_destination_fallback_count +=
                             metrics.route_destination_fallback_count;
-                        for (destination_name, count) in metrics.route_destination_selection_counts {
+                        for (destination_name, count) in metrics.route_destination_selection_counts
+                        {
                             *aggregate
                                 .route_destination_selection_counts
                                 .entry(destination_name)
                                 .or_default() += count;
                         }
                         aggregate
-                    });
+                    },
+                );
                 let weighted_state = state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                 aggregate.weighted_route_selection_count +=
                     weighted_state.weighted_route_selection_count;
@@ -659,26 +668,25 @@ fn select_weighted_route_destination_order(
 ) -> Vec<usize> {
     let mut state = state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     state.current_weights.retain(|cluster_name, _| {
-        destinations
-            .iter()
-            .any(|destination| destination.pool.cluster_name() == cluster_name)
+        destinations.iter().any(|destination| destination.pool.cluster_name() == cluster_name)
     });
     state.total_weight = destinations.iter().map(|destination| i64::from(destination.weight)).sum();
 
     for destination in destinations {
-        let entry = state
-            .current_weights
-            .entry(destination.pool.cluster_name().clone())
-            .or_insert(0);
+        let entry =
+            state.current_weights.entry(destination.pool.cluster_name().clone()).or_insert(0);
         *entry += i64::from(destination.weight);
     }
 
-    let Some(best_index) = best_weighted_route_destination_index(destinations, &state.current_weights)
+    let Some(best_index) =
+        best_weighted_route_destination_index(destinations, &state.current_weights)
     else {
         return Vec::new();
     };
     let total_weight = state.total_weight;
-    if let Some(current) = state.current_weights.get_mut(destinations[best_index].pool.cluster_name()) {
+    if let Some(current) =
+        state.current_weights.get_mut(destinations[best_index].pool.cluster_name())
+    {
         *current -= total_weight;
     }
 
@@ -690,30 +698,26 @@ fn select_weighted_route_destination_order(
             .enumerate()
             .filter(|(index, _)| !order.contains(index))
             .max_by(|(left_index, left), (right_index, right)| {
-                let left_weight = fallback_weights
-                    .get(left.pool.cluster_name())
-                    .copied()
-                    .unwrap_or_default();
-                let right_weight = fallback_weights
-                    .get(right.pool.cluster_name())
-                    .copied()
-                    .unwrap_or_default();
-                left_weight
-                    .cmp(&right_weight)
-                    .then_with(|| {
-                        right
-                            .pool
-                            .cluster_name()
-                            .cmp(left.pool.cluster_name())
-                            .then_with(|| right_index.cmp(left_index))
-                    })
+                let left_weight =
+                    fallback_weights.get(left.pool.cluster_name()).copied().unwrap_or_default();
+                let right_weight =
+                    fallback_weights.get(right.pool.cluster_name()).copied().unwrap_or_default();
+                left_weight.cmp(&right_weight).then_with(|| {
+                    right
+                        .pool
+                        .cluster_name()
+                        .cmp(left.pool.cluster_name())
+                        .then_with(|| right_index.cmp(left_index))
+                })
             })
             .map(|(index, _)| index);
         let Some(next_index) = next else {
             break;
         };
         order.push(next_index);
-        if let Some(current) = fallback_weights.get_mut(destinations[next_index].pool.cluster_name()) {
+        if let Some(current) =
+            fallback_weights.get_mut(destinations[next_index].pool.cluster_name())
+        {
             *current -= state.total_weight;
         }
     }
@@ -726,10 +730,8 @@ fn best_weighted_route_destination_index(
 ) -> Option<usize> {
     let mut best: Option<(usize, i64)> = None;
     for (index, destination) in destinations.iter().enumerate() {
-        let current = current_weights
-            .get(destination.pool.cluster_name())
-            .copied()
-            .unwrap_or_default();
+        let current =
+            current_weights.get(destination.pool.cluster_name()).copied().unwrap_or_default();
         match best {
             None => best = Some((index, current)),
             Some((best_index, best_weight)) => {
@@ -752,7 +754,10 @@ fn note_endpoint_across_weighted_destinations<F>(
     note: F,
 ) -> Result<EndpointHealthSnapshot, UpstreamHealthError>
 where
-    F: Fn(&RouteBackendPool, &lb_net_core::UpstreamEndpointId) -> Result<EndpointHealthSnapshot, UpstreamHealthError>,
+    F: Fn(
+        &RouteBackendPool,
+        &lb_net_core::UpstreamEndpointId,
+    ) -> Result<EndpointHealthSnapshot, UpstreamHealthError>,
 {
     for destination in destinations {
         if destination
@@ -771,13 +776,11 @@ where
             lb_net_core::UpstreamClusterName::new("weighted-destinations")
                 .unwrap_or_else(|_| unreachable!("static fallback cluster name is valid"))
         });
-    Err(UpstreamHealthError::EndpointNotTracked {
-        cluster,
-        endpoint_id: endpoint_id.clone(),
-    })
+    Err(UpstreamHealthError::EndpointNotTracked { cluster, endpoint_id: endpoint_id.clone() })
 }
 
 #[cfg(test)]
+#[allow(clippy::panic)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::time::Duration;
@@ -800,11 +803,7 @@ mod tests {
                     lb_net_core::UpstreamEndpointId::new(endpoint_id)?,
                     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
                     lb_net_core::EndpointState::Ready,
-                    lb_net_core::EndpointMetadata {
-                        zone: None,
-                        locality: None,
-                        weight: 1,
-                    },
+                    lb_net_core::EndpointMetadata { zone: None, locality: None, weight: 1 },
                 )?],
             )?,
             health_policy,
@@ -820,45 +819,28 @@ mod tests {
     #[test]
     fn weighted_route_backend_pool_rejects_invalid_destination_sets(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let single = single_endpoint_pool(
-            "stable",
-            "a",
-            9000,
-            crate::EndpointHealthPolicy::default(),
-        )?;
+        let single =
+            single_endpoint_pool("stable", "a", 9000, crate::EndpointHealthPolicy::default())?;
 
         let empty = RouteBackendPool::from_weighted_destinations([]);
-        assert!(matches!(
-            empty,
-            Err(RouteBackendPoolBuildError::EmptyDestinations)
-        ));
+        assert!(matches!(empty, Err(RouteBackendPoolBuildError::EmptyDestinations)));
 
-        let zero_weight = RouteBackendPool::from_weighted_destinations([WeightedRouteDestination {
-            weight: 0,
-            pool: single,
-        }]);
-        assert!(matches!(
-            zero_weight,
-            Err(RouteBackendPoolBuildError::ZeroWeightDestination(_))
-        ));
+        let zero_weight =
+            RouteBackendPool::from_weighted_destinations([WeightedRouteDestination {
+                weight: 0,
+                pool: single,
+            }]);
+        assert!(matches!(zero_weight, Err(RouteBackendPoolBuildError::ZeroWeightDestination(_))));
         Ok(())
     }
 
     #[test]
     fn weighted_route_backend_pool_distributes_traffic_by_weight(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let stable = single_endpoint_pool(
-            "stable",
-            "a",
-            9000,
-            crate::EndpointHealthPolicy::default(),
-        )?;
-        let canary = single_endpoint_pool(
-            "canary",
-            "b",
-            9001,
-            crate::EndpointHealthPolicy::default(),
-        )?;
+        let stable =
+            single_endpoint_pool("stable", "a", 9000, crate::EndpointHealthPolicy::default())?;
+        let canary =
+            single_endpoint_pool("canary", "b", 9001, crate::EndpointHealthPolicy::default())?;
         let pool = RouteBackendPool::from_weighted_destinations([
             WeightedRouteDestination { weight: 90, pool: stable },
             WeightedRouteDestination { weight: 10, pool: canary },
@@ -941,14 +923,11 @@ mod tests {
     #[test]
     fn select_upstream_with_transport_overrides_default_transport(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let pool = single_endpoint_pool(
-            "stable",
-            "a",
-            9000,
-            crate::EndpointHealthPolicy::default(),
-        )?;
+        let pool =
+            single_endpoint_pool("stable", "a", 9000, crate::EndpointHealthPolicy::default())?;
 
-        let selected = pool.select_upstream_with_transport(7, lb_net_core::UpstreamTransport::Http3)?;
+        let selected =
+            pool.select_upstream_with_transport(7, lb_net_core::UpstreamTransport::Http3)?;
 
         assert_eq!(selected.transport, lb_net_core::UpstreamTransport::Http3);
         Ok(())

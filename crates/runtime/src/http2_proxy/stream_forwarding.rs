@@ -673,7 +673,7 @@ async fn proxy_one_http2_stream(
 
         let unary_grpc_retry_safe = buffered_request_payload
             .as_ref()
-            .is_none_or(|payload| grpc_payload_has_at_most_one_message(payload.body.as_ref()))
+            .map_or(true, |payload| grpc_payload_has_at_most_one_message(payload.body.as_ref()))
             && grpc_payload_has_at_most_one_message(buffered_response_payload.body.as_ref());
 
         let grpc_failure_policy =
@@ -1056,6 +1056,7 @@ impl Drop for DestinationLatencyRecorder<'_> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_retry_response_with_optional_hedge(
     upstream_clients: UpstreamClientRegistry,
     target: lb_net_core::UpstreamTarget,
@@ -1130,6 +1131,7 @@ async fn dispatch_retry_response_with_optional_hedge(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_retry_response_attempt(
     upstream_clients: UpstreamClientRegistry,
     target: lb_net_core::UpstreamTarget,

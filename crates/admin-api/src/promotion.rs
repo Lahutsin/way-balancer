@@ -56,10 +56,7 @@ pub enum PromotionError {
     CandidateNotPublished(String),
     SnapshotLookup(SnapshotLookupError),
     DiffPreview(SnapshotDiffPreviewError),
-    StagedApplyRequired {
-        severity: SnapshotImpactSeverity,
-        strategy: PromotionExecutionStrategy,
-    },
+    StagedApplyRequired { severity: SnapshotImpactSeverity, strategy: PromotionExecutionStrategy },
     Rollout(RolloutError),
 }
 
@@ -139,7 +136,10 @@ impl PromotionCoordinator {
             candidate_version: candidate_version.to_string(),
             preview,
             recommended_strategy,
-            requires_staged_apply_ack: !matches!(recommended_strategy, PromotionExecutionStrategy::Immediate),
+            requires_staged_apply_ack: !matches!(
+                recommended_strategy,
+                PromotionExecutionStrategy::Immediate
+            ),
         })
     }
 
@@ -182,10 +182,7 @@ impl PromotionCoordinator {
             .map_err(PromotionError::Rollout)?;
 
         self.metrics.apply_count = self.metrics.apply_count.saturating_add(1);
-        Ok(PromotionApplyResponse {
-            preview,
-            rollout: rollout_response,
-        })
+        Ok(PromotionApplyResponse { preview, rollout: rollout_response })
     }
 
     #[must_use]
@@ -195,6 +192,7 @@ impl PromotionCoordinator {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use lb_config_model::WorkspaceConfig;
     use lb_test_support::{configure_test_trusted_signers, test_artifact_attestation};
@@ -296,8 +294,8 @@ mod tests {
     }
 
     #[test]
-    fn preview_recommends_staged_canary_for_medium_impact(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn preview_recommends_staged_canary_for_medium_impact() -> Result<(), Box<dyn std::error::Error>>
+    {
         let mut control = crate::SnapshotControlService::new();
         publish_snapshot(&mut control, "stable-v1", 90, 10, 1)?;
         publish_snapshot(&mut control, "canary-v2", 80, 20, 2)?;

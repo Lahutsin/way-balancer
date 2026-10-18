@@ -4,7 +4,9 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{PolicyBindingConfig, UpgradePolicyConfig, WorkspaceConfigError, WorkspaceDefaultsConfig};
+use crate::{
+    PolicyBindingConfig, UpgradePolicyConfig, WorkspaceConfigError, WorkspaceDefaultsConfig,
+};
 
 /// Declarative listener resource.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -493,11 +495,10 @@ mod tests {
 
     use super::{
         compile_listeners, AdminListenerPolicyConfig, ListenerAlpnProtocolConfig,
-        ListenerBindModeConfig, ListenerCertificateSourceConfig, ListenerClassConfig, ListenerResourceConfig,
-        ProxyProtocolModeConfig,
-        ListenerTlsMinimumVersionConfig, ListenerTlsSessionResumptionConfig,
-        ListenerTlsSessionResumptionModeConfig, ListenerTlsSniCertificateConfig,
-        ListenerTlsTerminationConfig,
+        ListenerBindModeConfig, ListenerCertificateSourceConfig, ListenerClassConfig,
+        ListenerResourceConfig, ListenerTlsMinimumVersionConfig,
+        ListenerTlsSessionResumptionConfig, ListenerTlsSessionResumptionModeConfig,
+        ListenerTlsSniCertificateConfig, ListenerTlsTerminationConfig, ProxyProtocolModeConfig,
     };
     use crate::{UpgradePolicyConfig, WorkspaceConfigError, WorkspaceDefaultsConfig};
 

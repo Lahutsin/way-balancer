@@ -116,16 +116,14 @@ impl ListenerAbuseProtectionState {
             return Ok(None);
         };
 
-        tracker.try_acquire(peer_addr).map(Some).inspect_err(|error| {
-            match error {
-                AbuseRejectionReason::SourceQuotaExceeded => {
-                    self.source_quota_rejections.fetch_add(1, Ordering::SeqCst);
-                }
-                AbuseRejectionReason::TrackedSourceLimitReached => {
-                    self.tracked_source_limit_rejections.fetch_add(1, Ordering::SeqCst);
-                }
-                AbuseRejectionReason::HandshakeLimitReached => {}
+        tracker.try_acquire(peer_addr).map(Some).inspect_err(|error| match error {
+            AbuseRejectionReason::SourceQuotaExceeded => {
+                self.source_quota_rejections.fetch_add(1, Ordering::SeqCst);
             }
+            AbuseRejectionReason::TrackedSourceLimitReached => {
+                self.tracked_source_limit_rejections.fetch_add(1, Ordering::SeqCst);
+            }
+            AbuseRejectionReason::HandshakeLimitReached => {}
         })
     }
 
@@ -292,6 +290,7 @@ fn normalize_source_key(ip: IpAddr, aggregation: SourceAggregation) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
     use std::time::Duration;

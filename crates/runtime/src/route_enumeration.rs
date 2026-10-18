@@ -283,6 +283,7 @@ fn normalize_source_key(ip: IpAddr, aggregation: SourceAggregation) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::thread;
@@ -370,7 +371,8 @@ mod tests {
             max_ban_duration: std::time::Duration::from_secs(8),
             max_tracked_sources: 16,
         });
-        let first = SocketAddr::new("::ffff:192.0.2.10".parse::<IpAddr>().expect("mapped ip"), 40000);
+        let first =
+            SocketAddr::new("::ffff:192.0.2.10".parse::<IpAddr>().expect("mapped ip"), 40000);
         let second = SocketAddr::new("192.0.2.99".parse::<IpAddr>().expect("ipv4 ip"), 40001);
 
         assert!(!state.record_query_probe(first, Some("example.test"), "/search?q=one"));

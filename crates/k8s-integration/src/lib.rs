@@ -8,9 +8,9 @@ pub use controller_pipeline::{
     GatewayControllerPipeline, GatewaySnapshotCandidate, PublishedGatewaySnapshot,
 };
 pub use endpoint_slices::{
-    DiscoveryApiVersion, DiscoverySnapshotBuildError, EndpointAddressType,
-    EndpointSliceApplyError, EndpointSliceConditions, EndpointSliceController,
-    EndpointSliceEndpoint, EndpointSliceResource, EndpointSliceStats, EndpointSliceUpdateOutcome,
+    DiscoveryApiVersion, DiscoverySnapshotBuildError, EndpointAddressType, EndpointSliceApplyError,
+    EndpointSliceConditions, EndpointSliceController, EndpointSliceEndpoint, EndpointSliceResource,
+    EndpointSliceStats, EndpointSliceUpdateOutcome,
 };
 pub use operator::{
     ConditionStatus, InMemoryReconcileBackend, KubernetesOperatorReconciler, OperatorState,

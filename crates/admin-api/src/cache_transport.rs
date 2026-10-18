@@ -161,25 +161,19 @@ impl HttpCachePeerConfig {
             return Err(InvalidHttpCachePeerConfig::EmptyTlsCaCertEnv);
         }
         if matches!(parsed_origin.scheme, PeerOriginScheme::Https)
-            && self
-                .tls_server_name
-                .as_deref()
-                .is_some_and(|value| value.trim().is_empty())
+            && self.tls_server_name.as_deref().is_some_and(|value| value.trim().is_empty())
         {
             return Err(InvalidHttpCachePeerConfig::EmptyTlsServerName);
         }
         if matches!(parsed_origin.scheme, PeerOriginScheme::Https)
-            && self.tls_server_name.as_deref().is_some_and(|value| {
-                ServerName::try_from(value.trim()).is_err()
-            })
+            && self
+                .tls_server_name
+                .as_deref()
+                .is_some_and(|value| ServerName::try_from(value.trim()).is_err())
         {
             return Err(InvalidHttpCachePeerConfig::InvalidTlsServerName);
         }
-        if self
-            .tls_cert_pin_sha256_env
-            .as_deref()
-            .is_some_and(|value| value.trim().is_empty())
-        {
+        if self.tls_cert_pin_sha256_env.as_deref().is_some_and(|value| value.trim().is_empty()) {
             return Err(InvalidHttpCachePeerConfig::EmptyTlsCertPinSha256Env);
         }
         if self.actor.contains(['\r', '\n', '\0'])
@@ -615,19 +609,17 @@ fn resolve_tls_server_name(
     origin: &ParsedPeerOrigin,
 ) -> Result<ServerName<'static>, String> {
     if let Some(server_name) = peer.tls_server_name.as_deref() {
-        return ServerName::try_from(server_name.trim())
-            .map(|parsed| parsed.to_owned())
-            .map_err(|error| {
-                format!(
-                    "invalid tls_server_name for peer {}: {error}",
-                    peer.node_id
-                )
-            });
+        return ServerName::try_from(server_name.trim()).map(|parsed| parsed.to_owned()).map_err(
+            |error| format!("invalid tls_server_name for peer {}: {error}", peer.node_id),
+        );
     }
     Ok(ServerName::IpAddress(origin.socket_addr.ip().into()))
 }
 
-fn verify_tls_peer_pin(peer: &HttpCachePeerConfig, connection: &ClientConnection) -> Result<(), String> {
+fn verify_tls_peer_pin(
+    peer: &HttpCachePeerConfig,
+    connection: &ClientConnection,
+) -> Result<(), String> {
     let Some(pin_env) = peer.tls_cert_pin_sha256_env.as_deref() else {
         return Ok(());
     };
@@ -655,8 +647,8 @@ fn decode_sha256_pin_hex(pin_hex: &str) -> Result<[u8; 32], String> {
     let mut decoded = [0_u8; 32];
     for (index, pair) in pin_hex.as_bytes().chunks_exact(2).enumerate() {
         let hex_pair = std::str::from_utf8(pair).map_err(|_| String::from("hex must be UTF-8"))?;
-        decoded[index] =
-            u8::from_str_radix(hex_pair, 16).map_err(|_| String::from("hex contains invalid digit"))?;
+        decoded[index] = u8::from_str_radix(hex_pair, 16)
+            .map_err(|_| String::from("hex contains invalid digit"))?;
     }
     Ok(decoded)
 }
@@ -958,20 +950,15 @@ mod tests {
 
     #[test]
     fn peer_config_rejects_remote_https_origin_even_with_tls_ca() {
-        let result = HttpCachePeerTransport::new([
-            HttpCachePeerConfig::new(
-                "node-b",
-                "https://198.51.100.10:8443",
-                "peer-a",
-                "LB_CACHE_TEST_SECRET",
-            )
-            .with_tls_ca_cert_env("LB_CACHE_TEST_CA"),
-        ]);
+        let result = HttpCachePeerTransport::new([HttpCachePeerConfig::new(
+            "node-b",
+            "https://198.51.100.10:8443",
+            "peer-a",
+            "LB_CACHE_TEST_SECRET",
+        )
+        .with_tls_ca_cert_env("LB_CACHE_TEST_CA")]);
 
-        assert!(matches!(
-            result,
-            Err(InvalidHttpCachePeerConfig::InsecureHttpsOrigin)
-        ));
+        assert!(matches!(result, Err(InvalidHttpCachePeerConfig::InsecureHttpsOrigin)));
     }
 
     #[test]
@@ -988,39 +975,29 @@ mod tests {
 
     #[test]
     fn peer_config_rejects_invalid_tls_server_name() {
-        let result = HttpCachePeerTransport::new([
-            HttpCachePeerConfig::new(
-                "node-b",
-                "https://127.0.0.1:8443",
-                "peer-a",
-                "LB_CACHE_TEST_SECRET",
-            )
-            .with_tls_ca_cert_env("LB_CACHE_TEST_CA")
-            .with_tls_server_name("bad name"),
-        ]);
+        let result = HttpCachePeerTransport::new([HttpCachePeerConfig::new(
+            "node-b",
+            "https://127.0.0.1:8443",
+            "peer-a",
+            "LB_CACHE_TEST_SECRET",
+        )
+        .with_tls_ca_cert_env("LB_CACHE_TEST_CA")
+        .with_tls_server_name("bad name")]);
 
-        assert!(matches!(
-            result,
-            Err(InvalidHttpCachePeerConfig::InvalidTlsServerName)
-        ));
+        assert!(matches!(result, Err(InvalidHttpCachePeerConfig::InvalidTlsServerName)));
     }
 
     #[test]
     fn peer_config_rejects_empty_tls_cert_pin_env() {
-        let result = HttpCachePeerTransport::new([
-            HttpCachePeerConfig::new(
-                "node-b",
-                "https://127.0.0.1:8443",
-                "peer-a",
-                "LB_CACHE_TEST_SECRET",
-            )
-            .with_tls_ca_cert_env("LB_CACHE_TEST_CA")
-            .with_tls_cert_pin_sha256_env("   "),
-        ]);
+        let result = HttpCachePeerTransport::new([HttpCachePeerConfig::new(
+            "node-b",
+            "https://127.0.0.1:8443",
+            "peer-a",
+            "LB_CACHE_TEST_SECRET",
+        )
+        .with_tls_ca_cert_env("LB_CACHE_TEST_CA")
+        .with_tls_cert_pin_sha256_env("   ")]);
 
-        assert!(matches!(
-            result,
-            Err(InvalidHttpCachePeerConfig::EmptyTlsCertPinSha256Env)
-        ));
+        assert!(matches!(result, Err(InvalidHttpCachePeerConfig::EmptyTlsCertPinSha256Env)));
     }
 }

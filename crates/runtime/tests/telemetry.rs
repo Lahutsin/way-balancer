@@ -144,12 +144,10 @@ fn runtime_telemetry_emits_structured_logs_and_metrics() -> Result<(), Box<dyn s
     assert!(metrics.contains(
         "runtime_listener_abuse_rejections_total{listener=\"ingress_tcp\",reason=\"source_quota_exceeded\"} 1"
     ));
-    assert!(metrics.contains(
-        "runtime_listener_abuse_tracked_sources{listener=\"ingress_tcp\"} 2"
-    ));
-    assert!(metrics.contains(
-        "runtime_listener_abuse_active_handshakes{listener=\"ingress_tcp\"} 1"
-    ));
+    assert!(metrics.contains("runtime_listener_abuse_tracked_sources{listener=\"ingress_tcp\"} 2"));
+    assert!(
+        metrics.contains("runtime_listener_abuse_active_handshakes{listener=\"ingress_tcp\"} 1")
+    );
     assert!(metrics.contains("runtime_listener_events_total{listener=\"ingress_tcp\",event_code=\"runtime.listener.started\"} 1"));
     assert!(metrics.contains(
         "runtime_breaker_events_total{scope=\"payments\",event_code=\"failure.breaker.opened\"} 1"
@@ -217,8 +215,17 @@ fn runtime_telemetry_emits_structured_logs_and_metrics() -> Result<(), Box<dyn s
     assert!(snapshot.logs.iter().any(|record| record.code.as_str() == "overload.request.shed"));
     assert!(snapshot.logs.iter().any(|record| record.code.as_str() == "cache.hit"));
     assert!(snapshot.logs.iter().any(|record| record.code.as_str() == "cache.revalidated"));
-    assert!(snapshot.events.iter().any(|event| event.code.as_str() == "runtime.http_upgrade.accepted"));
-    assert!(snapshot.events.iter().any(|event| event.code.as_str() == "runtime.http_upgrade.rejected"));
-    assert!(snapshot.events.iter().any(|event| event.code.as_str() == "runtime.http_upgrade.failed"));
+    assert!(snapshot
+        .events
+        .iter()
+        .any(|event| event.code.as_str() == "runtime.http_upgrade.accepted"));
+    assert!(snapshot
+        .events
+        .iter()
+        .any(|event| event.code.as_str() == "runtime.http_upgrade.rejected"));
+    assert!(snapshot
+        .events
+        .iter()
+        .any(|event| event.code.as_str() == "runtime.http_upgrade.failed"));
     Ok(())
 }

@@ -1,10 +1,10 @@
 #![allow(
-	clippy::large_enum_variant,
-	clippy::question_mark,
-	clippy::result_large_err,
-	clippy::too_many_arguments,
-	clippy::type_complexity,
-	clippy::useless_format
+    clippy::large_enum_variant,
+    clippy::question_mark,
+    clippy::result_large_err,
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::useless_format
 )]
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -36,21 +36,20 @@ use tokio::time;
 use tokio_rustls::TlsAcceptor;
 
 use crate::{
-	admin_bearer_secret, compile_anonymous_source_filter, compile_trusted_client_ip, ServeArgs,
+    admin_bearer_secret, compile_anonymous_source_filter, compile_trusted_client_ip, ServeArgs,
 };
 
 type DynError = Box<dyn Error + Send + Sync>;
 
 static TLS12_AND_TLS13: [&rustls::SupportedProtocolVersion; 2] =
-	[&rustls::version::TLS13, &rustls::version::TLS12];
+    [&rustls::version::TLS13, &rustls::version::TLS12];
 static TLS13_ONLY: [&rustls::SupportedProtocolVersion; 1] = [&rustls::version::TLS13];
 const ACTIVE_HEALTH_PROBE_INTERVAL: Duration = Duration::from_millis(500);
 const ACTIVE_HEALTH_PROBE_TIMEOUT: Duration = Duration::from_millis(150);
 const ROUTE_BACKEND_WARMUP_DURATION: Duration = Duration::from_secs(1);
 const PROXY_PROTOCOL_V1_MAX_LEN: usize = 108;
-const PROXY_PROTOCOL_V2_SIGNATURE: [u8; 12] = [
-	0x0d, 0x0a, 0x0d, 0x0a, 0x00, 0x0d, 0x0a, b'Q', b'U', b'I', b'T', 0x0a,
-];
+const PROXY_PROTOCOL_V2_SIGNATURE: [u8; 12] =
+    [0x0d, 0x0a, 0x0d, 0x0a, 0x00, 0x0d, 0x0a, b'Q', b'U', b'I', b'T', 0x0a];
 const ADMIN_AUDIT_DEFAULT_CAPACITY: usize = 64;
 const CONTROL_PLANE_JOURNAL_VERSION: u32 = 1;
 const RECOVERY_UNFINISHED_RELOAD_CODE: &str = "reload_recovered_unfinished";
@@ -59,13 +58,13 @@ static NEXT_CONTROL_PLANE_JOURNAL_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static RUSTLS_CRYPTO_PROVIDER_INSTALLED: OnceLock<()> = OnceLock::new();
 
 fn to_dyn_error(error: impl std::fmt::Display) -> DynError {
-	Box::new(io::Error::other(error.to_string()))
+    Box::new(io::Error::other(error.to_string()))
 }
 
 fn ensure_rustls_crypto_provider() {
-	RUSTLS_CRYPTO_PROVIDER_INSTALLED.get_or_init(|| {
-		let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-	});
+    RUSTLS_CRYPTO_PROVIDER_INSTALLED.get_or_init(|| {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    });
 }
 
 include!("tls.rs");

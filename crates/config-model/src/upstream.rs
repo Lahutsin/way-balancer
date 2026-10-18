@@ -69,15 +69,9 @@ pub enum DiscoverySourceConfig {
         min_refresh_secs: u64,
     },
     /// Consume Kubernetes EndpointSlice updates for one Service.
-    KubernetesEndpointSlice {
-        namespace: String,
-        service: String,
-    },
+    KubernetesEndpointSlice { namespace: String, service: String },
     /// Consume Consul-like service catalog updates.
-    ConsulLike {
-        service: String,
-        datacenter: Option<String>,
-    },
+    ConsulLike { service: String, datacenter: Option<String> },
 }
 
 /// Declarative cluster traffic policy.
@@ -307,7 +301,10 @@ impl fmt::Display for WorkspaceConfigError {
                 write!(formatter, "route {route_name} must declare only valid content types")
             }
             Self::InvalidRouteGrpcService(route_name) => {
-                write!(formatter, "route {route_name} must declare only valid gRPC service matchers")
+                write!(
+                    formatter,
+                    "route {route_name} must declare only valid gRPC service matchers"
+                )
             }
             Self::InvalidRouteGrpcMethod(route_name) => {
                 write!(formatter, "route {route_name} must declare only valid gRPC method matchers")
@@ -383,8 +380,7 @@ mod tests {
     use super::{
         compile_clusters, AffinityFallbackConfig, AffinityPolicyConfig, EndpointStateConfig,
         UpstreamClusterConfig, UpstreamEndpointConfig, UpstreamTrafficPolicyConfig,
-        UpstreamTransportConfig,
-        WorkspaceConfigError,
+        UpstreamTransportConfig, WorkspaceConfigError,
     };
 
     #[test]

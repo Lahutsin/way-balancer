@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::{RequestClassificationAction, RequestClassificationResult, RequestClassifierSignalKind};
+use crate::{
+    RequestClassificationAction, RequestClassificationResult, RequestClassifierSignalKind,
+};
 
 /// Auth-context snapshot used for abuse enforcement mapping.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -48,10 +50,7 @@ pub struct RequestClassificationEnforcementPolicy {
 
 impl Default for RequestClassificationEnforcementPolicy {
     fn default() -> Self {
-        Self {
-            tag_min_anomaly_score: 35,
-            trusted_principals: BTreeSet::new(),
-        }
+        Self { tag_min_anomaly_score: 35, trusted_principals: BTreeSet::new() }
     }
 }
 
@@ -104,9 +103,11 @@ impl RequestClassificationEnforcer {
             );
         }
 
-        if auth_context.principal.as_ref().is_some_and(|principal| {
-            self.policy.trusted_principals.contains(principal)
-        }) {
+        if auth_context
+            .principal
+            .as_ref()
+            .is_some_and(|principal| self.policy.trusted_principals.contains(principal))
+        {
             reasons.push(String::from("trusted principal exception applied"));
             return self.decision(
                 RequestClassificationEnforcementAction::Allow,
@@ -142,10 +143,7 @@ impl RequestClassificationEnforcer {
 
         if classification.anomaly_score >= self.policy.tag_min_anomaly_score
             || matches!(
-                auth_context
-                    .context_headers
-                    .get("x-way-balancer-risk-tier")
-                    .map(String::as_str),
+                auth_context.context_headers.get("x-way-balancer-risk-tier").map(String::as_str),
                 Some("elevated") | Some("high")
             )
         {
@@ -200,10 +198,12 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use super::{
-        RequestClassificationAuthContext, RequestClassificationEnforcer,
-        RequestClassificationEnforcementAction, RequestClassificationEnforcementPolicy,
+        RequestClassificationAuthContext, RequestClassificationEnforcementAction,
+        RequestClassificationEnforcementPolicy, RequestClassificationEnforcer,
     };
-    use crate::{RequestClassificationAction, RequestClassificationResult, RequestClassifierSignalKind};
+    use crate::{
+        RequestClassificationAction, RequestClassificationResult, RequestClassifierSignalKind,
+    };
 
     fn classification_result(
         anomaly_score: u8,
@@ -212,7 +212,10 @@ mod tests {
         RequestClassificationResult {
             anomaly_score,
             action,
-            signal_scores: BTreeMap::from([(RequestClassifierSignalKind::HeaderAnomaly, anomaly_score)]),
+            signal_scores: BTreeMap::from([(
+                RequestClassifierSignalKind::HeaderAnomaly,
+                anomaly_score,
+            )]),
         }
     }
 
@@ -221,22 +224,16 @@ mod tests {
         let enforcer = RequestClassificationEnforcer::default();
         let auth = RequestClassificationAuthContext::default();
 
-        let block = enforcer.evaluate(
-            &classification_result(90, RequestClassificationAction::Block),
-            &auth,
-        );
+        let block = enforcer
+            .evaluate(&classification_result(90, RequestClassificationAction::Block), &auth);
         assert_eq!(block.action, RequestClassificationEnforcementAction::Block);
 
-        let challenge = enforcer.evaluate(
-            &classification_result(60, RequestClassificationAction::Challenge),
-            &auth,
-        );
+        let challenge = enforcer
+            .evaluate(&classification_result(60, RequestClassificationAction::Challenge), &auth);
         assert_eq!(challenge.action, RequestClassificationEnforcementAction::Challenge);
 
-        let allow = enforcer.evaluate(
-            &classification_result(5, RequestClassificationAction::Allow),
-            &auth,
-        );
+        let allow =
+            enforcer.evaluate(&classification_result(5, RequestClassificationAction::Allow), &auth);
         assert_eq!(allow.action, RequestClassificationEnforcementAction::Allow);
     }
 
@@ -248,16 +245,10 @@ mod tests {
             ..RequestClassificationAuthContext::default()
         };
 
-        let decision = enforcer.evaluate(
-            &classification_result(65, RequestClassificationAction::Challenge),
-            &auth,
-        );
+        let decision = enforcer
+            .evaluate(&classification_result(65, RequestClassificationAction::Challenge), &auth);
         assert_eq!(decision.action, RequestClassificationEnforcementAction::Throttle);
-        assert!(decision
-            .audit
-            .reasons
-            .iter()
-            .any(|reason| reason.contains("fail-open")));
+        assert!(decision.audit.reasons.iter().any(|reason| reason.contains("fail-open")));
     }
 
     #[test]
@@ -272,10 +263,8 @@ mod tests {
             ..RequestClassificationAuthContext::default()
         };
 
-        let decision = enforcer.evaluate(
-            &classification_result(60, RequestClassificationAction::Challenge),
-            &auth,
-        );
+        let decision = enforcer
+            .evaluate(&classification_result(60, RequestClassificationAction::Challenge), &auth);
         assert_eq!(decision.action, RequestClassificationEnforcementAction::Allow);
         assert!(decision
             .audit
@@ -290,13 +279,14 @@ mod tests {
         let auth = RequestClassificationAuthContext {
             principal: Some(String::from("user-123")),
             external_auth_fail_open_applied: true,
-            context_headers: BTreeMap::from([(String::from("x-way-balancer-risk-tier"), String::from("high"))]),
+            context_headers: BTreeMap::from([(
+                String::from("x-way-balancer-risk-tier"),
+                String::from("high"),
+            )]),
         };
 
-        let decision = enforcer.evaluate(
-            &classification_result(30, RequestClassificationAction::Allow),
-            &auth,
-        );
+        let decision = enforcer
+            .evaluate(&classification_result(30, RequestClassificationAction::Allow), &auth);
 
         assert_eq!(decision.action, RequestClassificationEnforcementAction::Tag);
         assert_eq!(decision.audit.principal.as_deref(), Some("user-123"));

@@ -63,9 +63,12 @@ impl TrustedClientIpPolicy {
         peer_ip: IpAddr,
         headers: &http::HeaderMap,
     ) -> Result<TrustedClientIpResolution, TrustedClientIpError> {
-        self.resolve_from_header_iter(peer_ip, headers.iter().filter_map(|(name, value)| {
-            value.to_str().ok().map(|value| (name.as_str(), value))
-        }))
+        self.resolve_from_header_iter(
+            peer_ip,
+            headers.iter().filter_map(|(name, value)| {
+                value.to_str().ok().map(|value| (name.as_str(), value))
+            }),
+        )
     }
 
     fn resolve_from_header_iter<'a>(
@@ -105,15 +108,9 @@ impl TrustedClientIpPolicy {
         }
 
         let (header_source, chain) = if !forwarded_values.is_empty() {
-            (
-                TrustedClientIpHeaderSource::Forwarded,
-                parse_forwarded_chain(&forwarded_values)?,
-            )
+            (TrustedClientIpHeaderSource::Forwarded, parse_forwarded_chain(&forwarded_values)?)
         } else {
-            (
-                TrustedClientIpHeaderSource::XForwardedFor,
-                parse_x_forwarded_for_chain(&xff_values)?,
-            )
+            (TrustedClientIpHeaderSource::XForwardedFor, parse_x_forwarded_for_chain(&xff_values)?)
         };
         if chain.is_empty() {
             return Err(TrustedClientIpError::InvalidForwardingHeader);
@@ -226,9 +223,7 @@ mod tests {
     use http::HeaderValue;
     use ipnet::IpNet;
 
-    use super::{
-        TrustedClientIpError, TrustedClientIpHeaderSource, TrustedClientIpPolicy,
-    };
+    use super::{TrustedClientIpError, TrustedClientIpHeaderSource, TrustedClientIpPolicy};
 
     #[test]
     fn rejects_forwarding_headers_from_untrusted_peer() {

@@ -488,7 +488,6 @@ fn compile_http3_proxy_config(
     let http1 = compile_http1_proxy_config(config, listener, compiled_routes, None, None)?;
     let tls_server_config = Arc::new(build_tls_server_config(tls_termination)?);
     let quic_server_config = Arc::new(build_quic_server_config(Arc::clone(&tls_server_config))?);
-    let _ = config;
 
     Ok(ManagedHttp3ProxyConfig {
         http1,

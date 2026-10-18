@@ -1,6 +1,7 @@
 fn validate_admin_listener_policy(
     listener: &crate::ListenerResourceConfig,
     base_path: &str,
+    insecure_dev_mode_enabled: bool,
     report: &mut ValidationReport,
 ) {
     if listener.class != ListenerClassConfig::Admin && !listener.admin.is_default() {
@@ -18,6 +19,7 @@ fn validate_admin_listener_policy(
 
     if listener.protocol == ListenerProtocolConfig::Http1
         && !listener.bind_address.ip().is_loopback()
+        && !insecure_dev_mode_enabled
     {
         report.errors.push(ValidationError::semantic(
             ValidationCode::InvalidListenerField,

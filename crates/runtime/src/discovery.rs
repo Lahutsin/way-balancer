@@ -3,9 +3,7 @@ use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use crate::{
-    LifecycleStateMachine, RuntimeTelemetry, UpstreamHealthError, UpstreamHealthRegistry,
-};
+use crate::{LifecycleStateMachine, RuntimeTelemetry, UpstreamHealthError, UpstreamHealthRegistry};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum DiscoveryProviderKind {
@@ -199,7 +197,8 @@ struct DrainingEndpointKey {
 pub struct DiscoveryMembershipReconciler {
     drain_grace: Duration,
     now: Duration,
-    active_endpoints_by_source: BTreeMap<DiscoverySourceId, BTreeMap<lb_net_core::UpstreamEndpointId, DiscoveryEndpoint>>,
+    active_endpoints_by_source:
+        BTreeMap<DiscoverySourceId, BTreeMap<lb_net_core::UpstreamEndpointId, DiscoveryEndpoint>>,
     draining_deadlines: BTreeMap<DrainingEndpointKey, Duration>,
     endpoint_lifecycle: BTreeMap<DrainingEndpointKey, LifecycleStateMachine>,
     telemetry_scope: Option<String>,
@@ -285,7 +284,11 @@ impl DiscoveryMembershipReconciler {
             let next_ids = next_endpoints.keys().cloned().collect::<BTreeSet<_>>();
             let previous_ids = previous.keys().cloned().collect::<BTreeSet<_>>();
             for removed_id in previous_ids.difference(&next_ids) {
-                registry.set_endpoint_state(&cluster_name, removed_id, lb_net_core::EndpointState::Draining)?;
+                registry.set_endpoint_state(
+                    &cluster_name,
+                    removed_id,
+                    lb_net_core::EndpointState::Draining,
+                )?;
                 self.draining_deadlines.insert(
                     DrainingEndpointKey {
                         cluster_name: cluster_name.clone(),
@@ -380,10 +383,7 @@ impl DiscoveryMembershipReconciler {
         cluster_name: &lb_net_core::UpstreamClusterName,
         endpoint_id: &lb_net_core::UpstreamEndpointId,
     ) -> DrainingEndpointKey {
-        DrainingEndpointKey {
-            cluster_name: cluster_name.clone(),
-            endpoint_id: endpoint_id.clone(),
-        }
+        DrainingEndpointKey { cluster_name: cluster_name.clone(), endpoint_id: endpoint_id.clone() }
     }
 
     fn record_endpoint_activated(
@@ -393,10 +393,8 @@ impl DiscoveryMembershipReconciler {
         outcome: &mut DiscoveryReconcileOutcome,
     ) {
         let key = Self::endpoint_key(cluster_name, endpoint_id);
-        let machine = self
-            .endpoint_lifecycle
-            .entry(key)
-            .or_insert_with(LifecycleStateMachine::new_warming);
+        let machine =
+            self.endpoint_lifecycle.entry(key).or_insert_with(LifecycleStateMachine::new_warming);
         outcome.lifecycle_warming += 1;
         if machine.activate().is_err() {
             *machine = LifecycleStateMachine::new_active();
@@ -411,10 +409,8 @@ impl DiscoveryMembershipReconciler {
         outcome: &mut DiscoveryReconcileOutcome,
     ) {
         let key = Self::endpoint_key(cluster_name, endpoint_id);
-        let machine = self
-            .endpoint_lifecycle
-            .entry(key)
-            .or_insert_with(LifecycleStateMachine::new_active);
+        let machine =
+            self.endpoint_lifecycle.entry(key).or_insert_with(LifecycleStateMachine::new_active);
         if machine.start_draining().is_err() {
             machine.force_remove();
         }
@@ -453,11 +449,7 @@ impl DiscoveryMembershipReconciler {
 
 #[must_use]
 pub fn jittered_refresh_delay(valid_for: Duration, attempt: u32, seed: u64) -> Duration {
-    let base = if valid_for.is_zero() {
-        Duration::from_secs(1)
-    } else {
-        valid_for
-    };
+    let base = if valid_for.is_zero() { Duration::from_secs(1) } else { valid_for };
     let jitter_window_ms = (base.as_millis() / 5).max(1) as u64;
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     seed.hash(&mut hasher);
@@ -478,8 +470,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        failure_backoff_delay, jittered_refresh_delay, DiscoveryEndpoint, DiscoveryMembershipReconciler,
-        DiscoveryProviderKind, DiscoverySnapshot, DiscoverySourceId,
+        failure_backoff_delay, jittered_refresh_delay, DiscoveryEndpoint,
+        DiscoveryMembershipReconciler, DiscoveryProviderKind, DiscoverySnapshot, DiscoverySourceId,
     };
     use crate::{EndpointHealthPolicy, UpstreamHealthRegistry};
 
@@ -526,7 +518,8 @@ mod tests {
         let registry = registry()?;
         let mut reconciler = DiscoveryMembershipReconciler::new(Duration::from_secs(5));
 
-        let first = snapshot(1, vec![endpoint("payments-a", 8080)?, endpoint("payments-b", 8081)?])?;
+        let first =
+            snapshot(1, vec![endpoint("payments-a", 8080)?, endpoint("payments-b", 8081)?])?;
         let applied = reconciler.reconcile_snapshot(&registry, first)?;
         assert_eq!(applied.inserted, 2);
 
@@ -550,8 +543,12 @@ mod tests {
         assert!(matches!(
             registry.endpoint_health(&cluster_name, &draining_id),
             Err(crate::UpstreamHealthError::EndpointNotTracked { .. })
-                | Err(crate::UpstreamHealthError::Registry(crate::EndpointRegistryError::EndpointNotFound { .. }))
-                | Err(crate::UpstreamHealthError::Registry(crate::EndpointRegistryError::ClusterNotFound(_)))
+                | Err(crate::UpstreamHealthError::Registry(
+                    crate::EndpointRegistryError::EndpointNotFound { .. }
+                ))
+                | Err(crate::UpstreamHealthError::Registry(
+                    crate::EndpointRegistryError::ClusterNotFound(_)
+                ))
         ));
         Ok(())
     }

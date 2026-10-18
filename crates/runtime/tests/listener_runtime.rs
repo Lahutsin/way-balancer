@@ -1,6 +1,6 @@
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::net::TcpListener as StdTcpListener;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use lb_net_core::{ListenerBindMode, ListenerClass, ListenerConfig};

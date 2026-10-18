@@ -35,10 +35,7 @@ fn reload_health_name(state: ReloadHealthState) -> &'static str {
 }
 
 fn elapsed_millis_at_least_one(duration: Duration) -> u64 {
-    let millis = match u64::try_from(duration.as_millis()) {
-        Ok(millis) => millis,
-        Err(_) => u64::MAX,
-    };
+    let millis = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
     millis.max(1)
 }
 

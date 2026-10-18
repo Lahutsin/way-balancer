@@ -71,8 +71,7 @@ impl AdminRequestAction {
 }
 
 fn negotiate_admin_api_request(request: &crate::DemoRequestHead) -> AdminApiRequestMode {
-    let path_version = versioned_admin_target_parts(request.target.as_str())
-        .map(|(version, canonical_target)| (version, canonical_target));
+    let path_version = versioned_admin_target_parts(request.target.as_str());
     let header_version = request
         .header_value("x-lb-admin-api-version")
         .and_then(normalize_admin_api_version)

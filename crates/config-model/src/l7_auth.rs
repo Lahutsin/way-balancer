@@ -92,10 +92,7 @@ pub struct AuthorizationPolicyConfig {
 
 impl Default for AuthorizationPolicyConfig {
     fn default() -> Self {
-        Self {
-            rules: Vec::new(),
-            default_decision: AuthorizationDecisionConfig::Deny,
-        }
+        Self { rules: Vec::new(), default_decision: AuthorizationDecisionConfig::Deny }
     }
 }
 

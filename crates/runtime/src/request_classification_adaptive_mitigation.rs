@@ -1,6 +1,6 @@
 use crate::{
-    OverloadState, RequestClassificationEnforcementAction, RequestClassificationEnforcementDecision,
-    SheddingAction, SheddingDecision,
+    OverloadState, RequestClassificationEnforcementAction,
+    RequestClassificationEnforcementDecision, SheddingAction, SheddingDecision,
 };
 
 /// Policy controls for adapting abuse mitigation during overload.
@@ -72,9 +72,7 @@ impl RequestClassificationAdaptiveMitigator {
             && matches!(action, RequestClassificationEnforcementAction::Tag)
         {
             action = RequestClassificationEnforcementAction::Challenge;
-            reasons.push(String::from(
-                "overload shedding escalated tag action to challenge",
-            ));
+            reasons.push(String::from("overload shedding escalated tag action to challenge"));
         }
 
         if matches!(shedding.state, OverloadState::Brownout)
@@ -83,9 +81,7 @@ impl RequestClassificationAdaptiveMitigator {
             && matches!(action, RequestClassificationEnforcementAction::Challenge)
         {
             action = RequestClassificationEnforcementAction::Throttle;
-            reasons.push(String::from(
-                "brownout shedding escalated challenge action to throttle",
-            ));
+            reasons.push(String::from("brownout shedding escalated challenge action to throttle"));
         }
 
         if reasons.is_empty() {
@@ -113,14 +109,15 @@ mod tests {
 
     use super::RequestClassificationAdaptiveMitigator;
     use crate::{
-        RequestClassificationAction, RequestClassificationAuditRecord,
-        RequestClassificationAuthContext, RequestClassificationEnforcer,
-        RequestClassificationEnforcementAction, RequestClassificationEnforcementPolicy,
-        RequestClassificationResult, RequestClassifierSignalKind, SheddingAction,
-        SheddingDecision, OverloadState,
+        OverloadState, RequestClassificationAction, RequestClassificationAuditRecord,
+        RequestClassificationAuthContext, RequestClassificationEnforcementAction,
+        RequestClassificationEnforcementPolicy, RequestClassificationEnforcer,
+        RequestClassificationResult, RequestClassifierSignalKind, SheddingAction, SheddingDecision,
     };
 
-    fn enforcement_decision(action: RequestClassificationAction) -> crate::RequestClassificationEnforcementDecision {
+    fn enforcement_decision(
+        action: RequestClassificationAction,
+    ) -> crate::RequestClassificationEnforcementDecision {
         RequestClassificationEnforcer::default().evaluate(
             &RequestClassificationResult {
                 anomaly_score: 60,

@@ -255,7 +255,6 @@ impl HttpCacheAdminService {
         }
     }
 
-    #[must_use]
     pub fn with_invalidation_bus(
         mut self,
         node_id: impl Into<String>,
@@ -271,7 +270,6 @@ impl HttpCacheAdminService {
         Ok(self)
     }
 
-    #[must_use]
     pub fn with_invalidation_transport(
         mut self,
         node_id: impl Into<String>,

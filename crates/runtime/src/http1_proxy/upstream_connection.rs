@@ -1,3 +1,4 @@
+#[allow(clippy::too_many_arguments)]
 async fn ensure_upstream_connection(
     upstream: &mut Option<TcpStream>,
     active_upstream: &mut Option<lb_net_core::UpstreamTarget>,
