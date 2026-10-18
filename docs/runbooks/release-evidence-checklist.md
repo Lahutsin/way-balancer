@@ -7,7 +7,7 @@
 | `EVID-001` | Compatibility policy | `docs/runbooks/compatibility-matrix.md` | `./scripts/check-release-artifacts.sh` |
 | `EVID-002` | Upgrade and rollback policy | `docs/runbooks/upgrade-rollback-policy.md` | `cargo test -p lb-test-support --test upgrade_rollback_smoke` |
 | `EVID-003` | Disaster recovery and restore validation | `docs/runbooks/disaster-recovery.md` | `cargo test -p lb-test-support --test snapshot_restore_smoke` |
-| `EVID-004` | Secure-default artifact integrity expectations | `plan/features/13_artifact_integrity_and_secure_defaults.md` | `cargo test -p lb-config-model -p lb-runtime` |
+| `EVID-004` | Secure-default and artifact-integrity expectations | `docs/runbooks/security-hardening.md` | `cargo test -p lb-runtime missing_attestation_is_rejected_before_activation` |
 | `EVID-005` | Workspace verification baseline | `./scripts/quality.sh` output for the release candidate | `./scripts/quality.sh` |
 | `EVID-006` | SBOM placeholder or generated artifact location | `artifacts/sbom/README.md` | `./scripts/check-release-artifacts.sh` |
 | `EVID-007` | Provenance placeholder or generated artifact location | `artifacts/provenance/README.md` | `./scripts/check-release-artifacts.sh` |

@@ -4,7 +4,7 @@
 
 The admin surface is exposed by `lb-dataplane serve --config ...` and is intended for privileged operational control, not public application traffic.
 
-In the current workspace mode, the admin listener exposes liveness, serving-readiness, status, validation, audit, reload, and cache-control endpoints over HTTP/1.
+In the current workspace mode, the admin listener exposes liveness, serving-readiness, status, validation, audit, reload, warm-restart, and cache-control endpoints over HTTP/1.
 
 The legacy unversioned endpoints remain available for backward compatibility. The stable machine-readable contract is exposed additively under `/v1/...` and returns `X-LB-Admin-Api-Version: v1` on every response.
 
@@ -18,10 +18,11 @@ The legacy unversioned endpoints remain available for backward compatibility. Th
 | `/validate` | `GET` | `read` | `200 OK` or `400 Bad Request` | Dry-run current config file and preview active vs candidate snapshots, warnings, and apply strategy. |
 | `/audit` | `GET` | `audit` | `200 OK` | Recent admin-plane activity with actor, code, outcome, and detail. |
 | `/reload` | `POST` | `write` | `200 OK` or `500 Internal Server Error` | Apply the current config file using rollback-safe reload logic. |
+| `/restart` | `POST` | `write` | `200 OK` or `500 Internal Server Error` | Perform an explicit warm restart using the configured restart policy. |
 | `/cache/purge` | `POST` | `write` | `200 OK` or `400 Bad Request` | Purge cache entries by exact key or path prefix. |
 | `/cache/invalidate` | `POST` | `write` | `200 OK` or `400 Bad Request` | Apply a replay-safe invalidation event, usually for multi-node convergence. |
 
-Each listed endpoint also has a stable versioned form under `/v1`, such as `/v1/status`, `/v1/readyz`, and `/v1/reload`.
+Each listed endpoint also has a stable versioned form under `/v1`, such as `/v1/status`, `/v1/readyz`, `/v1/reload`, and `/v1/restart`.
 
 ## Versioned Contract
 
@@ -128,6 +129,7 @@ The detailed security posture and rollout guidance live in [Admin Plane Hardenin
 - service mode and config path
 - uptime and proxied request or connection counters
 - admin request and reload counters
+- warm-restart counters (`restart_requests`, `restart_success_count`, `restart_failure_count`, `restart_last_duration_ms`) and `last_restart_outcome_code`
 - `reload_health`
 - `last_reload_outcome_code`
 - reload duration metrics: `reload_total_duration_ms`, `reload_max_duration_ms`, `reload_last_duration_ms`, `reload_last_success_duration_ms`, `reload_last_failure_duration_ms`

@@ -5,7 +5,7 @@
 | `EVID-001` | `docs/runbooks/compatibility-matrix.md` | Supported versions and skew policy |
 | `EVID-002` | `docs/runbooks/upgrade-rollback-policy.md` | Upgrade and rollback release expectations |
 | `EVID-003` | `docs/runbooks/disaster-recovery.md` | Backup, restore, and compromise-aware recovery guidance |
-| `EVID-004` | `plan/features/13_artifact_integrity_and_secure_defaults.md` | Secure-default and artifact integrity baseline |
+| `EVID-004` | `docs/runbooks/security-hardening.md` and `cargo test -p lb-runtime missing_attestation_is_rejected_before_activation` | Secure-default and artifact integrity baseline |
 | `EVID-005` | `./scripts/quality.sh` output | Full workspace verification evidence |
 | `EVID-006` | `artifacts/sbom/README.md` | SBOM artifact location |
 | `EVID-007` | `artifacts/provenance/README.md` | Provenance artifact location |
